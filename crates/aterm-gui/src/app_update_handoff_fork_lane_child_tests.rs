@@ -83,14 +83,20 @@ fn descriptor_flags(fd: i32) -> i32 {
 
 #[cfg(target_vendor = "apple")]
 fn kernel_retains_close_on_fork() -> bool {
-    let probe = std::fs::File::open("/dev/null").expect("open the flag probe");
-    let flags = descriptor_flags(probe.as_raw_fd());
-    // SAFETY: F_SETFD changes only this test's owned probe descriptor.
+    use std::os::fd::AsFd as _;
+    // Use the managed constructor, then clear only this unrelated probe's mark so the
+    // capability oracle cannot inherit the constructor's answer. The attempt ends stay untouched.
+    let (probe, _peer) = aterm_uds::pipe().expect("an independent capability pipe");
+    let fd = probe.as_raw_fd();
+    let flags = descriptor_flags(fd);
+    // SAFETY: F_SETFD changes only the test's owned probe descriptor, before any child spawn.
     assert_eq!(
-        unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_SETFD, flags | FD_CLOFORK) },
-        0
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !FD_CLOFORK) },
+        0,
+        "clear the unrelated probe's fork mark"
     );
-    descriptor_flags(probe.as_raw_fd()) & FD_CLOFORK != 0
+    assert_eq!(descriptor_flags(fd) & FD_CLOFORK, 0);
+    astream_sys::close_on_fork(probe.as_fd()).expect("the kernel answers the flag request")
 }
 
 /// The fork lane's successor proves its adoption on the attempt's proof pipe and takes the

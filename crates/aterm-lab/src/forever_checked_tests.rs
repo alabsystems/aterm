@@ -178,39 +178,12 @@ fn each_folder_makes_its_own_leg() {
     }
 }
 
-/// THE DONE FOR YOU ROW'S TIP: the row's tip is the receipt's `landed_tip`, naming the head on
-/// `origin/main`. NEGATIVE CONTROLS: 9b's bare row (no tip) and a tip saying aterm checked
-/// nothing fail.
+/// THE WORKER'S `checked=`: `await task`'s row and `result`'s header carry the receipt's word.
+/// NEGATIVE CONTROL: main's (no `checked=`) fails.
 #[test]
-fn the_done_rows_tip_names_the_head() {
-    let seen = |tip: &str| {
+fn the_workers_await_and_result_say_checked() {
+    let seen = |checked: &str| {
         let mut s = landing(Some(RECEIPT_12), Vec::new());
-        s.window.read = true;
-        s.window.done_tip = vec![(T0 + 1_000, "-".into()), (T0 + 42_000, tip.to_string())];
-        s
-    };
-    let r = receipt_of(&seen("-"), T0).expect("the receipt");
-    let want = mode_words::landed_tip(Some(&r));
-    assert!(want.contains("1c81bc6f0e2a on origin/main"), "{want}");
-    assert_eq!(word_of(&done_tip(&seen(&want), T0)), "PASS");
-    assert_eq!(word_of(&done_tip(&seen("-"), T0)), "FAIL");
-    assert_eq!(word_of(&done_tip(&seen(mode_words::NO_RECORD), T0)), "FAIL");
-    let unread = Seen {
-        window: Default::default(),
-        ..seen("-")
-    };
-    let v = done_tip(&unread, T0);
-    assert!(v.why().contains("SKIPPED"), "a run with no window: {v:?}");
-}
-
-/// THE WORKER'S `checked=`: `await task`'s row and `result`'s header carry the receipt's word,
-/// and its row's tip says what aterm checked. NEGATIVE CONTROL: main's (no `checked=`, a tip of
-/// the hold's alone) fails.
-#[test]
-fn the_workers_await_result_and_row_say_checked() {
-    let seen = |checked: &str, tip: &str| {
-        let mut s = landing(Some(RECEIPT_12), Vec::new());
-        s.window.read = true;
         s.cover = Cover {
             awaited: Some((
                 T0 + 50_000,
@@ -225,17 +198,11 @@ fn the_workers_await_result_and_row_say_checked() {
             )),
             ..Cover::default()
         };
-        s.window.worker = vec![(
-            T0 + 45_000,
-            format!("mgr|mgr — 1 worker: 1 landed\nrow|✓ worker — landed #\ntip|{tip}"),
-        )];
         s
     };
-    let r = receipt_of(&seen("", ""), T0).expect("the receipt");
-    let tip = mode_words::checked_words(Some(&r));
-    let v = worker_checked(&seen(" checked=1c81bc6f0e2a@origin/main", &tip), T0);
+    let v = worker_checked(&seen(" checked=1c81bc6f0e2a@origin/main"), T0);
     assert_eq!(word_of(&v), "PASS", "{v:?}");
-    let v = worker_checked(&seen("", "not landed yet: 1 unpushed commit"), T0);
+    let v = worker_checked(&seen(""), T0);
     assert_eq!(word_of(&v), "FAIL", "{v:?}");
 }
 

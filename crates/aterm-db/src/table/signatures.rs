@@ -8,8 +8,10 @@
 //! clones. It can also retain successful authentication of a non-cutoff payload under an HMAC
 //! comparison token for the exact payload key. The caller must first obtain that key and judge
 //! the historical writer grant again; this fact grants no access. Cutoff payloads still decrypt.
-//! The journal cache charges the allocation, including both fixed fact slots. Neither historical
-//! keys, plaintext, source classification nor admission verdicts are kept with the wire.
+//! The journal cache charges the allocations, including both fixed fact slots. A compact entry
+//! can retain these facts without retaining ciphertext; newly read bytes are hashed independently
+//! before attaching them. Historical keys, plaintext, source classification and admission verdicts
+//! are never retained.
 
 use super::DOMAIN;
 use crate::{Error, Result, crypto};
@@ -45,6 +47,10 @@ pub(super) struct Identified(Arc<Wire>);
 
 struct Wire {
     wire: Vec<u8>,
+    facts: Arc<Verified>,
+}
+
+struct Verified {
     id: Digest,
     /// A successful check under the fixed signature domain, never a historical writer grant.
     signer: OnceLock<[u8; 32]>,
@@ -53,21 +59,58 @@ struct Wire {
     non_cut_key: OnceLock<crypto::PayloadKeyIdentity>,
 }
 
+/// Content-bound cryptographic facts, independently retainable without wire bodies.
+/// Neither the signer check nor the payload comparison token grants authority.
+#[derive(Clone)]
+pub(super) struct Facts(Arc<Vec<Arc<Verified>>>);
+
+impl Facts {
+    pub(super) fn of<'a>(wires: impl Iterator<Item = &'a Identified>) -> Self {
+        let mut facts: Vec<_> = wires.map(|wire| Arc::clone(&wire.0.facts)).collect();
+        facts.sort_unstable_by_key(|fact| fact.id);
+        facts.dedup_by_key(|fact| fact.id);
+        Self(Arc::new(facts))
+    }
+
+    /// Retained heap allocations, charging a shared fact in full in each owner.
+    /// Allocator rounding is outside this charge.
+    pub(super) fn allocation_bytes(&self) -> usize {
+        size_of::<Vec<Arc<Verified>>>()
+            + 2 * size_of::<usize>()
+            + self.0.capacity() * size_of::<Arc<Verified>>()
+            + self.0.len() * (size_of::<Verified>() + 2 * size_of::<usize>())
+    }
+
+    fn find(&self, id: Digest) -> Option<Arc<Verified>> {
+        self.0
+            .binary_search_by_key(&id, |fact| fact.id)
+            .ok()
+            .map(|at| Arc::clone(&self.0[at]))
+    }
+}
+
 impl Identified {
     pub(super) fn new(wire: Vec<u8>) -> Self {
+        Self::new_with(wire, None)
+    }
+
+    /// Hash the new bytes independently before reusing any content-bound fact.
+    pub(super) fn new_with(wire: Vec<u8>, known: Option<&Facts>) -> Self {
         #[cfg(test)]
         HASHED.set(HASHED.get() + 1);
         let id = Sha256::digest(&wire);
-        Self(Arc::new(Wire {
-            wire,
-            id,
-            signer: OnceLock::new(),
-            non_cut_key: OnceLock::new(),
-        }))
+        let facts = known.and_then(|known| known.find(id)).unwrap_or_else(|| {
+            Arc::new(Verified {
+                id,
+                signer: OnceLock::new(),
+                non_cut_key: OnceLock::new(),
+            })
+        });
+        Self(Arc::new(Wire { wire, facts }))
     }
 
     pub(super) fn id(&self) -> Digest {
-        self.0.id
+        self.0.facts.id
     }
 
     pub(super) fn wire(&self) -> &[u8] {
@@ -76,19 +119,20 @@ impl Identified {
 
     pub(super) fn verified_non_cut(&self, key_identity: &crypto::PayloadKeyIdentity) -> bool {
         self.0
+            .facts
             .non_cut_key
             .get()
             .is_some_and(|known| known.matches(key_identity))
     }
 
     pub(super) fn remember_non_cut(&self, key_identity: crypto::PayloadKeyIdentity) {
-        let _ = self.0.non_cut_key.set(key_identity);
+        let _ = self.0.facts.non_cut_key.set(key_identity);
     }
 
-    /// Both allocations a retained wire charges: its bytes and the shared wire with its two
-    /// reference counts. Allocator rounding is outside the journal cache's charge.
+    /// A retained wire's allocations: its byte capacity and both shared objects, including
+    /// their reference counts. Allocator rounding is outside the journal cache's charge.
     pub(super) fn allocation_bytes(&self) -> usize {
-        self.0.wire.capacity() + size_of::<Wire>() + 2 * size_of::<usize>()
+        self.0.wire.capacity() + size_of::<Wire>() + size_of::<Verified>() + 4 * size_of::<usize>()
     }
 }
 
@@ -138,13 +182,13 @@ impl Cache {
     }
 
     fn verify_identified(&self, signer: &[u8; 32], wire: &Identified) -> Result<Digest> {
-        if wire.0.signer.get() == Some(signer) {
+        if wire.0.facts.signer.get() == Some(signer) {
             return Ok(wire.id());
         }
         let id = self.verify_as(signer, wire.wire(), || wire.id())?;
         // Retain successes alone. Another valid signer can still be checked through the global
         // cache; losing this optional publication never changes a verification result.
-        let _ = wire.0.signer.set(*signer);
+        let _ = wire.0.facts.signer.set(*signer);
         Ok(id)
     }
 

@@ -3,6 +3,17 @@
 
 use super::*;
 
+/// Keep a failed assertion from leaving this fixture's original process group behind.
+struct ReapCohort(Spawned);
+
+impl Drop for ReapCohort {
+    fn drop(&mut self) {
+        let _ = self.0.kill_group();
+        let _ = self.0.child_mut().kill();
+        let _ = self.0.child_mut().wait();
+    }
+}
+
 #[test]
 fn dedicated_group_control_requires_the_same_current_unreaped_birth() {
     let mut born = super::super::command("/bin/cat")
@@ -11,16 +22,19 @@ fn dedicated_group_control_requires_the_same_current_unreaped_birth() {
         .spawn_cohort(BirthAttempt::new().unwrap())
         .unwrap();
     let input = crate::deadline::cat_echoes(born.child_mut());
+    assert!(!born.group_members_ended().unwrap());
     let mut replacement = super::super::command("/bin/cat")
         .stdin(super::super::Stdio::piped())
         .spawn()
         .unwrap();
     std::mem::swap(born.child_mut(), &mut replacement);
     let replaced = born.kill_group().unwrap_err().kind();
+    let replaced_observation = born.group_members_ended().unwrap_err().kind();
     std::mem::swap(born.child_mut(), &mut replacement);
     let owner = born.observed.key.owner;
     born.observed.key.owner.pid = if std::process::id() == 2 { 3 } else { 2 };
     let stale = born.terminate_group().unwrap_err().kind();
+    let stale_observation = born.group_members_ended().unwrap_err().kind();
     born.observed.key.owner = owner;
     born.continue_group().unwrap();
     born.kill_group().unwrap();
@@ -29,12 +43,15 @@ fn dedicated_group_control_requires_the_same_current_unreaped_birth() {
     replacement.kill().unwrap();
     replacement.wait().unwrap();
     assert_eq!(replaced, io::ErrorKind::PermissionDenied);
+    assert_eq!(replaced_observation, io::ErrorKind::PermissionDenied);
     assert_eq!(stale, io::ErrorKind::PermissionDenied);
+    assert_eq!(stale_observation, io::ErrorKind::PermissionDenied);
     assert!(!status.success());
     for refused in [
         born.terminate_group(),
         born.continue_group(),
         born.kill_group(),
+        born.group_members_ended().map(|_| ()),
     ] {
         assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
@@ -46,10 +63,10 @@ fn original_group_control_survives_leader_exit_and_reaches_stubborn_descendants(
     let directory = aterm_tempfile::tempdir().unwrap();
     let leave = directory.path().join("leave");
     let member = directory.path().join("member");
-    let mut born = super::super::command("/bin/sh")
+    let born = super::super::command("/bin/sh")
         .args([
             "-c",
-            "trap '' TERM; exec 3<&0; /bin/cat <&3 & printf '%s\\n' \"$!\" > \"$2\"; while test ! -f \"$1\"; do /bin/sleep 0.01; done; exit 0",
+            r#"trap '' TERM; exec 3<&0; /bin/sh -c 'printf "%s\n" "$$" > "$1"; exec /bin/cat <&3' member "$2" & while test ! -f "$1"; do /bin/sleep 0.01; done; exit 0"#,
             "original-group-control",
         ])
         .arg(&leave)
@@ -58,7 +75,11 @@ fn original_group_control_survives_leader_exit_and_reaches_stubborn_descendants(
         .stdout(super::super::Stdio::piped())
         .spawn_cohort(BirthAttempt::new().unwrap())
         .unwrap();
-    // Actual descendant output proves both the shell and its child executed.
+    let mut cleanup = ReapCohort(born);
+    let born = &mut cleanup.0;
+    // The descendant writes its own PID before execing cat. Its echo therefore proves the
+    // PID write completed as well as both processes executing; an independently scheduled
+    // parent write can still be empty when the first cat echo arrives.
     let input = crate::deadline::cat_echoes(born.child_mut());
     let descendant: i32 = std::fs::read_to_string(&member)
         .unwrap()
@@ -76,6 +97,7 @@ fn original_group_control_survives_leader_exit_and_reaches_stubborn_descendants(
         process::process_presence(descendant),
         process::ProcessPresence::Present
     );
+    assert!(!born.group_members_ended().unwrap());
     // A root-only signal cannot end the cat; the exited root still pins the
     // original group number until this actual owning reap.
     born.terminate_group().unwrap();
@@ -89,12 +111,27 @@ fn original_group_control_survives_leader_exit_and_reaches_stubborn_descendants(
     }
     let ended = process::process_presence(descendant);
     drop(input);
+    // An actual unreaped zombie still pins its group. The complete native
+    // observation permits the owning wait, not resource/kernel retirement.
+    while !born.group_members_ended().unwrap() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let safe_to_reap = born.group_members_ended().unwrap();
+    assert!(born.child_mut().owns_unreaped());
     let status = born.child_mut().wait().unwrap();
     assert!(status.success(), "preserve the root's actual zero exit");
     assert!(matches!(
         ended,
         process::ProcessPresence::Exited | process::ProcessPresence::Absent
     ));
+    assert!(
+        safe_to_reap,
+        "the same original complete ended population must permit the owning wait"
+    );
+    assert_eq!(
+        born.group_members_ended().unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
     assert_eq!(
         born.kill_group().unwrap_err().kind(),
         io::ErrorKind::PermissionDenied

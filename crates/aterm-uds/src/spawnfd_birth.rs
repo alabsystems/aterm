@@ -230,7 +230,26 @@ impl Spawned {
         self.signal_group(libc::SIGKILL)
     }
 
-    fn signal_group(&mut self, signal: i32) -> io::Result<()> {
+    /// Observe complete native member populations while the same original
+    /// unreaped leader still pins its group. This only chooses when an owning
+    /// wait may run: exited members still keep the kernel group present, and
+    /// actual kernel absence remains mandatory for resource retirement.
+    ///
+    /// # Errors
+    /// Original child, birth or scope custody changed. An incomplete or
+    /// unavailable member observation returns false, never drain authority.
+    pub fn group_members_ended(&mut self) -> io::Result<bool> {
+        let group = self.original_group()?;
+        let ended = members_ended(group as u32);
+        if self.original_group()? != group {
+            return Err(io::Error::other(
+                "original group changed during observation",
+            ));
+        }
+        Ok(ended)
+    }
+
+    fn original_group(&mut self) -> io::Result<i32> {
         let group = i32::try_from(self.child_mut().id())
             .ok()
             .filter(|group| *group > 1)
@@ -244,6 +263,11 @@ impl Spawned {
                 "group control requires its original current owner and unreaped dedicated birth",
             ));
         }
+        Ok(group)
+    }
+
+    fn signal_group(&mut self, signal: i32) -> io::Result<()> {
+        let group = self.original_group()?;
         // SAFETY: only the controlled dedicated-group spawn creates Spawned.
         // Its same original Child is exclusively borrowed, remains unreaped,
         // and pins group > 1 against number reuse even after terminal exit.
@@ -263,6 +287,31 @@ impl Spawned {
     pub fn into_child(self) -> Child {
         self.observed.into_child()
     }
+}
+
+// DATA for choosing the owning reap, moved from the existing admitted
+// controller. A second complete listing cannot gain a new member; this is
+// never kernel absence, resource settlement or permission to signal a record.
+fn members_ended(group: u32) -> bool {
+    let Some(first) = process::group_members(group).filter(|m| m.complete) else {
+        return false;
+    };
+    let ended = |pid| {
+        matches!(
+            process::process_presence(pid),
+            process::ProcessPresence::Exited | process::ProcessPresence::Absent
+        )
+    };
+    if !first.pids.iter().all(|&pid| ended(pid)) {
+        return false;
+    }
+    let Some(second) = process::group_members(group).filter(|m| m.complete) else {
+        return false;
+    };
+    second
+        .pids
+        .iter()
+        .all(|pid| first.pids.contains(pid) && ended(*pid))
 }
 
 /// This exact one-use attempt did not start a target. Its original process cancelled it

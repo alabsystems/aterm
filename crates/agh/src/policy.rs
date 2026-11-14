@@ -1051,10 +1051,8 @@ impl Router {
             Presence::Absent => refuse(
                 RefusalCode::WriterAbsent,
                 format!("the writer for {owner} ({writer}) is absent"),
-                format!(
-                    "agh auth add {writer} --file PATH --tier {} --owner {owner} --write",
-                    profile.tier.slug()
-                ),
+                crate::identity::vault::absent_step(profile)
+                    .unwrap_or_else(|| "agh auth status names its token's source".to_string()),
                 vec![(ChainStep::Profile(writer.to_string()), judged)],
             ),
             Presence::Unusable(slug) => refuse(

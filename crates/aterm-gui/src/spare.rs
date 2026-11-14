@@ -3158,10 +3158,10 @@ impl Wake {
             Wake::StatusAction { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::StatusMenuOpening { .. } => None,
+            #[cfg(unix)]
+            Wake::FleetTraffic => None,
             #[cfg(target_os = "macos")]
             Wake::FleetAccessChanged => None,
-            #[cfg(target_os = "macos")]
-            Wake::SiblingRaised { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::NoticeReady => None,
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]

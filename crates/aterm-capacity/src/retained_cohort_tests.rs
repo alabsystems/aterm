@@ -45,6 +45,90 @@ fn cpu_pool_width(fixture: &CohortFixture, width: u32) -> RetainedPool {
 mod loans;
 
 #[test]
+fn original_root_check_preserves_the_live_unreaped_and_retired_boundaries() {
+    let fixture = CohortFixture::new();
+    let foreign_fixture = CohortFixture::new();
+    let pool = cpu_pool(&fixture);
+    let foreign_pool = cpu_pool(&foreign_fixture);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let foreign_fence = Fence::acquire(&foreign_fixture.namespace, Instant::now()).unwrap();
+    let mut retained = RetainedCohort::new(
+        &fence,
+        fixture.claim(),
+        pool.try_acquire(owner()).unwrap().unwrap(),
+    )
+    .unwrap();
+    let mut foreign = RetainedCohort::new(
+        &foreign_fence,
+        foreign_fixture.claim(),
+        foreign_pool.try_acquire(owner()).unwrap().unwrap(),
+    )
+    .unwrap();
+    let mut root = Running::new(retained.launch(&fence, &mut cat()).unwrap());
+    let mut foreign_root = Running::new(foreign.launch(&foreign_fence, &mut cat()).unwrap());
+    let mut subgroup = Running::new(
+        retained
+            .launch_subgroup(&fence, &mut root.owned, &mut cat())
+            .unwrap(),
+    );
+
+    retained
+        .check_original_root(&fence, &mut root.owned)
+        .unwrap();
+    assert!(
+        retained
+            .check_original_root(&foreign_fence, &mut root.owned)
+            .is_err()
+    );
+    assert!(
+        retained
+            .check_original_root(&fence, &mut foreign_root.owned)
+            .is_err()
+    );
+    assert!(
+        retained
+            .check_original_root(&fence, &mut subgroup.owned)
+            .is_err()
+    );
+    assert!(!root.owned.child_mut().is_reaped());
+    assert!(!foreign_root.owned.child_mut().is_reaped());
+    assert!(!subgroup.owned.child_mut().is_reaped());
+    assert_cpu_denied(&pool);
+
+    root.input.take();
+    until_within(MUST_HAPPEN, "original root exits without reap", || {
+        root.owned.child_mut().exited().unwrap().then_some(())
+    });
+    retained
+        .check_original_root(&fence, &mut root.owned)
+        .unwrap();
+    assert!(!root.owned.child_mut().is_reaped());
+    assert!(retained.try_finish(&fence).is_err());
+    assert_cpu_denied(&pool);
+
+    root.end();
+    assert!(
+        retained
+            .check_original_root(&fence, &mut root.owned)
+            .is_err()
+    );
+    subgroup.end();
+    retained.retire_subgroup(&fence, &subgroup.owned).unwrap();
+    retained.try_finish(&fence).unwrap();
+    assert!(
+        retained
+            .check_original_root(&fence, &mut root.owned)
+            .is_err()
+    );
+    assert_settled_cpu_available(&pool).settle().unwrap();
+    foreign_root.end();
+    foreign.try_finish(&foreign_fence).unwrap();
+    assert_settled_cpu_available(&foreign_pool)
+        .settle()
+        .unwrap();
+}
+
+#[test]
 fn retained_bundle_covers_registered_subgroup_after_original_root_exits() {
     let fixture = CohortFixture::new();
     let other = CohortFixture::new();

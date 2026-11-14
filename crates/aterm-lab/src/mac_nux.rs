@@ -2998,6 +2998,7 @@ fn setup_reading(g: &Guest) -> Result<crate::mac_nux_guest::Reading, Fail> {
     }
     Ok(crate::mac_nux_guest::Reading {
         setup: setup_field(status).map(str::to_owned),
+        network: crate::mac_nux_guest::network_field(status).map(str::to_owned),
         record: read_record(record),
         acts: acts(moved),
     })

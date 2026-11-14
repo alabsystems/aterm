@@ -31,6 +31,9 @@ use std::{
     time::Instant,
 };
 
+mod mesh_access;
+pub use mesh_access::MeshAccess;
+
 /// The bound of a table-ID list: the tables one Mac selects, and a round's clock mark.
 pub const MAX_TABLES: usize = 64;
 
@@ -1530,8 +1533,8 @@ impl Replica {
         })
     }
 
-    /// The wire of operation `id` of `table`, where held, for each of `ids` in order; an id this
-    /// Mac does not hold is left out.
+    /// The currently replication-eligible wire of each of `ids`, in request order.
+    /// Absent or withheld records are omitted; physical inventory can still retain them.
     ///
     /// # Errors
     /// Custody, admission or the store's read fails.
@@ -1541,13 +1544,7 @@ impl Replica {
         };
         round.local(None, |session| {
             let store = round.store(session, table)?;
-            let mut wires = Vec::new();
-            for id in ids {
-                if let Some(wire) = store.wire_unchecked(id) {
-                    wires.push(wire.to_vec());
-                }
-            }
-            Ok(wires)
+            Ok(store.replication_wires_unchecked(ids))
         })
     }
 
@@ -2201,12 +2198,11 @@ impl Round<'_> {
         }
     }
 
-    fn prepare_batch<K>(
+    fn prepare_proofs(
         &self,
         session: &Session<'_>,
         id: Digest,
-        keys: &[K],
-        mut encode: impl FnMut(&Session<'_>, &Store, &K) -> Result<Vec<u8>>,
+        keys: &[ProofKey],
     ) -> Result<Vec<Vec<u8>>> {
         // The sender supplies its current admitted session. No table contents
         // are needed when the outgoing batch has no keys to encode.
@@ -2215,8 +2211,32 @@ impl Round<'_> {
         }
         let store = self.store(session, id)?;
         keys.iter()
-            .map(|key| encode(session, &store, key))
+            .map(|key| {
+                store
+                    .proof_wire_unchecked(session, key)?
+                    .ok_or_else(|| Error::new("table conflict disappeared"))
+            })
             .collect()
+    }
+
+    /// Selected identities may become withheld while the peer sends its batch.
+    /// Recheck the actual send turn and restart a legacy round rather than
+    /// encoding an unavailable selection as an empty, apparently drained batch.
+    fn prepare_operations(
+        &self,
+        session: &Session<'_>,
+        id: Digest,
+        ids: &[Digest],
+    ) -> Result<Vec<Vec<u8>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.store(session, id)?;
+        let wires = store.replication_wires_unchecked(ids);
+        if wires.len() != ids.len() {
+            return Err(Error::snapshot_changed());
+        }
+        Ok(wires)
     }
 
     fn retain_primary(&self, peer: Actor, id: Digest) -> Result<bool> {
@@ -3285,13 +3305,7 @@ impl Round<'_> {
         if let Some(last) = proofs.last() {
             repair.conflicts.insert(id, *last);
         }
-        let prepare = |session: &Session<'_>| {
-            self.prepare_batch(session, id, &proofs, |session, store, key| {
-                store
-                    .proof_wire_unchecked(session, key)?
-                    .ok_or_else(|| Error::new("table conflict disappeared"))
-            })
-        };
+        let prepare = |session: &Session<'_>| self.prepare_proofs(session, id, &proofs);
         match side {
             Side::Initiator => {
                 self.send_batch(stream, peer, prepare, BatchKind::Conflict, report)?;
@@ -3407,13 +3421,8 @@ impl Round<'_> {
             repair.records.insert(id, *last);
         }
         let prepare = |session: &Session<'_>| {
-            self.prepare_batch(session, id, &ids, |_, store, key| {
-                store
-                    .wire_unchecked(key)
-                    .map(ToOwned::to_owned)
-                    .ok_or_else(|| Error::new("table record disappeared"))
-            })
-            .map_err(|error| at("batch preparation", error))
+            self.prepare_operations(session, id, &ids)
+                .map_err(|error| at("batch preparation", error))
         };
         let sent = report.sent;
         match side {

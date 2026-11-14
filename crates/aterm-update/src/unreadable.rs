@@ -13,8 +13,16 @@ use crate::paths::Staging;
 /// log captured on any day holds the explanation.
 const RENOTICE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Whether the last completed check found the channel unreadable.
+/// Whether the last check this process completed found the channel unreadable: its own check
+/// loop's latch. What the machine's last check found is the status ledger's [`NOTE`], which
+/// every process reads alike.
 static STRANDED: AtomicBool = AtomicBool::new(false);
+
+/// The delivery note (`status.toml`'s `delivery`) of a check that found the channel unreadable:
+/// [`fn@crate::status`] reads the strand from it, so the process that checked, a window that did
+/// not and a fresh `aterm update status` all say the same, until a check by any of them records
+/// another outcome.
+pub(crate) const NOTE: &str = "unreadable";
 
 /// The last time the log warning was emitted, for the [`RENOTICE_AFTER`] throttle.
 fn last_warned() -> &'static Mutex<Option<Instant>> {
@@ -29,7 +37,8 @@ fn last_explanation() -> &'static Mutex<Option<String>> {
     LAST.get_or_init(|| Mutex::new(None))
 }
 
-/// Whether the most recent check found this machine unable to read its channel.
+/// Whether the most recent check this process made found this machine unable to read its
+/// channel.
 #[must_use]
 pub(crate) fn is_stranded() -> bool {
     STRANDED.load(Ordering::Relaxed)
@@ -44,9 +53,12 @@ pub(crate) fn clear() {
     }
 }
 
-/// Announce the stranded state.
+/// Announce the stranded state: in the status ledger, marked [`NOTE`] on this one record, and in
+/// this process. The mark is that record's alone, never this process's delivery note, so no later
+/// record this process writes (an apply's, a refusal's, the activation of a newer build) says the
+/// strand again, nor writes it back over a readable check another process recorded since.
 pub(crate) fn announce(staging: &Staging, current_build: u64, explanation: &str) {
-    crate::status::record(staging, current_build, explanation);
+    crate::status::record_noted(staging, current_build, explanation, NOTE);
     *last_explanation().lock().unwrap_or_else(|e| e.into_inner()) = Some(explanation.to_string());
 
     let first = !STRANDED.swap(true, Ordering::Relaxed);

@@ -6,6 +6,7 @@
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
+use crate::run_end::QuitDesk;
 use crate::{App, WindowId, restore};
 
 fn leaf(title: &str) -> restore::RestoredSplitTree {
@@ -938,4 +939,473 @@ fn a_cold_drain_opens_each_restored_tab_parked_as_it_placed_it() {
         .collect();
     assert_eq!(shown.len(), 1, "the person's tab: {shown:?}");
     assert!(shown[0].contains(" parked=0 "), "CONTROL: {}", shown[0]);
+}
+
+/// What `result` answers of a [`stored_result`].
+const STORED_ANSWER: &str =
+    "OK 1 source=transcript session=0b22 uuid=a-1 bytes=17\nFixed the parser.\n";
+
+/// A done worker's stored result under session ID `sid` at record rev `rev`, as its done edge
+/// leaves it in the tasks directory: the snapshot of the one reply `Fixed the parser.` and its
+/// sidecar.
+fn stored_result(
+    sid: &aterm_session::SessionId,
+    rev: u64,
+    scratch: &std::path::Path,
+) -> aterm_agent::harness::result::Snapshot {
+    use aterm_agent::harness::result;
+    let tasks = crate::task_record::tasks_dir().expect("the test binary's state root");
+    let line = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Fixed the parser."}]}}"#;
+    result::snapshot(
+        &tasks,
+        &result::result_stem(Some(sid.as_str()), rev),
+        Some((&scratch.join("t.jsonl"), &format!("{line}\n"))),
+        result::DoneBy::Turn,
+    )
+    .expect("written")
+}
+
+/// The snapshot `snap` and the sidecar beside it.
+fn pair(snap: &aterm_agent::harness::result::Snapshot) -> [std::path::PathBuf; 2] {
+    [
+        snap.path.clone(),
+        aterm_agent::harness::result::sidecar_of(&snap.path),
+    ]
+}
+
+/// The task file of session `sid`, as its spawn wrote it.
+fn task_file(sid: &aterm_session::SessionId) -> std::path::PathBuf {
+    crate::task_launch::TaskSeed::new(b"t".to_vec())
+        .write_for(sid)
+        .expect("written")
+}
+
+/// Make tab `at` of `wl` a parked worker whose session had ID `sid`, its task ended done with the
+/// stored result `snap`.
+fn done_worker_at(
+    wl: &mut restore::WindowLayout,
+    at: usize,
+    sid: &aterm_session::SessionId,
+    snap: &aterm_agent::harness::result::Snapshot,
+) {
+    let tab = &mut wl.restored_tabs[at];
+    tab.parked = true;
+    if let restore::RestoredSplitTree::Leaf {
+        view: restore::RestoredView::Terminal(leaf),
+    } = &mut tab.root
+    {
+        leaf.sid = Some(sid.as_str().to_owned());
+        leaf.task = Some(format!(
+            "rev=7 state=done from=ctl since=1700000000000 result_bytes={} attention=0 \
+             why=landed result_path={}",
+            snap.bytes,
+            crate::control::pct_encode(&snap.path.to_string_lossy())
+        ));
+    }
+}
+
+/// The session and context of window `wid`'s parked worker titled `title`.
+fn worker(
+    app: &App,
+    wid: WindowId,
+    title: &str,
+) -> Option<(u64, std::sync::Arc<crate::SessionCtx>)> {
+    app.windows[&wid]
+        .tab_set
+        .parked()
+        .iter()
+        .filter(|tab| named(app, tab) == title)
+        .find_map(|tab| {
+            let session = app
+                .view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)?;
+            Some((session, std::sync::Arc::clone(&app.pool.get(session)?.ctx)))
+        })
+}
+
+/// A desk of one window with a person's tab and two parked workers, each ended done with a
+/// stored result.
+struct TwoDoneWorkers {
+    app: App,
+    /// `W1`'s result: it came back from an earlier launch, under the session ID it had then.
+    carried: aterm_agent::harness::result::Snapshot,
+    /// `W2`'s result: it ended a task since the launch, under its own session ID.
+    own: aterm_agent::harness::result::Snapshot,
+    /// `W2`'s task file.
+    own_task: std::path::PathBuf,
+}
+
+impl TwoDoneWorkers {
+    /// The four result files.
+    fn results(&self) -> Vec<std::path::PathBuf> {
+        pair(&self.carried)
+            .into_iter()
+            .chain(pair(&self.own))
+            .collect()
+    }
+}
+
+/// [`TwoDoneWorkers`], restored from a layout a crashed run left: `W1`'s leaf names the ID it
+/// had, whose task file no quit removed.
+fn two_done_workers(scratch: &std::path::Path) -> TwoDoneWorkers {
+    use crate::task_record::{TaskMark, TaskState, cmd_result, mark_session_task};
+    let wid = WindowId(0);
+    let was = aterm_session::SessionId::generate();
+    let carried = stored_result(&was, 2, scratch);
+    let left = task_file(&was);
+    let mut app = App::headless_for_test();
+    let mut wl = window(&["A", "W1", "W2"], 0);
+    done_worker_at(&mut wl, 1, &was, &carried);
+    parked_at(&mut wl, &[2]);
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![wl]));
+    drain(&mut app);
+    assert!(
+        !left.exists(),
+        "the restore's close swept the task file W1's old ID left"
+    );
+    let (w1, w1_ctx) = worker(&app, wid, "W1").expect("W1 came back parked");
+    assert_eq!(
+        cmd_result(&w1_ctx, w1, ""),
+        STORED_ANSWER,
+        "and kept the result W1's record names, which reads back"
+    );
+    let (w2, w2_ctx) = worker(&app, wid, "W2").expect("W2 came back parked");
+    let own_task = task_file(&w2_ctx.self_id);
+    mark_session_task(&w2_ctx, w2, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    let own = stored_result(&w2_ctx.self_id, 9, scratch);
+    let done = TaskMark {
+        why: Some(crate::task_record::WHY_LANDED),
+        result_bytes: own.bytes,
+        result_path: Some(own.path.clone()),
+        ..TaskMark::new(TaskState::Done)
+    };
+    mark_session_task(&w2_ctx, w2, &done).expect("unfenced");
+    assert_eq!(cmd_result(&w2_ctx, w2, ""), STORED_ANSWER, "PRECONDITION");
+    TwoDoneWorkers {
+        app,
+        carried,
+        own,
+        own_task,
+    }
+}
+
+/// CLOSING THE LAST WINDOW IS A QUIT THAT KEEPS THE RESULTS ITS LAYOUT NAMES (tracker ST-01). The
+/// close captures the layout, each worker tab's task row in it, and then closes every tab one by
+/// one, which takes each session out of the store before the run's end writes that layout. The
+/// results the rows name stay through both, one under its session's own ID and one under an
+/// earlier ID of its tab, and the relaunch reads each back. Before 2026-11-12 each tab's close
+/// removed its results (and, since the result came back under an earlier ID, that file too), so
+/// only a quit from the menu kept them. The task file goes at the run's end, and the restore's
+/// close sweeps what the layout's session IDs left. CONTROL: a quit that publishes no layout
+/// takes every file of the tabs it closed.
+#[test]
+fn a_last_window_s_close_keeps_the_results_its_layout_names() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-last-window-results")
+        .tempdir()
+        .expect("scratch dir");
+    let wid = WindowId(0);
+    let mut desk = two_done_workers(scratch.path());
+    let results = desk.results();
+    assert!(matches!(
+        desk.app.close_window_logical(wid),
+        crate::CloseOutcome::Exit
+    ));
+    assert!(
+        results.iter().all(|file| file.exists()),
+        "the close removed no result: the layout it captured names each"
+    );
+    let mut published = None;
+    desk.app.settle_quit_desk_and_tasks(
+        |app| app.write_quit_desk_with(|_, _| Ok(())),
+        |_, quit| {
+            assert!(quit.wrote);
+            published.clone_from(&quit.published);
+        },
+    );
+    let layout = published.expect("the quit published its layout");
+    assert!(
+        results.iter().all(|file| file.exists()),
+        "the run's end keeps what the layout names"
+    );
+    assert!(
+        !desk.own_task.exists(),
+        "and takes the task file, which no restored session reads"
+    );
+
+    // The relaunch: each worker comes back under a new ID and reads its result.
+    let mut next = App::headless_for_test();
+    next.pending_restore = Some(
+        restore::RestoreManifest::from_toml(&layout.to_toml().expect("the layout writes"))
+            .expect("the layout parses back"),
+    );
+    drain(&mut next);
+    for title in ["W1", "W2"] {
+        let (session, ctx) = worker(&next, wid, title).expect("the worker came back");
+        assert_eq!(
+            crate::task_record::cmd_result(&ctx, session, ""),
+            STORED_ANSWER,
+            "{title}: its result reads back after the quit"
+        );
+    }
+    assert!(
+        results.iter().all(|file| file.exists()),
+        "the restore's sweep keeps what its records name"
+    );
+
+    // CONTROL: the same close, and a quit that publishes no layout.
+    assert!(matches!(
+        next.close_window_logical(wid),
+        crate::CloseOutcome::Exit
+    ));
+    next.settle_quit_desk_and_tasks(|_| QuitDesk::default(), |_, _| {});
+    assert!(
+        results.iter().all(|file| !file.exists()),
+        "CONTROL: no layout names them, so they go with the quit"
+    );
+}
+
+/// THE QUIT KEEPS WHAT A PUBLISHED LAYOUT NAMES, however its write ended: a write that failed
+/// before it published leaves no layout, so nothing is kept; one that published the layout and
+/// failed at its directory's sync left a layout the next launch reads, so its results stay.
+#[test]
+fn a_quit_keeps_results_for_a_layout_published_though_its_write_failed() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-quit-write-failed")
+        .tempdir()
+        .expect("scratch dir");
+    let failed = std::io::Error::other("the disk said no");
+    for (published, fault) in [
+        (
+            false,
+            restore::RestoreFault::settled("session.toml was not written"),
+        ),
+        (
+            true,
+            restore::RestoreFault::published_but("session.toml", &failed),
+        ),
+    ] {
+        let mut desk = two_done_workers(scratch.path());
+        let results = desk.results();
+        assert!(matches!(
+            desk.app.close_window_logical(WindowId(0)),
+            crate::CloseOutcome::Exit
+        ));
+        desk.app.settle_quit_desk_and_tasks(
+            |app| app.write_quit_desk_with(move |_, _| Err(fault)),
+            |_, quit| {
+                assert!(quit.wrote, "the quit had a layout to write");
+                assert_eq!(quit.published.is_some(), published);
+            },
+        );
+        assert_eq!(
+            results.iter().filter(|file| file.exists()).count(),
+            if published { results.len() } else { 0 },
+            "published = {published}"
+        );
+        assert!(!desk.own_task.exists(), "published = {published}");
+        for file in results.iter().filter(|file| file.exists()) {
+            std::fs::remove_file(file).expect("removed");
+        }
+    }
+}
+
+/// A SEAMLESS UPDATE'S CANDIDATE REMOVES NO FILE OF A SESSION IT CLOSES BEFORE ITS COMMIT: the
+/// session is one it adopted, the handoff is withheld, and the predecessor resumes with a record
+/// that names those files. CONTROL: a process that is no candidate, at a quit that publishes no
+/// layout, takes them.
+#[test]
+fn a_candidate_before_its_commit_removes_no_file_of_a_session_it_closes() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-candidate-close")
+        .tempdir()
+        .expect("scratch dir");
+    for candidate in [true, false] {
+        let mut desk = two_done_workers(scratch.path());
+        let mut files = desk.results();
+        files.push(desk.own_task.clone());
+        desk.app.incoming_handoff_pending = candidate;
+        let _ = desk.app.close_window_logical(WindowId(0));
+        desk.app
+            .settle_quit_desk_and_tasks(|_| QuitDesk::default(), |_, _| {});
+        assert_eq!(
+            files.iter().filter(|file| file.exists()).count(),
+            if candidate { files.len() } else { 0 },
+            "candidate = {candidate}"
+        );
+        for file in files.iter().filter(|file| file.exists()) {
+            std::fs::remove_file(file).expect("removed");
+        }
+    }
+}
+
+/// A RESTORED WORKER'S CLOSE TAKES THE RESULT ITS TAB CAME BACK WITH, which its session's ID does
+/// not name, and leaves another worker's files.
+#[test]
+fn a_restored_worker_s_close_takes_the_result_its_tab_came_back_with() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-restored-worker-close")
+        .tempdir()
+        .expect("scratch dir");
+    let wid = WindowId(0);
+    let mut desk = two_done_workers(scratch.path());
+    let (w1, _) = worker(&desk.app, wid, "W1").expect("W1");
+    let (w2, _) = worker(&desk.app, wid, "W2").expect("W2");
+    assert!(matches!(
+        desk.app.close_session_by_id(w1),
+        Ok(crate::app_tabs::CloseProgress::Retired)
+    ));
+    assert!(
+        pair(&desk.carried).iter().all(|file| !file.exists()),
+        "W1's close took the result under its earlier ID"
+    );
+    assert!(
+        pair(&desk.own).iter().all(|file| file.exists()) && desk.own_task.exists(),
+        "W2's files stay"
+    );
+    assert!(matches!(
+        desk.app.close_session_by_id(w2),
+        Ok(crate::app_tabs::CloseProgress::Retired)
+    ));
+    assert!(
+        pair(&desk.own).iter().all(|file| !file.exists()) && !desk.own_task.exists(),
+        "CONTROL: W2's close takes its own"
+    );
+}
+
+/// A QUIT INSIDE THE DRAIN CLEARS WHAT THE TABS IT PLACED LEFT under the session IDs the taken
+/// layout names. The layout the quit writes names a placed tab by its new ID, so no later launch
+/// would look under the old one: its task file and a result no row names would stay for good. A
+/// tab still owed is written as the taken layout had it, and keeps every file under its ID for
+/// the launch that restores it, as the placed tab keeps the result its row names. CONTROL: a quit
+/// that publishes no layout clears all of it: the run's end settles the take, which removes the
+/// taken layout, and retires the crash journal, so nothing names those IDs again (before
+/// 2026-11-13 it cleared nothing of the taken layout, and every file of its tabs stayed for good).
+#[test]
+fn a_quit_inside_the_drain_clears_what_the_tabs_it_placed_left() {
+    struct Left {
+        task: std::path::PathBuf,
+        snap: aterm_agent::harness::result::Snapshot,
+        /// A result a done edge wrote after the layout's last write, which no row names.
+        unnamed: [std::path::PathBuf; 2],
+    }
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-quit-inside-drain")
+        .tempdir()
+        .expect("scratch dir");
+    let tasks = crate::task_record::tasks_dir().expect("the test binary's state root");
+    // The test may run before anything else in this binary made the directory.
+    std::fs::create_dir_all(&tasks).expect("the tasks directory");
+    let left = |sid: &aterm_session::SessionId| {
+        let unnamed =
+            ["md", "src"].map(|ext| tasks.join(format!("{}-9.result.{ext}", sid.as_str())));
+        for file in &unnamed {
+            std::fs::write(file, "").expect("written");
+        }
+        Left {
+            task: task_file(sid),
+            snap: stored_result(sid, 2, scratch.path()),
+            unnamed,
+        }
+    };
+    for published in [true, false] {
+        let wid = WindowId(0);
+        let sids = [(); 2].map(|()| aterm_session::SessionId::generate());
+        let lefts = [left(&sids[0]), left(&sids[1])];
+        let mut app = App::headless_for_test();
+        let mut wl = window(&["A", "W1", "W2"], 0);
+        done_worker_at(&mut wl, 1, &sids[0], &lefts[0].snap);
+        done_worker_at(&mut wl, 2, &sids[1], &lefts[1].snap);
+        app.pending_restore = Some(restore::RestoreManifest::new(vec![wl]));
+        while worker(&app, wid, "W1").is_none() && worker(&app, wid, "W2").is_none() {
+            assert!(
+                !slice(&mut app),
+                "PRECONDITION: the drain places one worker before it ends"
+            );
+        }
+        let placed = usize::from(worker(&app, wid, "W1").is_none());
+        let owed = 1 - placed;
+        assert!(
+            worker(&app, wid, ["W1", "W2"][owed]).is_none(),
+            "PRECONDITION: the other worker is still owed"
+        );
+
+        app.settle_quit_desk_and_tasks(
+            |app| {
+                app.write_quit_desk_with(move |_, _| {
+                    if published {
+                        Ok(())
+                    } else {
+                        Err(restore::RestoreFault::settled(
+                            "session.toml was not written",
+                        ))
+                    }
+                })
+            },
+            |_, _| {},
+        );
+
+        let (placed, owed) = (&lefts[placed], &lefts[owed]);
+        assert!(
+            !placed.task.exists() && placed.unnamed.iter().all(|file| !file.exists()),
+            "published = {published}: what the placed tab's old ID left, and no row names, goes"
+        );
+        // The owed tab's every file, and the result the placed tab's row names.
+        let named_by_the_layout = || {
+            [&owed.task]
+                .into_iter()
+                .chain(&owed.unnamed)
+                .cloned()
+                .chain(pair(&owed.snap))
+                .chain(pair(&placed.snap))
+        };
+        if published {
+            assert!(
+                named_by_the_layout().all(|file| file.exists()),
+                "the owed tab keeps every file under the ID the written layout keeps, and the \
+                 placed tab the result its row names"
+            );
+        } else {
+            assert!(
+                named_by_the_layout().all(|file| !file.exists()),
+                "CONTROL: with no layout published nothing names the taken layout's tabs again \
+                 (the take is settled and the journal retired): every file of theirs goes"
+            );
+        }
+        let emptied = crate::session_store::new_store();
+        for (sid, left) in sids.iter().zip(&lefts) {
+            crate::task_launch::retire_task_file(
+                &emptied,
+                sid,
+                std::slice::from_ref(&left.snap.path),
+                false,
+            );
+        }
+    }
+}
+
+/// THE RESTORE'S CLOSE SWEEPS WHAT A COLD RESTORE'S LAYOUT LEFT, AND NOTHING IN A SEAMLESS
+/// UPDATE'S SUCCESSOR: its sessions keep their IDs, so the files under the IDs its layout names
+/// are its live sessions' own, which go at their close or at its quit.
+#[test]
+fn the_restore_s_close_sweeps_no_layout_of_a_seamless_successor() {
+    let was = aterm_session::SessionId::generate();
+    let left = task_file(&was);
+    let mut wl = window(&["A"], 0);
+    if let restore::RestoredSplitTree::Leaf {
+        view: restore::RestoredView::Terminal(leaf),
+    } = &mut wl.restored_tabs[0].root
+    {
+        leaf.sid = Some(was.as_str().to_owned());
+    }
+    let tasks = crate::task_launch::RestoredTasks::of(&restore::RestoreManifest::new(vec![wl]));
+    let mut app = App::headless_for_test();
+    app.handoff_successor = true;
+    app.close_restore_pass(&[], &tasks);
+    assert!(left.exists(), "a successor sweeps nothing");
+    app.handoff_successor = false;
+    app.close_restore_pass(&[], &tasks);
+    assert!(!left.exists(), "CONTROL: a cold restore's close sweeps it");
 }

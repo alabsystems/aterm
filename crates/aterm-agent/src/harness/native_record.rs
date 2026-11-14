@@ -19,6 +19,7 @@ struct State {
     completed: Option<Box<Prepare>>,
     noexec: Option<Box<Prepare>>,
     observation: Option<SavedObservation>,
+    closed: Option<Box<Prepare>>,
     rollback: bool,
     retired: bool,
     candidate: Option<Pending>,
@@ -43,6 +44,7 @@ impl State {
             completed: st.native_completed_prepare.clone(),
             noexec: st.native_noexec_prepare.clone(),
             observation: st.native_observation.clone(),
+            closed: st.native_closed.clone(),
             rollback: st.native_rollback,
             retired: st.native_retired_unissued,
             candidate: st.native_account_candidate.clone(),
@@ -251,6 +253,9 @@ pub(super) fn restore_inactive(
     next.native_completed_prepare = current.native_completed_prepare.clone();
     next.native_noexec_prepare = current.native_noexec_prepare.clone();
     next.native_observation = current.native_observation.clone();
+    // A closed restart's watch is passive, as a positive no-exec is: the record restored as it
+    // was keeps it, and no fresh plan is minted before a lane settles it.
+    next.native_closed = current.native_closed.clone();
     next.native_rollback = current.native_rollback;
     next.native_retired_unissued = current.native_retired_unissued;
     next.native_account_candidate = current.native_account_candidate.clone();

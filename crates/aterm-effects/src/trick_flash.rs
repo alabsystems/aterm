@@ -381,7 +381,7 @@ impl TrickFlash {
         )
     )]
     #[inline]
-    pub(crate) fn on_rescan(
+    pub(crate) fn on_rescan<S: RowSource>(
         &mut self,
         scope: Option<u64>,
         now: Instant,
@@ -390,7 +390,7 @@ impl TrickFlash {
         cursor: Option<(u16, u16)>,
         paintable: bool,
         row_buf: &mut Vec<RenderCell>,
-        mut load_row: impl FnMut(usize, &mut Vec<RenderCell>),
+        mut load_row: S,
     ) {
         let base_y_now = match self.declared.take() {
             Some((declared_for, y)) if declared_for == scope => Some(y),
@@ -992,13 +992,61 @@ const fn scrolled(row: u16, then: Option<i64>, now: Option<i64>) -> (i64, i64) {
     ((row as i64).saturating_sub(delta), delta)
 }
 
+/// Zero-copy row reader for [`TrickFlash::on_rescan`] and dense-scan cutoffs: either borrows
+/// directly from an existing `&[Vec<RenderCell>]` snapshot ([`CellRows`]) or populates `row_buf`.
+pub(crate) trait RowSource {
+    fn load_row<'b>(&mut self, row: usize, row_buf: &'b mut Vec<RenderCell>) -> &'b [RenderCell]
+    where
+        Self: 'b;
+}
+
+/// [`RowSource`] over an already-materialized frame cell matrix.
+pub(crate) struct CellRows<'a>(pub(crate) &'a [Vec<RenderCell>]);
+
+impl RowSource for CellRows<'_> {
+    #[inline]
+    fn load_row<'b>(&mut self, row: usize, _row_buf: &'b mut Vec<RenderCell>) -> &'b [RenderCell]
+    where
+        Self: 'b,
+    {
+        self.0.get(row).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// [`RowSource`] populating `row_buf` from an [`aterm_core::terminal::Terminal`].
+pub(crate) struct TermRows<'a>(pub(crate) &'a aterm_core::terminal::Terminal);
+
+impl RowSource for TermRows<'_> {
+    #[inline]
+    fn load_row<'b>(&mut self, row: usize, row_buf: &'b mut Vec<RenderCell>) -> &'b [RenderCell]
+    where
+        Self: 'b,
+    {
+        self.0.render_row_into(row, row_buf);
+        row_buf.as_slice()
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct EmptyRows;
+
+#[cfg(test)]
+impl RowSource for EmptyRows {
+    #[inline]
+    fn load_row<'b>(&mut self, _row: usize, _row_buf: &'b mut Vec<RenderCell>) -> &'b [RenderCell]
+    where
+        Self: 'b,
+    {
+        &[]
+    }
+}
 /// Find a pending slot's word.
 #[allow(
     clippy::too_many_arguments,
     reason = "on_rescan's list minus the gate it already applied; the slot, the clock, both carets, the geometry and the row source are each read once"
 )]
 #[inline]
-fn locate(
+fn locate<S: RowSource>(
     slot: &Slot,
     now: Instant,
     cursor: (u16, u16),
@@ -1006,34 +1054,54 @@ fn locate(
     rows: usize,
     grid_cols: u16,
     row_buf: &mut Vec<RenderCell>,
-    load_row: &mut impl FnMut(usize, &mut Vec<RenderCell>),
+    load_row: &mut S,
 ) -> Option<Located> {
     let (expected, delta) = scrolled(slot.caret.0, slot.base_y, base_y_now);
-    let mut found = None;
     if expected >= 0 && (expected as usize) < rows {
         let row = expected as usize;
-        load_row(row, row_buf);
         let cursor_col = if usize::from(cursor.0) == row {
             Some(cursor.1)
         } else {
             None
         };
-        found = find_word(slot, row_buf, cursor_col, false).map(|hit| (row, hit));
+        {
+            let row_slice = load_row.load_row(row, row_buf);
+            if let Some(hit) = find_word(slot, row_slice, cursor_col, false) {
+                return finish_located(slot, now, base_y_now, (row, grid_cols), hit, row_slice);
+            }
+        }
         let left_behind = cursor.0 != slot.caret.0 || cursor.1 < slot.caret.1;
-        if found.is_none() && delta == 0 && left_behind {
+        if delta == 0 && left_behind {
             let min_above = row.saturating_sub(SEARCH_UP_ROWS);
             let mut above = row;
             while above > min_above {
                 above -= 1;
-                load_row(above, row_buf);
-                if let Some(hit) = find_word(slot, row_buf, None, true) {
-                    found = Some((above, hit));
-                    break;
+                let above_slice = load_row.load_row(above, row_buf);
+                if let Some(hit) = find_word(slot, above_slice, None, true) {
+                    return finish_located(
+                        slot,
+                        now,
+                        base_y_now,
+                        (above, grid_cols),
+                        hit,
+                        above_slice,
+                    );
                 }
             }
         }
     }
-    let (row, (hit, mirrored)) = found?;
+    None
+}
+
+#[inline]
+fn finish_located(
+    slot: &Slot,
+    now: Instant,
+    base_y_now: Option<i64>,
+    (row, grid_cols): (usize, u16),
+    (hit, mirrored): (Hit, bool),
+    matched_cells: &[RenderCell],
+) -> Option<Located> {
     if row > u16::MAX as usize {
         return None;
     }
@@ -1050,19 +1118,19 @@ fn locate(
         val: 0.0,
         strength: 0.0,
     };
-    let _ = capture(&mut loc, usize::from(slot.len), row_buf);
+    let _ = capture(&mut loc, usize::from(slot.len), matched_cells);
     Some(loc)
 }
 
 #[inline]
-fn follow(
+fn follow<S: RowSource>(
     slot: &Slot,
     mut loc: Located,
     base_y_now: Option<i64>,
     rows: usize,
     grid_cols: u16,
     row_buf: &mut Vec<RenderCell>,
-    load_row: &mut impl FnMut(usize, &mut Vec<RenderCell>),
+    load_row: &mut S,
 ) -> Option<Located> {
     if loc.grid_cols != grid_cols {
         return None;
@@ -1075,20 +1143,20 @@ fn follow(
     if row >= rows || row > u16::MAX as usize {
         return None;
     }
-    load_row(row, row_buf);
+    let row_slice = load_row.load_row(row, row_buf);
     let n = usize::from(slot.len);
     let mut i = 0;
     while i < n {
         let want = slot.chars[if loc.mirrored { n - 1 - i } else { i }];
         let col_idx = usize::from(loc.cols[i]);
-        if col_idx >= row_buf.len() || row_buf[col_idx].wide || row_buf[col_idx].ch != want {
+        if col_idx >= row_slice.len() || row_slice[col_idx].wide || row_slice[col_idx].ch != want {
             return None;
         }
         i += 1;
     }
     loc.row = row as u16;
     loc.base_y = base_y_now;
-    if capture(&mut loc, n, row_buf) {
+    if capture(&mut loc, n, row_slice) {
         Some(loc)
     } else {
         None

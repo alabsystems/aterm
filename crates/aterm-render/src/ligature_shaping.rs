@@ -168,11 +168,65 @@ pub fn cell_is_shapeable(cell: &RenderCell, has_cluster: bool, image_covered: bo
         && matches!(cell.script, aterm_core::terminal::Script::Normal)
 }
 
+/// Bounded segment-property to [`ShapePlan`] memo (at most 4 entries per face slot).
+#[derive(Default)]
+pub(crate) struct ShapePlanMemo {
+    entries: Vec<(SegmentProperties, ShapePlan)>,
+}
+
+impl ShapePlanMemo {
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn plan_for<'a>(
+        &'a mut self,
+        face: &ShapeFace<'_>,
+        features: &[Feature],
+        props: SegmentProperties,
+    ) -> &'a ShapePlan {
+        let slot = self
+            .entries
+            .iter()
+            .position(|(p, _)| *p == props)
+            .unwrap_or_else(|| {
+                #[cfg(test)]
+                note_shape_plan_build();
+                let plan = ShapePlan::new(face, props.direction, props.script, features);
+                if self.entries.len() == 4 {
+                    self.entries[3] = (props, plan);
+                    3
+                } else {
+                    self.entries.push((props, plan));
+                    self.entries.len() - 1
+                }
+            });
+        &self.entries[slot].1
+    }
+}
+
+/// Reusable scratch buffers for [`map_shaped_run`], avoiding heap allocations on unligated runs.
+#[derive(Default)]
+pub(crate) struct MapScratch {
+    byte_to_idx: Vec<usize>,
+    out: Vec<Option<u16>>,
+}
+
 /// One row's fixed font instance and feature list.
 pub(crate) struct RowShaper<'a> {
     face: ShapeFace<'a>,
     features: &'a [Feature],
-    plans: Vec<(SegmentProperties, ShapePlan)>,
+    #[cfg(test)]
+    plans: ShapePlanMemo,
+    #[cfg(test)]
+    map_scratch: MapScratch,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -186,11 +240,15 @@ impl<'a> RowShaper<'a> {
         Self {
             face,
             features,
-            plans: Vec::new(),
+            #[cfg(test)]
+            plans: ShapePlanMemo::default(),
+            #[cfg(test)]
+            map_scratch: MapScratch::default(),
         }
     }
 
     /// Shape one run and return its grid plan, or `None` unless the shape is grid-mappable ([`classify_shape`]) and changed a glyph vs the plain cmap.
+    #[cfg(test)]
     pub(crate) fn shape(
         &mut self,
         run: &str,
@@ -202,18 +260,54 @@ impl<'a> RowShaper<'a> {
         if run_chars.len() < min_run {
             return None;
         }
-        let shaped = self.shape_buffer(run, scratch);
+        let shaped = Self::shape_substitute_only_buffer(
+            &self.face,
+            self.features,
+            &mut self.plans,
+            run,
+            scratch,
+        );
         let result = map_shaped_run(
             self.face.face(),
             run,
             run_chars,
             admit_collapsed,
             shaped.glyph_infos(),
+            &mut self.map_scratch,
         );
         *scratch = shaped.clear();
         result
     }
 
+    /// Shape one run against external persistent `plans` and `map_scratch`.
+    pub(crate) fn shape_cached(
+        &self,
+        run: &str,
+        run_chars: &[char],
+        admit_collapsed: bool,
+        scratch: &mut UnicodeBuffer,
+        plans: &mut ShapePlanMemo,
+        map_scratch: &mut MapScratch,
+    ) -> Option<ShapedRun> {
+        let min_run = if self.features.len() > 2 { 1 } else { 2 };
+        if run_chars.len() < min_run {
+            return None;
+        }
+        let shaped =
+            Self::shape_substitute_only_buffer(&self.face, self.features, plans, run, scratch);
+        let result = map_shaped_run(
+            self.face.face(),
+            run,
+            run_chars,
+            admit_collapsed,
+            shaped.glyph_infos(),
+            map_scratch,
+        );
+        *scratch = shaped.clear();
+        result
+    }
+
+    #[cfg(test)]
     fn shape_buffer(&mut self, run: &str, scratch: &mut UnicodeBuffer) -> GlyphBuffer {
         let mut buffer = std::mem::take(scratch);
         buffer.push_str(run);
@@ -222,23 +316,26 @@ impl<'a> RowShaper<'a> {
             direction: buffer.direction(),
             script: buffer.script(),
         };
-        let slot = self
-            .plans
-            .iter()
-            .position(|(p, _)| *p == props)
-            .unwrap_or_else(|| {
-                #[cfg(test)]
-                note_shape_plan_build();
-                let plan = ShapePlan::new(&self.face, props.direction, props.script, self.features);
-                if self.plans.len() == 4 {
-                    self.plans[3] = (props, plan);
-                    3
-                } else {
-                    self.plans.push((props, plan));
-                    self.plans.len() - 1
-                }
-            });
-        aterm_font::shape::shape_with_plan(&self.face, &self.plans[slot].1, buffer)
+        let plan = self.plans.plan_for(&self.face, self.features, props);
+        aterm_font::shape::shape_with_plan(&self.face, plan, buffer)
+    }
+
+    fn shape_substitute_only_buffer(
+        face: &ShapeFace<'_>,
+        features: &[Feature],
+        plans: &mut ShapePlanMemo,
+        run: &str,
+        scratch: &mut UnicodeBuffer,
+    ) -> GlyphBuffer {
+        let mut buffer = std::mem::take(scratch);
+        buffer.push_str(run);
+        buffer.guess_segment_properties();
+        let props = SegmentProperties {
+            direction: buffer.direction(),
+            script: buffer.script(),
+        };
+        let plan = plans.plan_for(face, features, props);
+        aterm_font::shape::shape_substitute_only_with_plan(face, plan, buffer)
     }
 }
 
@@ -263,6 +360,7 @@ fn map_shaped_run(
     run_chars: &[char],
     admit_collapsed: bool,
     glyphs: &[GlyphInfo],
+    scratch: &mut MapScratch,
 ) -> Option<ShapedRun> {
     match classify_shape(run_chars.len(), glyphs.len(), admit_collapsed) {
         ShapeVerdict::OneToOne => {}
@@ -282,16 +380,17 @@ fn map_shaped_run(
     }
     let n = run_chars.len();
     let ascii = run.len() == n;
-    let mut byte_to_idx: Vec<usize> = Vec::new();
+    scratch.byte_to_idx.clear();
     if !ascii {
-        byte_to_idx.reserve_exact(n);
+        scratch.byte_to_idx.reserve(n);
         let mut b = 0usize;
         for ch in run_chars {
-            byte_to_idx.push(b);
+            scratch.byte_to_idx.push(b);
             b += ch.len_utf8();
         }
     }
-    let mut out: Vec<Option<u16>> = vec![None; n];
+    scratch.out.clear();
+    scratch.out.resize(n, None);
     for info in glyphs {
         let gid = u16::try_from(info.glyph_id).ok()?;
         let cluster = info.cluster as usize;
@@ -301,17 +400,17 @@ fn map_shaped_run(
             }
             cluster
         } else {
-            let Ok(idx) = byte_to_idx.binary_search(&cluster) else {
+            let Ok(idx) = scratch.byte_to_idx.binary_search(&cluster) else {
                 return None;
             };
             idx
         };
-        if out[idx].replace(gid).is_some() {
+        if scratch.out[idx].replace(gid).is_some() {
             return None;
         }
     }
     let mut any_changed = false;
-    for (slot, &ch) in out.iter_mut().zip(run_chars) {
+    for (slot, &ch) in scratch.out.iter_mut().zip(run_chars) {
         let gid = (*slot)?;
         let cmap = face.glyph_index(ch).map_or(0, |g| g.0);
         if gid == 0 && cmap != 0 {
@@ -326,7 +425,7 @@ fn map_shaped_run(
     if !any_changed {
         return None;
     }
-    Some(ShapedRun::PerColumn(out.into_boxed_slice()))
+    Some(ShapedRun::PerColumn(scratch.out.as_slice().into()))
 }
 
 /// Whether the primary face's `GSUB` table advertises a programming-ligature feature (`liga` or `calt`).

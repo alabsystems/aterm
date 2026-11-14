@@ -43,11 +43,28 @@ impl Drop for Job {
         drop(self.child.stdin.take());
         let ended = aterm_spec::wait::within(HANG, GAP, || self.child.try_wait().ok().flatten());
         if !ended.is_some_and(|status| status.success()) {
-            let removed = aterm_keeper::job::remove(&self.label);
+            let removed = remove_job(&self.label);
             aterm_uds::deadline::kill_within(&mut self.child, HANG);
             eprintln!("keeper cleanup helper failed; direct removal: {removed:?}");
         }
     }
+}
+
+/// `launchctl remove` acknowledges a request before launchd finishes stopping the job.
+/// A successful cleanup receipt requires the registered job to have disappeared.
+fn remove_job(label: &str) -> std::io::Result<()> {
+    let request_error = aterm_keeper::job::remove(label).err();
+    aterm_spec::wait::within(HANG, GAP, || match aterm_keeper::job::state(label) {
+        Ok(aterm_keeper::job::JobState::Absent) => Some(Ok(())),
+        Ok(aterm_keeper::job::JobState::Loaded { .. }) => None,
+        Err(error) => Some(Err(error)),
+    })
+    .unwrap_or_else(|| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("test keeper {label} remained registered after removal: {request_error:?}"),
+        ))
+    })
 }
 
 #[test]
@@ -59,9 +76,7 @@ fn cleanup_actor() {
     println!("keeper cleanup ready");
     std::io::stdout().flush().unwrap();
     std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).unwrap();
-    if aterm_keeper::job::state(&label).unwrap() != aterm_keeper::job::JobState::Absent {
-        aterm_keeper::job::remove(&label).unwrap();
-    }
+    remove_job(&label).unwrap();
     // Its owner may have died: do not write libtest's result into the closed proof pipe.
     std::process::exit(0);
 }

@@ -1914,6 +1914,7 @@ fn update_status(staged: bool) -> aterm_update::UpdateStatus {
         failing_checks_kind: String::new(),
         channel_unreadable: false,
         hold: None,
+        start_failure: None,
         last: None,
         offered: None,
         behind: false,

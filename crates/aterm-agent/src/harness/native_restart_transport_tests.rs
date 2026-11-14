@@ -27,6 +27,9 @@ mod completion;
 #[path = "native_noexec_recovery_tests.rs"]
 mod noexec;
 
+#[path = "native_restart_cadence_tests.rs"]
+mod cadence;
+
 const SID: &str = "s-native-transport";
 
 #[test]
@@ -906,7 +909,7 @@ fn common(line: &str) -> Option<String> {
     }
     if line == format!("@{SID} native-act info") {
         return Some(format!(
-            "OK native-act state=info epoch={} native-act=1 handoff=blocked clock=monotonic-us own-image=grok-alab:upgrade\n",
+            "OK native-act state=info epoch={} native-act=1 handoff=close clock=monotonic-us own-image=grok-alab:upgrade\n",
             "34".repeat(16)
         ));
     }

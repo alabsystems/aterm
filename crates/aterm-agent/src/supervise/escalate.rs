@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Raising and clearing worker `attention` for the menu bar.
+//! Raising and clearing worker `attention`, and the needs entry the window shows.
 
 use super::super::journal::{
     AGAIN_ADOPTED, AGAIN_RETRY, ATTENTION_KEPT, ATTENTION_SKIPPED, CLEARED_BOX, CLEARED_NEEDS,
@@ -967,7 +967,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Whether the needs entry is owed a write, its retry due ([`Self::arm_needs_retry`]): a write
-    /// of it is pending, or the set it was told is not the one the menu bar shows
+    /// of it is pending, or the set it was told is not the one the window shows
     /// (`TurnEndState::shown_key`). An entry a loop before this one left ([`NEEDS_LEFT`]) where
     /// none is shown is owed nothing here: a point takes it down ([`NEEDS_LEFT_DOWN`]).
     pub(super) fn needs_owed(&self) -> bool {

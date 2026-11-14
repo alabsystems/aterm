@@ -635,6 +635,7 @@ fn with_jobs_aged(seq: u64, age_ms: u64) -> Snapshot {
 fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
     static JOBS: Arming = Arming::new();
     let run = |text: &str, wait: Duration, makes: bool| {
+        let left = text.starts_with("left");
         let shared = Arc::new(Shared::paced(Duration::from_secs(3600), wait));
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         shared.install(tx);
@@ -645,13 +646,43 @@ fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
                 while let Ok(msg) = rx.recv() {
                     assert!(matches!(msg, Msg::Pull));
                     seen.push(JOBS.armed());
-                    let age = if makes { 0 } else { 25_100 };
-                    shared.publish_for_test(with_jobs_aged(7301, age), Vec::new());
+                    let observed = Instant::now();
+                    let age = if makes { 1 } else { 0 };
+                    let jobs_at = if makes {
+                        Some(observed)
+                    } else {
+                        observed.checked_sub(Duration::from_millis(25_100))
+                    };
+                    let mut offered = with_jobs_aged(7301, age);
+                    if left {
+                        offered.left = Some(Arc::new(aterm_vitals::left::LeftView::default()));
+                    }
+                    shared.publish(
+                        Arc::new(offered),
+                        &Machine::default(),
+                        observed,
+                        jobs_at,
+                        if left { jobs_at } else { None },
+                        true,
+                    );
                 }
                 seen
             })
         };
-        shared.publish_for_test(with_jobs_aged(7300, 25_000), Vec::new());
+        let mut initial = with_jobs_aged(7300, 25_000);
+        if left {
+            initial.left = Some(Arc::new(aterm_vitals::left::LeftView::default()));
+        }
+        let now = Instant::now();
+        let old = now.checked_sub(Duration::from_secs(25));
+        shared.publish(
+            Arc::new(initial),
+            &Machine::default(),
+            now,
+            old,
+            if left { old } else { None },
+            true,
+        );
         let q = SysQuery::parse(text).expect("query");
         let (held, state) = shared.fresh_for(&q, &Arming::new(), &JOBS, &Arming::new());
         assert!(!JOBS.armed(), "{text}: disarmed once answered");
@@ -659,6 +690,20 @@ fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
         (held.map(|h| h.snap.seq), state, probe.join().unwrap())
     };
     let hang = Duration::from_secs(60);
+    for text in ["left", "left fresh=0"] {
+        assert_eq!(
+            run(text, hang, true),
+            (Some(7301), Freshness::Fresh, vec![true])
+        );
+    }
+    assert_eq!(
+        run("left fresh=60000", hang, true),
+        (Some(7300), Freshness::Fresh, vec![])
+    );
+    assert_eq!(
+        run("left", Duration::from_millis(200), false).1,
+        Freshness::Stale
+    );
     assert_eq!(
         run("jobs", hang, true),
         (Some(7301), Freshness::Fresh, vec![true]),
@@ -1419,6 +1464,136 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
     assert_eq!(t.not_measured, ["protected"]);
 }
 
+/// The root `sys disk` lists at `path`.
+#[cfg(unix)]
+fn root_at<'a>(roots: &'a [Root], path: &std::path::Path) -> Option<&'a Root> {
+    roots.iter().find(|r| std::path::Path::new(&r.path) == path)
+}
+
+/// SYS DISK ATTRIBUTES A BUILD BY PATH TO ITS SESSION'S TAB (DC-01): Tab 1's pane sits in one
+/// repository and a build started in it compiled a linked worktree elsewhere, leaving its
+/// build-start line under the pane's session. `sys disk scope=tab` for that tab lists the
+/// worktree as a project and its build mirror as build output, each the tab's; the line's
+/// build folder lies inside the mirror and is no row. Tab 2 lists neither. NEGATIVE CONTROLS:
+/// with no line, and with the same line under a session no pane has, Tab 1 lists its pane's
+/// repository alone. The board is one real discovery over a scratch home.
+#[cfg(unix)]
+#[test]
+fn sys_disk_attributes_a_build_by_path_to_its_sessions_tab() {
+    use crate::diskwalk_host::{
+        DiskScope, Facts, PaneFacts, PaneReads, Published, TabFacts, build_mirror, discovered_board,
+    };
+    use crate::tab_model::TabId;
+    use aterm_sysprobe::volumes::VolumeKey;
+    let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+    let home = aterm_diskwalk::canonical(tmp.path())
+        .expect("absolute temp folder")
+        .join("home");
+    let (main, wt, two) = (home.join("main"), home.join("wt"), home.join("two"));
+    for folder in [main.join(".git"), wt.join("src"), two.clone()] {
+        std::fs::create_dir_all(folder).expect("mkdir");
+    }
+    std::fs::write(wt.join(".git"), "gitdir: elsewhere\n").expect("the worktree's link file");
+    let cache = atpkg::build_cache::cache_root(&home);
+    let build = atpkg::build_cache::build_dir(&cache, &wt);
+    std::fs::create_dir_all(&build).expect("mkdir");
+    let mirror = build_mirror(&cache, &wt);
+    let session = |key: u64| format!("s-{key:020x}");
+    let line = |session: String| atpkg::build_start::Start {
+        session,
+        workspace: wt.clone(),
+        build: Some(build.clone()),
+        pid: 4242,
+        at_ms: 1_731_450_000_000,
+    };
+    let now = Instant::now();
+    let discovered = |lines: Vec<atpkg::build_start::Start>| -> Published {
+        let cwds = [(101_u32, main.clone()), (102, two.clone())];
+        let facts = Facts {
+            panes: [(1_u64, 101_u32), (2, 102)]
+                .into_iter()
+                .map(|(key, pid)| PaneFacts {
+                    key,
+                    session: session(key),
+                    shell_pid: pid,
+                    front_pid: pid,
+                    report: None,
+                })
+                .collect(),
+            tabs: [(1_u64, 1_usize), (2, 2)]
+                .into_iter()
+                .map(|(key, number)| TabFacts {
+                    id: TabId::from_stored(key),
+                    label: format!("Tab {number}"),
+                    number: Some(number),
+                    window: 1,
+                    panes: vec![key],
+                })
+                .collect(),
+            home: Some(home.clone()),
+            ..Facts::default()
+        };
+        let reads = PaneReads {
+            cwd: Box::new(move |pid| {
+                cwds.iter()
+                    .find(|(shell, _)| *shell == pid)
+                    .map(|(_, at)| at.clone())
+            }),
+            exe: Box::new(|pid| Some(format!("p{pid}"))),
+            pool: Box::new(|_, _| Some(VolumeKey::Fsid(1))),
+            starts: Box::new(move || lines.clone()),
+        };
+        let scopes = [
+            DiskScope::Tab(TabId::from_stored(1)),
+            DiskScope::Tab(TabId::from_stored(2)),
+            DiskScope::Aterm,
+        ];
+        discovered_board(facts, reads, &scopes, now)
+    };
+    let panes = [pane_fact(1, 1, 1), pane_fact(2, 2, 2)];
+    let listed = |board: &Published, key: u64| -> Vec<Root> {
+        let keys = [key];
+        let ask = disk_ask(ScopeArg::Tab, &panes, &keys, Some(key), false);
+        let reports = sys_reports(board, &ask);
+        disk_view(board, &reports, &ask, &[], None, now).0
+    };
+
+    let board = discovered(vec![line(session(1))]);
+    let roots = listed(&board, 1);
+    let worktree = root_at(&roots, &wt).expect("the worktree the tab's build compiled");
+    assert_eq!(worktree.kinds, ["project"], "{roots:#?}");
+    assert_eq!(worktree.tab, Some(1));
+    assert_eq!(worktree.keys, [1], "the tab's pane");
+    assert!(worktree.scopes.iter().any(|s| s == "tab:1"), "{roots:#?}");
+    let output = root_at(&roots, &mirror).expect("the worktree's build mirror");
+    assert_eq!(output.kinds, ["build"], "{roots:#?}");
+    assert_eq!(output.tab, Some(1));
+    assert!(
+        build.starts_with(&mirror) && root_at(&roots, &build).is_none(),
+        "the line's build folder is counted in the mirror: {roots:#?}"
+    );
+    assert!(root_at(&roots, &main).is_some(), "{roots:#?}");
+    assert_eq!(roots.len(), 3, "{roots:#?}");
+    let other = listed(&board, 2);
+    assert_eq!(
+        other.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+        [two.display().to_string()],
+        "the other tab lists its own folder alone"
+    );
+
+    for (what, lines) in [
+        ("no line", Vec::new()),
+        ("another session's line", vec![line(session(9))]),
+    ] {
+        let roots = listed(&discovered(lines), 1);
+        assert_eq!(
+            roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+            [main.display().to_string()],
+            "{what}"
+        );
+    }
+}
+
 /// SYS DISK'S SCOPE LINES AND JSON AGREE WITH THE BAR: every figure from one board, the bytes
 /// after the clamp to the Mac's used.
 #[test]
@@ -1784,6 +1959,8 @@ fn a_why_with_the_split_cold_reads_the_services_on_their_own() {
             snap: Arc::new(Snapshot::default()),
             unix_ms: 0,
             at: Instant::now(),
+            jobs_at: None,
+            left_at: None,
         })
     };
     let reading = || {
@@ -1826,6 +2003,8 @@ fn a_why_with_the_split_cold_reads_the_services_on_their_own() {
             snap: Arc::new(warm.clone()),
             unix_ms: 0,
             at: Instant::now(),
+            jobs_at: None,
+            left_at: None,
         })
     };
     assert!(!read_for("why mem", warm()));

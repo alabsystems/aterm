@@ -614,6 +614,7 @@ fn an_unsigned_journal_names_the_bytes_it_will_sign() {
         artifact: None,
         macho_sha256: None,
         linux: None,
+        windows: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

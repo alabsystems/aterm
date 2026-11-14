@@ -12,6 +12,11 @@ fn a_read_stops_at_its_limit_and_says_so() {
 
 #[test]
 fn a_detached_write_reaches_the_reader_and_closes() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "aterm-uds is a dev-dependency here on Linux alone, and this unit-test binary \
+                  forks and spawns nothing that could hold the write end"
+    )]
     let (mut reader, writer) = io::pipe().unwrap();
     write_detached(OwnedFd::from(writer), b"LANE-42".to_vec()).unwrap();
     let mut got = Vec::new();

@@ -293,6 +293,44 @@ fn authenticated_builtin_claim_lifecycle_preserves_passive_continuity() {
         }
     }
 }
+
+/// THE BUILT-IN HARNESS'S OWN LEASE RENEWS IN PLACE, A LOOKALIKE'S NEVER: aterm's harness renewing
+/// its `ttl=` claim keeps the revision, while the same holder text renewed by another principal,
+/// every field of the claim but its lease the same, is no authenticated built-in custody: it moves
+/// the authority's Relaunch epoch, and the revision with it.
+#[test]
+#[cfg(unix)]
+fn only_the_builtin_harness_renews_its_own_lease_in_place() {
+    use crate::session_timeline::claim_supervisor;
+    let handle = crate::session_store::test_handle_on(7624, -1);
+    let (_client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
+    let _serving = ServingFd::enter(&server);
+    let _direct = DirectPeer::enter();
+    let _principal = ServingPrincipal::enter(Principal::Harness);
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERVING_CONNECTION.with(|connection| connection.set(self.0));
+        }
+    }
+    let _restore = Restore(SERVING_CONNECTION.with(|connection| connection.replace(Some(72))));
+    let holder = crate::harness_host::holder();
+    let authority = || handle.ctx.meta.lock().unwrap().supervisor_authority(100);
+    claim_supervisor(&handle.ctx, &holder, None, Some(200), 100).unwrap();
+    let held = authority();
+    claim_supervisor(&handle.ctx, &holder, None, Some(300), 100).unwrap();
+    assert_eq!(authority(), held, "the harness's own lease renews in place");
+    let _instance = ServingPrincipal::enter(Principal::Instance);
+    claim_supervisor(&handle.ctx, &holder, None, Some(300), 100).unwrap();
+    let lookalike = authority();
+    assert!(!held.same_builtin_relaunch_continuity(&lookalike));
+    assert_ne!(
+        lookalike.revision(),
+        held.revision(),
+        "a lookalike's renewal is a new authority"
+    );
+}
+
 fn requests() -> [ObservationRequest; 2] {
     let process = |pid, parent| Process {
         pid,

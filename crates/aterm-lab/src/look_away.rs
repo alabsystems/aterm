@@ -6,14 +6,21 @@
 //! aterm runs as its own launchd job, as aterm.app does, so Launch Services knows it and macOS can
 //! make it the active app. (A lab's jailed window never can: the jail denies `launchservicesd`,
 //! so its aterm never checks in and its window is never key.) Its front tab's task is marked
-//! working, then done, while another app the drive opens itself is the active app: the menu
-//! bar's Done for you row must stand, and must still stand after a controller's `focus in` and a
-//! second done (a ctl client's focus report is no look). Once that app is quit by its PID
-//! and aterm is the active app again, the row must go, and a done while aterm stays active must
-//! be seen as it lands, even after a controller's `focus out`. `--aterm` picks the aterm under
-//! test, so the same verb reads main's build as the negative control (there the row is seen
-//! while they are away), and a build whose look reads the controller-written focus flag fails the
-//! two controller legs.
+//! working, then done, while another app the drive opens itself is the active app: the done
+//! must stand unseen, and must still stand after a controller's `focus in` and a second done (a
+//! ctl client's focus report is no look). Once that app is quit by its PID and aterm is the
+//! active app again, the done must be seen, and a done while aterm stays active must be seen as
+//! it lands, even after a controller's `focus out`. `--aterm` picks the aterm under test, so the
+//! same verb reads main's build as the negative control (there the done is seen while they are
+//! away), and a build whose look reads the controller-written focus flag fails the two
+//! controller legs.
+//!
+//! A done nobody saw is the tab's `•`, which the front tab never wears, so each read asks the
+//! session itself: `status done_unseen=`, a development build's field that states the rule the
+//! `•` reads for a tab in front too ([`Drive::unseen`]). A read moves no tab: bringing the tab
+//! under test back in front while aterm is the active app is itself a look, and would make the
+//! done seen whatever their return did. A build with no such field (a release build, one from
+//! before the field) reads `?`, which is COULD NOT RUN.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -35,10 +42,12 @@ const USAGE: &str = "usage: targo --unverified lab look-away [--aterm PATH] [--k
 
 OPENS A WINDOW on this desk (take the desk's window lock first). A private aterm runs as its own
 launchd job; its front tab's task is marked done while Calculator, opened and quit by PID here,
-is the active app. PASS: the menu bar's Done for you row stands while Calculator is active
-(done=1), still stands after `ctl focus in` and a second done (done=1), goes once aterm is
-active again (done=0), and a done while aterm stays active is seen as it lands, even after
-`ctl focus out` (done=0). --aterm main's build is the negative control (done=0 away).
+is the active app. PASS: the done stands unseen while Calculator is active (`status
+done_unseen=1`, a development build's field; no tab moves for a read), still stands after
+`ctl focus in` and a second done (unseen=1), is seen once aterm is active again (unseen=0), and
+a done while aterm stays active is seen as it lands, even after `ctl focus out` (unseen=0).
+--aterm picks a build to read as the negative control (unseen=0 away); one with no
+`done_unseen=` reads `?` and could not run.
 Exit 0 PASS, 1 FAIL, 3 COULD NOT RUN.
 ";
 
@@ -174,18 +183,18 @@ pub fn front_sid(ls: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `done=` on `chrome`'s `statusitem` line: how many Done for you rows the menu bar holds.
+/// `done_unseen=` on a session's `status` reply: `1` while its done stands unseen, `0` once it
+/// was looked at. `None` where the reply is no `OK` line or names no such field.
 #[must_use]
-pub fn done_rows(chrome: &str) -> Option<String> {
-    chrome
-        .lines()
-        .find(|l| l.starts_with("statusitem "))?
+pub fn unseen_of(status: &str) -> Option<&str> {
+    status
+        .strip_prefix("OK ")?
         .split_whitespace()
-        .find_map(|w| w.strip_prefix("done="))
-        .map(str::to_string)
+        .find_map(|w| w.strip_prefix("done_unseen="))
+        .filter(|v| matches!(*v, "0" | "1"))
 }
 
-/// The four reads of a drive (`done=` each).
+/// The four reads of a drive (`unseen=` each).
 #[derive(Clone, Copy, Debug)]
 pub struct Reads<'a> {
     /// A done while another app is active.
@@ -198,13 +207,13 @@ pub struct Reads<'a> {
     pub present: &'a str,
 }
 
-/// The verdict on the reads: away the row stands and a controller's `focus in` does not make it
-/// go, back it goes, and a done while aterm is active is seen as it lands whatever a
+/// The verdict on the reads: away the done stands unseen and a controller's `focus in` does not
+/// see it, back it is seen, and a done while aterm is active is seen as it lands whatever a
 /// controller's `focus out` said.
 #[must_use]
 pub fn verdict(r: Reads<'_>) -> (bool, String) {
     let said = format!(
-        "away done={}, want 1; after ctl focus in done={}, want 1; back done={}, want 0; a done while aterm is active after ctl focus out done={}, want 0",
+        "away unseen={}, want 1; after ctl focus in unseen={}, want 1; back unseen={}, want 0; a done while aterm is active after ctl focus out unseen={}, want 0",
         r.away, r.faked, r.back, r.present
     );
     (
@@ -226,8 +235,12 @@ impl Drive {
         self.inst.ctl(args).stdout
     }
 
-    fn done(&self) -> String {
-        done_rows(&self.ctl(&["chrome"])).unwrap_or_else(|| "?".into())
+    /// Whether the tab under test's done stands unseen, as its own `status` says
+    /// ([`unseen_of`]): a read that moves no tab and looks at nothing. `?` where the reply
+    /// names no `done_unseen=`.
+    fn unseen(&self) -> String {
+        let status = self.ctl(&[&format!("@{}", self.sid), "status"]);
+        unseen_of(&status).unwrap_or("?").to_string()
     }
 
     /// Mark the front tab's task working, then done; each reply must say so.
@@ -277,14 +290,14 @@ impl Drive {
     fn run(&self) -> Res {
         let raised = self.ctl(&["raise", &self.sid]);
         self.await_front(self.aterm_pid, "aterm after raise")?;
-        let before = self.done();
+        let before = self.unseen();
         if before != "0" {
             return Err(could_not(&format!(
-                "the menu bar held {before} Done for you row(s) before the drive"
+                "the tab under test read unseen={before} before the drive"
             )));
         }
         println!(
-            "  front     {} raise @{}: {}; aterm pid {} is the active app; done={before}",
+            "  front     {} raise @{}: {}; aterm pid {} is the active app; unseen={before}",
             self.at(),
             self.sid,
             raised.trim(),
@@ -298,10 +311,10 @@ impl Drive {
             other.pid
         );
         let marked = self.mark_done()?;
-        let away = self.done();
+        let away = self.unseen();
         let away_front = front_pid();
         println!(
-            "  end       {} {marked}; done={away} (front pid {away_front:?})",
+            "  end       {} {marked}; unseen={away} (front pid {away_front:?})",
             self.at()
         );
         if away_front != Some(other.pid) {
@@ -311,10 +324,10 @@ impl Drive {
         }
         self.ctl_focus("in")?;
         let marked = self.mark_done()?;
-        let faked = self.done();
+        let faked = self.unseen();
         let faked_front = front_pid();
         println!(
-            "  faked     {} ctl focus in, then {marked}; done={faked} (front pid {faked_front:?})",
+            "  faked     {} ctl focus in, then {marked}; unseen={faked} (front pid {faked_front:?})",
             self.at()
         );
         if faked_front != Some(other.pid) {
@@ -331,27 +344,27 @@ impl Drive {
         }
         let raised = self.ctl(&["raise", &self.sid]);
         self.await_front(self.aterm_pid, "aterm after its return")?;
-        let mut back = self.done();
+        let mut back = self.unseen();
         let gone = crate::wait_until(HANG, || {
-            back = self.done();
+            back = self.unseen();
             back == "0"
         });
         println!(
-            "  back      {} raise @{}: {}; aterm is the active app; done={back}{}",
+            "  back      {} raise @{}: {}; aterm is the active app; unseen={back}{}",
             self.at(),
             self.sid,
             raised.trim(),
             if gone {
                 ""
             } else {
-                " (the row stood a minute)"
+                " (the done stood unseen a minute)"
             }
         );
         self.ctl_focus("out")?;
         let marked = self.mark_done()?;
-        let present = self.done();
+        let present = self.unseen();
         println!(
-            "  present   {} ctl focus out, then {marked} while aterm is active; done={present} (front pid {:?})",
+            "  present   {} ctl focus out, then {marked} while aterm is active; unseen={present} (front pid {:?})",
             self.at(),
             front_pid()
         );

@@ -545,6 +545,10 @@ fn cargo_wrapper_admits_named_units_and_passes_through_probes() {
         let mut args: Vec<OsString> = vec![compiler.into()];
         if mode == "invalid" {
             args.extend(["--crate-type", kind].map(OsString::from));
+        } else if mode == "harnessless" {
+            // A `harness = false` test target, as Cargo spelled `aterm-uds`'s `tether_image`
+            // (2026-11-13): no `--test`, no `--crate-type`, only `--cfg test`.
+            args.extend(["--crate-name", "fixture", "--cfg", "test"].map(OsString::from));
         } else {
             args.extend(["--crate-name", "fixture", "--crate-type", kind].map(OsString::from));
         }
@@ -574,15 +578,34 @@ fn cargo_wrapper_admits_named_units_and_passes_through_probes() {
         package: "fixture".into(),
         kind: "fixture lib".into(),
     };
+    let test_unit = crate::unitgraph::UnitName {
+        package: "fixture".into(),
+        kind: "fixture test".into(),
+    };
     for mode in [
-        "unit", "probe", "version", "missing", "invalid", "record", "fail",
+        "unit",
+        "harnessless",
+        "probe",
+        "version",
+        "missing",
+        "invalid",
+        "record",
+        "fail",
     ] {
         let book = dir.path().join(format!("{mode}.json"));
         let pending = dir.path().join(format!("{mode}.pending.json"));
-        if matches!(mode, "unit" | "probe" | "version" | "missing" | "invalid") {
+        if matches!(
+            mode,
+            "unit" | "harnessless" | "probe" | "version" | "missing" | "invalid"
+        ) {
             let mut records = crate::memory::Records::default();
             records.push(
                 crate::shape::compiler_unit_key(crate::shape::UNIT_STAGE, "/fixture", &unit),
+                2 << 30,
+                1,
+            );
+            records.push(
+                crate::shape::compiler_unit_key(crate::shape::UNIT_STAGE, "/fixture", &test_unit),
                 2 << 30,
                 1,
             );
@@ -629,11 +652,19 @@ fn cargo_wrapper_admits_named_units_and_passes_through_probes() {
         // envelope for a version string, and was refused on a Mac that can never have it.
         assert_eq!(
             log.contains("compiler width now 1"),
-            matches!(mode, "unit" | "missing" | "invalid"),
+            matches!(mode, "unit" | "harnessless" | "missing" | "invalid"),
             "{log}"
         );
         if mode == "unit" {
             assert!(log.contains("3 GiB"), "{log}");
+        } else if mode == "harnessless" {
+            // NEGATIVE CONTROL: unnamed, a harness-less test target claimed the stage's whole
+            // unmeasured envelope, alone on a Mac smaller than the plan, and kept no peak.
+            assert!(
+                log.contains("admitted fixture fixture test with 3 GiB")
+                    && !log.contains("unidentified"),
+                "{log}"
+            );
         } else if matches!(mode, "missing" | "invalid") {
             assert!(
                 log.contains("16 GiB"),
@@ -647,7 +678,7 @@ fn cargo_wrapper_admits_named_units_and_passes_through_probes() {
             .any(|row| valid_unit_row(row, crate::shape::UNIT_STAGE));
         assert_eq!(
             recorded,
-            matches!(mode, "unit" | "missing" | "record"),
+            matches!(mode, "unit" | "harnessless" | "missing" | "record"),
             "only successful named compilers leave a pending observation ({mode})"
         );
         if mode == "record" {

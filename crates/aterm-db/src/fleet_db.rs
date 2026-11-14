@@ -2090,17 +2090,7 @@ pub(crate) fn try_run_with(
     let has_dir_flag = words.iter().any(|w| w == "--dir");
     let is_fleet_verb = matches!(
         cmd,
-        "tables"
-            | "computers"
-            | "emails"
-            | "phones"
-            | "ai-accounts"
-            | "ai_accounts"
-            | "delete"
-            | "dump"
-            | "load"
-            | "bootstrap"
-            | "rekey"
+        "tables" | "delete" | "dump" | "load" | "bootstrap" | "rekey"
     );
     let is_positional_crud = !has_dir_flag
         && matches!(
@@ -2164,31 +2154,6 @@ pub(crate) fn try_run_with(
                 .filter_map(|id| db.provenance(id))
                 .collect();
             Ok(Some(json!({ "operations": ops })))
-        }
-        "computers" | "emails" | "phones" | "ai-accounts" | "ai_accounts" => {
-            if args.len() > 1 || args.first().is_some_and(|a| a.starts_with("--")) {
-                return Err(Error::new(
-                    "unexpected arguments: expected optional [<key>] [--show-passwords]",
-                ));
-            }
-            let (logical, _) = resolve_table(cmd)?;
-            let db = open_at(&dir)?;
-            let view = db.view();
-            if let Some(key) = args.first() {
-                let row = get_row(&view, logical, key)?
-                    .ok_or_else(|| Error::new("row not found in table"))?;
-                Ok(Some(redact_row(logical, row, show_passwords)))
-            } else {
-                let rows: Vec<Value> = scan_table(&view, logical)?
-                    .into_values()
-                    .map(|r| redact_row(logical, r, show_passwords))
-                    .collect();
-                Ok(Some(json!({
-                    "table": logical,
-                    "count": rows.len(),
-                    "rows": rows,
-                })))
-            }
         }
         "scan" => {
             let table = match args.as_slice() {

@@ -147,9 +147,16 @@ struct Seen {
     /// Its place among its block's Claude sessions in the text's order: the
     /// round of the client's round robin it is in.
     round: Option<usize>,
+    /// Whether it is its machine's most pressing Claude session: the client's first of the
+    /// block (the least rank, the earliest line among equals), whose leading excerpt line the
+    /// client fills before any machine's second line of words.
+    first: bool,
     /// Whether its `asked:` and its `said:` show.
     asked: bool,
     said: bool,
+    /// How many of its excerpt lines show, its `attention:` and `goal:` lines included: its
+    /// leading line, the client's first of the least rank, is `attention:` where it has one.
+    lines: usize,
     /// Whether its line carries the client's mark that excerpts were cut.
     marked: bool,
 }
@@ -308,8 +315,10 @@ pub fn judge_text(
                     Seen {
                         rank: ranks.get(&s.sid).copied(),
                         round: None,
+                        first: false,
                         asked: next.iter().any(|l| l.starts_with("    asked: ")),
                         said: next.iter().any(|l| l.starts_with("    said: ")),
+                        lines: next.iter().filter(|l| is_excerpt_row(l)).count(),
                         marked: line.contains(aterm_ctl::EXCERPTS_CUT),
                     },
                 ));
@@ -324,8 +333,14 @@ pub fn judge_text(
             }
         }
         seen.sort_by_key(|(at, _)| *at);
-        if !seen.is_empty() {
-            firsts.push((w.i, Some(claude.len())));
+        let lead = seen
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, one))| one.rank.unwrap_or(u8::MAX))
+            .map(|(n, _)| n);
+        if let Some(n) = lead {
+            firsts.push((w.i, Some(claude.len() + n)));
+            seen[n].1.first = true;
         }
         for (round, (_, mut one)) in seen.into_iter().enumerate() {
             if !one.rank.is_some_and(aterm_ctl::survey_urgent) {
@@ -407,8 +422,9 @@ pub fn judge_text(
         if budget_cut {
             format!(
                 "{excerpted} of {} with both shown, the budget cut: the client's fill order \
-                 (asking and stalled first, then a round robin over the machines, said before \
-                 asked) {} ({unranked} with no rank in the json)",
+                 (every asking and stalled session's leading line, then each other machine's \
+                 most pressing session's, then the asking and stalled \
+                 whole, then a round robin over the machines, said before asked) {} ({unranked} with no rank in the json)",
                 claude.len(),
                 if filled_in_order(&claude) {
                     "held"
@@ -484,18 +500,37 @@ pub fn judge_text(
 
 /// Whether `claude` (every Claude session of a cut read, in its order) shows
 /// its excerpts as the client fills a tight read: every one it keeps first
-/// across the read (no round) with both excerpt lines before any other
-/// shows a word; every other in a round with both before any in a later
-/// round shows a word; and in a
-/// round, every one's `said:` before any one's `asked:`.
+/// across the read (no round, asking or stalled) and each machine's most
+/// pressing one ([`Seen::first`]) its leading line (any excerpt line: the
+/// client's first of the least rank) before any shows a line past it, the
+/// ones kept first before the other machines' firsts; every one kept first
+/// with both excerpt lines before any other shows a line past its leading
+/// one; every other in a round with both before any in a later round shows
+/// a word; and in a round, every one's `said:` before any one's `asked:`.
 fn filled_in_order(claude: &[Seen]) -> bool {
     let shows = |seen: &Seen| seen.asked || seen.said;
+    let urgent = |seen: &Seen| seen.round.is_none();
+    let leads = |seen: &Seen| seen.first || urgent(seen);
+    // A line past the first tier: any of a session that leads nothing, a leader's second.
+    let past_lead = |seen: &Seen| seen.lines > usize::from(leads(seen));
+    let firsts = || claude.iter().filter(|seen| seen.first);
+    let led = claude
+        .iter()
+        .filter(|seen| leads(seen))
+        .all(|seen| seen.lines > 0);
+    let urgent_led = claude
+        .iter()
+        .filter(|seen| urgent(seen))
+        .all(|seen| seen.lines > 0);
     let urgent_shown = claude
         .iter()
         .filter(|seen| seen.round.is_none())
         .all(Seen::both_shown);
     let others = || claude.iter().filter(|seen| seen.round.is_some());
-    (urgent_shown || !others().any(shows))
+    (led || !claude.iter().any(past_lead))
+        && (urgent_led || !firsts().any(|seen| !urgent(seen) && seen.lines > 0))
+        && firsts().all(|seen| seen.said || !seen.asked)
+        && (urgent_shown || !others().any(past_lead))
         && others().all(|a| {
             others().all(|b| {
                 let (ra, rb) = (a.round, b.round);
@@ -529,11 +564,11 @@ fn closing_counts(line: &str) -> (usize, usize) {
 }
 
 /// Whether a text line is an excerpt line (`    asked: …`, `    said: …`,
-/// `    attention: …`).
+/// `    attention: …`, `    goal: …`).
 fn is_excerpt_row(line: &str) -> bool {
     line.strip_prefix("    ")
         .and_then(|rest| rest.split_once(": "))
-        .is_some_and(|(word, _)| matches!(word, "asked" | "said" | "attention"))
+        .is_some_and(|(word, _)| matches!(word, "asked" | "said" | "attention" | "goal"))
 }
 
 /// Whether an excerpt line was cut: it ends in `…`, or its words start with

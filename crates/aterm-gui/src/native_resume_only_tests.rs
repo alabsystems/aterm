@@ -10,6 +10,9 @@ use aterm_agent::harness::{accounts, cli::Env, codex_renewal as recovery};
 #[path = "native_resume_phase_tests.rs"]
 mod phase;
 
+#[path = "native_closed_bound_tests.rs"]
+mod closed_bound;
+
 struct World {
     _root: aterm_tempfile::TempDir,
     handle: crate::session_store::SessionHandle,

@@ -84,6 +84,32 @@ fn native_exec_claim_transfer_keeps_identity_and_rejects_stale_authority() {
     assert!(meta.transfer_native_exec_claim(&moved, 13, 100).is_none());
 }
 
+/// A `ttl=` renewal of a live claim moves only its lease, so it keeps the revision; the same claim
+/// made after its lease lapsed is a new claim and moves it, as the lapse's release would have.
+#[test]
+fn a_lease_renewal_keeps_the_revision_and_a_claim_after_its_lapse_moves_it() {
+    let handle = crate::session_store::test_handle_on(7625, -1);
+    let revision = |now_us| {
+        handle
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .supervisor_authority(now_us)
+            .revision()
+    };
+    claim_supervisor(&handle.ctx, "drive-loop", None, Some(200), 100).unwrap();
+    let held = revision(100);
+    claim_supervisor(&handle.ctx, "drive-loop", None, Some(400), 150).unwrap();
+    assert_eq!(revision(150), held, "a lease renewal keeps the revision");
+    claim_supervisor(&handle.ctx, "drive-loop", None, Some(600), 450).unwrap();
+    assert_ne!(
+        revision(450),
+        held,
+        "a claim after its lapse is a new claim"
+    );
+}
+
 #[test]
 fn passive_relaunch_continuity_rejects_spoofed_holder_and_expired_foreign_aba() {
     let mut meta = SessionMeta::default();
@@ -245,6 +271,124 @@ fn supervisor_authority_captures_partial_full_and_expired_ownership() {
     );
     assert_eq!(partial.connection(), Some(4));
     assert!(partial.external_takes(host, Scope::Upgrade));
+}
+
+/// CLAUDE CODE UNDER claude-code-alab (`docs/DESIGN-harness-repos-2026-10-24.md` §8.3, §11 D53):
+/// its proven claim takes from the built-in Claude Code engine exactly the duties its scope
+/// names. Under `scope=upgrade`, the claim its launch makes, the built-in relaunch lane keeps
+/// the crash relaunch and its passive continuity; under `relaunch,upgrade` it keeps neither
+/// lane, and the change of relaunch ownership breaks that continuity. Under both, turn ends,
+/// approvals, questions and walls stay the built-in engine's, typed by its own holder alone, and
+/// the claim speaks for no box or wall.
+#[test]
+fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_nothing_else() {
+    use aterm_agent::harness::contract::{Scope, Words, read};
+    let host = crate::harness_host::holder();
+    let holder = "claude-code-alab@4242";
+    let h = crate::session_store::test_handle_on(7641, -1);
+    let ctx = &h.ctx;
+    let mut before = ctx.meta.lock().unwrap().supervisor_authority(1);
+    for (words, taken) in [
+        ("scope=upgrade", &[Scope::Upgrade][..]),
+        ("scope=relaunch,upgrade", &[Scope::Relaunch, Scope::Upgrade]),
+    ] {
+        let Words::Scoped(claim) = read(holder, &["contract=3", words, "vendor=2.1.310"]) else {
+            panic!("the roster admits claude-code-alab's {words}");
+        };
+        assert_eq!(claim.row.program, aterm_phase::Program::Claude);
+        let now = crate::metrics::now_us();
+        claim_supervisor_scoped(
+            ctx,
+            holder,
+            Some(71),
+            crate::harness_claim::Scoped {
+                proven: crate::self_claim::Proven {
+                    pid: 4242,
+                    start: "fixture-birth".to_string(),
+                },
+                claim,
+            },
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the proven claim");
+        let meta = ctx.meta.lock().unwrap();
+        assert!(meta.claim_proven(now), "{words}: supervisor_proven=1");
+        assert!(
+            !meta.supervisor_proven(now),
+            "{words}: never codex-alab's self-claim"
+        );
+        let live = meta.live_claim(now).expect("the live claim");
+        assert!(!live.speaks_for_boxes_and_walls(), "{words}");
+        let authority = meta.supervisor_authority(now);
+        assert_eq!(authority.holder(), Some(holder));
+        assert_eq!(authority.contract(), Some(3));
+        for duty in Scope::ALL {
+            let theirs = taken.contains(&duty);
+            assert_eq!(live.takes(duty), theirs, "{words}: {duty:?}");
+            assert_eq!(
+                authority.external_takes(&host, duty),
+                theirs,
+                "{words}: {duty:?}"
+            );
+            assert_eq!(
+                authority.builtin_keeps(&host, duty),
+                !theirs,
+                "{words}: {duty:?}"
+            );
+        }
+        let relaunch_theirs = taken.contains(&Scope::Relaunch);
+        assert_eq!(
+            authority.same_builtin_relaunch_continuity(&before),
+            !relaunch_theirs,
+            "{words}: the built-in relaunch lane's continuity follows the relaunch duty"
+        );
+        drop(meta);
+        // The typing duties stay the built-in holder's; the harness's own connection types none.
+        for duty in [
+            Scope::TurnEnd,
+            Scope::Approvals,
+            Scope::Questions,
+            Scope::Walls,
+        ] {
+            let request = |holder: &str| SupervisorInputRequest {
+                holder: holder.to_string(),
+                revision: authority.revision(),
+                duty,
+            };
+            assert!(
+                SupervisorInputFence::authorize(
+                    ctx,
+                    request(&host),
+                    &SupervisorInputCaller {
+                        principal: crate::control::Principal::Harness,
+                        connection: Some(9),
+                        peer: None,
+                        proof: None,
+                    },
+                    now,
+                )
+                .is_ok(),
+                "{words}: the built-in engine keeps {duty:?}"
+            );
+            assert!(
+                SupervisorInputFence::authorize(
+                    ctx,
+                    request(holder),
+                    &SupervisorInputCaller {
+                        principal: crate::control::Principal::Instance,
+                        connection: Some(71),
+                        peer: Some(4242),
+                        proof: authority.identity().cloned(),
+                    },
+                    now,
+                )
+                .is_err(),
+                "{words}: claude-code-alab types nothing for {duty:?}"
+            );
+        }
+        before = authority;
+    }
 }
 
 #[test]

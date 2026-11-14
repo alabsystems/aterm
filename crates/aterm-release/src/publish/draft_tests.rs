@@ -72,6 +72,7 @@ impl Lab {
             artifact: Some("b".repeat(64)),
             macho_sha256: Some("c".repeat(64)),
             linux: None,
+            windows: None,
             manifest_signed: false,
             signature_required: false,
             signature_pubkey: None,
@@ -1228,6 +1229,93 @@ fn head_patch_names_the_sign_release_form_that_reaches_the_bound_release() {
     );
     assert!(!lab.fake.seen().iter().any(|r| r.method == "PATCH"));
     lab.fake.assert_clean();
+}
+
+/// A WINDOWS DECLARATION THE DRAFT DID NOT SIGN IS REFUSED, NOT DROPPED: the draft signed its
+/// bytes with no Windows zip and the cut adopting it declares one; the draft froze one and the
+/// cut declares none, another handoff directory, or another digest than the one its zip was
+/// bound to. Each refusal names both and `--forget`, and leaves the cut's declaration as it
+/// was; the draft's own directory is adopted, with or without its digest named again.
+/// NEGATIVE CONTROL: adoption took the draft's Windows handoff over the declaration, so a
+/// release run again with `--windows-artifacts` after a `--mac-only` draft published no
+/// Windows zip and printed nothing.
+#[test]
+fn a_windows_declaration_the_draft_did_not_sign_is_refused() {
+    use crate::buildplan::windows::Handoff;
+    let mut lab = Lab::new();
+    lab.stage().unwrap();
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let named = "a".repeat(64);
+    let declared = Handoff::new(dir.path(), Some(&named)).unwrap();
+    lab.ctx.windows = Some(declared.clone());
+    let refused = adopt(&mut lab.ctx).unwrap_err().to_string();
+    for words in [
+        "signed no Windows zip",
+        &format!(
+            "declares the Windows zip of {}",
+            declared.directory.display()
+        ),
+        "ship release --forget` withdraws it with its reservation",
+    ] {
+        assert!(refused.contains(words), "{words}: {refused}");
+    }
+    assert_eq!(
+        lab.ctx.windows.as_ref(),
+        Some(&declared),
+        "kept, not dropped"
+    );
+
+    // The draft froze one: a cut declaring none, or another directory, is refused.
+    let mut journal = Journal::load(&lab.ctx.journal_path).unwrap().unwrap();
+    journal.windows = Some(declared.clone());
+    journal.save(&lab.ctx.journal_path).unwrap();
+    lab.ctx.windows = None;
+    let refused = adopt(&mut lab.ctx).unwrap_err().to_string();
+    assert!(refused.contains("declares no Windows zip"), "{refused}");
+    let other = aterm_tempfile::tempdir().unwrap();
+    lab.ctx.windows = Some(Handoff::new(other.path(), Some(&named)).unwrap());
+    assert!(
+        adopt(&mut lab.ctx).is_err(),
+        "another directory was adopted"
+    );
+    // Its own directory with another digest is refused, naming both.
+    lab.ctx.windows = Some(Handoff::new(dir.path(), Some(&"b".repeat(64))).unwrap());
+    let refused = adopt(&mut lab.ctx).unwrap_err().to_string();
+    assert!(
+        refused.contains(&named) && refused.contains(&"b".repeat(64)),
+        "{refused}"
+    );
+    // Its own directory agrees, its digest named again or not: the draft's bound one is taken.
+    for again in [Some(named.as_str()), None] {
+        lab.ctx.windows = Some(Handoff::new(dir.path(), again).unwrap());
+        adopt(&mut lab.ctx).unwrap();
+        assert_eq!(lab.ctx.windows.as_ref(), Some(&declared));
+    }
+}
+
+/// A REAL CUT NAMES THE DIGEST OF A WINDOWS ZIP IT WILL ADMIT ITSELF BEFORE IT CLAIMS: with no
+/// private draft and no `--windows-sha256` it is refused before the claim, since the zip is
+/// admitted after it and `cut --resume` takes no flag. A digest, a draft (which bound one when it
+/// signed), or no Windows declaration lets it go on.
+/// NEGATIVE CONTROL: a cut that claimed without one stopped at its sign step for a digest no
+/// resume could name.
+#[test]
+fn a_real_cut_names_the_windows_digest_before_it_claims() {
+    use super::super::windows_bound_before_claim as bound;
+    use crate::buildplan::windows::Handoff;
+    let dist = aterm_tempfile::tempdir().unwrap();
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let unbound = Handoff::new(dir.path(), None).unwrap();
+    let refused = bound(Some(&unbound), dist.path()).unwrap_err().to_string();
+    assert!(
+        refused.contains("--windows-sha256") && refused.contains("nothing was claimed"),
+        "{refused}"
+    );
+    let named = Handoff::new(dir.path(), Some(&"a".repeat(64))).unwrap();
+    bound(Some(&named), dist.path()).unwrap();
+    bound(None, dist.path()).unwrap();
+    fs::write(dist.path().join(JOURNAL), "").unwrap();
+    bound(Some(&unbound), dist.path()).unwrap();
 }
 
 #[test]

@@ -12753,6 +12753,88 @@ fn a_check_reads_which_instance_answered_from_its_instance_line() {
     );
 }
 
+/// CHECK READS UPDATE (ATERM-KI-1111-23): what a check reads of the answering instance's updater
+/// ([`update_of`], [`Surveyed::checked`]) is its first `instance` line's `update*=` words, each
+/// pct-decoded once: a held build named by its version or its number, nothing from a line with no
+/// `update=` (an aterm older than these words), and never a later instance's, a session row's or a
+/// value outside its grammar (an escape is no version).
+/// NEGATIVE CONTROL: an `update_of` that reads the last `instance` line fails "the first instance
+/// line"; one that reads any line with an `update=` word fails "a session row is no instance".
+#[test]
+fn a_check_reads_the_answerers_updater_from_its_first_instance_line() {
+    use aterm_types::update_standing::{UpdateFact, UpdateStanding};
+    let of = |lines: &[&str]| update_of(&lines.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>());
+    let held = of(&[
+        "instance pid=7 host=m version=0.199.0 window=1 at_ms=1800000600000 update=held \
+         update_at=1800000000 update_to=0.200.0%2Bg1 update_until=1800003600 \
+         update_why=crash-loop update_tries=2 update_checks=on access=read",
+    ])
+    .expect("a held standing");
+    assert_eq!(
+        held,
+        UpdateFact {
+            to: Some("0.200.0+g1".to_owned()),
+            checked_at: Some(1_800_000_000),
+            until: Some(1_800_003_600),
+            why: Some("crash-loop"),
+            tries: Some(2),
+            checks: Some(true),
+            said_at: Some(1_800_000_600),
+            ..UpdateFact::of(UpdateStanding::Held)
+        },
+        "with the clock the line was said on"
+    );
+    assert_eq!(
+        of(&["instance pid=7 version=0.199.0 update=behind update_to=build%20512"])
+            .and_then(|fact| fact.to),
+        Some("build 512".to_owned()),
+        "a build named by its number"
+    );
+    assert_eq!(
+        of(&["instance pid=1 host=m version=0.162.0 sessions=0 window=1"]),
+        None,
+        "an older aterm says nothing"
+    );
+    assert_eq!(
+        of(&["instance pid=1 version=0.1.0 update=held update_to=%1B%5B2J"])
+            .map(|fact| (fact.standing.known(), fact.to)),
+        Some((Some(UpdateStanding::Held), None)),
+        "an escape is no version"
+    );
+    assert_eq!(
+        of(&[
+            "instance pid=1 version=0.146.0 window=1 update=current",
+            "instance pid=2 version=0.147.0 window=1 update=held",
+        ])
+        .and_then(|fact| fact.standing.known()),
+        Some(UpdateStanding::Current),
+        "the first instance line"
+    );
+    assert_eq!(
+        of(&["session id=s1 update=held", "instance pid=1 version=0.1.0"]),
+        None,
+        "a session row is no instance"
+    );
+    let surveyed = Surveyed {
+        scope: FleetScope::Facts,
+        addr: "127.0.0.1:7101".parse().unwrap(),
+        node: None,
+        proven: false,
+        key: None,
+        lines: vec![
+            "instance pid=1 version=0.199.0 window=1 update=check-failed update_why=network"
+                .to_owned(),
+        ],
+    };
+    let checked = surveyed.checked();
+    assert_eq!(
+        checked.update.map(|fact| (fact.standing.known(), fact.why)),
+        Some((Some(UpdateStanding::CheckFailed), Some("network"))),
+        "a check carries it"
+    );
+    assert_eq!(checked.answerer, Answerer::Window("0.199.0".to_owned()));
+}
+
 /// Two nodes whose ids share their first eight characters never print alike in one message: each
 /// is named by the shortest head no other node it is named beside shares, up to its whole id.
 ///
@@ -12859,6 +12941,9 @@ mod keyring_reads;
 
 #[path = "fleet_member_tests/quiet_writes.rs"]
 mod quiet_writes;
+
+#[path = "fleet_member_tests/survey_asker.rs"]
+mod survey_asker;
 
 /// Every failure names its kind as one token of [`REASONS`], and every token but the reader's
 /// own `gone` names some failure; two failures of one kind at two addresses share the token

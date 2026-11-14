@@ -18,31 +18,6 @@ const OWN_13916: &str = "codex-alab 0.1.0-dev.13916 \u{b7} based on OpenAI Codex
                          \u{2500}\u{2500}\u{2500}[Cruise]\u{2500}[Land]\u{2500}[Off]\u{2500}\
                          \u{2500}\u{2500}[ALab on]";
 
-/// This Mac's first count sits right after its lead, so the row is read past ` — ` under
-/// either lead; a row that is not This Mac's counts nothing.
-#[test]
-fn this_mac_s_first_count_is_read_past_its_lead() {
-    assert_eq!(
-        landing_on_this_mac("This Mac \u{2014} 1 landing \u{b7} 1 resting \u{b7} 3 shells"),
-        1
-    );
-    assert_eq!(
-        landing_on_this_mac("m0 Heron \u{2014} 2 landing \u{b7} 2 shells"),
-        2
-    );
-    assert_eq!(
-        landing_on_this_mac("m8 Heron \u{2014} 1 resting \u{b7} 2 landing"),
-        2
-    );
-    assert_eq!(landing_on_this_mac("m8 Heron \u{2014} 3 shells"), 0);
-    assert_eq!(landing_on_this_mac("-"), 0, "CONTROL: never read");
-    assert_eq!(
-        surfaces::count_in("This Mac \u{2014} 1 landing", "landing"),
-        0,
-        "CONTROL: the whole row hides its first count"
-    );
-}
-
 #[test]
 fn the_pad_is_the_row_over_the_last_prompt() {
     let text = format!("> hello\n\n  {OWN}  \n» Ask Codex\n\n  ? for shortcuts\n");
@@ -146,45 +121,6 @@ fn its_own_line_names_the_face_from_the_build_that_says_it() {
     assert!(old.contains("no host footer"), "{old}");
 }
 
-#[test]
-fn a_workers_rows_are_judged_by_the_hold_it_was_told() {
-    let row =
-        |w: &str| format!("mgr|manager \u{2014} 1 worker: 1 {w}\nrow|\u{25cf} worker \u{2014} {w}");
-    let at = |t: i64, w: &str| (t, row(w));
-    let went = [at(0, "working"), at(2, "landing"), at(6, "landed")];
-    assert_eq!(worker_rows(&went, true), Ok("goes from landing to landed"));
-    let skipped = [at(0, "working"), at(6, "landed")];
-    assert_eq!(
-        worker_rows(&skipped, false),
-        Err(None),
-        "no hold told: a named skip"
-    );
-    assert!(
-        matches!(worker_rows(&skipped, true), Err(Some(_))),
-        "CONTROL: a hold told and no landing row"
-    );
-    assert!(
-        matches!(
-            worker_rows(&[at(0, "landed"), at(2, "landing")], true),
-            Err(Some(_))
-        ),
-        "CONTROL: landed before landing"
-    );
-    assert!(
-        matches!(worker_rows(&[at(0, "working")], false), Err(Some(_))),
-        "CONTROL: never landed"
-    );
-}
-
-#[test]
-fn a_workers_row_says_landing_then_landed() {
-    let landing = "mgr|manager \u{2014} 1 worker: landing\nrow|\u{25cf} worker \u{2014} landing";
-    let landed = "mgr|manager \u{2014} 1 worker: landed\nrow|\u{2713} worker \u{2014} landed #";
-    assert!(under_says(landing, "landing") && !under_says(landing, "landed"));
-    assert!(under_says(landed, "landed") && !under_says(landed, "landing"));
-    assert!(!under_says("-", "landed"), "CONTROL: no row");
-}
-
 fn read(t: i64, words: &str) -> (i64, Read) {
     (
         t,
@@ -194,49 +130,60 @@ fn read(t: i64, words: &str) -> (i64, Read) {
             pad: None,
             state: "-".into(),
             hover: "-".into(),
-            here: "-".into(),
         },
     )
 }
 
-/// A LANDING RESTS ON WHAT IT TOLD, NOT ON A CLOCK: its Done for you row is waited for up to
-/// [`ROW_HANG`] after `end=` told the end; a landing a later read still shows with `end=-` is
-/// at rest at once (its missing end is judged); a read of the landing alone is not; its row
-/// read rests it. CONTROL: before [`ROW_HANG`] with the end told and no row, it is not at rest.
 #[test]
-fn a_landing_rests_on_its_end_and_its_row() {
-    let landed = |end: &str| format!("task=landed end={end}");
+fn a_workers_status_is_judged_by_the_hold_it_was_told() {
+    let working = "task=open land_since=-";
+    let holding = "task=open land_since=1793451264";
+    let landed = "task=landed land_since=-";
+    let went = [read(0, working), read(2, holding), read(6, landed)];
+    assert_eq!(
+        worker_went(&went, true),
+        Ok("goes from its hold told to landed")
+    );
+    let skipped = [read(0, working), read(6, landed)];
+    assert_eq!(
+        worker_went(&skipped, false),
+        Err(None),
+        "no hold told: a named skip"
+    );
+    assert!(
+        matches!(worker_went(&skipped, true), Err(Some(_))),
+        "CONTROL: a hold told and never read"
+    );
+    assert!(
+        matches!(
+            worker_went(&[read(0, landed), read(2, holding)], true),
+            Err(Some(_))
+        ),
+        "CONTROL: landed before its hold"
+    );
+    assert!(
+        matches!(worker_went(&[read(0, working)], false), Err(Some(_))),
+        "CONTROL: never landed"
+    );
+}
+
+/// A LANDING RESTS ON A READ PAST IT, NOT ON A CLOCK: the read that first shows the landing is
+/// not rest, since its `end=` may be from just before; any later read is.
+#[test]
+fn a_landing_rests_on_a_read_past_it() {
     let mut s = Seen {
-        reads: vec![read(0, "task=open end=-"), read(10_000, &landed("-"))],
+        reads: vec![
+            read(0, "task=open end=-"),
+            read(10_000, "task=landed end=-"),
+        ],
         last_t: 10_000,
-        ..Seen::default()
     };
-    assert!(
-        !landing_at_rest(&s, "land", 10_000),
-        "the landing's first read alone"
-    );
+    assert!(!landing_at_rest(&s), "the landing's first read alone");
     s.last_t = 12_000;
-    assert!(
-        landing_at_rest(&s, "land", 12_000),
-        "a later read still says end=-"
-    );
-    s.reads[1] = read(10_000, &landed("1793451264"));
-    assert!(
-        !landing_at_rest(&s, "land", 10_000 + ms(ROW_HANG) - 1),
-        "CONTROL: the end told, its row not yet due"
-    );
-    assert!(
-        landing_at_rest(&s, "land", 10_000 + ms(ROW_HANG)),
-        "the row's hang detector"
-    );
-    s.rows
-        .push((11_000, "done|\u{2713} land \u{2014} landed 1m".to_string()));
-    assert!(landing_at_rest(&s, "land", 11_000), "its row read");
-    assert!(
-        !landing_at_rest(&s, "reland", 11_000),
-        "CONTROL: another tab's row"
-    );
+    assert!(landing_at_rest(&s), "a later read");
     assert_eq!(landed_run(&s).len(), 1);
+    s.reads.truncate(1);
+    assert!(!landing_at_rest(&s), "CONTROL: never landed");
 }
 
 /// THE OPEN PAGE'S NEXT TURN MAY ARM, NEVER FIRE: with Settings ▸ Harness open and every leg

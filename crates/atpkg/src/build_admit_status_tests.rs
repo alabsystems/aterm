@@ -191,11 +191,13 @@ fn an_ordinary_status_error_cannot_release_a_signalled_builds_live_member() {
         wait_for("actual member execution is proved", || {
             actor.world.join("probe").exists().then_some(())
         });
-        if !fault {
-            wait_for("healthy supervisor observed the live member", || {
-                actor.world.join("observed").exists().then_some(())
-            });
-        }
+        // The root ends only once the supervisor's meter booked its member, faulted or not:
+        // a member first read after its root died is reparented away and never booked
+        // (`aterm_capacity::tree_meter`), so ending the root on the probe alone races the
+        // meter's first read and leaves the supervisor waiting on a booking that cannot come.
+        wait_for("the supervisor observed the live member", || {
+            actor.world.join("observed").exists().then_some(())
+        });
         assert_eq!(
             Ledger::at(actor.world.join("ledger")).list().unwrap().len(),
             1

@@ -13,12 +13,22 @@
 //! machine is a member, since it can deliver a newly published `ai-mailbox.toml`, after which
 //! the routes are read again. The line also names what is never a route here: the row's own desk
 //! browser profile, which opens a window and so is never used unattended, and
-//! `[harness] hosts`, which renew their own logins and none of this machine's. No route opens a
-//! window on this desk or the system's default browser, and none copies, stores or relays a
-//! login: a route that runs makes a fresh one on this machine. A Claude OAuth page that
-//! Cloudflare's bot check holds ends the attempt as a stop on the account's own record
-//! ([`super::accounts::AttemptOutcome::Blocked`]), which holds the row out of the background and
-//! is what a person's own renewal reads; no other Mac is asked to open a browser for it.
+//! `[harness] hosts`, which renew their own logins and none of this machine's. No route copies,
+//! stores or relays a login, and none sends a sign-in, its URL or a code to another machine:
+//! a route that runs makes a fresh login on this machine. One exception stands, and only in
+//! the headless route: where a person turned the fleet's mail relay on (`relay = true`), that
+//! route's mailbox read asks the relay's Mac for the login code and names the account's
+//! address to it. On macOS a Claude row's sign-in that this Mac started for itself, at its
+//! own desktop, runs in a window of aterm's own instead of a headless page (`signin_window`,
+//! one window at a time under its own lock, a token's window included), where the window
+//! reads the row's mailbox by itself on this Mac (never the relay, never webmail) or a
+//! person is at the terminal to type the code: it signs in there with that code, and the
+//! window's page hands the callback to its own waiting sign-in. Claude's consent page may hold
+//! `Authorize` behind a human check, which aterm never operates; where it does, the sign-in
+//! ends `blocked` unless a person at the desk completes the check, and the upkeep then opens no
+//! window for that row again: a person's own renewal does. Off macOS, under SSH, for another
+//! machine's request and in a tab another Mac's fleet drive started or typed into there is no
+//! window, and the headless route ends at Cloudflare's page.
 //!
 //! This module holds the ladder's words and its clocks; `accounts_sync` reads the machine and
 //! runs the routes.
@@ -65,6 +75,16 @@ pub(super) enum Mailbox {
     SharedNoPassword,
     /// None is configured for the row.
     None,
+}
+
+impl Mailbox {
+    /// Whether it ends the lab's ask for the row's mailbox password ([`Read::wants_mailbox`]):
+    /// one the sign-in reads without a browser, or a webmail inbox with the row's password,
+    /// whether or not a headless browser is here to read the webmail. A webmail inbox with no
+    /// password ([`Mailbox::WebmailNoPassword`]) leaves the ask standing.
+    pub(super) const fn holds(self) -> bool {
+        matches!(self, Self::Ready | Self::WebmailOnly)
+    }
 }
 
 /// What the LAN vault's refresh found ([`super::accounts_sync`]'s `run_vault_sync`).
@@ -233,12 +253,9 @@ impl Read {
             )
     }
 
-    /// Whether the row's mailbox ends the lab's ask for it ([`Read::wants_mailbox`]): one the
-    /// sign-in reads without a browser, or a webmail inbox with the row's password, whether or
-    /// not a headless browser is here to read the webmail. A webmail inbox with no password
-    /// ([`Mailbox::WebmailNoPassword`]) leaves the ask standing.
-    pub(super) fn holds_mailbox(&self) -> bool {
-        matches!(self.mailbox, Mailbox::Ready | Mailbox::WebmailOnly)
+    /// Whether the row's mailbox ends the lab's ask for it ([`Mailbox::holds`]).
+    pub(super) const fn holds_mailbox(&self) -> bool {
+        self.mailbox.holds()
     }
 
     /// The route a sign-in can take now, in the ladder's order: a mailbox read directly, the
@@ -317,13 +334,17 @@ impl Read {
     }
 }
 
-/// How one run of a route ended, in the words its record says. A run of `claude auth login`
-/// that made no login, or did not finish, is named by how it exited (`code`, where the run gave
-/// one), never read as the vendor's refusal, and then by what its opener's headless sign-in met
-/// where its outcome file names it (`met`: Cloudflare's bot check or block page, or no callback
-/// in time; [`super::open_url::Met::words`]), so a bot check is named on record. What it met
-/// never enters the ladder's backoff key, which is what the ladder read before the run
-/// ([`Ladder::failed`]).
+/// How one run of a route ended, in the words its record says: the upkeep's ladder and a
+/// renewal run by hand ([`super::cli`]'s `note_hand_renewal`) both say it here. A run of
+/// `claude auth login` that made no login, or did not finish, is named by how it exited (`code`,
+/// where the run gave one), never read as the vendor's refusal, and then by what its opener's
+/// sign-in met where its outcome file names it (`met`: Cloudflare's bot check or block page, no
+/// callback in time, or a failure with the opener's own reason;
+/// [`super::open_url::Met::words`]), so a bot check is named on record. A run that ended where
+/// only a person goes on is what it met alone, since that may be a missing desktop session,
+/// the consent page's human check, a window a person closed or a consent page that named
+/// another account, and no bot check. What it met never enters the ladder's backoff key,
+/// which is what the ladder read before the run ([`Ladder::failed`]).
 pub(super) fn how_it_ended(
     renewal: super::cli::Renewal,
     code: Option<i32>,
@@ -336,6 +357,7 @@ pub(super) fn how_it_ended(
             None => format!("claude auth login ended; {}", met.words()),
         },
         (Renewal::Failed, Some(met)) => format!("{}; {}", run_words(renewal, code), met.words()),
+        (Renewal::BotCheck, Some(met)) => met.words(),
         _ => run_words(renewal, code),
     }
 }
@@ -843,6 +865,129 @@ pub(super) fn last_started(store: &super::accounts::Store) -> std::io::Result<Op
         .and_then(Started::parse))
 }
 
+/// The file beside [`SIGNIN_SPACING_FILE`] that names the sign-in this Mac is running now. It is
+/// written at every start, while the sign-in lock is held, and removed when the provider flow
+/// ends ([`RunningMark`]).
+pub(super) const SIGNIN_RUNNING_FILE: &str = "signin-running";
+
+/// The first line of [`SIGNIN_RUNNING_FILE`].
+const RUNNING_HEAD: &str = "aterm-signin-running-v1";
+
+/// The sign-in this Mac is running: its CLI's id, its label, when it started (Unix seconds) and
+/// the process that runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Running {
+    cli: String,
+    label: String,
+    at: i64,
+    pid: u32,
+}
+
+impl Running {
+    /// Reads [`Self::text`]; anything else is no record.
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != RUNNING_HEAD {
+            return None;
+        }
+        let mut words = lines.next()?.split(' ');
+        let running = Self {
+            cli: words.next()?.to_owned(),
+            label: words.next()?.to_owned(),
+            at: words.next()?.parse().ok()?,
+            pid: words.next()?.parse().ok()?,
+        };
+        (words.next().is_none()
+            && lines.next().is_none()
+            && super::accounts::admissible_label(&running.label))
+        .then_some(running)
+    }
+
+    /// The file's text: the head line, then `<cli> <label> <at> <pid>`.
+    fn text(&self) -> String {
+        format!(
+            "{RUNNING_HEAD}\n{} {} {} {}\n",
+            self.cli, self.label, self.at, self.pid
+        )
+    }
+}
+
+/// Where `store`'s Mac names its running sign-in ([`SIGNIN_RUNNING_FILE`]).
+fn running_path(store: &super::accounts::Store) -> std::path::PathBuf {
+    store.shared_dir().join(SIGNIN_RUNNING_FILE)
+}
+
+/// A started sign-in's record in [`SIGNIN_RUNNING_FILE`], removed when it drops. A record
+/// another start has since replaced is left as that start's.
+#[derive(Debug)]
+struct RunningMark {
+    path: std::path::PathBuf,
+    text: String,
+}
+
+impl RunningMark {
+    /// Names `cli`'s `label` as the sign-in this process runs from `at`. The record is a fact
+    /// for readers and no admission, so a record that cannot be written starts the sign-in
+    /// all the same, unnamed.
+    fn note(
+        store: &super::accounts::Store,
+        cli: super::accounts::Cli,
+        label: &str,
+        at: i64,
+    ) -> Option<Self> {
+        let path = running_path(store);
+        let text = Running {
+            cli: cli.id().to_owned(),
+            label: label.to_owned(),
+            at,
+            pid: std::process::id(),
+        }
+        .text();
+        super::atomic_write::write_atomic(&path, &text).ok()?;
+        Some(Self { path, text })
+    }
+}
+
+impl Drop for RunningMark {
+    fn drop(&mut self) {
+        if super::accounts::read_bounded(&self.path, 4096)
+            .ok()
+            .flatten()
+            .is_some_and(|text| text == self.text)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// A started sign-in's record ([`RunningMark::note`]) for a test of a reader in another crate:
+/// `cli`'s `label` reads as signing in until what it returns drops.
+#[cfg(any(test, debug_assertions))]
+pub(super) fn running_fixture(
+    store: &super::accounts::Store,
+    cli: super::accounts::Cli,
+    label: &str,
+    at: i64,
+) -> Option<Box<dyn std::any::Any>> {
+    RunningMark::note(store, cli, label, at).map(|mark| Box::new(mark) as Box<dyn std::any::Any>)
+}
+
+/// The label of `cli`'s row whose sign-in runs on `store`'s Mac now, in this process or another:
+/// what [`SIGNIN_RUNNING_FILE`] names while the process that wrote it lives. A sign-in killed
+/// mid-run leaves its record, which then names nothing.
+#[must_use]
+pub(super) fn signing_in(
+    store: &super::accounts::Store,
+    cli: super::accounts::Cli,
+) -> Option<String> {
+    let running = super::accounts::read_bounded(&running_path(store), 4096)
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(Running::parse)?;
+    (running.cli == cli.id() && aterm_uds::process::pid_alive(running.pid)).then_some(running.label)
+}
+
 /// Why this Mac may start one sign-in. There is no other reason to start one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Why {
@@ -1206,6 +1351,7 @@ impl SignIn {
         )
         .map_err(|error| Refused::Record(error.to_string()))?;
         Ok(Begun {
+            _running: RunningMark::note(store, super::accounts::Cli::Codex, label, now),
             signin: SigninOwner::Native(turn),
             cli: self.cli,
             label: self.label,
@@ -1251,6 +1397,7 @@ impl SignIn {
         )
         .map_err(|e| Refused::Record(e.to_string()))?;
         Ok(Begun {
+            _running: RunningMark::note(store, cli, label, now),
             signin: SigninOwner::Global(signin),
             cli: self.cli,
             label: self.label,
@@ -1259,11 +1406,15 @@ impl SignIn {
     }
 }
 
-/// A sign-in [`SignIn::begin`] started: it holds the sign-in lock until the provider flow ends.
-/// The functions that start a provider's login take one.
+/// A sign-in [`SignIn::begin`] started: it holds the sign-in lock until the provider flow ends,
+/// and this Mac's record that the sign-in runs ([`signing_in`]) for as long. The functions that
+/// start a provider's login take one.
 #[derive(Debug)]
 #[must_use]
 pub(super) struct Begun {
+    /// Dropped before the lock is released, so no record outlives its sign-in's lock. `None`
+    /// for a recovery, which starts no provider, and where the record could not be written.
+    _running: Option<RunningMark>,
     signin: SigninOwner,
     cli: super::accounts::Cli,
     label: String,
@@ -1288,6 +1439,7 @@ impl Begun {
         }
         turn.check_store(store)?;
         Ok(Self {
+            _running: None,
             signin: SigninOwner::NativeRecovery(Box::new(turn)),
             cli: store.cli(),
             label: label.to_owned(),
@@ -1313,6 +1465,7 @@ impl Begun {
             .check_store(store)
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            _running: None,
             signin: SigninOwner::Global(signin),
             cli: store.cli(),
             label: label.to_owned(),
@@ -1382,6 +1535,7 @@ pub(super) fn begun_fixture(
     label: &str,
 ) -> Begun {
     Begun {
+        _running: None,
         signin: SigninOwner::Global(signin),
         cli,
         label: label.to_owned(),

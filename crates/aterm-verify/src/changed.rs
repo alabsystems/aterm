@@ -981,6 +981,145 @@ pub fn resolve_paths(
     )
 }
 
+/// A round's selection (`verify land`, [`crate::cli::JUDGED`]) of the merge in the working
+/// tree, which merges main tip `base` into the commit `judged`, whose own judgment passed and
+/// is kept. `paths` are the paths the merge shares between the two sides.
+///
+/// Where Git made the merge (`mechanical`) and no crate may own any of them (each is Markdown
+/// of the no-reach class, [`aterm_census::no_reach::class`]), the two sides' code is disjoint
+/// and the selection is the cone of those paths: no crate, or a reader of one. A merge a
+/// person made after such Markdown conflicted is not judged so: a conflict was judged in full
+/// before a round answered for it, main's unshared change against the branch included, and
+/// the round judges no less of that.
+///
+/// Else it is what a judgment of the merge since `base` would select ([`resolve`]), less the
+/// crates neither the shared paths nor the merge's change since `judged` reaches ([`meet`]). A
+/// crate so left out builds from the files it had in the judged tree (nothing main changed is
+/// among its inputs), so the kept judgment's row is still its verdict; every crate main's
+/// change reaches within the branch's cone is judged against the branch's change, as a full
+/// judgment of the merge would.
+///
+/// The shared paths' own cone is read as a judgment's where Git made the merge (`mechanical`):
+/// each path's file is compared with `judged`'s, so a member whose share is confined to its own
+/// tests brings no dependent. Where a person resolved or edited the merge, a shared path may be
+/// a change of main's that the merge dropped: its file is then `judged`'s own, which that
+/// comparison reads as a change of nothing, so no member is judged alone for a shared path, and
+/// the cone holds every dependent of each path's owner.
+pub fn resolve_round(
+    root: &Path,
+    tools: &Toolchain,
+    path_env: &OsStr,
+    base: &str,
+    judged: &str,
+    paths: Vec<String>,
+    mechanical: bool,
+) -> Selection {
+    let unowned = no_crate_may_own(root, path_env, &paths);
+    let shared = resolve_paths(
+        root,
+        tools,
+        path_env,
+        judged,
+        paths,
+        mechanical.then_some(judged),
+    );
+    if unowned && mechanical {
+        return shared;
+    }
+    let whole = resolve(root, tools, path_env, base);
+    let since = resolve(root, tools, path_env, judged);
+    let members = read_members(root, tools, path_env);
+    meet(whole, &[since, shared], &|names| members.any_has_lib(names))
+}
+
+/// Whether each of `paths` is Markdown no crate's cone holds, by the checkout's own layout
+/// ([`aterm_census::no_reach::class`]). A checkout whose files cannot be listed answers no.
+fn no_crate_may_own(root: &Path, path_env: &OsStr, paths: &[String]) -> bool {
+    let Ok(listed) = listed_files(root, path_env) else {
+        return false;
+    };
+    let manifest = crate::read_regular_text(root.join("Cargo.toml")).ok();
+    let layout =
+        aterm_census::no_reach::Layout::new(manifest.as_deref(), listed.iter().map(String::as_str));
+    paths
+        .iter()
+        .all(|path| aterm_census::no_reach::class(path, &layout))
+}
+
+/// `whole`, the selection a judgment would make, less each crate none of `reached` holds: what
+/// is left to judge of it where a judgment of everything outside `reached` already stands
+/// ([`resolve_round`]). The seeds, and so what each cell closes over, stay `whole`'s: another
+/// OS's graph may hold a dependent this machine's graph does not. `whole` itself where it or one
+/// of `reached` is widened, and where nothing would be left of a selection that holds crates:
+/// nothing then says which of them the others reach. `any_lib` says whether one of the crates
+/// left, by name, has a library target.
+#[must_use]
+pub fn meet(
+    whole: Selection,
+    reached: &[Selection],
+    any_lib: &dyn Fn(&[String]) -> bool,
+) -> Selection {
+    let (seeds, crates, had_lib, all_targets, unlinted, direct_dependents, alone) = match whole {
+        widened @ Selection::Widened(_) => return widened,
+        Selection::Narrowed {
+            seeds,
+            crates,
+            any_lib,
+            all_targets,
+            unlinted,
+            direct_dependents,
+            alone,
+        } => (
+            seeds,
+            crates,
+            any_lib,
+            all_targets,
+            unlinted,
+            direct_dependents,
+            alone,
+        ),
+    };
+    let mut keep: BTreeSet<&str> = BTreeSet::new();
+    let mut widened = false;
+    for selection in reached {
+        match selection {
+            Selection::Widened(_) => widened = true,
+            Selection::Narrowed { crates, .. } => {
+                keep.extend(
+                    crates
+                        .iter()
+                        .filter_map(|spec| crate::scope::spec_name(spec)),
+                );
+            }
+        }
+    }
+    let left: Vec<String> = crates
+        .iter()
+        .filter(|spec| crate::scope::spec_name(spec).is_some_and(|name| keep.contains(name)))
+        .cloned()
+        .collect();
+    let (crates, any_lib) = if widened || left.is_empty() {
+        (crates, had_lib)
+    } else {
+        let names: Vec<String> = left
+            .iter()
+            .filter_map(|spec| crate::scope::spec_name(spec))
+            .map(str::to_string)
+            .collect();
+        let any_lib = any_lib(&names);
+        (left, any_lib)
+    };
+    Selection::Narrowed {
+        seeds,
+        crates,
+        any_lib,
+        all_targets,
+        unlinted,
+        direct_dependents,
+        alone,
+    }
+}
+
 /// Every file of the checkout, tracked or not, by repo-relative path.
 fn listed_files(root: &Path, path_env: &OsStr) -> Result<Vec<String>, String> {
     let out = git(root, path_env)

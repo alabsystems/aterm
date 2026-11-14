@@ -401,7 +401,8 @@ fn a_flash_is_the_pet_s_the_caret_s_or_the_trail_s_by_where_it_lay() {
             (t, (vec![pet], Some(caret), vec![]))
         })
         .collect();
-    let [pet, caret, icon, trail] = by_place(&turns, (2, 16), W, &boxes);
+    let [pet, caret, icon, page, trail] = by_place(&turns, (2, 16), W, &boxes, &HashMap::new());
+    assert_eq!(page, PixelRead::default());
     assert_eq!(icon, PixelRead::default());
     assert_eq!((pet.most, pet.over.as_slice()), (8, &[10][..]));
     assert_eq!((caret.most, caret.over.as_slice()), (8, &[30][..]));
@@ -431,13 +432,13 @@ fn a_turn_on_the_frame_a_body_left_its_pixel_is_the_body_s() {
             };
             boxes.insert(was, (body, None, vec![]));
         }
-        by_place(&turns, (2, 16), W, &boxes).map(|read| read.over)
+        by_place(&turns, (2, 16), W, &boxes, &HashMap::new()).map(|read| read.over)
     };
     let (none, this) = (Vec::<u32>::new, || vec![10u32]);
     // Gone the frame before the turn: four of seven are the pet's.
-    assert_eq!(read(16), [this(), none(), none(), none()]);
+    assert_eq!(read(16), [this(), none(), none(), none(), none()]);
     // Control: gone two frames before, the turn is not the box's leaving, and three of seven stay the trail's.
-    assert_eq!(read(32), [none(), none(), none(), this()]);
+    assert_eq!(read(32), [none(), none(), none(), none(), this()]);
 }
 
 #[test]
@@ -466,19 +467,144 @@ fn a_pixel_the_pet_and_the_caret_shared_is_not_the_trail_s_own() {
                 (t, (body, cell, mark))
             })
             .collect();
-        by_place(&turns, (2, 16), W, &boxes).map(|read| read.over)
+        by_place(&turns, (2, 16), W, &boxes, &HashMap::new()).map(|read| read.over)
     };
     let (none, this) = (Vec::<u32>::new, || vec![10u32]);
     // Three in the pet's box and two in the caret's cell: neither holds half of seven, the two together
     // do, and the pixel goes to the one that held more.
-    assert_eq!(split(3, 2, 0), [this(), none(), none(), none()]);
-    assert_eq!(split(2, 3, 0), [none(), this(), none(), none()]);
+    assert_eq!(split(3, 2, 0), [this(), none(), none(), none(), none()]);
+    assert_eq!(split(2, 3, 0), [none(), this(), none(), none(), none()]);
     // A word icon's box is a place too: the icon's pop is not the trail's flash.
-    assert_eq!(split(0, 1, 6), [none(), none(), this(), none()]);
-    assert_eq!(split(2, 2, 2), [this(), none(), none(), none()]);
+    assert_eq!(split(0, 1, 6), [none(), none(), this(), none(), none()]);
+    assert_eq!(split(2, 2, 2), [this(), none(), none(), none(), none()]);
     // The control: two and one are three of seven, under half, and the pixel is the trail's own.
-    assert_eq!(split(2, 1, 0), [none(), none(), none(), this()]);
-    assert_eq!(split(1, 1, 1), [none(), none(), none(), this()]);
+    assert_eq!(split(2, 1, 0), [none(), none(), none(), none(), this()]);
+    assert_eq!(split(1, 1, 1), [none(), none(), none(), none(), this()]);
+}
+
+#[test]
+fn a_pixel_that_turns_with_the_page_is_the_page_s_own() {
+    // Seven turns 144 ms apart, a build log's line scrolling over the pixel. The page's clean twin turned there
+    // on the same frames, or a frame step off (a turn is seen on the frame after it): the page alone is over the
+    // bound and nothing is left of the pixel's turns once each of the page's has taken one, so it is the page's
+    // own and no effect's flash.
+    let times: Vec<u32> = (1..=7).map(|k| 144 * k).collect();
+    let read = |turns: Vec<u32>, page: Vec<u32>| {
+        let turns: HashMap<u32, Vec<u32>> = [(10, turns)].into_iter().collect();
+        let page: HashMap<u32, Vec<u32>> = [(10, page)].into_iter().collect();
+        by_place(&turns, (2, 16), W, &HashMap::new(), &page).map(|read| read.over)
+    };
+    let (none, this) = (Vec::<u32>::new, || vec![10u32]);
+    let (paged, trail) = (
+        [none(), none(), none(), this(), none()],
+        [none(), none(), none(), none(), this()],
+    );
+    assert_eq!(read(times.clone(), times.clone()), paged);
+    let late: Vec<u32> = times.iter().map(|t| t + 16).collect();
+    assert_eq!(read(times.clone(), late), paged);
+    // The controls: the page turned there on three of the seven, or two frames off: the trail's.
+    assert_eq!(read(times.clone(), times[..3].to_vec()), trail);
+    let off: Vec<u32> = times.iter().map(|t| t + 32).collect();
+    assert_eq!(read(times.clone(), off), trail);
+}
+
+#[test]
+fn the_page_excuses_no_flash_the_effects_carry_over_the_bound() {
+    let (none, this) = (Vec::<u32>::new, || vec![10u32]);
+    let read = |turns: Vec<u32>, page: Vec<u32>, caret: bool| {
+        let boxes: HashMap<u32, Boxes> = turns
+            .iter()
+            .map(|&t| {
+                let cell = caret.then_some(PxBox {
+                    x0: 8,
+                    y0: 0,
+                    x1: 12,
+                    y1: 1,
+                });
+                (t, (vec![], cell, vec![]))
+            })
+            .collect();
+        let turns: HashMap<u32, Vec<u32>> = [(10, turns)].into_iter().collect();
+        let page: HashMap<u32, Vec<u32>> = [(10, page)].into_iter().collect();
+        by_place(&turns, (2, 16), W, &boxes, &page).map(|read| read.over)
+    };
+    let trail = [none(), none(), none(), none(), this()];
+    // Eight turns 120 ms apart, four of them the page's: the page alone (two flashes) is under the bound, and
+    // the effects' four carry the pixel over it. Half the turns fell with the page's, which once made it the
+    // page's.
+    let eight: Vec<u32> = (1..=8).map(|k| 120 * k).collect();
+    assert_eq!(read(eight.clone(), eight[..4].to_vec(), false), trail);
+    // The page over the bound alone, and the effects turning between each two of its turns: what is left once
+    // the page's turns are taken (seven) is over the bound too.
+    let page: Vec<u32> = (1..=7).map(|k| 144 * k).collect();
+    let mut both: Vec<u32> = page.iter().flat_map(|&t| [t, t + 64]).collect();
+    both.sort_unstable();
+    assert_eq!(read(both, page.clone(), false), trail);
+    // One turn of the page excuses one: a pixel that turns a frame before, on and a frame after each of the
+    // page's seven keeps fourteen of its own.
+    let blips: Vec<u32> = page.iter().flat_map(|&t| [t - 16, t, t + 16]).collect();
+    assert_eq!(read(blips, page.clone(), false), trail);
+    // The page over the bound at one moment excuses no other: the same eight turns at 5 s, after seven of the
+    // page's alone at the pixel in its first second, are the trail's. Read over the whole film, the page was
+    // over the bound and what was left of the pixel's turns was not, which once made them the page's.
+    let late = || page.iter().copied().chain(eight.iter().map(|t| t + 5_000));
+    let paged = page
+        .iter()
+        .copied()
+        .chain(eight[..4].iter().map(|t| t + 5_000));
+    assert_eq!(read(late().collect(), paged.collect(), false), trail);
+    // Nor in the second before its own: a turn of the effects 130 ms before the page's seven makes a second of
+    // seven turns, six of them the page's, though the page alone is over the bound a second later.
+    let led: Vec<u32> = std::iter::once(14).chain(page.iter().copied()).collect();
+    assert_eq!(read(led, page.clone(), false), trail);
+    // Nor at its edge: the effects' turn among the page's seven leaves a second of six of the page's and itself.
+    let mut among: Vec<u32> = std::iter::once(500).chain(page.iter().copied()).collect();
+    among.sort_unstable();
+    assert_eq!(read(among, page.clone(), false), trail);
+    // The control: an effects' turn amid a page that turns ten times a second for three, every second holding it
+    // over the bound by the page alone, is excused with it.
+    let long: Vec<u32> = (1..=30).map(|k| 100 * k).collect();
+    let mut amid: Vec<u32> = std::iter::once(1_550).chain(long.iter().copied()).collect();
+    amid.sort_unstable();
+    assert_eq!(
+        read(amid, long, false),
+        [none(), none(), none(), this(), none()]
+    );
+    // The boxes come first: the clean twin holds the caret, so the caret's cell turning with the page is the
+    // caret's, not the page's.
+    assert_eq!(
+        read(page.clone(), page.clone(), true),
+        [none(), this(), none(), none(), none()]
+    );
+    // The control: the same pixel out of the caret's cell is the page's.
+    assert_eq!(
+        read(page.clone(), page, false),
+        [none(), none(), none(), this(), none()]
+    );
+}
+
+#[test]
+fn a_letter_typed_onto_the_page_is_read_as_the_page_s() {
+    // Under the bound the place is a reading, not the law: three turns of a pixel a letter typed onto the page
+    // turned, the clean twin turning with it, are the page's; with the page turning once of them, the trail's.
+    let times: Vec<u32> = vec![144, 288, 432];
+    let read = |page: Vec<u32>| {
+        let turns: HashMap<u32, Vec<u32>> = [(10, times.clone())].into_iter().collect();
+        let page: HashMap<u32, Vec<u32>> = [(10, page)].into_iter().collect();
+        by_place(&turns, (2, 16), W, &HashMap::new(), &page).map(|read| read.turns)
+    };
+    assert_eq!(read(times.clone()), [0, 0, 0, 3, 0]);
+    assert_eq!(read(vec![288]), [0, 0, 0, 0, 3]);
+}
+
+#[test]
+fn a_page_turn_takes_one_turn_within_a_frame_of_it() {
+    // Each of the page's turns takes the earliest turn within a frame step of it that no earlier one took.
+    assert_eq!(unmatched(&[100, 116, 132], &[116], 16), vec![116, 132]);
+    assert_eq!(unmatched(&[100, 116, 132], &[100, 132], 16), vec![132]);
+    assert_eq!(unmatched(&[100, 116], &[84, 116], 16), Vec::<u32>::new());
+    assert_eq!(unmatched(&[100, 150], &[116, 134], 16), Vec::<u32>::new());
+    assert_eq!(unmatched(&[100], &[133], 16), vec![100]);
 }
 
 fn png(px: &[Rgb]) -> Vec<u8> {
@@ -760,7 +886,7 @@ const NO_PET: &str = "trail pet_action=none pet_body=none head_body=none pet_pos
 #[test]
 fn a_calm_film_keeps_every_law() {
     let dir = film(6, |_, _| {}, |_| NO_PET.to_string());
-    let read = judge_film(dir.path()).expect("the film reads");
+    let read = judge_film(dir.path(), false).expect("the film reads");
     assert_eq!((read.frames, read.last_ms, read.width), (6, 96, W));
     assert_eq!(
         (read.flash.most, read.light.most, read.twin.most),
@@ -784,7 +910,71 @@ fn a_calm_film_keeps_every_law() {
     );
     // A folder with no film is an error, never a clean reading.
     let empty = aterm_tempfile::tempdir().expect("a scratch folder");
-    assert!(judge_film(empty.path()).is_err());
+    assert!(judge_film(empty.path(), false).is_err());
+}
+
+#[test]
+fn a_planted_star_is_read_as_a_flash_and_nothing_else_is() {
+    // A calm film of 70 frames (1120 ms). Control: unplanted, it reads no flash and no star.
+    let dir = film(70, |_, _| {}, |_| NO_PET.to_string());
+    let calm = judge_film(dir.path(), false).expect("the film reads");
+    assert_eq!((calm.flash.over.len(), calm.star), (0, None));
+    // Planted, the law puts the star's 9 px over the bound, and no other pixel.
+    let read = judge_film(dir.path(), true).expect("the film reads");
+    let star = read.star.expect("a star was planted");
+    assert_eq!((star.at, star.over), (star_box(W, H), 9));
+    assert_eq!((star.at.x0, star.at.y0), (48, 28));
+    assert_eq!(read.flash.over.len(), 9, "{:?}", read.flash.over);
+    let broken = read.broken();
+    assert!(
+        broken
+            .iter()
+            .any(|b| b.starts_with("flash: 9 px flash faster than 3 a second"))
+            && !broken.iter().any(|b| b.starts_with("star:")),
+        "{broken:?}"
+    );
+    assert!(
+        read.render()
+            .contains("STAR     planted_at=48,28 star_px_over3=9 of 9"),
+        "{}",
+        read.render()
+    );
+    // A star the law missed breaks the film by name.
+    let missed = Reading {
+        star: Some(StarRead { over: 3, ..star }),
+        ..Reading::default()
+    };
+    assert_eq!(
+        missed.broken(),
+        [
+            "star: the planted star flashed in 3 of its 9 px: the flash law missed a flash it was given"
+        ]
+    );
+}
+
+#[test]
+fn a_star_is_lit_every_other_eighth_of_a_second_against_its_page() {
+    let lit_at = |page: Rgb, ms: u64| {
+        let mut frame = Image::from_pixels(W, H, vec![page; W * H]);
+        plant_star(&mut frame, ms);
+        let b = star_box(W, H);
+        let x = usize::try_from(b.x0).expect("in the frame");
+        let y = usize::try_from(b.y1 - 1).expect("in the frame");
+        (frame.at(x, y), frame.at(x - 1, y))
+    };
+    assert_eq!(
+        lit_at(PAGE, 0),
+        (WHITE, PAGE),
+        "white on a dark page, inside its box alone"
+    );
+    assert_eq!(lit_at(PAGE, 124), (WHITE, PAGE));
+    assert_eq!(lit_at(PAGE, 125), (PAGE, PAGE), "dark for the next eighth");
+    assert_eq!(lit_at(PAGE, 250), (WHITE, PAGE));
+    assert_eq!(
+        lit_at(WHITE, 16),
+        ([0, 0, 0], WHITE),
+        "black on a light page"
+    );
 }
 
 #[test]
@@ -809,7 +999,7 @@ fn a_wash_over_a_letter_breaks_the_contrast_law() {
         },
         |_| NO_PET.to_string(),
     );
-    let read = judge_film(dir.path()).expect("the film reads");
+    let read = judge_film(dir.path(), false).expect("the film reads");
     assert_eq!(
         (read.contrast.lowered, read.contrast.lowered_frames),
         (4, 4)
@@ -833,7 +1023,7 @@ fn a_wash_over_a_letter_breaks_the_contrast_law() {
         |_, px| paint(px, GRID.cell_box(1, 3, 1), [0x20, 0x24, 0x2a]),
         |_| NO_PET.to_string(),
     );
-    let read = judge_film(dir.path()).expect("the film reads");
+    let read = judge_film(dir.path(), false).expect("the film reads");
     let broken = read.broken();
     assert!(
         broken
@@ -866,7 +1056,7 @@ fn a_film_s_pet_is_read_from_its_status_rows() {
             )
         },
     );
-    let read = judge_film(dir.path()).expect("the film reads");
+    let read = judge_film(dir.path(), false).expect("the film reads");
     assert_eq!(
         (read.pet.on_glass, read.pet.on_letters, read.pet.on_caret),
         (12, 2, 0)
@@ -898,7 +1088,7 @@ fn the_worst_pixel_s_layer_is_the_census_s() {
         },
         |_| NO_PET.to_string(),
     );
-    let read = judge_film(dir.path()).expect("the film reads");
+    let read = judge_film(dir.path(), false).expect("the film reads");
     assert_eq!((read.flash.most, read.flash.over.len()), (8, 2));
     assert_eq!(
         read.twin.most, 8,
@@ -922,7 +1112,8 @@ fn the_worst_pixel_s_layer_is_the_census_s() {
     assert_eq!(read.trail_layers, read.layers);
     assert!(lines.contains(
         "pet_most=0 pet_turns_most=0 pet_px_over3=0 caret_most=0 caret_turns_most=0 caret_px_over3=0 \
-             icon_most=0 icon_turns_most=0 icon_px_over3=0 trail_most=8 trail_turns_most=16 trail_px_over3=2"
+             icon_most=0 icon_turns_most=0 icon_px_over3=0 page_most=0 page_turns_most=0 page_px_over3=0 \
+             trail_most=8 trail_turns_most=16 trail_px_over3=2"
     ));
     assert_eq!(
         read.broken()[0],
@@ -944,7 +1135,7 @@ fn a_run_films_the_flagship_on_both_themes_and_carets_unless_told() {
         a.scenes,
         ["typing", "burst", "context", "enter", "backspace"]
     );
-    assert!(a.replay && !a.report_only);
+    assert!(a.replay && !a.report_only && !a.plant_star);
     let a = parse_args(&args(&[
         "out",
         "fire",
@@ -958,6 +1149,7 @@ fn a_run_films_the_flagship_on_both_themes_and_carets_unless_told() {
         "steam,cjk",
         "--no-replay",
         "--report-only",
+        "--plant-star",
     ]))
     .expect("a run");
     assert_eq!((a.style.as_str(), a.pet.as_str()), ("fire", "dog"));
@@ -973,7 +1165,7 @@ fn a_run_films_the_flagship_on_both_themes_and_carets_unless_told() {
     assert_eq!(a.themes, ["dark", "github-light", "solarized-dark"]);
     assert_eq!(a.carets, ["underline"]);
     assert_eq!(a.scenes, ["steam", "cjk"]);
-    assert!(!a.replay && a.report_only);
+    assert!(!a.replay && a.report_only && a.plant_star);
     let all = parse_args(&args(&["out", "--all-scenes"])).expect("a run");
     assert_eq!(all.scenes.len(), SCENES.len());
     let root = Path::new("/films");

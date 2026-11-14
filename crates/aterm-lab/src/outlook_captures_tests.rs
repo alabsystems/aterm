@@ -128,6 +128,7 @@ fn outlook_of(world: &World, now: i64) -> aterm_agent::harness::outlook::Outlook
         credits: false,
         now,
         offset: |_| 0,
+        signing_in: None,
     })
 }
 

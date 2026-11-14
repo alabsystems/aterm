@@ -8268,7 +8268,7 @@ fn a_handoff_s_close_regrids_each_handed_over_tab_its_window_moved_under() {
     let grid = (27, 80);
     let (mut new, handed) = handoff_into_moved_window(grid);
     let bootstrap = resize_sites(&new, 0);
-    new.close_restore_pass(&[]);
+    new.close_restore_pass(&[], &crate::task_launch::RestoredTasks::default());
     for id in &handed {
         assert_eq!(
             grid_of(&new, *id),
@@ -8362,7 +8362,7 @@ fn a_carried_full_screen_s_tabs_wait_for_its_size_from_its_entry() {
         plan(&[(wid, show)], ShowLane::Cold),
         Some(wid),
     ));
-    new.close_restore_pass(&[]);
+    new.close_restore_pass(&[], &crate::task_launch::RestoredTasks::default());
     let owed = new.windows[&wid]
         .restore_regrid_owed
         .expect("the close owes the re-grid");
@@ -8512,7 +8512,7 @@ fn a_headless_maximized_row_is_regridded_at_the_close() {
         app.carried_window_show.is_none(),
         "PRECONDITION: a headless instance carries no show"
     );
-    app.close_restore_pass(&[]);
+    app.close_restore_pass(&[], &crate::task_launch::RestoredTasks::default());
     let ws = &app.windows[&wid];
     assert!(
         ws.restore_regrid_owed.is_none(),

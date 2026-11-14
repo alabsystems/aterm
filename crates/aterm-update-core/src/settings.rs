@@ -309,6 +309,17 @@ pub fn read_config_text(path: &Path) -> std::io::Result<Option<String>> {
         {
             return Ok(None);
         }
+        // Windows opens no folder for reading (std asks no FILE_FLAG_BACKUP_SEMANTICS): a folder
+        // at the name, or a link (junction, symlink) the open followed to one, is refused as
+        // access denied, and is a name that is no file. The look follows links as the open did;
+        // a file whose ACL denies reading still reads as a file and stays an error.
+        #[cfg(windows)]
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     let meta = file.metadata()?;

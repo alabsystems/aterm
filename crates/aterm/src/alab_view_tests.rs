@@ -66,10 +66,192 @@ fn a_registry_mailbox_names_its_own_login() {
     );
 }
 
+/// One materializer pass over this stand-in home's shared files, as the process that owns the
+/// Commons runtime runs one after its stores grow.
+fn materialize(paths: &Paths, config: &Path) -> Vec<aterm_db::file::materialize::Outcome> {
+    aterm_db::file::materialize::pass(
+        paths,
+        config,
+        None,
+        &aterm_db::file::materialize::Pass::now(true),
+    )
+}
+
+/// A cache as `install` makes one, at `paths` and `config`: nothing held, nothing read yet.
+fn fresh(paths: &Paths, config: &Path) -> &'static Cache {
+    Box::leak(Box::new(Cache {
+        paths: paths.clone(),
+        config: config.to_path_buf(),
+        settled: None,
+        held: Mutex::new(Held {
+            projected: None,
+            pending: true,
+        }),
+        refreshing: Mutex::new(()),
+        mail_refused: Mutex::new(None),
+    }))
+}
+
+/// SF-04's exit (docs/DESIGN-shared-files-2026-11-11.md §11): the harness's lab is read from
+/// the shared files, so it is served across a restart while the registry refuses every strict
+/// reader. A stand-in lab's registry holds one Mac (`m7`, bound by this Mac's own facts row),
+/// one account and the link between them. Before any pass the source is pending, never absent;
+/// after a pass the lab serves the account, the link and this Mac, deciding as the registry's
+/// own projection does. The home is then fenced under a writer succession that stays pending
+/// (ATERM-KI-1109-1): the registry refuses, a pass records the files `held (succession)`, and a
+/// new process (a restart) is served the same lab, with no receipt admitted from it (writers
+/// stay strict). With the snapshot gone, a new process is pending, not absent: an empty
+/// snapshot never lets a sheet read in a lab's place.
+/// NEGATIVE CONTROL: with `Cache::refresh` reading `Registry::observe_installed_projection` as
+/// it did before SF-04, the restarted cache is pending: `` a restart is served the held lab ``
+/// fails; with the pass marking no machine `=here`, `` this Mac is the machine its own facts
+/// row binds `` fails.
+#[test]
+fn the_lab_is_served_from_the_snapshot_across_a_restart_while_the_registry_refuses() {
+    use aterm_db::alab::registry::{ACCOUNT, ADDRESS, MACHINE, MACHINE_FACTS, PREFERENCE};
+    use aterm_db::typed::{Collection, cell, keys};
+    use aterm_file::{Why, Word};
+    use aterm_json::{Value, json};
+    use aterm_secrets::commons::roster::Role;
+
+    // Made-up names: no account of the owner's is named in a test.
+    const ADA: &str = "ada.fb@alpha.example";
+    let lab = aterm_db::table::fixture::Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let config = paths.home.join("aterm.toml");
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    let ada = keys::address_pk(ADA).unwrap();
+    let account = keys::account_pk("claude", ADA).unwrap();
+    let machine = keys::machine_pk("m7");
+    let link = keys::preference_pk(&machine, &account).unwrap();
+    let owner = |collection: &'static Collection, pk: &str, col: &str, value: Value| {
+        cell::change(
+            collection,
+            cell::CellKey {
+                pk,
+                col,
+                elem: None,
+            },
+            &cell::CellValue::owner(collection.version, value),
+        )
+        .unwrap()
+    };
+    let cells = vec![
+        owner(&ADDRESS, &ada, "addr", json!(ADA)),
+        owner(&MACHINE, &machine, "label", json!("m7")),
+        owner(&MACHINE, &machine, "status", json!("active")),
+        owner(&ACCOUNT, &account, "provider", json!("anthropic")),
+        owner(&ACCOUNT, &account, "realm", json!("claude")),
+        owner(&ACCOUNT, &account, "login", json!(ada)),
+        owner(&ACCOUNT, &account, "status", json!("active")),
+        owner(&PREFERENCE, &link, "machine", json!(machine)),
+        owner(&PREFERENCE, &link, "account", json!(account)),
+        owner(&PREFERENCE, &link, "rank", json!(1)),
+        owner(&PREFERENCE, &link, "why", json!("owner")),
+    ];
+    let facts = aterm_db::database::Change {
+        collection: MACHINE_FACTS.name.into(),
+        key: keys::uuid32(&lab.machine(0)),
+        value: Some(json!({"r": 1, "n": 1, "mac": machine, "label": "m7"})),
+    };
+    registry.write(vec![cells, vec![facts]]).unwrap();
+
+    let first = fresh(paths, &config);
+    let before = alab_roster::Source::snapshot(&first);
+    assert!(
+        before.pending() && !before.permits_sheet(),
+        "no pass yet: the source is pending, never absent"
+    );
+
+    materialize(paths, &config);
+    let live = alab_roster::Source::snapshot(&first)
+        .lab()
+        .expect("a pass's snapshot serves the lab");
+    assert_eq!(
+        live.me
+            .as_ref()
+            .map(|me| (me.key.as_str(), me.label.as_deref())),
+        Some((machine.as_str(), Some("m7"))),
+        "this Mac is the machine its own facts row binds"
+    );
+    assert_eq!(live.accounts.len(), 1);
+    let served = &live.accounts[0];
+    assert_eq!(
+        (served.pk.as_str(), served.email.as_str(), served.joinable),
+        (account.as_str(), ADA, true)
+    );
+    assert_eq!(
+        served.preferred_on(&live.me.as_ref().unwrap().key),
+        Some(Some(1)),
+        "the link orders this Mac's pool"
+    );
+    let native = registry.observe_projection(&config).unwrap();
+    assert_eq!(
+        decided(&live),
+        decided(&first.lab_for_source(native.source())),
+        "the snapshot's lab decides as the registry's own projection does"
+    );
+
+    aterm_db::file::fixture::fence_pending(paths, &lab.bootstrap(0));
+    let refused = registry
+        .observe_projection(&config)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("still preserving old records"),
+        "the registry refuses a strict reader: {refused}"
+    );
+    for outcome in materialize(paths, &config) {
+        assert_eq!(
+            (outcome.word, outcome.why),
+            (Word::Held, Some(Why::Succession)),
+            "{}: {:?}",
+            outcome.name,
+            outcome.detail
+        );
+    }
+
+    let restarted = fresh(paths, &config);
+    let held = alab_roster::Source::snapshot(&restarted);
+    assert!(
+        !held.pending() && held.names_this_mac(),
+        "a restart is served the held lab"
+    );
+    assert_eq!(decided(&held.lab().unwrap()), decided(&live));
+    assert_eq!(
+        decided(&alab_roster::Source::snapshot(&first).lab().unwrap()),
+        decided(&live),
+        "the running process keeps serving it too"
+    );
+    let capture = alab_roster::Source::capture(&restarted);
+    let store = aterm_agent::harness::accounts::Store::at(&paths.home.join("account-test"));
+    let roster = paths.home.join("accounts.toml");
+    assert!(
+        alab_roster::test_publish_source_roster(
+            &store,
+            &roster,
+            "# refused\n",
+            capture.native_guard().unwrap()
+        )
+        .is_err(),
+        "a held lab admits no receipt: writers stay strict"
+    );
+    assert!(!roster.exists());
+
+    let root = aterm_db::file::root(paths);
+    std::fs::remove_file(root.snapshot(&aterm_db::file::ACCOUNTS.file())).unwrap();
+    let emptied = alab_roster::Source::snapshot(&fresh(paths, &config));
+    assert!(
+        emptied.pending() && !emptied.permits_sheet(),
+        "a missing snapshot is pending, never absent"
+    );
+}
+
 pub(super) fn nothing_held() -> Held<Inventory> {
     Held {
         projected: None,
-        looked: None,
         pending: true,
     }
 }
@@ -82,14 +264,14 @@ fn current_local_policy_withholds_a_cached_projection_without_erasing_it() {
     let config = dir.path().join("aterm.toml");
     aterm_uds::atomic_file::write(&config, b"[alab]\nroster = true\n", 0o600).unwrap();
     let mut held = nothing_held();
-    look(&mut held, Ok(Some(naming(Some("m3")))), Instant::now());
+    look(&mut held, Ok(Some(naming(Some("m3")))));
     let cache = Cache {
         paths: Paths::for_home(dir.path()),
         config: config.clone(),
         settled: None,
         held: Mutex::new(held),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     };
     let observed = cache.projection();
     let original = observed.lab().unwrap();
@@ -347,21 +529,20 @@ fn naming_policy_and_pending_status_are_read_from_one_retained_snapshot() {
     let root = aterm_tempfile::tempdir().unwrap();
     let config = root.path().join("aterm.toml");
     let mut held = nothing_held();
-    look(&mut held, Ok(Some(naming(Some("m86")))), Instant::now());
+    look(&mut held, Ok(Some(naming(Some("m86")))));
     let cache = Cache {
         paths: Paths::for_home(root.path()),
         config: config.clone(),
         settled: None,
         held: Mutex::new(held),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     };
     let expected = cache.projection().machine_name();
     assert!(matches!(&expected, RegistryNameRead::Bound(Ok(_))));
     look(
         &mut cache.held.lock().unwrap(),
         Err("temporarily unavailable".into()),
-        Instant::now(),
     );
     assert_eq!(cache.projection().machine_name(), expected);
     aterm_uds::atomic_file::write(&config, b"[alab\n", 0o600).unwrap();
@@ -378,19 +559,13 @@ fn naming_policy_and_pending_status_are_read_from_one_retained_snapshot() {
         Err("first read unavailable".into()),
         Err("source history incomplete".into()),
     ] {
-        look(&mut cache.held.lock().unwrap(), read, Instant::now());
+        look(&mut cache.held.lock().unwrap(), read);
         assert_eq!(
             cache.projection().machine_name(),
             RegistryNameRead::Pending,
             "an unread first registry is not proof that no binding exists"
         );
-        let held = cache.held.lock().unwrap();
-        assert!(held.pending);
-        assert!(due(
-            held.looked,
-            held.pending,
-            Instant::now() + RETRY_FAILED
-        ));
+        assert!(cache.held.lock().unwrap().pending);
     }
 }
 
@@ -404,14 +579,14 @@ fn an_unread_registry_keeps_both_consumers_pending_without_a_history_marker() {
         Err("source history incomplete".to_owned()),
     ] {
         let mut held = nothing_held();
-        look(&mut held, read, Instant::now());
+        look(&mut held, read);
         let cache = Cache {
             paths: Paths::for_home(root.path()),
             config: root.path().join("aterm.toml"),
             settled: None,
             held: Mutex::new(held),
             refreshing: Mutex::new(()),
-            refresher: OnceLock::new(),
+            mail_refused: Mutex::new(None),
         };
         let observed = cache.projection();
         assert_eq!(observed.machine_name(), RegistryNameRead::Pending);
@@ -426,21 +601,19 @@ fn an_unread_registry_keeps_both_consumers_pending_without_a_history_marker() {
 /// successful complete read replaces the pair, and successful absence clears it.
 #[test]
 fn a_look_preserves_a_projection_and_keeps_unknown_absence_pending() {
-    let now = Instant::now();
     let failed = || Err::<Option<Projected<Inventory>>, String>("custody unreadable".into());
     for (read, what) in [
         (failed(), "a failed read"),
         (Err("source history incomplete".into()), "a partial history"),
     ] {
         let mut held = nothing_held();
-        look(&mut held, read, now);
+        look(&mut held, read);
         assert!(held.pending, "{what}");
         assert!(held.projected.is_none(), "{what}");
-        assert_eq!(held.looked, Some(now), "{what}");
     }
 
     let mut held = nothing_held();
-    look(&mut held, Ok(Some(naming(Some("m3")))), now);
+    look(&mut held, Ok(Some(naming(Some("m3")))));
     let lab = held.lab().cloned().expect("the projection is held");
     assert_eq!(
         lab.me.as_ref().and_then(|me| me.label.as_deref()),
@@ -453,7 +626,7 @@ fn a_look_preserves_a_projection_and_keeps_unknown_absence_pending() {
         (Err("source history incomplete".into()), "a partial history"),
         (failed(), "a failed read"),
     ] {
-        look(&mut held, read, now);
+        look(&mut held, read);
         assert!(
             held.lab().is_some_and(|kept| Arc::ptr_eq(kept, &lab)),
             "{what} keeps the lab"
@@ -468,14 +641,14 @@ fn a_look_preserves_a_projection_and_keeps_unknown_absence_pending() {
     let mut next = naming(Some("m3"));
     Arc::make_mut(&mut next.lab).settled = true;
     next.source = Inventory([8; 32]);
-    look(&mut held, Ok(Some(next)), now);
+    look(&mut held, Ok(Some(next)));
     assert!(
         held.lab().is_some_and(|lab| lab.settled),
         "a complete read installs local overlays with the new source"
     );
     assert_eq!(held.projected.as_ref().unwrap().source, Inventory([8; 32]));
     assert!(!Arc::ptr_eq(held.lab().unwrap(), &lab));
-    look(&mut held, Ok(None), now);
+    look(&mut held, Ok(None));
     assert!(
         held.projected.is_none(),
         "absence clears the projection and its source together"
@@ -492,7 +665,7 @@ fn current_commons_policy_hides_a_source_and_preserves_its_history() {
         settled: None,
         held: Mutex::new(nothing_held()),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     };
     cache.refresh_with(|| Ok(Some(naming(Some("m3")))));
     let original = cache.capture().1.unwrap();
@@ -567,6 +740,8 @@ fn current_commons_policy_hides_a_source_and_preserves_its_history() {
     );
 }
 
+/// The lab is read from the shared files a pass wrote, and its mail routes and settlement from
+/// the registry read beside them.
 #[test]
 fn native_cache_projects_mail_and_settlement_from_its_captured_source() {
     use aterm_db::alab::registry::{ADDRESS, MAILBOX};
@@ -623,11 +798,10 @@ fn native_cache_projects_mail_and_settlement_from_its_captured_source() {
         settled: Some(settled.clone()),
         held: Mutex::new(Held {
             projected: None,
-            looked: None,
             pending: true,
         }),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     };
     aterm_uds::atomic_file::write(
         &cache.config,
@@ -639,18 +813,21 @@ fn native_cache_projects_mail_and_settlement_from_its_captured_source() {
         0o600,
     )
     .unwrap();
+    materialize(paths, &cache.config);
     cache.refresh();
     assert!(
         cache.capture().0.pending(),
         "a cold excluded registry must not become proof of absence"
     );
     aterm_uds::atomic_file::write(&cache.config, b"", 0o600).unwrap();
+    materialize(paths, &cache.config);
     cache.refresh();
     let (snapshot, projected) = cache.capture();
     let projected = projected.unwrap();
     assert!(Arc::ptr_eq(&snapshot.lab().unwrap(), &projected.lab));
-    assert_eq!(projected.source.revision(), source.revision());
-    assert_eq!(projected.source.source().mailboxes()[0].pk, mailbox);
+    let mail = projected.source.mail.as_ref().unwrap();
+    assert_eq!(mail.source().revision(), source.source().revision());
+    assert_eq!(mail.source().mailboxes()[0].pk, mailbox);
     assert_eq!(
         projected.lab.mailboxes["ai@example.test"],
         "owner@example.test"
@@ -679,11 +856,10 @@ fn a_new_installation_is_an_absent_source_without_custody() {
         settled: None,
         held: Mutex::new(Held {
             projected: None,
-            looked: None,
             pending: true,
         }),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     }));
     cache.refresh();
     let absent = alab_roster::Source::capture(&cache);
@@ -717,11 +893,10 @@ fn native_cache_does_not_convert_missing_projection_to_fallback_authority() {
         settled: None,
         held: Mutex::new(Held {
             projected: None,
-            looked: None,
             pending: true,
         }),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     }));
     cache.refresh();
     assert!(
@@ -791,13 +966,12 @@ fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save
             settled: Some(settled.clone()),
             held: Mutex::new(Held {
                 projected: None,
-                looked: None,
                 pending: true,
             }),
             refreshing: Mutex::new(()),
-            refresher: OnceLock::new(),
+            mail_refused: Mutex::new(None),
         }));
-        cache.refresh();
+        materialize(paths, &config);
         let captured = alab_roster::Source::capture(&cache);
         let source = captured.native_guard().unwrap();
         let old_lab = captured.snapshot().lab().unwrap();
@@ -818,8 +992,11 @@ fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save
                     ]])
                     .unwrap();
                 assert_eq!(
-                    cache.lab_for_source(registry.observe_projection(&config).unwrap().source()),
-                    old_lab
+                    decided(
+                        &cache
+                            .lab_for_source(registry.observe_projection(&config).unwrap().source())
+                    ),
+                    decided(&old_lab)
                 );
                 if change == 4 {
                     cache.refresh();
@@ -849,15 +1026,13 @@ fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save
         let roster = paths.home.join("accounts.toml");
         let result =
             alab_roster::test_publish_source_roster(&store, &roster, "# admitted\n", source);
-        let admitted = matches!(change, 0 | 5 | 7);
+        // A write that leaves the lab as it was (1, and 4 read again) decides nothing
+        // differently: the receipt is admitted. A changed policy (2) or settlement (3), or a
+        // registry the admission cannot read whole (6), admits none.
+        let admitted = matches!(change, 0 | 1 | 4 | 5 | 7);
         assert_eq!(result.is_ok(), admitted, "change={change}: {result:?}");
         assert_eq!(roster.exists(), admitted);
         assert_eq!(store.dir.join("sync-commit.json").exists(), admitted);
-        assert_eq!(
-            cache.held.lock().unwrap().looked.is_some(),
-            admitted || change == 4,
-            "only the rejected cached revision is invalidated"
-        );
         if admitted {
             let caller = paths.home.join("caller.toml");
             let excluded = format!(
@@ -902,11 +1077,10 @@ fn caller_policy_is_observed_even_without_a_host_projection() {
         settled: None,
         held: Mutex::new(Held {
             projected: None,
-            looked: Some(Instant::now()),
             pending: false,
         }),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     }));
     aterm_uds::atomic_file::write(&caller, b"[alab]\nroster=false\n", 0o600).unwrap();
     assert!(
@@ -931,7 +1105,7 @@ fn equal_visible_labs_keep_the_source_of_each_complete_refresh() {
         settled: None,
         held: Mutex::new(nothing_held()),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     };
     cache.refresh_with(|| Ok(Some(naming(Some("m3")))));
     let (snapshot, captured) = cache.capture();
@@ -954,25 +1128,6 @@ fn equal_visible_labs_keep_the_source_of_each_complete_refresh() {
     aterm_uds::atomic_file::write(&cache.config, b"[alab\n", 0o600).unwrap();
     let (pending, hidden) = cache.capture();
     assert!(pending.pending() && hidden.is_none());
-}
-
-/// A caller looks at the first look and, while a failed look left the source pending, again
-/// once 15 seconds passed; otherwise the refresher looks.
-/// NEGATIVE CONTROL: with `failed` ignored, `` the refresher looks while a lab is held ``
-/// fails; with `>` for `>=`, `` 15 s after a pending look `` fails.
-#[test]
-fn a_caller_looks_first_and_again_only_15_s_after_a_pending_look() {
-    let at = Instant::now();
-    let after = |secs| at + Duration::from_secs(secs);
-    assert!(
-        !due(Some(at), false, after(3600)),
-        "the refresher looks while a lab is held"
-    );
-    assert!(due(None, false, at), "the first look");
-    assert!(due(None, true, at), "the first look");
-    assert!(!due(Some(at), true, after(14)), "14 s after a pending look");
-    assert!(due(Some(at), true, after(15)), "15 s after a pending look");
-    assert!(!due(Some(after(1)), true, at), "a look stamped after now");
 }
 
 /// A completed round settles a table only where its witness counts an operation of one of

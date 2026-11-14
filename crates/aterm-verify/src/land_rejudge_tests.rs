@@ -10,12 +10,27 @@ const SOURCE: &str = "pub fn value() -> u8 { dep::value() }\n\n\n\n\n\n\n\npub c
 /// Main changes unrelated crates and the branch's file. Dependency moves must still compile
 /// and test the branch against the new dependency. NEGATIVE CONTROL: the branch freezes the
 /// dependency's old value, violating the merged test, and the re-judge refuses the landing.
+/// In those three main's change reaches the branch's whole cone, so the first judgment leaves
+/// nothing standing and the merge is judged in full. In `narrow` the branch also changes
+/// `fan0`, and main changes `fan1` and the shared file, neither of which reaches `fan0`: the
+/// first judgment stands, and one round judges the merge over the crates of the branch's cone
+/// that main's change reaches, `a` and `consumer`, by the real reach and the real selection of
+/// a round. NEGATIVE CONTROLS: `narrow-conflict` freezes the dependency's old value there too,
+/// and the round refuses the landing; in `narrow-wide` main changes `wide`, which `fan0`
+/// builds on, so its change reaches the branch's every crate and the merge is judged in full.
 /// Run explicitly: `targo --unverified test -p aterm-verify --lib landing_rejudge_replay
 /// -- --ignored --nocapture` (the nested compiler is part of this measurement, not the unit set).
 #[test]
 #[ignore = "explicit local landing measurement with nested Trust compilation"]
 fn landing_rejudge_replay() {
-    for scenario in ["wide", "dependency", "semantic-conflict"] {
+    for scenario in [
+        "wide",
+        "dependency",
+        "semantic-conflict",
+        "narrow",
+        "narrow-conflict",
+        "narrow-wide",
+    ] {
         replay(scenario);
     }
 }
@@ -77,12 +92,24 @@ fn replay(scenario: &str) {
     git(&world.work, &["add", "-A"]);
     git(&world.work, &["commit", "-q", "-m", "fixture workspace"]);
     git(&world.work, &["push", "-q", "origin", "HEAD:main"]);
-    let branch_source = if scenario == "semantic-conflict" {
+    let narrow = scenario.starts_with("narrow");
+    let conflict = scenario.ends_with("conflict");
+    // Whether a round answers for the merge: main's change reaches less than the branch's.
+    let round = narrow && scenario != "narrow-wide";
+    let branch_source = if conflict {
         SOURCE.replace("{ dep::value() }", "{ 1 }")
     } else {
         SOURCE.replace("{ dep::value() }", "{ dep::value() + 0 }")
     };
     commit(&world.work, "crates/a/src/lib.rs", &branch_source);
+    if narrow {
+        commit(
+            &world.work,
+            "crates/fan0/src/lib.rs",
+            "pub fn value() -> u8 { wide::value() + 0 }\n",
+        );
+    }
+    let mut rounds = Vec::new();
     let mut judged = Vec::new();
     let mut moved = String::new();
     let mut said = Vec::new();
@@ -143,12 +170,20 @@ fn replay(scenario: &str) {
                         "{}",
                         String::from_utf8_lossy(&out.stderr)
                     );
-                    rival_moves(
-                        &world,
-                        "crates/wide/src/lib.rs",
-                        "pub fn value() -> u8 { 2 }\n",
-                    );
-                    if scenario != "wide" {
+                    if round {
+                        rival_moves(
+                            &world,
+                            "crates/fan1/src/lib.rs",
+                            "pub fn value() -> u8 { wide::value() + 0 }\n",
+                        );
+                    } else {
+                        rival_moves(
+                            &world,
+                            "crates/wide/src/lib.rs",
+                            "pub fn value() -> u8 { 2 }\n",
+                        );
+                    }
+                    if scenario != "wide" && scenario != "narrow" && scenario != "narrow-wide" {
                         // Main's own test changes with its dependency; the branch's distinct
                         // contract is the semantic conflict, invisible to a textual merge.
                         rival_moves(
@@ -158,7 +193,7 @@ fn replay(scenario: &str) {
                         );
                     }
                     let main_source = SOURCE.replace("MAIN: u8 = 0", "MAIN: u8 = 1");
-                    let main_source = if scenario == "wide" {
+                    let main_source = if matches!(scenario, "wide" | "narrow" | "narrow-wide") {
                         main_source
                     } else {
                         main_source.replace("assert_eq!(value(), 1)", "assert_eq!(value(), 2)")
@@ -175,25 +210,85 @@ fn replay(scenario: &str) {
                     )
                 })
             },
-            branch: &mut |_, _| crates(&["a"]),
+            branch: &mut |_, _| crates(if narrow { &["a", "fan0"] } else { &["a"] }),
             lane: &mut |_, _| Lane::Pass,
-            recheck: &mut |_, _, _| panic!("a source edit is never rechecked"),
+            reach: &live_reach,
+            recheck: &mut |root, _, base, delta| {
+                assert!(
+                    round,
+                    "a main change that reaches the branch's whole cone is judged in full"
+                );
+                let began = Instant::now();
+                // The round's own selection ([`crate::run`] under `--judged` and `--shared`).
+                let selection = crate::changed::resolve_round(
+                    root,
+                    &tools,
+                    &path_env,
+                    base,
+                    &delta.judged,
+                    delta.shared.clone(),
+                    delta.mechanical,
+                );
+                let crate::changed::Selection::Narrowed { crates, .. } = selection else {
+                    panic!("fixture cone widened: {selection:?}");
+                };
+                let out = run_tests(root, &crates);
+                println!(
+                    "landing-rejudge scenario={scenario} round crates={} shared={:?} wall_ms={} base={base} success={}",
+                    crates.len(),
+                    delta.shared,
+                    began.elapsed().as_millis(),
+                    out.status.success()
+                );
+                rounds.push((base.to_owned(), crates));
+                let mut rows = vec![
+                    row("fmt", "ok"),
+                    row("census", "ok"),
+                    row("export-scan", "ok"),
+                ];
+                if out.status.success() {
+                    rows.push(row("test", "ok"));
+                    ran(exit::PASS, rows, began.elapsed().as_secs())
+                } else {
+                    rows.push(red("test", &["-p a --lib -- contract"]));
+                    ran(exit::FAILED, rows, began.elapsed().as_secs())
+                }
+            },
             hand_over: &mut |_, _, _| panic!("no handoff was expected"),
             say: &mut |line| said.push(line.to_owned()),
             remote: &crate::remote::run,
             pause: &no_retry,
         },
     );
-    assert_eq!(judged.len(), 2, "{said:#?}");
-    assert_eq!(judged[1].1, ["a", "consumer"]);
-    assert_eq!(judged[1].0, moved);
-    if scenario == "semantic-conflict" {
+    if round {
+        assert_eq!(judged.len(), 1, "the first judgment stands: {said:#?}");
+        assert_eq!(judged[0].1, ["a", "consumer", "fan0"]);
+        assert_eq!(rounds.len(), 1, "{said:#?}");
+        assert_eq!(rounds[0].1, ["a", "consumer"]);
+        assert_eq!(rounds[0].0, moved);
+    } else {
+        assert!(rounds.is_empty(), "{said:#?}");
+        assert_eq!(judged.len(), 2, "{said:#?}");
+        if narrow {
+            assert_eq!(judged[1].1, ["a", "consumer", "fan0"]);
+        } else {
+            assert_eq!(judged[1].1, ["a", "consumer"]);
+        }
+        assert_eq!(judged[1].0, moved);
+    }
+    if conflict {
         assert_eq!(code, exit::FAILED, "{said:#?}");
         assert_eq!(origin_main(&world), moved, "semantic red pushes nothing");
     } else {
         assert_eq!(code, exit::PASS, "{said:#?}");
         let receipt = stated(&world, &origin_main(&world)).expect("receipt");
-        assert_eq!(receipt.checked[1].base, moved);
         assert_eq!(receipt.composed_onto, None);
+        if round {
+            assert_eq!(receipt.checked.len(), 1);
+            assert_eq!(receipt.rechecked.len(), 1);
+            assert_eq!(receipt.rechecked[0].base, moved);
+        } else {
+            assert_eq!(receipt.checked[1].base, moved);
+        }
     }
 }

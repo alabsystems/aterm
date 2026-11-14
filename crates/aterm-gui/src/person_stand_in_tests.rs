@@ -129,12 +129,13 @@ fn the_person_verb_reads_its_forms_and_refuses_unarmed_and_in_release() {
     assert_eq!(armed(" look  12 "), Ok(PersonAsked::Look(Some(12))));
     assert_eq!(armed("look off"), Ok(PersonAsked::Look(None)));
     assert_eq!(
-        armed("menubar press 3.0"),
+        armed("menubar press 3"),
         Ok(PersonAsked::Press(
-            crate::status_item::MenuAt::parse("3.0").expect("a path")
+            crate::status_item::MenuAt::parse("3").expect("a place")
         ))
     );
     assert_eq!(armed("menubar click"), Ok(PersonAsked::Click));
+    assert_eq!(armed("menubar open"), Ok(PersonAsked::Open));
     for junk in [
         "",
         "look",
@@ -145,8 +146,10 @@ fn the_person_verb_reads_its_forms_and_refuses_unarmed_and_in_release() {
         "menubar",
         "menubar press",
         "menubar press 1.",
+        "menubar press 3.0",
         "menubar press x",
         "menubar click 1",
+        "menubar open 1",
         "invoke TakeOver",
     ] {
         let refusal = armed(junk).expect_err(junk);
@@ -174,8 +177,6 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     end_after(&mut app, &sid, 45 * SEC);
     assert!(app.end_unseen(0), "PRECONDITION: a background end stands");
     assert_eq!(marks(&app)[0], ChipLevel::Done);
-    assert_eq!(app.status_glance().done.len(), 1);
-    assert_eq!(app.status_glance().button_title(), "\u{276f}");
     app.switch_tab_in(WindowId(0), 0);
     assert!(app.end_unseen(0), "a headless window: nobody looks");
     app.switch_tab_in(WindowId(0), 1);
@@ -188,16 +189,14 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     );
     assert!(app.end_unseen(0), "a look sees the front tab alone");
     assert_eq!(marks(&app)[0], ChipLevel::Done, "the `•` stands");
-    assert_eq!(app.status_glance().done.len(), 1, "the row stands");
-    assert_eq!(app.status_glance().button_title(), "\u{276f}");
 
     app.take_status_rebuild();
     app.switch_tab_in(WindowId(0), 0);
     assert!(!app.end_unseen(0), "seen by the one rule");
-    assert!(app.take_status_rebuild(), "the look dirties the glance");
-    let g = app.status_glance();
-    assert!(g.done.is_empty(), "the row goes: {:?}", g.done);
-    assert_eq!(g.button_title(), "\u{276f}", "and `❯•`");
+    assert!(
+        app.take_status_rebuild(),
+        "the look owes the Agents surfaces a rebuild"
+    );
     assert_eq!(marks(&app)[0], ChipLevel::Off);
 
     end_after(&mut app, &sid, 40 * SEC);
@@ -206,7 +205,6 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     assert_eq!(look(&mut app, None), Ok("person look off".to_string()));
     end_after(&mut app, &sid, 40 * SEC);
     assert!(app.end_unseen(0), "nobody looks: it stands");
-    assert_eq!(app.status_glance().done.len(), 1, "a Done for you row");
 }
 
 #[test]
@@ -215,8 +213,6 @@ fn a_stand_in_look_sees_the_front_tab_at_once() {
     end_after(&mut app, &sid, 45 * SEC);
     app.switch_tab_in(WindowId(0), 0);
     assert!(app.end_unseen(0), "in front, nobody looks: it stands");
-    assert_eq!(app.status_glance().done.len(), 1);
-    assert_eq!(app.status_glance().button_title(), "\u{276f}");
     app.take_status_rebuild();
 
     assert_eq!(
@@ -224,10 +220,7 @@ fn a_stand_in_look_sees_the_front_tab_at_once() {
         Ok("person look window=0".to_string())
     );
     assert!(!app.end_unseen(0), "seen at once");
-    assert!(app.take_status_rebuild(), "the glance told");
-    let g = app.status_glance();
-    assert!(g.done.is_empty(), "the row goes: {:?}", g.done);
-    assert_eq!(g.button_title(), "\u{276f}", "and `❯•`");
+    assert!(app.take_status_rebuild(), "the Agents surfaces told");
 }
 
 #[test]
@@ -261,7 +254,6 @@ fn a_look_at_a_window_behind_sees_nothing() {
     );
     app.switch_tab_in(WindowId(0), 0);
     assert!(app.end_unseen(0), "a look at a window behind sees nothing");
-    assert_eq!(app.status_glance().done.len(), 1, "the row stands");
 
     let _ = app.close_window_logical(w1);
     assert_eq!(
@@ -272,86 +264,103 @@ fn a_look_at_a_window_behind_sees_nothing() {
     app.switch_tab_in(WindowId(0), 1);
     app.switch_tab_in(WindowId(0), 0);
     assert!(!app.end_unseen(0), "in front, looked at: seen");
-    assert!(app.status_glance().done.is_empty(), "the row goes");
 }
 
-/// The `statusmenu` line `chrome` prints after the one starting `head`, and
-/// its path (macOS: the menu-bar item's own platform).
+/// The place of the `statusmenu` line `chrome` prints for the row titled `title`.
 #[cfg(target_os = "macos")]
-fn row_after(app: &App, head: &str) -> (String, crate::status_item::MenuAt) {
+fn row_titled(app: &App, title: &str) -> crate::status_item::MenuAt {
     let lines = app.status_item_chrome_lines();
-    let at = lines
+    let line = lines
         .iter()
-        .position(|l| l.starts_with(head))
-        .unwrap_or_else(|| panic!("no {head:?} line: {lines:#?}"));
-    let line = lines[at + 1].clone();
-    let path = line
-        .rsplit_once(" at=")
+        .find(|l| l.starts_with(&format!("statusmenu {title:?} ")))
+        .unwrap_or_else(|| panic!("no {title:?} line: {lines:#?}"));
+    line.rsplit_once(" at=")
         .and_then(|(_, at)| crate::status_item::MenuAt::parse(at))
-        .unwrap_or_else(|| panic!("no path: {line}"));
-    (line, path)
+        .unwrap_or_else(|| panic!("no place: {line}"))
 }
 
-/// A STAND-IN PRESS GOES WHERE A CLICK GOES (§12.5.6): the Done for you row
-/// `chrome` prints, pressed by its path, posts the row's action as the
-/// AppKit relay posts a click; that wake's dispatch brings the landed tab
-/// to the front and its end is seen, and the row and `❯•` go — a click's Go
-/// is a look by its own act (§11.4.3, item 4), look or not.
+/// A STAND-IN PRESS GOES WHERE A CLICK GOES: a level's row `chrome` prints, pressed by its
+/// place, posts the row's action as the AppKit relay posts a click, and that wake's dispatch
+/// stores the level at once; a grey line and a place past the menu post nothing. The store is
+/// this test thread's (`control::store_fleet_access`).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stand_in_press_goes_where_a_click_goes() {
-    let (mut app, sid, _host) = desk();
-    end_after(&mut app, &sid, 45 * SEC);
-    assert!(app.end_unseen(0), "PRECONDITION: a background end stands");
-    let (line, at) = row_after(&app, "statusmenu \"Done for you (1)\"");
-    let label = line
-        .strip_prefix("statusmenu ")
-        .and_then(|l| l.split_once("\" enabled=yes"))
-        .map(|(label, _)| format!("{label}\""))
-        .unwrap_or_else(|| panic!("an action row: {line}"));
-    // The row's age is said from the wall clock, so it may tick between the
-    // read and the press ("landed 0s", then "landed 1s"): the row is the same.
-    let unaged = |said: &str| {
-        said.rsplit_once(" landed ")
-            .map_or_else(|| said.to_string(), |(row, _)| row.to_string())
-    };
+    use aterm_types::fleet_access::FleetAccess::{Full, ReadOnly};
+    let (mut app, _sid, _host) = desk();
+    let mut slot = crate::fleet_glance::FleetSlot::default();
+    slot.book.in_fleet = true;
+    app.fleet_glance = Some(crate::fleet_glance::FleetGlance::over(slot));
+    let now = aterm_time::unix_millis().unwrap_or(0);
+    let _ = app
+        .fleet_traffic
+        .set(Some(crate::fleet_traffic::FleetTraffic::over(
+            Some(crate::status_item::a_blocked_hour(now)),
+            0,
+        )));
+    let stored = crate::control::fleet_access_now;
+    assert_eq!(stored(), ReadOnly, "PRECONDITION: the default");
+
+    let at = row_titled(&app, Full.label());
     let mut posted = Vec::new();
     let pressed = app.person_menubar_press(&at, &mut |wake| {
         posted.push(wake);
         true
     });
-    assert!(label.contains(" landed "), "the row says its age: {label}");
-    assert_eq!(
-        pressed.map(|said| unaged(&said)),
-        Ok(unaged(&format!("pressed {label}")))
-    );
-    assert!(app.end_unseen(0), "nothing ran before the wake");
+    assert_eq!(pressed, Ok(format!("pressed {:?}", Full.label())));
+    assert_eq!(stored(), ReadOnly, "nothing ran before the wake");
     assert_eq!(posted.len(), 1, "one click posted: {posted:?}");
     for wake in posted {
         let crate::Wake::StatusAction { action } = wake else {
             panic!("a status action: {wake:?}");
         };
+        assert_eq!(
+            action,
+            crate::status_item::StatusAction::SetFleetAccess(Full)
+        );
         app.dispatch_status_action(action);
     }
-    assert_eq!(
-        app.focused_session_id(WindowId(0)),
-        Some(0),
-        "the landed tab in front"
+    assert_eq!(stored(), Full, "a pick in the menu is stored at once");
+    let checked = app
+        .status_item_chrome_lines()
+        .into_iter()
+        .filter(|l| l.contains(" checked=yes"))
+        .collect::<Vec<_>>();
+    assert_eq!(checked.len(), 1, "{checked:#?}");
+    assert!(
+        checked[0].starts_with(&format!("statusmenu {:?} ", Full.label())),
+        "{checked:#?}"
     );
-    assert!(!app.end_unseen(0), "its end seen");
-    let g = app.status_glance();
-    assert!(g.done.is_empty(), "the row goes: {:?}", g.done);
-    assert_eq!(g.button_title(), "\u{276f}");
+
+    // The whole record is one press away, and posts its own action.
+    let at = row_titled(&app, "All activity\u{2026}");
+    let mut posted = Vec::new();
+    assert!(
+        app.person_menubar_press(&at, &mut |wake| {
+            posted.push(wake);
+            true
+        })
+        .is_ok()
+    );
+    assert!(
+        matches!(
+            posted[..],
+            [crate::Wake::StatusAction {
+                action: crate::status_item::StatusAction::AllActivity
+            }]
+        ),
+        "{posted:?}"
+    );
 
     let lines = app.status_item_chrome_lines();
     let info = lines
         .iter()
-        .find(|l| l.contains(" enabled=no at="))
-        .unwrap_or_else(|| panic!("an information line: {lines:#?}"));
+        .find(|l| l.contains(" enabled=no"))
+        .unwrap_or_else(|| panic!("a grey line: {lines:#?}"));
     let info_at = info
         .rsplit_once(" at=")
         .and_then(|(_, at)| crate::status_item::MenuAt::parse(at))
-        .expect("a path");
+        .expect("a place");
     let mut posted = Vec::new();
     let mut post = |wake| {
         posted.push(wake);
@@ -361,66 +370,36 @@ fn a_stand_in_press_goes_where_a_click_goes() {
         app.person_menubar_press(&info_at, &mut post),
         Err("not an action".to_string())
     );
-    let past = crate::status_item::MenuAt::parse(&(lines.len() + 5).to_string()).expect("a path");
+    let past = crate::status_item::MenuAt::parse(&(lines.len() + 5).to_string()).expect("a place");
     assert_eq!(
         app.person_menubar_press(&past, &mut post),
         Err(format!("no row at {}", lines.len() + 5))
     );
     assert!(posted.is_empty(), "nothing posted: {posted:?}");
+}
 
-    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("aterm-person-press-")
-        .tempdir()
-        .expect("exclusive result dir");
-    let path = dir.path().join("result.md");
-    std::fs::write(&path, "# the worker's result\n").expect("result");
-    for state in [
-        crate::task_record::TaskState::Working,
-        crate::task_record::TaskState::Done,
-    ] {
-        let mut mark = crate::task_record::TaskMark::new(state);
-        if state == crate::task_record::TaskState::Done {
-            mark.result_bytes = 22;
-            mark.result_path = Some(path.clone());
-        }
-        crate::task_record::mark_session_task(&ctx, 0, &mark).expect("marked");
-        app.on_task_changed(0);
-    }
-    app.switch_tab_in(WindowId(0), 1);
-    let entered = app
-        .status_glance()
-        .reads
-        .first()
-        .map(|r| r.entered)
-        .expect("PRECONDITION: a result to read");
-    assert_ne!(
-        app.done_seen.get(&0),
-        Some(&entered),
-        "PRECONDITION: unread"
-    );
-    let (line, at) = row_after(&app, "statusmenu \"Done for you (1)\"");
-    let mut posted = Vec::new();
-    let pressed = app.person_menubar_press(&at, &mut |wake| {
-        posted.push(wake);
-        true
-    });
-    assert!(pressed.is_ok(), "{line}: {pressed:?}");
-    for wake in posted {
-        let crate::Wake::StatusAction { action } = wake else {
-            panic!("a status action: {wake:?}");
-        };
-        assert!(
-            matches!(action, crate::status_item::StatusAction::ReadResult(_)),
-            "{line}: {action:?}"
-        );
-        app.dispatch_status_action(action);
-    }
+/// A STAND-IN OPEN IS THE MENU'S OPEN: `person menubar open` states that the person saw what
+/// this Mac's lock refused, so the bar's blocked mark clears, with no menu on the screen.
+#[test]
+fn a_stand_in_open_clears_the_bars_blocked_mark() {
+    let (mut app, _sid, _host) = desk();
+    let mut slot = crate::fleet_glance::FleetSlot::default();
+    slot.book.in_fleet = true;
+    app.fleet_glance = Some(crate::fleet_glance::FleetGlance::over(slot));
+    let now = aterm_time::unix_millis().unwrap_or(0);
+    let _ = app
+        .fleet_traffic
+        .set(Some(crate::fleet_traffic::FleetTraffic::over(
+            Some(crate::status_item::a_blocked_hour(now)),
+            0,
+        )));
+    let blocked = |app: &App| field(&app.status_item_chrome_lines()[0], "blocked");
+    assert_eq!(blocked(&app).as_deref(), Some("yes"));
     assert_eq!(
-        app.done_seen.get(&0),
-        Some(&entered),
-        "the result opened, its done seen"
+        app.person_stand_in(PersonAsked::Open),
+        Ok("opened the menu".to_string())
     );
+    assert_eq!(blocked(&app).as_deref(), Some("no"));
 }
 
 #[test]
@@ -529,7 +508,7 @@ fn status_says_a_carried_ends_cheer_is_spent() {
 /// The `access=` and `shown=` words of the `statusitem` chrome line: the level in force and the
 /// level the lock shows.
 fn lock_words(app: &App) -> (Option<String>, Option<String>) {
-    let line = app.status_item_chrome_line();
+    let line = app.status_item_chrome_lines().swap_remove(0);
     (field(&line, "access"), field(&line, "shown"))
 }
 

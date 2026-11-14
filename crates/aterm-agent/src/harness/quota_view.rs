@@ -1176,7 +1176,9 @@ impl Outlook {
             .chain(carrier_row.filter(|c| Some(*c) != tab_row).map(Some))
             .collect();
         let picked = pick_named(&order, &must);
-        let row_figure = tab_row.map_or(Figure::Unread, |i| self.rows[i].figure(as_of));
+        // This tab's own figure is its week's reading: the pane's session is the evidence that
+        // its account runs, so its lead never says a login.
+        let row_figure = tab_row.map_or(Figure::Unread, |i| self.rows[i].week_figure(as_of));
         let tab_figure = match own {
             Some(own) if row_figure != Figure::Out => own,
             _ => row_figure,
@@ -1581,6 +1583,7 @@ impl Outlook {
             Figure::AtLeast(_) => format!("{} of its week, read earlier", tab.figure.words()),
             Figure::Out => "out now".to_owned(),
             Figure::Unread => format!("{NO_FIGURE}, Claude reports it with its next reply"),
+            Figure::SignedOut | Figure::SigningIn => tab.figure.words(),
         });
         if let Some(own) = &view.tail.own {
             parts.push(match own.by_reset {
@@ -1703,7 +1706,7 @@ impl Outlook {
                     Figure::Exact(_) | Figure::AtLeast(_) => {
                         format!("{} of its week", n.figure.spoken())
                     }
-                    Figure::Out => n.figure.spoken(),
+                    Figure::Out | Figure::SignedOut | Figure::SigningIn => n.figure.spoken(),
                     Figure::Unread => format!("{NO_FIGURE}; Claude reports it with its next reply"),
                 });
                 if let Some(reset) = n.reset.filter(|_| n.figure != Figure::Unread) {
@@ -1950,7 +1953,14 @@ impl QuotaView {
             let role = if n.this_tab { Role::Lit } else { Role::Value };
             out.put(&names.lay(&n.name), role, n.this_tab);
             out.put(" ", Role::Quiet, false);
-            out.put(&n.figure.words(), role, n.this_tab);
+            // An account's login is a fact of its row, said quietly in its figure's place; the
+            // narrow form goes with the narrow name.
+            let (words, ink) = match (n.figure.of_login(), names) {
+                (true, Names::Whole) => (n.figure.words(), Role::Quiet),
+                (true, Names::Local) => (n.figure.narrow_words(), Role::Quiet),
+                (false, _) => (n.figure.words(), role),
+            };
+            out.put(&words, ink, n.this_tab && !n.figure.of_login());
         };
         match lead {
             Lead::Full => {

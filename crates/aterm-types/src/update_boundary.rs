@@ -42,7 +42,11 @@ pub enum GuardedItem {
     /// handoff or its cancellation's settlement, an account claim, fence or closure), through its
     /// kernel outcome and the durable record of it, or until it can start nothing more: a
     /// signalled restart past its deadline, or an image move whose actor is gone, stops holding
-    /// it, and a record it still makes takes a fresh hold.
+    /// it, and a record it still makes takes a fresh hold. An image move or a restart that may
+    /// have started its effect holds it no longer than its close (its deadline plus the
+    /// completion grace), where it is sealed `closed` over whatever its journal recorded. A
+    /// successor answers a cold or asked restart from that record, `closed` where execution was
+    /// possible and `lapsed` where it was not, and keeps refusing a private one's.
     HarnessNativeMutation,
 }
 

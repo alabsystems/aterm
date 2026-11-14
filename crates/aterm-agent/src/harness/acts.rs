@@ -591,7 +591,7 @@ pub fn nudge_words(nudges: u32) -> Option<String> {
     }
 }
 
-/// A read hold's tip (a worker's menu row, its tab's tip): `not landed yet: <legs>`, then its
+/// A read hold's tip (the Overview's held-chip line): `not landed yet: <legs>`, then its
 /// nudges.
 #[must_use]
 pub fn held_tip(legs: &str, nudges: u32) -> String {
@@ -744,8 +744,8 @@ pub fn is_driver_line(line: &str) -> bool {
 }
 
 /// A STOPPED AUTOPILOT, IN WORDS (§14.3): ONE function for every surface that says the stop —
-/// the chip's title and description, the state line, the hover and the Overview, a worker's tip —
-/// and for the lab that reads them. `switch`: the person's switch to Land would ask once more
+/// the chip's title and description, the state line, the hover and the Overview — and for the
+/// lab that reads them. `switch`: the person's switch to Land would ask once more
 /// over it ([`TYPES_AGAIN_OR_SWITCH`]), else [`TYPES_AGAIN`].
 #[must_use]
 pub fn stop_words(held: HeldBy, form: StopForm, switch: bool) -> String {

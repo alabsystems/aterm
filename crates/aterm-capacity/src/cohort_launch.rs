@@ -49,6 +49,37 @@ impl CohortChild {
         &self.cohort
     }
 
+    /// Recheck the actual exclusive child and its original dedicated birth,
+    /// without reaping it or deriving control from a numeric observation.
+    /// An exited, unreaped leader still pins the original group. This supplies
+    /// no evidence that the leader or any descendant has retired.
+    ///
+    /// # Errors
+    /// The original owner, scope or child changed, the child was reaped, or its
+    /// dedicated group does not match the privately captured cohort.
+    pub fn check_original_unreaped(&mut self) -> io::Result<()> {
+        if !self.spawned.key().is_current()
+            || !self.spawned.is_original_child()
+            || Scope::of_key(self.spawned.key()) != self.cohort.scope
+            || self.spawned.child_mut().is_reaped()
+            || self.cohort.group() <= 1
+            || i32::try_from(self.spawned.child_mut().id()).ok() != Some(self.cohort.group())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "group control requires its original current owner and unreaped dedicated birth",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Complete member-ended observation under the actual original child,
+    /// before its owning wait. This supplies no kernel-drain or release fact.
+    pub fn group_members_ended(&mut self) -> io::Result<bool> {
+        self.check_original_unreaped()?;
+        self.spawned.group_members_ended()
+    }
+
     /// Request a signal for this actual launch's original dedicated group. The
     /// exclusive unreaped-child borrow pins its original group number through
     /// the syscall, even if its leader has exited. A decoded observation, reaped
@@ -62,19 +93,7 @@ impl CohortChild {
     /// The original owner/scope changed or is unreadable, the leader was reaped,
     /// the original dedicated birth does not match, or the kernel refused the signal.
     pub fn request_group(&mut self, signal: CohortSignal) -> io::Result<()> {
-        let group = self.cohort.group();
-        if !self.spawned.key().is_current()
-            || !self.spawned.is_original_child()
-            || Scope::of_key(self.spawned.key()) != self.cohort.scope
-            || self.spawned.child_mut().is_reaped()
-            || group <= 1
-            || i32::try_from(self.spawned.child_mut().id()).ok() != Some(group)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "group control requires its original current owner and unreaped dedicated birth",
-            ));
-        }
+        self.check_original_unreaped()?;
         // Keep admission's original bound-cohort checks above. The native
         // birth owner additionally checks its exact unreaped Child before the
         // syscall; no observation or reservation creates signalling authority.

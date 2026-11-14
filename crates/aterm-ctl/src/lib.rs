@@ -48,6 +48,8 @@ pub mod board;
 mod drift;
 /// The `amacs` client's `edit` and `await edit` exchanges with the window hosting its tab, the wait re-armed past every bound and every update.
 pub mod edit;
+/// The fleet activity record's file: the agent requests that crossed between this Mac and another.
+pub mod fleet_activity;
 /// The telemetry rows a fleet spawn and a worker's board close write (Continuum TM-1).
 pub mod fleet_telemetry;
 pub mod github_usage;
@@ -3670,6 +3672,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
 
 /// [`main_entry`] with the verbs the embedding binary answers in-process ([`LocalVerbs`]).
 pub fn main_entry_with(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> ExitCode {
+    let code = answered(argv, local);
+    // What the call asked of another Mac is in the fleet activity record before the process
+    // ends, where it can be written in a moment: after the answer is out, never before.
+    let _ = stdout_handle().flush();
+    fleet_activity::drain();
+    code
+}
+
+/// [`main_entry_with`]'s answer and exit status, everything printed.
+fn answered(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> ExitCode {
     match real_main(argv, local) {
         Ok(code) => code,
         Err(e) => {

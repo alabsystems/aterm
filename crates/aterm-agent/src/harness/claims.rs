@@ -205,7 +205,9 @@ pub struct Row {
     pub machine: String,
     /// The Mac's `m<N>` label as it wrote it; empty when it has none.
     pub label: String,
-    /// The row's revision: 1 for a Mac's first row, one more for each row after.
+    /// The row's revision: 1 for a Mac's first row, one more for each row after. 0 only for a
+    /// row nobody wrote under this machine: an earlier writer seat's row carried as this Mac's
+    /// ([`claimed`]).
     pub counter: u64,
     /// The claims lapse at this instant (Unix seconds) unless the Mac writes its row again.
     pub until: i64,
@@ -511,7 +513,10 @@ pub struct Mine {
 /// passes, or `None` where its row already holds just that and is not due again
 /// ([`RENEW_WITHIN_S`]), or exceeds [`MAX_CLAIM_BYTES`], when its live row does not
 /// hold `key`. A claim the row already holds keeps its `since`; a lapsed row starts every claim
-/// afresh.
+/// afresh. A row at counter 0 is one this Mac has not written under its current seat (the
+/// newest row an earlier writer seat of its Commons home signed, as the table read carries it):
+/// it is always written, at counter 1, so the claims it keeps go on with their `since` under the
+/// seat that now writes.
 #[must_use]
 pub fn claimed(
     current: Option<&Row>,
@@ -543,6 +548,7 @@ pub fn claimed(
     }
     claims.sort_by(|a, b| a.key.cmp(&b.key));
     if let Some(row) = live
+        && row.counter > 0
         && row.claims == claims
         && row.until.saturating_sub(now) >= RENEW_WITHIN_S
         && row.label == me.label
@@ -580,8 +586,9 @@ pub fn released(current: Option<&Row>, drop: impl Fn(&Claim) -> bool, now: i64) 
 /// given up, and the rest kept no longer than [`SESSION_FRESH_S`] more, the most a claim it took
 /// before the quiet can still count as use ([`in_use`]), so other Macs read a sleeping Mac's
 /// accounts free then, not at its row's `until` up to a day away. `None` where its live row
-/// changes neither way. The first claim after the quiet renews the row ([`RENEW_WITHIN_S`]), its
-/// claims' `since` kept while the row is still live.
+/// changes neither way, unless it is at counter 0, one this Mac has not written under its current
+/// seat ([`claimed`]), which is written then. The first claim after the quiet renews the row
+/// ([`RENEW_WITHIN_S`]), its claims' `since` kept while the row is still live.
 #[must_use]
 pub fn quieted(current: Option<&Row>, drop: impl Fn(&Claim) -> bool, now: i64) -> Option<Row> {
     let row = current.filter(|row| row.until > now)?;
@@ -596,7 +603,7 @@ pub fn quieted(current: Option<&Row>, drop: impl Fn(&Claim) -> bool, now: i64) -
     } else {
         row.until.min(now.saturating_add(SESSION_FRESH_S))
     };
-    if claims.len() == row.claims.len() && until == row.until {
+    if row.counter > 0 && claims.len() == row.claims.len() && until == row.until {
         return None;
     }
     Some(Row {
@@ -894,7 +901,9 @@ pub trait Table: Send + Sync {
 pub struct Tabled {
     /// This Mac's Commons machine (lowercase hex).
     pub me: String,
-    /// Every row the table holds.
+    /// Every row the table holds. Where this Mac's current seat has written no row yet, its own
+    /// row may be the newest one an earlier writer seat of its Commons home signed, at counter 0
+    /// ([`claimed`]): that seat's claims are this Mac's, and keep their seniority here.
     pub book: Book,
     /// Whether this Mac can write its row, and why not.
     pub writable: Result<(), String>,

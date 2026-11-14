@@ -831,12 +831,23 @@ enum Offer {
 }
 
 impl Offer {
-    fn wires(&self, stores: &dyn Stores) -> io::Result<Vec<Vec<u8>>> {
+    fn send(&self, stores: &dyn Stores, writer: &mut impl Write) -> io::Result<usize> {
         match self {
-            Self::Members(ids) if !ids.is_empty() => stores.members_wires(ids),
-            Self::Proofs(table, keys) if !keys.is_empty() => stores.table_proof_wires(*table, keys),
-            Self::Table(table, ids) if !ids.is_empty() => stores.table_wires(*table, ids),
-            _ => Ok(Vec::new()),
+            Self::Members(ids) => send(
+                writer,
+                ids.chunks(crate::ingest::BATCH)
+                    .map(|ids| stores.members_wires(ids)),
+            ),
+            Self::Proofs(table, keys) => send(
+                writer,
+                keys.chunks(crate::ingest::BATCH)
+                    .map(|keys| stores.table_proof_wires(*table, keys)),
+            ),
+            Self::Table(table, ids) => send(
+                writer,
+                ids.chunks(crate::ingest::BATCH)
+                    .map(|ids| stores.table_wires(*table, ids)),
+            ),
         }
     }
 }
@@ -1064,35 +1075,45 @@ fn exchange_stream(
             }
         };
         if initiator {
-            moved.sent += send(stream, &offer.wires(stores)?)?;
+            moved.sent += offer.send(stores, stream)?;
             moved.add(receive(stores, egress, stream, unit)?);
         } else {
             moved.add(receive(stores, egress, stream, unit)?);
-            moved.sent += send(stream, &offer.wires(stores)?)?;
+            moved.sent += offer.send(stores, stream)?;
         }
     }
     Ok(moved)
 }
 
-/// Send `wires` in batches, then an empty batch: how many went.
-fn send(writer: &mut impl Write, wires: &[Vec<u8>]) -> io::Result<usize> {
-    if wires.is_empty() {
-        writer.write_all(&0u32.to_le_bytes())?;
-        writer.flush()?;
-        return Ok(0);
-    }
-    let cap = wires
-        .iter()
-        .take(crate::ingest::BATCH)
-        .map(|w| 4 + w.len())
-        .sum::<usize>()
-        .saturating_add(8)
-        .min(aterm_net::fleet::link::FRAME_MAX);
-    let mut buf = Vec::with_capacity(cap);
-    for batch in wires.chunks(crate::ingest::BATCH) {
-        if buf.len() + 4 > aterm_net::fleet::link::FRAME_MAX {
-            writer.write_all(&buf)?;
-            buf.clear();
+/// Fetch only the next bounded batch after writing its predecessor. No payload
+/// selection survives a preceding network write; only identities do. An empty
+/// selection within the stream is skipped, and only its end writes the zero batch.
+fn send(
+    writer: &mut impl Write,
+    batches: impl IntoIterator<Item = io::Result<Vec<Vec<u8>>>>,
+) -> io::Result<usize> {
+    let mut buf = Vec::new();
+    let mut sent = 0;
+    for wires in batches {
+        let wires = wires?;
+        if wires.len() > crate::ingest::BATCH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "an outgoing Inventory lookup exceeded its batch bound",
+            ));
+        }
+        if wires.is_empty() {
+            continue;
+        }
+        let batch = &wires;
+        if buf.capacity() == 0 {
+            let cap = batch
+                .iter()
+                .map(|wire| 4 + wire.len())
+                .sum::<usize>()
+                .saturating_add(8)
+                .min(aterm_net::fleet::link::FRAME_MAX);
+            buf.reserve_exact(cap);
         }
         buf.extend_from_slice(&(batch.len() as u32).to_le_bytes());
         for wire in batch {
@@ -1112,15 +1133,14 @@ fn send(writer: &mut impl Write, wires: &[Vec<u8>]) -> io::Result<usize> {
                 writer.write_all(wire)?;
             }
         }
-    }
-    if buf.len() + 4 > aterm_net::fleet::link::FRAME_MAX {
         writer.write_all(&buf)?;
         buf.clear();
+        sent += batch.len();
     }
     buf.extend_from_slice(&0u32.to_le_bytes());
     writer.write_all(&buf)?;
     writer.flush()?;
-    Ok(wires.len())
+    Ok(sent)
 }
 
 /// Receive `unit`'s batches into the stores: what they applied, and what waits or found them

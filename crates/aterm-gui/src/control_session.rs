@@ -4526,7 +4526,7 @@ fn claim_reply(
                 crate::self_claim::claimed(
                     ctx,
                     &proven,
-                    claimed.revision,
+                    claimed.placement,
                     claimed.changed,
                     claimed.replaced.as_deref(),
                 );
@@ -5010,7 +5010,7 @@ fn land_held_of<'a>(
     (since && nudges && read == legs && (read || !rest.contains(&true))).then_some(held)
 }
 
-/// `meta set harness_land since=<ms> nudges=<n> [read=1 legs=… [open=…] [changed=… untracked=… stashes=… unpushed=… unlanded=…] [left=…]]` / `meta unset harness_land` — an agent that supervises itself tells WHY ITS OWN LAND STILL HOLDS, as aterm's loop tells its own ([`aterm_agent::harness::acts::LandHeld`], read by [`land_held_of`]), or that no landing holds, so `status land_held= land_nudges= land_since=`, the menu bar's `landing` and every hold line say its hold as they say aterm's own. THE HOLD IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_land`]), NEVER on aterm's own glass (which stays cleared beside a proven self-claim), and gone wherever that stop goes; shown while the claim stands ([`crate::App::shown_hold`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
+/// `meta set harness_land since=<ms> nudges=<n> [read=1 legs=… [open=…] [changed=… untracked=… stashes=… unpushed=… unlanded=…] [left=…]]` / `meta unset harness_land` — an agent that supervises itself tells WHY ITS OWN LAND STILL HOLDS, as aterm's loop tells its own ([`aterm_agent::harness::acts::LandHeld`], read by [`land_held_of`]), or that no landing holds, so `status land_held= land_nudges= land_since=` and every hold line say its hold as they say aterm's own. THE HOLD IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_land`]), NEVER on aterm's own glass (which stays cleared beside a proven self-claim), and gone wherever that stop goes; shown while the claim stands ([`crate::App::shown_hold`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
 pub(crate) fn cmd_meta_harness_land(
     ctx: &SessionCtx,
     conn: Option<u64>,
@@ -5103,7 +5103,7 @@ fn pct_strict(value: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// `meta set harness_needs entry=<pct text> need=<pct need> [need=<pct need> …]` / `meta unset harness_needs` — an agent that supervises itself tells EVERY NEED ITS `owner=needs` ENTRY STANDS FOR, whole and in its order ([`harness_needs_of`]), or that the entry went, so the menu bar's rows one level in, the hover's lines and `status needs_told=` say its set as they say aterm's own loop's, where its entry alone gives the first need and a count. THE SET IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): told as aterm's own loop's is (`HarnessNeeds::told` then `ToldNeeds::tell` beside the session's `owner=needs` entry as stored now, [`crate::session_timeline::SessionMeta::tell_self_needs`]), so a set told before its entry stands waits for it and one told for another entry's text is never read; kept with that claim's proof, NEVER in the timeline's set (aterm's own loop's), and gone wherever that stop goes; read while the claim stands ([`crate::needs::told_of`]). `OK` whether or not it moved; only a move of what a reader reads beside the standing entry is a change, which wakes the window.
+/// `meta set harness_needs entry=<pct text> need=<pct need> [need=<pct need> …]` / `meta unset harness_needs` — an agent that supervises itself tells EVERY NEED ITS `owner=needs` ENTRY STANDS FOR, whole and in its order ([`harness_needs_of`]), or that the entry went, so the hover's lines and `status needs_told=` say its set as they say aterm's own loop's, where its entry alone gives the first need and a count. THE SET IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): told as aterm's own loop's is (`HarnessNeeds::told` then `ToldNeeds::tell` beside the session's `owner=needs` entry as stored now, [`crate::session_timeline::SessionMeta::tell_self_needs`]), so a set told before its entry stands waits for it and one told for another entry's text is never read; kept with that claim's proof, NEVER in the timeline's set (aterm's own loop's), and gone wherever that stop goes; read while the claim stands ([`crate::needs::told_of`]). `OK` whether or not it moved; only a move of what a reader reads beside the standing entry is a change, which wakes the window.
 pub(crate) fn cmd_meta_harness_needs(
     ctx: &SessionCtx,
     conn: Option<u64>,
@@ -6407,10 +6407,10 @@ fn needs_generation_after(seen: u64, within: std::time::Duration) -> u64 {
 
 /// This window's needs row at `now_unix_ms` (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.14),
 /// read from each session in `store` that has not exited and whose sid is minted, as the survey
-/// reads it (`survey::session_row`) and the Fleet menu reads a peer's survey (`fleet_glance`):
+/// reads it (`survey::session_row`) and the fleet glance reads a peer's survey (`fleet_glance`):
 /// a need where its published verdict names one, `harness` where that need is a harness's own
 /// ask and not the program's report, its manager the sid its task came from, and its since the
-/// survey age the Fleet menu ages it by (`task_ms` for `stalled`, none for `ask` or for
+/// survey age the fleet glance ages it by (`task_ms` for `stalled`, none for `ask` or for
 /// `frozen` and `stopped` on a non-agent, else `agent_ms`) taken from now; a hold where one
 /// stands, by the Mac that holds it where that is a node id; and each manager with how many of
 /// these sessions' tasks came from it. Ids, words and times only, each list sorted by sid.

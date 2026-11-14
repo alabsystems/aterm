@@ -6,7 +6,7 @@
 use super::*;
 use aterm_agent::harness::{
     account_work, cli::Env, codex_enrollment::SourceProofLaunch, codex_session_slot::Caller,
-    codex_source_registry::Registry, native_act::Process,
+    native_act::Process,
 };
 use aterm_window::platform::pump_events::EventLoopExtPumpEvents;
 use std::os::fd::AsFd;
@@ -121,7 +121,10 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
     let scope = lifetime
         .enter()
         .ok_or("source fixture App admission closed")?;
-    let registry = Arc::new(Registry::for_app(&lifetime));
+    // The app's own constructor, as the native host fixture's: its registry is bound to the
+    // fixture's lifetime and is the one its dispatches lend.
+    let account_services = AccountServices::for_app(lifetime.clone());
+    let registry = Arc::clone(&account_services.source_registry);
     let mut builder = crate::quiet_driver_event_loop_builder::<Wake>();
     builder.with_headless();
     let mut event_loop = builder
@@ -225,10 +228,7 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
         }))),
         store,
         proxy: event_loop.create_proxy(),
-        account_services: AccountServices {
-            source_registry: Arc::clone(&registry),
-            lifetime: lifetime.clone(),
-        },
+        account_services,
         token: Arc::new(token),
         sock_dir: root.clone(),
         recovery_count_admission: Arc::new(

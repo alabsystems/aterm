@@ -3812,8 +3812,7 @@ impl App {
                 let _ = self.focus_session_preferring(Some(wid), manager);
             }
             Some(TeamAct::Overview) => {
-                let at = crate::app_overview::OverviewAt::Manager(session);
-                if let Err(e) = self.open_overview_raised(wid, at) {
+                if let Err(e) = self.open_overview_raised(wid, session) {
                     aterm_log::info!("team chip {session}: {e}");
                 }
             }

@@ -1558,6 +1558,14 @@ impl Laid {
                 .is_some_and(|c| c.pending.is_none() && c.journal.bound(&cohort.record()))
     }
 
+    pub(crate) fn original_root_bound(&self, cohort: &Cohort) -> bool {
+        self.check_custody().is_ok()
+            && self.granted.is_some()
+            && self.custody.as_ref().is_some_and(|custody| {
+                custody.pending.is_none() && custody.journal.root_bound(&cohort.record())
+            })
+    }
+
     pub(crate) fn is_cohort(&self) -> bool {
         self.custody.is_some()
     }

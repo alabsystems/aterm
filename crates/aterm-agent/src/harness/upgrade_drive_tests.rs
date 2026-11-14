@@ -401,6 +401,69 @@ fn a_screen_reply_carries_the_title_read_with_its_rows_or_none() {
     );
 }
 
+/// CLAUDE CODE UNDER claude-code-alab (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D53): on a
+/// tab whose `status` shows its proven contract 3 claim, the built-in Claude Code lane decides
+/// nothing: [`step`] answers [`SKIP_SELF_CLAIMED`] and [`due`] `No` on its `status`, under
+/// `scope=upgrade` (the claim its launch makes) and `relaunch,upgrade` alike, and asks the
+/// instance for nothing but that `status` and the roster. CONTROL: the same tab with the claim
+/// unproven is the lane's again, which goes on to judge the roster.
+#[test]
+#[cfg(unix)]
+fn a_proven_claude_code_alab_claim_stands_the_built_in_claude_upgrade_lane_down() {
+    const TAB: &str = "s-cca";
+    for scope in ["upgrade", "relaunch,upgrade"] {
+        for proven in [true, false] {
+            let dir = scratch("claude-code-alab-claim");
+            let mut opts = drive(&dir);
+            let status = format!(
+                "OK schema=1 sid=0 program=claude-alab supervisor=claude-code-alab%404242 \
+                 supervisor_proven={} supervisor_version=0.1.0 supervisor_vendor=2.1.310 \
+                 supervisor_contract=3 supervisor_scope={scope} supervisor_revision=3 \
+                 autopilot=cruise",
+                u8::from(proven)
+            );
+            let (socket, requests) = crate::harness::fake_instance(
+                &dir.join("claimed.sock"),
+                "claimed-tab",
+                move |line| {
+                    if line == "version" {
+                        "OK fixture".into()
+                    } else if line == format!("@{TAB} status") {
+                        status.clone()
+                    } else if line == "who" {
+                        "OK 0".into()
+                    } else {
+                        "ERR unexpected".into()
+                    }
+                },
+            );
+            opts.sock = Some(socket);
+            opts.token = Some(HarnessToken::new("claimed-tab"));
+            opts.only_sid = Some(TAB.to_string());
+            let report = step(&opts);
+            if proven {
+                assert_eq!(report.step, SKIP_SELF_CLAIMED, "{scope}");
+                assert_eq!(report.tab, TAB);
+                assert!(!report.is_act(), "{scope}: {report:?}");
+                assert_eq!(due(&opts), Due::No, "{scope}");
+            } else {
+                assert_eq!(
+                    report.step, "wait:tab-not-live",
+                    "{scope}: an unproven holder's tab is the lane's to judge by the roster"
+                );
+            }
+            let asked = requests.lock().unwrap().clone();
+            assert!(
+                asked
+                    .iter()
+                    .all(|line| line == "version" || line == "who" || line.ends_with(" status")),
+                "{scope}: {asked:?}"
+            );
+            assert!(asked.iter().any(|line| line.ends_with(" status")));
+        }
+    }
+}
+
 /// A proven self-claim (`supervisor_proven=1`) is its agent's session: no upgrade decision of
 /// aterm's ([`due`], [`step`]).
 #[test]

@@ -118,6 +118,38 @@ fn lane_record_with(
     }
 }
 
+/// Whether the identity this Mac's agh routes a write of `slug` to may push to it, by one read
+/// of the repository's permissions as that identity (what `agh can <slug> push` asks):
+/// `Ok(Ok(()))` when it may; `Ok(Err(why))` when no writer is routed, GitHub refuses it or it
+/// holds no push; `Err(why)` when GitHub could not be asked. Nothing is written.
+pub(crate) fn push_right(slug: &str) -> Result<Result<(), String>, String> {
+    use agh::error::Kind;
+    let dirs = agh::config::Dirs::from_env()
+        .ok_or("agh configuration and state directories are unavailable")?;
+    let client = configured(&dirs)?;
+    let slug = Slug::parse(slug).map_err(|error| error.why.clone())?;
+    match client
+        .repos()
+        .permissions(&slug, agh::policy::Access::WriterRead)
+    {
+        Ok((_, permissions)) if permissions.push => Ok(Ok(())),
+        Ok(_) => Ok(Err(format!(
+            "its token reads {slug} and holds no push on it"
+        ))),
+        Err(error) => {
+            let why = client.redactor().apply(&error.why);
+            match error.kind {
+                Kind::Refused
+                | Kind::Unauthenticated
+                | Kind::Forbidden
+                | Kind::NotFound
+                | Kind::NotVisible => Ok(Err(why)),
+                _ => Err(why),
+            }
+        }
+    }
+}
+
 pub(crate) fn origin_slug(repo: &Path) -> Result<Slug, String> {
     let mut command = crate::ledger::object_git(repo).map_err(|error| error.to_string())?;
     command.args(["remote", "get-url", "origin"]);
@@ -242,7 +274,11 @@ impl Remote {
         ))
     }
 
-    fn import_snapshot(&self, objects: impl IntoIterator<Item = String>) -> Result<(), String> {
+    /// Import the exact immutable objects from one admitted advertisement in a single batch.
+    pub(crate) fn import_snapshot(
+        &self,
+        objects: impl IntoIterator<Item = String>,
+    ) -> Result<(), String> {
         self.ensure_origin()?;
         let objects = objects.into_iter().collect::<BTreeSet<_>>();
         if !objects.is_empty() {

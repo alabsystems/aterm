@@ -951,6 +951,7 @@ enum ShapedHit<'a> {
 struct ShapedRunCache {
     cur: FxHashMap<StyleBits, KeyedHashMap<Box<str>, ShapedRunGlyphs>>,
     prev: FxHashMap<StyleBits, KeyedHashMap<Box<str>, ShapedRunGlyphs>>,
+    plans: [ligature_shaping::ShapePlanMemo; 5],
 }
 
 impl ShapedRunCache {
@@ -985,7 +986,63 @@ impl ShapedRunCache {
     fn clear(&mut self) {
         self.cur.clear();
         self.prev.clear();
+        for plan_memo in &mut self.plans {
+            plan_memo.clear();
+        }
     }
+}
+
+#[derive(Default)]
+struct ChainMissMemo {
+    sig: u64,
+    chars: FxHashSet<char>,
+}
+
+impl ChainMissMemo {
+    #[inline]
+    fn sync(&mut self, sig: u64) {
+        if self.sig != sig {
+            self.chars.clear();
+            self.sig = sig;
+        }
+    }
+}
+
+#[derive(Default)]
+struct ChainPickMemo {
+    sig: u64,
+    entries: FxHashMap<char, Option<usize>>,
+}
+
+impl ChainPickMemo {
+    #[inline]
+    fn sync(&mut self, sig: u64) {
+        if self.sig != sig {
+            self.entries.clear();
+            self.sig = sig;
+        }
+    }
+}
+
+fn chain_memo_sig(chain: &[FallbackFace], runtime_discovery: bool) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    runtime_discovery.hash(&mut h);
+    chain.len().hash(&mut h);
+    for face in chain {
+        (face.bytes.as_ptr() as usize).hash(&mut h);
+        face.index.hash(&mut h);
+        face.scope.is_some().hash(&mut h);
+        face.path
+            .as_deref()
+            .map(|s| (s.as_ptr() as usize, s.len()))
+            .hash(&mut h);
+        face.relocated_from
+            .as_deref()
+            .map(|s| (s.as_ptr() as usize, s.len()))
+            .hash(&mut h);
+    }
+    h.finish()
 }
 
 #[derive(Default)]
@@ -1415,16 +1472,18 @@ pub struct Renderer {
     shaping: aterm_types::text_shaping::TextShapingConfig,
     resolved_features: Vec<aterm_types::text_shaping::FontFeature>,
     engine_features: Vec<aterm_font::shape::Feature>,
-    shaped_runs: ShapedRunCache,
+    shaped_runs: Box<ShapedRunCache>,
     fallback_chain: Vec<FallbackFace>,
     display_layer: Vec<DisplayLayerFace>,
     fallback_pick: FxHashMap<char, usize>,
+    fallback_miss: ChainMissMemo,
     fallback_paths: Vec<String>,
     fallback_user_prefix: usize,
     cfg_fallback_fonts: Vec<String>,
     cfg_symbol_font: Option<String>,
     cfg_emoji_font: Option<String>,
     symbol_chain: Vec<FallbackFace>,
+    symbol_pick: ChainPickMemo,
     symbol_fallback_paths: Vec<String>,
     symbol_user_prefix: usize,
     fallback_parse_rx: Option<FallbackParseRx>,
@@ -1465,6 +1524,7 @@ pub struct Renderer {
     bg_fills_emitted: std::cell::Cell<u32>,
     shape_run_scratch: String,
     shape_chars_scratch: Vec<char>,
+    shape_map_scratch: ligature_shaping::MapScratch,
     shaping_buffer: aterm_font::shape::UnicodeBuffer,
     deco_scratch: Vec<[usize; 4]>,
     deco_skip_rect_scratch: Vec<[usize; 4]>,
@@ -6829,16 +6889,18 @@ impl Renderer {
             engine_features: ligature_shaping::engine_features(
                 &ligature_shaping::build_feature_list(&[], true),
             ),
-            shaped_runs: ShapedRunCache::default(),
+            shaped_runs: Box::default(),
             fallback_chain: Vec::new(),
             display_layer: Vec::new(),
             fallback_pick: FxHashMap::default(),
+            fallback_miss: ChainMissMemo::default(),
             fallback_paths: Vec::new(),
             fallback_user_prefix: 0,
             cfg_fallback_fonts: Vec::new(),
             cfg_symbol_font: None,
             cfg_emoji_font: None,
             symbol_chain: Vec::new(),
+            symbol_pick: ChainPickMemo::default(),
             symbol_fallback_paths: Vec::new(),
             symbol_user_prefix: 0,
             fallback_parse_rx: None,
@@ -6877,6 +6939,7 @@ impl Renderer {
             bg_fills_emitted: std::cell::Cell::new(0),
             shape_run_scratch: String::new(),
             shape_chars_scratch: Vec::new(),
+            shape_map_scratch: ligature_shaping::MapScratch::default(),
             shaping_buffer: aterm_font::shape::UnicodeBuffer::new(),
             deco_scratch: Vec::new(),
             deco_skip_rect_scratch: Vec::new(),
@@ -7773,6 +7836,11 @@ impl Renderer {
         if self.fallback_pick.contains_key(&ch) {
             return true;
         }
+        let sig = chain_memo_sig(&self.fallback_chain, self.runtime_discovery);
+        self.fallback_miss.sync(sig);
+        if self.fallback_miss.chars.contains(&ch) {
+            return false;
+        }
         let incidental = aterm_grapheme::is_emoji_presentation(ch)
             || font_chain::is_private_use(ch)
             || bundled::is_yijing_line_symbol(ch);
@@ -7795,6 +7863,9 @@ impl Renderer {
                 self.fallback_pick.insert(ch, i);
                 return true;
             }
+        }
+        if self.fallback_parse_rx.is_none() {
+            self.fallback_miss.chars.insert(ch);
         }
         false
     }
@@ -7829,11 +7900,16 @@ impl Renderer {
 
     fn symbol_chain_pick(&mut self, ch: char) -> Option<usize> {
         self.ensure_symbol_fallback();
+        let sig = chain_memo_sig(&self.symbol_chain, self.runtime_discovery);
+        self.symbol_pick.sync(sig);
+        if let Some(&cached) = self.symbol_pick.entries.get(&ch) {
+            return cached;
+        }
         let incidental =
             aterm_grapheme::is_emoji_presentation(ch) || font_chain::is_private_use(ch);
         let nerd_owned = bundled::ACTIVE && !incidental && embedded_symbols_own_text_point(ch);
         let yield_private_use = self.foreign_private_use_yields(ch);
-        self.symbol_chain.iter().position(|face| {
+        let pick = self.symbol_chain.iter().position(|face| {
             if incidental && symbol_face_is_text_only_backstop(face) {
                 return false;
             }
@@ -7847,7 +7923,11 @@ impl Renderer {
                 .ok()
                 .and_then(|parsed| parsed.glyph_index(ch))
                 .is_some_and(|g| g.0 != 0)
-        })
+        });
+        if pick.is_some() || self.symbol_parse_rx.is_none() {
+            self.symbol_pick.entries.insert(ch, pick);
+        }
+        pick
     }
 
     fn foreign_private_use_yields(&self, ch: char) -> bool {
@@ -8610,6 +8690,7 @@ impl Renderer {
         };
         self.fallback_chain.remove(i);
         self.fallback_pick.clear();
+        self.fallback_miss.chars.clear();
         self.keys.clear();
         self.clear_glyph_images();
         self.clear_face_address_caches();
@@ -8622,6 +8703,7 @@ impl Renderer {
             return false;
         };
         self.symbol_chain.remove(i);
+        self.symbol_pick.entries.clear();
         self.keys.clear();
         self.clear_glyph_images();
         self.clear_face_address_caches();
@@ -10873,6 +10955,7 @@ impl Renderer {
         let cache = &mut self.shaped_runs;
         let features = &self.engine_features;
         let shaping_buffer = &mut self.shaping_buffer;
+        let shape_map_scratch = &mut self.shape_map_scratch;
         let admit_collapsed = self.shaping.admit_collapsed;
         ligature_shaping::plan_row_runs(
             cells,
@@ -10911,8 +10994,16 @@ impl Renderer {
                             ))
                         })
                     });
-                    face.as_mut()
-                        .and_then(|f| f.shape(run, run_chars, admit_collapsed, shaping_buffer))
+                    face.as_ref().and_then(|f| {
+                        f.shape_cached(
+                            run,
+                            run_chars,
+                            admit_collapsed,
+                            shaping_buffer,
+                            &mut cache.plans[0],
+                            shape_map_scratch,
+                        )
+                    })
                 } else {
                     // Preserve each sibling's collection index, and shape at
                     // the face's own instance (`styled_vars`).
@@ -10933,8 +11024,16 @@ impl Renderer {
                             ))
                         })
                     });
-                    face.as_mut()
-                        .and_then(|f| f.shape(run, run_chars, admit_collapsed, shaping_buffer))
+                    face.as_ref().and_then(|f| {
+                        f.shape_cached(
+                            run,
+                            run_chars,
+                            admit_collapsed,
+                            shaping_buffer,
+                            &mut cache.plans[slot + 1],
+                            shape_map_scratch,
+                        )
+                    })
                 };
                 let res = res.map(std::sync::Arc::new);
                 cache.insert(style, Box::<str>::from(run), res.clone());
@@ -12012,6 +12111,12 @@ impl Renderer {
         if self.fallback_pick.len() > CHAR_MEMO_CAP {
             self.fallback_pick.clear();
         }
+        if self.fallback_miss.chars.len() > CHAR_MEMO_CAP {
+            self.fallback_miss.chars.clear();
+        }
+        if self.symbol_pick.entries.len() > CHAR_MEMO_CAP {
+            self.symbol_pick.entries.clear();
+        }
         if self.shaped_runs.cur_len() > SHAPED_RUN_CAP {
             self.shaped_runs.rotate();
         }
@@ -12363,7 +12468,9 @@ impl Renderer {
             FxBlend::Linear,
             Some(&dirty),
         );
-        self.draw_cursor(&mut cache.pixels, w, h, input);
+        if dirty.get(input.cursor_row).copied().unwrap_or(false) {
+            self.draw_cursor(&mut cache.pixels, w, h, input);
+        }
 
         clone_damage_cache_from_stamped(&mut cache.input, input);
         cache.cursor_blink_phase = self.cursor_blink_phase;
@@ -12764,6 +12871,22 @@ impl Renderer {
             {
                 dirty[r - 1] = true;
             }
+        }
+        let cur_style = effective_cursor_style(cur, self.cursor_style_override);
+        if cur.cursor_row > 0
+            && cur.cursor_row < rows
+            && cur.cursor_col < cur.cols
+            && cur.cursor_visible
+            && cursor_shown(cur_style, self.cursor_blink_phase)
+            && matches!(
+                cur_style,
+                CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock
+            )
+            && dirty[cur.cursor_row - 1]
+            && !dirty[cur.cursor_row]
+            && self.row_may_ink_above(cur, cur.cursor_row)
+        {
+            dirty[cur.cursor_row] = true;
         }
         self.knock_cut.spans = bodies;
     }
@@ -16613,14 +16736,9 @@ pub fn chrome_ring_runs(
     if m.rings.is_empty() || cell_w == 0 || cell_h < 4 {
         return out;
     }
+    #[inline]
     fn enc(l: f32) -> u32 {
-        let l = l.clamp(0.0, 1.0);
-        let c = if l <= 0.003_130_8 {
-            12.92 * l
-        } else {
-            1.055f32.mul_add(l.powf(1.0 / 2.4), -0.055)
-        };
-        (c * 255.0).round().clamp(0.0, 255.0) as u32
+        crate::capture_pixels::srgb8_from_linear(l)
     }
     let split = |c: u32| {
         [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff].map(|v| SRGB_TO_LINEAR_LUT[v as usize])
@@ -17101,16 +17219,17 @@ pub fn compute_dirty_rows(
                 || prev_style != cur_style
                 || prev_input.cursor_color != input.cursor_color
                 || prev_input.cursor_fill_override != input.cursor_fill_override));
-    if prev_shown {
-        mark(dirty, prev_input.cursor_row);
-    }
-    if cur_shown {
-        mark(dirty, input.cursor_row);
-    }
-
     let blink_or_override_changed = prev_blink_phase != cur_blink_phase
         || prev_cursor_style_override != cur_cursor_style_override
         || prev_input.cursor_effect_style_override != input.cursor_effect_style_override;
+    if cursor_changed || blink_or_override_changed {
+        if prev_shown {
+            mark(dirty, prev_input.cursor_row);
+        }
+        if cur_shown {
+            mark(dirty, input.cursor_row);
+        }
+    }
 
     let trail_changed = prev_input.cursor_trail != input.cursor_trail
         || (prev_input.cursor_trail_color != input.cursor_trail_color

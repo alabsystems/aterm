@@ -589,7 +589,7 @@ impl MessageView {
             "recorded" => self.record_words(),
             "evicted" => "dropped \u{2014} too many at once".to_string(),
             "carried" => "carried over to the updated aterm".to_string(),
-            "review" => "here and in the menu bar".to_string(),
+            "review" => "here".to_string(),
             other => after(other),
         }
     }

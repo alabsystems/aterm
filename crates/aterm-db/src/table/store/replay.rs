@@ -8,7 +8,10 @@ use super::group::Boundary;
 use super::{CONFLICT_SUBJECT, Receipt, SUBJECT, Stored, Witness};
 use crate::{
     Error, Result,
-    table::{Envelope, ReadBatch, signatures::Identified},
+    table::{
+        Envelope, ReadBatch,
+        signatures::{Facts, Identified},
+    },
 };
 use astream_wire::Offset;
 use aterm_journal::Log;
@@ -89,6 +92,14 @@ impl Linked {
 /// leaves the wire, identified once; the chain `before` it advances through it, which refuses a
 /// record out of order.
 fn identify(record: astream_broker::BrokerRecord, before: Witness) -> Result<Linked> {
+    identify_with(record, before, None)
+}
+
+fn identify_with(
+    record: astream_broker::BrokerRecord,
+    before: Witness,
+    facts: Option<&Facts>,
+) -> Result<Linked> {
     if !matches!(record.subject.as_str(), SUBJECT | CONFLICT_SUBJECT) || record.body.len() < 8 {
         return Err(Error::new("foreign table journal record"));
     }
@@ -96,7 +107,10 @@ fn identify(record: astream_broker::BrokerRecord, before: Witness) -> Result<Lin
     let conflict = record.subject == CONFLICT_SUBJECT;
     let mut wire = record.body;
     wire.drain(..8);
-    let wire = Identified::new(wire);
+    let wire = match facts {
+        Some(facts) => Identified::new_with(wire, Some(facts)),
+        None => Identified::new(wire),
+    };
     let through = before.advance(record.seq.0, wire.id(), received_ms)?;
     Ok(Linked {
         wire,
@@ -112,11 +126,20 @@ pub(super) fn identify_onto(
     links: &mut Vec<Linked>,
     records: Vec<astream_broker::BrokerRecord>,
 ) -> Result<()> {
+    identify_onto_with(links, records, None)
+}
+
+/// Identify freshly read bytes before attaching any retained cryptographic facts.
+pub(super) fn identify_onto_with(
+    links: &mut Vec<Linked>,
+    records: Vec<astream_broker::BrokerRecord>,
+    facts: Option<&Facts>,
+) -> Result<()> {
     for record in records {
         let before = links
             .last()
             .map_or_else(Witness::default, |link| link.through);
-        links.push(identify(record, before)?);
+        links.push(identify_with(record, before, facts)?);
     }
     Ok(())
 }
@@ -188,10 +211,10 @@ impl Claim {
 /// An observer exposes only independently witnessed receipts. A sealed append
 /// awaiting its custody witness is left to the exclusive writer's recovery path.
 /// `links` are a journal's identified records ([`identify_onto`]) and `refused` the refusal
-/// that stopped their identification, if any: each link is admitted against `acknowledged` in
-/// order, then the refusal stands, then the chain must have reached the claim, so the answer is
-/// a replay's that pushed each record in turn, its first refusal included. The replay holds the
-/// first `acknowledged.count` records under `acknowledged`.
+/// that stopped their identification, if any. Checking the contiguous chain's acknowledged
+/// prefix and final endpoint answers as admitting every link in order, then the identification
+/// refusal, then requiring the chain to have reached the claim. It preserves a replay's first
+/// refusal while holding only the first `acknowledged.count` records under `acknowledged`.
 /// Links a reader keeps are copied into the replay; links nothing else holds are moved.
 pub(super) fn witnessed(
     links: Cow<'_, [Linked]>,
@@ -233,8 +256,21 @@ pub(super) fn repair_ids(
 
 fn witnessed_count(links: &[Linked], refused: Option<Error>, boundary: Boundary) -> Result<usize> {
     let mut claim = Claim::new(boundary);
-    for link in links {
+    // identify_onto already established the contiguous custody chain. Only its
+    // acknowledged endpoint can disagree with the claim's hash; only its last
+    // endpoint can exceed the allowed tail. Check the prefix first, preserving
+    // its refusal ahead of a later tail or identification failure.
+    if let Some(link) = boundary
+        .acknowledged()
+        .count
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| links.get(index))
+    {
         claim.admit(link.through)?;
+    }
+    if let Some(last) = links.last() {
+        claim.admit(last.through)?;
     }
     if let Some(refused) = refused {
         return Err(refused);

@@ -1209,6 +1209,8 @@ fn the_left_door_reads_only_a_fresh_view() {
             }),
             unix_ms: 0,
             at: std::time::Instant::now(),
+            jobs_at: None,
+            left_at: None,
         })
     };
     let gone = |_: u32| Reread::Read(None);

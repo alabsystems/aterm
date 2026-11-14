@@ -84,7 +84,17 @@ fn each_historical_closure_law_has_a_falsifying_control() {
         "AnswerLapsed",
         "Fresh",
     ];
+    let closed_early: &[&str] = &[
+        "Record",
+        "May",
+        "Deliver",
+        "Expire",
+        "ReadClock",
+        "ReadJournal",
+        "AnswerClosed",
+    ];
     for (bug, law, path) in [
+        (10, "ClosedOnlyPastClose", closed_early),
         (1, "LapsedNeverGranted", read_first),
         (1, "NoDoubleExec", read_first),
         (2, "LapsedNeverGranted", may_answered),

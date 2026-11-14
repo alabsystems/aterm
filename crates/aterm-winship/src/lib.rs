@@ -4,7 +4,9 @@
 //! `aterm-winship` — the Windows owner loop, as code: smoke a packaged build
 //! headless in an isolated environment (`smoke`), build, stage and install
 //! origin/main without stopping a running window (`update`), run that daily
-//! (`schedule`), and say what is installed and staged (`status`).
+//! (`schedule`), say what is installed and staged (`status`), and build a
+//! claimed release commit's Windows zip and the receipt the release cutter
+//! admits (`release-build`, `handoff`).
 //!
 //! A dev tool: nothing here is linked into the shipped `aterm`. It runs the
 //! dist's own images and the tree's own `apps\aterm-win\build.ps1` and
@@ -18,9 +20,11 @@
 //! decided when it runs (`repo`).
 
 pub mod env;
+pub mod handoff;
 pub mod plan;
 pub mod pointer;
 pub mod proc;
+pub mod release;
 pub mod repo;
 pub mod schedule;
 pub mod smoke;
@@ -49,6 +53,8 @@ USAGE:
     aterm-winship update [--repo <dir>] [--no-install] [--restart] [--force] [--log]
     aterm-winship schedule [--daily HH:MM] [--repo <dir>] [--remove] [--dry-run]
     aterm-winship status [--repo <dir>]
+    aterm-winship release-build --version <v> --build-number <n> --commit <sha> --out <dir>
+                                [--repo <dir>]
 
 smoke     Start <dist>\\aterm-gui.exe --headless in an isolated environment
           (a scratch root; TMP, TEMP, LOCALAPPDATA, APPDATA and USERPROFILE
@@ -81,6 +87,23 @@ schedule  Register the per-user Scheduled Task aterm-winship-update that runs
           schtasks line and the task's XML and changes nothing.
 status    The installed build, the staged pointer, the repository, origin/main
           and the build tree. Reads only.
+release-build
+          Build the release cut's Windows zip, aterm-<v>-windows-x86_64.zip,
+          and its receipt <zip>.handoff.toml into --out (absent or empty), for
+          `targo --unverified ship cut --windows-artifacts <dir>` on the Mac.
+          The checkout (--repo, else the working directory) must be the clean
+          commit. It runs the checkout's apps\\aterm-win\\build.ps1 -Zip with
+          the release identity pinned (ATERM_STAMP=commit, the build number as
+          SOURCE_DATE_EPOCH, the commit, ATERM_RELEASE_BUILD=1) and the lane
+          named: the Trust build the commit's trust.lock pins when the targo
+          on PATH is it, else the stock release its stock_pin.rs pins, given
+          to build.ps1 by path; cargo configuration the commit does not hold
+          refuses the build. It checks BUILD.json, that the checkout is still
+          the clean commit and the compiler unchanged, and admits the pair as
+          the cutter will. Its last line prints the zip's SHA-256, which the
+          Mac's `ship release --windows-sha256` must name: the carry is not
+          trusted. Exit 0 made, 1 the build or a check failed, 3 nothing was
+          built.
 
 The repository is --repo <dir>; else the one recorded in
 %LOCALAPPDATA%\\aterm\\build\\repo.txt (written when the build tree is made and
@@ -118,6 +141,8 @@ pub enum Verb {
         /// The repository whose origin/main is read; decided at run time when `None`.
         repo: Option<PathBuf>,
     },
+    /// `release-build`.
+    ReleaseBuild(release::Options),
 }
 
 type Words<'a> = std::slice::Iter<'a, String>;
@@ -213,6 +238,35 @@ pub fn parse(args: &[String]) -> Result<Verb, String> {
                 }
             }
             Ok(Verb::Status { repo })
+        }
+        "release-build" => {
+            let (mut version, mut build, mut commit, mut out, mut repo) =
+                (None, None, None, None, None);
+            while let Some(word) = words.next() {
+                match word.as_str() {
+                    "--version" => version = Some(value(word, &mut words)?),
+                    "--build-number" => {
+                        let text = value(word, &mut words)?;
+                        build = Some(text.parse::<u64>().map_err(|_| {
+                            format!("{verb}: --build-number {text:?} is not a number")
+                        })?);
+                    }
+                    "--commit" => commit = Some(value(word, &mut words)?),
+                    "--out" => out = Some(PathBuf::from(value(word, &mut words)?)),
+                    "--repo" => repo = Some(PathBuf::from(value(word, &mut words)?)),
+                    other => return Err(unknown(other)),
+                }
+            }
+            let need = |flag: &str| format!("{verb}: {flag} is required (aterm-winship help)");
+            let opts = release::Options {
+                version: version.ok_or_else(|| need("--version"))?,
+                build: build.ok_or_else(|| need("--build-number"))?,
+                commit: commit.ok_or_else(|| need("--commit"))?,
+                out: out.ok_or_else(|| need("--out"))?,
+                repo,
+            };
+            opts.check()?;
+            Ok(Verb::ReleaseBuild(opts))
         }
         other => Err(format!("unknown verb '{other}' (aterm-winship help)")),
     }
@@ -404,6 +458,28 @@ pub fn run(args: &[String]) -> i32 {
         }
         return outcome.code();
     }
+    if let Verb::ReleaseBuild(opts) = &verb {
+        return match release::release_build(opts, &env) {
+            Ok(made) => {
+                println!(
+                    "release-build: wrote {} ({} bytes, sha256 {}) and {}, built in the {} lane; \
+                     carry the folder to the Mac's --windows-artifacts directory, and give \
+                     `ship release` --windows-sha256 {} as read here, not off the carried files",
+                    made.zip.display(),
+                    made.admitted.size,
+                    made.admitted.sha256,
+                    made.receipt.display(),
+                    made.admitted.lane,
+                    made.admitted.sha256
+                );
+                PASS
+            }
+            Err((code, why)) => {
+                eprintln!("aterm-winship: {why}");
+                code
+            }
+        };
+    }
     let layout = match Layout::from_env(&env) {
         Ok(layout) => layout,
         Err(e) => {
@@ -442,7 +518,7 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
         Verb::Status { repo } => update::status(repo.as_deref(), &layout, &mut Out::terminal()),
-        Verb::Help | Verb::Smoke(_) => PASS,
+        Verb::Help | Verb::Smoke(_) | Verb::ReleaseBuild(_) => PASS,
     }
 }
 

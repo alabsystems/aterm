@@ -12,3 +12,8 @@ canonical owned-child implementation with its 60-second hang detector. All
 production entry points retain their canonical behavior and target guards.
 Trait imports needed by the local std facade are retained. Native connected-peer
 and held output-directory accessors observe retained originals; they confer no grant.
+
+The native signing module is imported from Trust `f11e1d3defbfce3c0accc50f1b4167e1123c61dd`.
+It captures actual socket credentials and checks caller-selected requirements;
+it provides no independent approved Host/cohort or installation policy.
+Keeper owns asynchronous completion and its original trustd deadlines.

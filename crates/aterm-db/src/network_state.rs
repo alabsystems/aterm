@@ -909,10 +909,23 @@ impl Observer {
         }
     }
 
+    /// Confirm this Mac's own Commons `identity` and `trust` context as the history's observer.
+    /// A history retained under another trust context is refused, and so is one another machine
+    /// observed, unless that machine is one of `succeeded`'s: the Commons machines of the writer
+    /// generations this home succeeds on this disk, as its authenticated lineage proves them
+    /// (`runtime::succeeded_machines`), asked only when the retained observer is another machine.
+    /// Such a history is this Mac's own from before its writer succession, and this observer
+    /// takes it up ([`Self::take_up`]); a refused one stays refused, its contacts ignored and its
+    /// history unavailable, until a later confirmation proves it (the serving session tries
+    /// again, `runtime::Confirmation`).
+    ///
+    /// # Errors
+    /// The history has no journal, or it is refused.
     pub(crate) fn local(
         &mut self,
         identity: MachineIdentity,
         trust: aterm_secrets::commons::journal::Trust,
+        succeeded: impl FnOnce() -> Vec<[u8; 16]>,
     ) -> Result<()> {
         self.local_verified = false;
         if self.log.is_none() {
@@ -931,18 +944,22 @@ impl Observer {
             self.dirty = true;
             self.urgent = true;
         }
-        if self
+        if let Some(retained) = self
             .state
             .observer
             .as_ref()
-            .is_some_and(|old| old.machine_id != identity.machine_id)
+            .map(|old| old.machine_id)
+            .filter(|old| *old != identity.machine_id)
         {
-            self.accepting = false;
-            self.seen.clear();
-            self.state.history = HistoryState::Unavailable;
-            return Err(Error::new(
-                "network observer identity differs from retained history",
-            ));
+            if !succeeded().contains(&retained) {
+                self.accepting = false;
+                self.seen.clear();
+                self.state.history = HistoryState::Unavailable;
+                return Err(Error::new(
+                    "network observer identity differs from retained history",
+                ));
+            }
+            self.take_up(&identity);
         }
         if self.state.observer.as_ref() != Some(&identity) {
             if self
@@ -966,6 +983,32 @@ impl Observer {
             self.state.history = HistoryState::Ready;
         }
         Ok(())
+    }
+    /// Take this history up for `identity`, the successor of the machine that observed it
+    /// ([`Self::local`]). Its peers are this Mac's own evidence of whom it heard and when,
+    /// whichever of its seats heard them, so each keeps its slot, its first and last contact and
+    /// its samples: a peer this Mac goes on hearing is contacted into its slot again, one it no
+    /// longer hears goes unheard from its last contact (as across a restart), and a reader that
+    /// waits while a peer is known (the registry import's empty-view guard) still knows it. What
+    /// the earlier seat's rounds produced as another Commons actor is dropped, as a reopen and a
+    /// change of incarnation drop it: each peer's latest repair round, the account exchange, the
+    /// live contacts and their sampling. A peer that is `identity` itself leaves the list, since
+    /// an observer never contacts itself. The revision goes on counting. [`Self::local`] then
+    /// records the new identity, which the next observation checkpoints at once, as it does any
+    /// change of this Mac's own identity.
+    fn take_up(&mut self, identity: &MachineIdentity) {
+        self.state
+            .peers
+            .retain(|peer| peer.identity.machine_id != identity.machine_id);
+        for peer in &mut self.state.peers {
+            peer.last_repair = None;
+        }
+        self.state.accounts_exchange = None;
+        self.seen.clear();
+        self.repair_sampled.clear();
+        self.accounts_exchange_sampled = None;
+        self.dirty = true;
+        self.changed = true;
     }
     /// Only callers resolving a completed authenticated exchange to a verified
     /// Commons binding may add an identity. Discovery addresses never call this.

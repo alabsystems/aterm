@@ -105,6 +105,51 @@ fn a_plain_drive_shell_is_fresh_and_clears_only_its_inherited_command() {
     );
 }
 
+/// WHAT ANOTHER MAC'S DRIVE STARTS CARRIES THAT MAC'S MARK: a tab a fleet drive asked for, a
+/// worker's or a plain shell's, runs everything with the mark of another machine's request in
+/// its environment, once, whatever the host's own environment said of it, and never adopts a
+/// shell that started without it. So a sign-in started there opens nothing on this Mac's
+/// desk. CONTROL: a tab this Mac asked for carries none.
+#[test]
+fn a_fleet_drives_tab_carries_the_mark_of_another_machines_request() {
+    let mark = aterm_agent::harness::remote_renew::FOR_PEER_ENV;
+    let mut app = App::headless_for_test();
+    let marks = |factory: &crate::spawn::SessionFactory| -> Vec<String> {
+        factory
+            .env_add
+            .iter()
+            .filter(|(name, _)| name == mark)
+            .map(|(_, value)| value.clone())
+            .collect()
+    };
+    let ordinary = tab_spawn_factory(app.session_factory.clone(), None, false);
+    assert!(marks(&ordinary).is_empty(), "this Mac's own tab");
+    assert_eq!(marks(&for_fleet_drive(ordinary)), ["1"]);
+    // A host that itself carried another value hands the tab the mark once.
+    app.session_factory
+        .env_add
+        .push((mark.to_owned(), String::new()));
+    let fleet = for_fleet_drive(tab_spawn_factory(app.session_factory.clone(), None, true));
+    assert_eq!(marks(&fleet), ["1"]);
+    for ask in [
+        SpawnAsk {
+            fleet: true,
+            ..SpawnAsk::default()
+        },
+        SpawnAsk {
+            fleet: true,
+            cwd: Some("/private/tmp".to_owned()),
+            ..SpawnAsk::default()
+        }
+        .for_fleet_shell(),
+    ] {
+        assert!(
+            !can_adopt_spare(&ask),
+            "a shell already running has no mark"
+        );
+    }
+}
+
 fn piped_session(id: u64) -> (Session, std::fs::File) {
     let (read, write) = aterm_uds::pipe().expect("pipe");
     let read = std::fs::File::from(std::os::fd::OwnedFd::from(read));

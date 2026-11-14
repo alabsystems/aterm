@@ -62,6 +62,9 @@ pub(crate) struct RestoreDrain {
     filling: Option<FillingWindow>,
     placed: RestoredWindows,
     fold: restore::LayoutFold,
+    /// What the layout names in the tasks directory, swept once the drain has placed every tab
+    /// (`App::close_restore_pass`), or at a quit before that ([`Self::tasks`]).
+    tasks: crate::task_launch::RestoredTasks,
     began: std::time::Instant,
     slices: u32,
     longest: std::time::Duration,
@@ -70,6 +73,10 @@ pub(crate) struct RestoreDrain {
 impl RestoreDrain {
     /// Initializes a [`RestoreDrain`] from an optional restore manifest.
     pub(crate) fn new(manifest: Option<restore::RestoreManifest>) -> Self {
+        let tasks = manifest
+            .as_ref()
+            .map(crate::task_launch::RestoredTasks::of)
+            .unwrap_or_default();
         let (windows, fold) = manifest.map_or_else(Default::default, |manifest| {
             (manifest.windows.into(), manifest.fold)
         });
@@ -79,6 +86,7 @@ impl RestoreDrain {
             filling: None,
             placed: RestoredWindows::default(),
             fold,
+            tasks,
             began: std::time::Instant::now(),
             slices: 0,
             longest: std::time::Duration::ZERO,
@@ -140,6 +148,12 @@ impl RestoreDrain {
     /// Returns the live [`WindowId`] whose tabs are currently being populated.
     pub(crate) fn filling_window(&self) -> Option<WindowId> {
         self.filling.as_ref().map(|filling| filling.wid)
+    }
+
+    /// What the layout this drain is placing names in the tasks directory: swept when the drain
+    /// ends, or at a quit that comes first (`App::settle_quit_desk_and_tasks`).
+    pub(crate) const fn tasks(&self) -> &crate::task_launch::RestoredTasks {
+        &self.tasks
     }
 }
 
@@ -1486,20 +1500,34 @@ impl App {
     /// Starts rebuilding the previous session's layout from `pending_restore` on first resume.
     pub(crate) fn apply_pending_restore(&mut self, el: &ActiveEventLoop) {
         let mut handed_off_leaves = Vec::new();
+        let mut tasks = crate::task_launch::RestoredTasks::default();
         if let Some(manifest) = self.pending_restore.take() {
             // A cold restore hands nothing off and keeps none.
             if !self.seamless_adopt.is_empty() {
                 handed_off_leaves = manifest.handed_off_leaves();
             }
+            tasks = crate::task_launch::RestoredTasks::of(&manifest);
             let fold = manifest.fold.clone();
             self.apply_restore_manifest(el, manifest);
             self.say_layout_folded(&fold);
         }
-        self.close_restore_pass(&handed_off_leaves);
+        self.close_restore_pass(&handed_off_leaves, &tasks);
     }
 
-    fn close_restore_pass(&mut self, handed_off_leaves: &[restore::TerminalLeafRestore]) {
+    fn close_restore_pass(
+        &mut self,
+        handed_off_leaves: &[restore::TerminalLeafRestore],
+        tasks: &crate::task_launch::RestoredTasks,
+    ) {
         self.adopt_orphan_shells_as_tabs(handed_off_leaves);
+        // Every record the layout brings back is seeded and every shell handed back is a tab: what
+        // the layout's session IDs left in the tasks directory, and no record here keeps, goes. A
+        // seamless update's successor sweeps nothing: its sessions keep their IDs, so the files
+        // under the IDs its layout names are its own live sessions', which go at their close or
+        // at its quit as any session's do. The predecessor ends at the Commit and removes none.
+        if !self.handoff_successor {
+            tasks.sweep(&self.store);
+        }
         self.seamless_held.clear();
         self.seamless_held_shown.clear();
         self.hand_restored_agents();
@@ -1671,7 +1699,7 @@ impl App {
         }
         self.record_carried_window_show(&drain.placed.shown, drain.placed.bootstrap);
         self.say_layout_folded(&drain.fold);
-        self.close_restore_pass(&[]);
+        self.close_restore_pass(&[], &drain.tasks);
         aterm_log::info!(
             "session restore: drained {} window(s) in {} slice(s) over {:.1} ms, longest slice \
              {:.1} ms",

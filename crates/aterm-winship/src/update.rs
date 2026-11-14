@@ -258,7 +258,7 @@ pub(crate) fn ensure_tree(repo: &Repo, layout: &Layout, out: &mut Out) -> Result
 }
 
 /// PowerShell 7 where it is on `PATH`, else Windows PowerShell.
-fn powershell(env: &[(String, String)]) -> PathBuf {
+pub(crate) fn powershell(env: &[(String, String)]) -> PathBuf {
     crate::env::lookup(env, "PATH")
         .into_iter()
         .flat_map(|path| std::env::split_paths(path).collect::<Vec<_>>())

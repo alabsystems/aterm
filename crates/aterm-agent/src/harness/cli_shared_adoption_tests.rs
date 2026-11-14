@@ -1184,7 +1184,7 @@ fn cancelled_shared_adoption_retains_pending_custody_without_publishing_or_recov
 
 #[cfg(unix)]
 #[test]
-fn typed_unavailable_issuer_keeps_the_consumed_shared_attempt_pending_without_replay() {
+fn a_hosts_deferred_provider_keeps_the_consumed_shared_attempt_pending_without_replay() {
     let (_tmp, env, approval, mut host) = fixture(16);
     let lifetime = crate::harness::account_work::Lifetime::default();
     host.work = lifetime.enter();
@@ -1199,7 +1199,7 @@ fn typed_unavailable_issuer_keeps_the_consumed_shared_attempt_pending_without_re
     assert!(failure.is_deferred());
     assert!(
         !host.work_cancelled(),
-        "remote refusal must not close the requester's App epoch"
+        "a deferral must not close the App's work epoch"
     );
     assert_eq!(host.calls.load(Ordering::SeqCst), 1);
     assert_eq!(host.status_calls.load(Ordering::SeqCst), 0);

@@ -7,7 +7,8 @@
 //! (§4.16, [`crate::members_cli::parse_lab`]); the rest are this machine's membership in a fleet,
 //! the machines `aterm ctl survey --fleet` reads
 //! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5). A removed mode word exits 2 naming the
-//! `aterm ctl` verb that does its work. A new verb is one word in [`route`] and its arm here.
+//! `aterm ctl` verb that does its work. `activity` reads this Mac's fleet activity record
+//! ([`crate::fleet_activity`]). A new verb is one word in [`route`] and its arm here.
 
 use std::process::ExitCode;
 
@@ -27,8 +28,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
                 .collect();
             crate::members_cli::lab_entry(crate::members_cli::Front::Fleet, &args)
         }
+        #[cfg(unix)]
+        Route::Activity => crate::fleet_activity::main_entry(&argv[1..]),
         #[cfg(not(unix))]
-        Route::View | Route::Lab => {
+        Route::View | Route::Lab | Route::Activity => {
             eprintln!("aterm fleet: this platform keeps no fleet membership");
             ExitCode::from(2)
         }
@@ -61,6 +64,9 @@ enum Route {
     View,
     /// A lab verb `aterm members` runs too (`remove`, `admit`, `invite`, `requests`, `ignore`).
     Lab,
+    /// `activity`: the agent requests that crossed between this Mac and its fleet's others
+    /// ([`crate::fleet_activity`]), a local read that changes nothing.
+    Activity,
     /// A removed mode, with what does its work ([`gone_to`]).
     Gone(&'static str),
     /// A membership mode the usage names (`init`, `join`, `peers`, `allow`, `access`,
@@ -75,6 +81,7 @@ fn route(mode: Option<&str>) -> Route {
         Some("-h" | "--help") => Route::Help,
         None | Some("--json") => Route::View,
         Some("remove" | "admit" | "invite" | "requests" | "ignore") => Route::Lab,
+        Some("activity") => Route::Activity,
         Some(
             "init" | "join" | "peers" | "allow" | "access" | "publish" | "sync" | "census"
             | "leave" | "name",

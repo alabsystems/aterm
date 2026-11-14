@@ -13,6 +13,7 @@ use crate::ai::connector::Cli;
 use crate::harness::accounts;
 use crate::harness::cli::{Env, PoolMoves, SurveyPool};
 use crate::harness::repo_work::home::{self as repo_home, HomeRepo, HomeRepos};
+use aterm_types::update_standing::UpdateFact;
 
 const WINDOW_LAST_FILE: &str = "window-last";
 const SSH_PUBKEY_MAX: usize = 16 << 10;
@@ -115,6 +116,11 @@ pub struct SwarmSurveyFacts {
     /// ([`repo_home::read_home`]: `repos=`, `repos_at=`, `repos_cut=` and one `repo` line
     /// each); `None` before a read finished, which a reader takes as unknown, never as none.
     pub repos: Option<HomeRepos>,
+    /// Where this Mac's updater stands, as `aterm update status` decides it (the `update*=`
+    /// words, [`UpdateFact::tokens`]): a resource fact, carried at both levels. `None` where the
+    /// collector read no updater ([`Self::collect`] reads none; the window and the node job fill
+    /// it) and from an aterm older than the words, which a reader takes as unknown.
+    pub update: Option<UpdateFact>,
 }
 
 /// What a Mac's ledgers keep of rotations, across its pools: whether rotation has ever happened
@@ -190,6 +196,7 @@ impl SwarmSurveyFacts {
                 home: None,
                 home_free_mb: None,
                 repos: None,
+                update: None,
             },
         }
     }
@@ -277,15 +284,18 @@ impl SwarmSurveyFacts {
             home: home.and_then(Path::to_str).map(str::to_owned),
             home_free_mb: home.and_then(free_mb),
             repos: home.and_then(repo_home::latest),
+            update: None,
         }
     }
 
     /// Space-prefixed `key=value` tokens appended onto `survey`'s `instance …` header line: with
     /// `accounts=` counting the `account` lines that follow, and `accounts_unread=` naming the
     /// pools none of whose rows they list because their records could not be read (`-` for none).
-    /// Volume free space (`home_free_mb=`) is a resource fact. A reply at `content` also adds
-    /// the home location and its checkouts' count and read (`home=`, `repos=`, `repos_at=`,
-    /// `repos_cut=`): work locations remain content, as a session's folder is.
+    /// Volume free space (`home_free_mb=`) is a resource fact, and so is where the updater stands
+    /// (the `update*=` words after `roster_unread=`, where [`Self::update`] says it). A reply at
+    /// `content` also adds the home location and its checkouts' count and read (`home=`,
+    /// `repos=`, `repos_at=`, `repos_cut=`): work locations remain content, as a session's folder
+    /// is.
     #[must_use]
     pub fn header_tokens(&self, content: bool) -> String {
         let home = if content {
@@ -302,7 +312,7 @@ impl SwarmSurveyFacts {
         };
         format!(
             " label={} window={} window_last={} ssh_host_key={} home_free_mb={}{home} accounts={} \
-             accounts_unread={} moves_7d={} move_tries_7d={} last_move={} roster_unread={}",
+             accounts_unread={} moves_7d={} move_tries_7d={} last_move={} roster_unread={}{}",
             word_token(self.label.as_deref()),
             u8::from(self.window),
             opt_u64_token(self.window_last),
@@ -314,6 +324,9 @@ impl SwarmSurveyFacts {
             opt_u64_token(self.moves.and_then(|m| u64::try_from(m.tried_7d).ok())),
             opt_i64_token(self.moves.and_then(|m| m.last)),
             u8::from(self.roster_unread),
+            self.update
+                .as_ref()
+                .map_or_else(String::new, UpdateFact::tokens),
         )
     }
 
@@ -539,6 +552,8 @@ impl SwarmSurveyFacts {
             home_free_mb: field_raw(&header, "home_free_mb")
                 .map_or(Ok(None), |raw| parse_opt_u64(raw, "home_free_mb"))?,
             repos,
+            // Lenient: a word outside its grammar reads as unknown and never fails the facts.
+            update: UpdateFact::of_fields(&header),
         })
     }
 }
@@ -891,6 +906,7 @@ fn claude_token_states(env: &Env) -> BTreeMap<String, String> {
                 logins: &[],
                 now: env.now,
                 offers: view::OFFERED_HERE,
+                enrolled: &accounts::enrolled,
             },
             &vault,
         )

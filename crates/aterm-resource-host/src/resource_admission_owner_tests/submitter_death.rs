@@ -118,7 +118,7 @@ fn actual_submitter_sigkill_preserves_outside_owner_custody() {
         .write_all(principal.as_bytes())
         .unwrap();
     let image = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-    let (worker_input, worker_continuation) = io::pipe().unwrap();
+    let (worker_input, worker_continuation) = aterm_uds::pipe().unwrap();
     let worker_input_identity = descriptor_identity(&worker_input);
     let mut command = spawnfd::command(&image);
     command
@@ -127,7 +127,7 @@ fn actual_submitter_sigkill_preserves_outside_owner_custody() {
         .arg(&world.scratch.path)
         .stdin(spawnfd::Stdio::from(worker_input));
     let mut submitter = OwnedChild(command.spawn().unwrap());
-    let (unrelated_input, unrelated_continuation) = io::pipe().unwrap();
+    let (unrelated_input, unrelated_continuation) = aterm_uds::pipe().unwrap();
     let mut unrelated = OwnedChild(
         spawnfd::command("/bin/cat")
             .stdin(spawnfd::Stdio::from(unrelated_input))

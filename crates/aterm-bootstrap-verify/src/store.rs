@@ -8,19 +8,9 @@ use std::os::unix::fs::MetadataExt as _;
 
 use aterm_toml::Value;
 
-use crate::chain::{open_file, parse_toml, read_bounded_file, strings};
+use crate::chain::{Policy, open_file, parse_toml, read_bounded_file, strings};
 use crate::py::{PyPath, bare_os_error, equals_int, equals_str, os_error, truthy, uint, uint_or};
 use crate::{MAX_BINARY, Refusal, Verdict, require};
-
-/// The durable policy `.aterm-update/state.toml` records.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Policy {
-    pub floors: [u64; 3],
-    pub revoked_machines: Vec<String>,
-    pub rejected_build: u64,
-    /// `[min_build_sources]` as recorded, read by [`crate::withdrawn_floor`].
-    pub min_build_sources: Option<Value>,
-}
 
 /// Whether another account can write the directory `path`, which `meta` describes.
 fn shared_write(path: &std::path::Path, meta: &std::fs::Metadata, me: u32) -> bool {

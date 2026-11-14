@@ -20,6 +20,7 @@ use super::{
 };
 use crate::typed::{
     cell::{self, Cells, Projection},
+    keys,
     owned::OwnedRead,
 };
 use aterm_json::Value;
@@ -175,6 +176,18 @@ fn label_number(label: Option<&str>) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// By machine key, then smaller rank first and an unranked one last, then account.
+fn sort_preferences(preferences: &mut [Preference]) {
+    preferences.sort_by(|a, b| {
+        (&a.machine, a.rank.is_none(), a.rank, &a.account).cmp(&(
+            &b.machine,
+            b.rank.is_none(),
+            b.rank,
+            &b.account,
+        ))
+    });
+}
+
 impl LabView {
     /// Read canonical identities from the authenticated registry view.
     pub fn read_view(
@@ -262,11 +275,7 @@ impl LabView {
             .rows
             .iter()
             .filter_map(|(uuid, row)| {
-                let value = &row.value;
-                let mac = value
-                    .get("merged_into")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("mac").and_then(Value::as_str))?;
+                let mac = registry::bound_machine(&row.value)?;
                 machines
                     .get(mac)
                     .is_some_and(|machine| machine.live)
@@ -289,14 +298,7 @@ impl LabView {
                     })
             })
             .collect();
-        preferences.sort_by(|a, b| {
-            (&a.machine, a.rank.is_none(), a.rank, &a.account).cmp(&(
-                &b.machine,
-                b.rank.is_none(),
-                b.rank,
-                &b.account,
-            ))
-        });
+        sort_preferences(&mut preferences);
         let observed = mail::observed(obs.rows.iter().map(|(key, row)| (key.as_str(), &row.value)));
         let address_index = AddressIndex::of(&addresses);
         Self {
@@ -308,6 +310,142 @@ impl LabView {
             addresses,
             address_index,
             observed,
+        }
+    }
+
+    /// The view the shared files `ai/accounts`, `ai/links` and `lab/machines` hold
+    /// (docs/DESIGN-shared-files-2026-11-11.md §4, SF-04): what [`Self::read`] projects from the
+    /// registry, read from this Mac's snapshots, which answer in every custody state. This Mac is
+    /// the live machine the snapshot marks `=here` (the one its own facts row binds when the pass
+    /// ran), and each seat of `=seats` is bound as [`Self::bound`] says. A label or nickname whose
+    /// cell is a conflict, or one the guards refused, is read as [`Self::read`] reads a conflicted
+    /// register. The snapshots carry no address rows: [`Self::mailbox`], [`Self::mailboxes`] and
+    /// [`Self::aliases`] answer nothing here, and mail metadata is read from the registry.
+    #[must_use]
+    pub fn of_files(
+        accounts: &aterm_file::Read,
+        links: &aterm_file::Read,
+        machines: &aterm_file::Read,
+    ) -> Self {
+        let value = |row: &aterm_file::Row, column: &str| {
+            row.values
+                .get(column)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        // A register's own value: the cell shows exactly the value, with no conflict and no
+        // refusal in its place.
+        let unconflicted = |row: &aterm_file::Row, column: &str| {
+            value(row, column).filter(|text| row.cell(column) == text)
+        };
+        let shown = |row: &aterm_file::Row, column: &str| {
+            Some(row.cell(column).to_owned()).filter(|cell| !cell.is_empty())
+        };
+        let yes = |row: &aterm_file::Row, column: &str| row.cell(column) == "yes";
+        let machine_rows: BTreeMap<String, Machine> = machines
+            .rows()
+            .iter()
+            .map(|row| {
+                let nickname = if row.cell("nickname").is_empty() {
+                    MachineNickname::Unset
+                } else if let Some(word) = unconflicted(row, "nickname") {
+                    MachineNickname::Named {
+                        word,
+                        automatic: yes(row, "nickname_auto"),
+                    }
+                } else {
+                    MachineNickname::Conflict
+                };
+                let aliases = row
+                    .values
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                let machine = Machine {
+                    pk: row.pk.clone(),
+                    label: unconflicted(row, "label"),
+                    nickname,
+                    aliases,
+                    status: value(row, "status"),
+                    os: value(row, "os"),
+                    chip: value(row, "chip"),
+                    ram_gb: row.values.get("ram_gb").and_then(Value::as_u64),
+                    live: row.live,
+                };
+                (row.pk.clone(), machine)
+            })
+            .collect();
+        let live = |pk: &str| machine_rows.get(pk).is_some_and(|machine| machine.live);
+        let mut bound = BTreeMap::new();
+        let mut me = None;
+        for row in machines.rows().iter().filter(|row| live(&row.pk)) {
+            for uuid in row
+                .cell("seats")
+                .split(", ")
+                .filter(|uuid| !uuid.is_empty())
+            {
+                bound.insert(uuid.to_owned(), row.pk.clone());
+            }
+            if yes(row, "here") {
+                me = Some(row.pk.clone());
+            }
+        }
+        let account_rows: BTreeMap<String, Account> = accounts
+            .rows()
+            .iter()
+            .map(|row| {
+                let pk = row.pk.clone();
+                let realm = value(row, "realm");
+                let account = Account {
+                    label: value(row, "label")
+                        .or_else(|| keys::default_account_label(realm.as_deref()?, &pk).ok()),
+                    legacy_label: value(row, "legacy_label"),
+                    provider: value(row, "provider"),
+                    plan: value(row, "plan"),
+                    login: shown(row, "login_email"),
+                    // `=email` is the identity's address where one is set.
+                    identity: if row.cell("identity").is_empty() {
+                        None
+                    } else {
+                        shown(row, "email")
+                    },
+                    status: value(row, "status"),
+                    region: value(row, "region"),
+                    flow: value(row, "flow"),
+                    browser: value(row, "browser"),
+                    live: row.live,
+                    realm,
+                    pk: pk.clone(),
+                };
+                (pk, account)
+            })
+            .collect();
+        let mut preferences: Vec<Preference> = links
+            .rows()
+            .iter()
+            .filter(|row| row.live)
+            .filter_map(|row| {
+                let machine = value(row, "machine")?;
+                let account = value(row, "account")?;
+                (live(&machine) && account_rows.contains_key(&account)).then(|| Preference {
+                    rank: row.values.get("rank").and_then(Value::as_u64),
+                    machine,
+                    account,
+                })
+            })
+            .collect();
+        sort_preferences(&mut preferences);
+        Self {
+            me,
+            bound,
+            machines: machine_rows,
+            accounts: account_rows,
+            preferences,
+            ..Self::default()
         }
     }
 

@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::io;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -888,6 +888,24 @@ impl SinkWriter {
     #[must_use]
     pub fn master(&self) -> i32 {
         self.master
+    }
+
+    /// Borrow the descriptor actually owned by this sink, without duplicating it.
+    /// Retaining the sink keeps this descriptor allocated; exit may still retire
+    /// its terminal. Callers must independently recheck foreground and liveness.
+    /// A sink wrapping somebody else's raw descriptor supplies no such borrow.
+    #[cfg(unix)]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "fd_lifecycle",
+            action = "UseFd",
+            project = "aterm_session::sink::SinkWriter::project_fd_state"
+        )
+    )]
+    #[must_use]
+    pub fn owned_master(&self) -> Option<BorrowedFd<'_>> {
+        self._owned.as_ref()?.0.as_ref().map(AsFd::as_fd)
     }
 
     /// Jobs submitted to this sink's ordered input writer and not yet completed.

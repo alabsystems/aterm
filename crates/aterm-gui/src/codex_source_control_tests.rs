@@ -737,3 +737,31 @@ fn actual_direct_socket_cleanup_reaches_retained_identity_without_foreground_or_
     connection_closed(id);
     drained.resume().unwrap();
 }
+
+#[test]
+fn owned_control_wire_requires_a_member_and_exact_challenge_fields() {
+    let base = format!(
+        "schema=1 request=0123456789abcdef0000000000000001 operation={} member={}",
+        "a".repeat(32),
+        "b".repeat(32)
+    );
+    let begin = format!("member-control-begin {base}");
+    assert!(matches!(
+        Request::parse(&begin).unwrap().action,
+        Action::ControlBegin
+    ));
+    assert!(Request::parse(&format!("{begin} nonce={}", "c".repeat(32))).is_none());
+    assert!(Request::parse(&begin.replace(&format!(" member={}", "b".repeat(32)), "")).is_none());
+    let ack = format!("member-control-ack {base} nonce={}", "c".repeat(32));
+    assert!(matches!(
+        Request::parse(&ack).unwrap().action,
+        Action::ControlAck { .. }
+    ));
+    for bad in [
+        ack.replace("nonce=", "proof="),
+        format!("{ack} extra=1"),
+        ack.replace(&"c".repeat(32), "short"),
+    ] {
+        assert!(Request::parse(&bad).is_none());
+    }
+}

@@ -286,23 +286,45 @@ fn home_at(now: &Now, days: &HomeDays, rule: Rule) -> Result<HomeNet, Away> {
             return Err(Away::NewNetwork { days: had });
         }
     }
-    Ok(HomeNet { own, mask })
+    Ok(HomeNet::of(own, mask, &now.own))
 }
 
-/// This Mac's home ALab LAN, as its address and mask there ([`home_net_at`]): what a member's
-/// desk judges a proving Mac's network by (`crate::members::desk`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// This Mac's home ALab LAN, as its address and mask there ([`home_net_at`]) and each other
+/// address it holds on that subnet: what a member's desk judges a proving Mac's network by
+/// (`crate::members::desk`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HomeNet {
     own: Ipv4Addr,
     mask: Ipv4Addr,
+    /// This Mac's other addresses on the subnet (a second interface there, Ethernet beside
+    /// Wi-Fi), in order, each once.
+    also: Vec<Ipv4Addr>,
 }
 
 impl HomeNet {
+    /// This Mac at `own` under `mask`, where `held` is every address it holds on any interface
+    /// (`aterm_netplace::proof::Now::own`): those on the subnet beside `own` are kept, so a peer
+    /// at one of them is this Mac and not another host ([`HomeNet::holds`]).
+    pub(crate) fn of(own: Ipv4Addr, mask: Ipv4Addr, held: &[IpAddr]) -> Self {
+        let mut also: Vec<Ipv4Addr> = held
+            .iter()
+            .filter_map(|address| ipv4(*address))
+            .filter(|address| *address != own && same(*address, own, mask))
+            .collect();
+        also.sort_unstable();
+        also.dedup();
+        Self { own, mask, also }
+    }
+
     /// Whether `peer` is another host on this network: an IPv4 (or IPv4-mapped) address on its
-    /// subnet that is not this Mac's address there.
+    /// subnet that is none of this Mac's addresses there. A Mac with two interfaces on the home
+    /// subnet reaches itself from the second one's address, and a proof from there is its own
+    /// process's, not another Mac's.
     #[must_use]
     pub fn holds(&self, peer: IpAddr) -> bool {
-        ipv4(peer).is_some_and(|peer| peer != self.own && same(peer, self.own, self.mask))
+        ipv4(peer).is_some_and(|peer| {
+            peer != self.own && same(peer, self.own, self.mask) && !self.also.contains(&peer)
+        })
     }
 
     /// The test home network: this Mac at `192.168.1.20/24`.
@@ -315,11 +337,15 @@ impl HomeNet {
         )
     }
 
-    /// A home network a test names: this Mac at `own` under `mask`.
+    /// A home network a test names: this Mac at `own` under `mask`, its one address there.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub const fn at(own: Ipv4Addr, mask: Ipv4Addr) -> Self {
-        Self { own, mask }
+        Self {
+            own,
+            mask,
+            also: Vec::new(),
+        }
     }
 }
 

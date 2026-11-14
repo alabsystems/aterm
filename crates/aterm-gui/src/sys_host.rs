@@ -60,10 +60,14 @@ pub(crate) struct PaneFact {
 pub(crate) struct Held {
     /// The snapshot.
     pub(crate) snap: Arc<Snapshot>,
-    /// When it landed, wall clock (unix ms).
+    /// The machine observation’s wall clock (unix ms).
     pub(crate) unix_ms: u64,
-    /// …and on the monotonic clock.
+    /// When the machine observation began on the monotonic clock.
     pub(crate) at: Instant,
+    /// When the carried job pass observed its input, independent of publication.
+    pub(crate) jobs_at: Option<Instant>,
+    /// Input observation of the independently assessed leftover view.
+    pub(crate) left_at: Option<Instant>,
 }
 
 /// A reply's identity for a later `since=`: what its fingerprints were
@@ -106,6 +110,7 @@ struct State {
     head_seq: u64,
     panes: Vec<PaneFact>,
     machine: Machine,
+    jobs_continuous: bool,
     events: VecDeque<Event>,
     /// The newest snapshot seq whose events left the ring (0: none did).
     evicted_through: u64,
@@ -136,6 +141,8 @@ enum Part {
     Split,
     /// Its jobs view (`sys jobs`), carried from the engine's last pass.
     Jobs,
+    /// Its independently assessed leftover view.
+    Left,
 }
 
 /// How the workers pull: at most one pull per `gap`, each waited for at most
@@ -278,8 +285,17 @@ impl Shared {
     }
 
     /// Publish the probe thread's newest snapshot and wake waiting workers.
-    pub(crate) fn publish(&self, snap: Arc<Snapshot>, machine: &Machine) {
+    pub(crate) fn publish(
+        &self,
+        snap: Arc<Snapshot>,
+        machine: &Machine,
+        at: Instant,
+        jobs_at: Option<Instant>,
+        left_at: Option<Instant>,
+        jobs_continuous: bool,
+    ) {
         let mut g = self.lock();
+        g.jobs_continuous = jobs_continuous;
         if g.machine != *machine {
             g.machine.clone_from(machine);
         }
@@ -293,10 +309,13 @@ impl Shared {
         }
         g.head_seq = g.head_seq.max(snap.seq);
         if !snap.machine_only || g.held.is_none() {
+            let unix_ms = u64::try_from(snap.at_unix_ms).unwrap_or(0);
             g.held = Some(Held {
                 snap,
-                unix_ms: aterm_time::unix_millis().unwrap_or(0),
-                at: Instant::now(),
+                unix_ms,
+                at,
+                jobs_at,
+                left_at,
             });
         }
         drop(g);
@@ -323,6 +342,12 @@ impl Shared {
         self.fresh_by(fresh, force, Part::Split, force)
     }
 
+    /// A leftover assessment of the requested age, independent of the machine snapshot.
+    pub(crate) fn fresh_left(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
+        let _armed = crate::vitals_host::JOBS_ARMED.arm();
+        self.fresh_by(fresh, force, Part::Left, false)
+    }
+
     /// The snapshot `q` reads, as fresh as it asks: a `sys why` by its split set, arming `split`
     /// while it waits, a `sys jobs` by its jobs view, arming `jobs` (the stuck engine) while it
     /// waits, and a `sys cores`, `sys report` or forced `sys why` by its CPU Stats sample too,
@@ -342,6 +367,10 @@ impl Shared {
                 let _armed = split.arm();
                 let _hardware = force.then(|| hardware.arm());
                 self.fresh_why(fresh, force)
+            }
+            View::Left => {
+                let _armed = jobs.arm();
+                self.fresh_by(fresh, fresh_ms == 0, Part::Left, false)
             }
             View::Jobs => {
                 let _armed = jobs.arm();
@@ -375,7 +404,8 @@ impl Shared {
             match part {
                 Part::Whole => Some(h.at),
                 Part::Split => split_landed(h),
-                Part::Jobs => Some(jobs_landed(h)),
+                Part::Jobs => jobs_landed(h),
+                Part::Left => h.left_at,
             }
             .filter(|_| sampled(h))
         };
@@ -400,7 +430,7 @@ impl Shared {
         // one, so the gap runs from the oldest of their last pulls (none when one never pulled).
         let needs = [
             (armed, g.last_split_pull),
-            (part == Part::Jobs, g.last_jobs_pull),
+            (matches!(part, Part::Jobs | Part::Left), g.last_jobs_pull),
             (hardware, g.last_hardware_pull),
         ];
         let last_pull = if needs.iter().any(|(need, _)| *need) {
@@ -437,7 +467,7 @@ impl Shared {
                     if armed {
                         g.last_split_pull = Some(now);
                     }
-                    if part == Part::Jobs {
+                    if matches!(part, Part::Jobs | Part::Left) {
                         g.last_jobs_pull = Some(now);
                     }
                     if hardware {
@@ -457,7 +487,14 @@ impl Shared {
                 && (!split
                     || !h.snap.coal_lane.on()
                     || split_ns(&h.snap).is_some_and(|ns| Some(ns) != old_split))
-                && (part != Part::Jobs || h.snap.jobs_age_ms == 0)
+                && (!matches!(part, Part::Jobs | Part::Left)
+                    || landed(h).is_some_and(|at| {
+                        if force {
+                            at >= now
+                        } else {
+                            at.elapsed() <= fresh
+                        }
+                    }))
                 && sampled(h)
             {
                 return (Some(h.clone()), Freshness::Fresh);
@@ -512,7 +549,11 @@ impl Shared {
     pub(crate) fn jobs_snapshot(&self) -> Option<(Arc<Snapshot>, Instant, bool)> {
         let g = self.lock();
         let h = g.held.as_ref().filter(|h| h.snap.jobs.is_some())?;
-        Some((Arc::clone(&h.snap), jobs_landed(h), g.tx.is_some()))
+        Some((
+            Arc::clone(&h.snap),
+            jobs_landed(h)?,
+            g.tx.is_some() && g.jobs_continuous,
+        ))
     }
 
     fn facts(&self) -> (Vec<PaneFact>, Machine) {
@@ -577,7 +618,20 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn publish_for_test(&self, snap: Snapshot, panes: Vec<PaneFact>) {
         self.set_facts(panes);
-        self.publish(Arc::new(snap), &Machine::default());
+        let at = Instant::now();
+        let jobs_at = snap
+            .jobs
+            .as_ref()
+            .and_then(|_| at.checked_sub(Duration::from_millis(snap.jobs_age_ms)));
+        let left_at = snap.left.as_ref().map(|_| at);
+        self.publish(
+            Arc::new(snap),
+            &Machine::default(),
+            at,
+            jobs_at,
+            left_at,
+            true,
+        );
     }
 }
 
@@ -599,11 +653,9 @@ fn split_landed(h: &Held) -> Option<Instant> {
     h.at.checked_sub(Duration::from_nanos(h.snap.at_ns.saturating_sub(ns)))
 }
 
-/// When `h`'s jobs view was made, on the landing's clock: `h` landed [`Snapshot::jobs_age_ms`]
-/// after the engine's pass that made it (at once, for a view its own reading made).
-fn jobs_landed(h: &Held) -> Instant {
-    h.at.checked_sub(Duration::from_millis(h.snap.jobs_age_ms))
-        .unwrap_or(h.at)
+/// When the job pass observed its input. Publication cannot refresh an older observation.
+fn jobs_landed(h: &Held) -> Option<Instant> {
+    h.jobs_at
 }
 
 fn split_ns(snap: &Snapshot) -> Option<u64> {
@@ -1467,10 +1519,17 @@ fn volume_facts(path: &std::path::Path) -> Option<VolumeFacts> {
         return None;
     }
     let reading = crate::vitals_host::tab_volume(path)?;
-    let level = crate::disk_board::SHELF
-        .board_lock()
-        .row_at(&reading.mount)
-        .map(|r| r.level.as_str().to_owned());
+    let now = crate::disk_board::unix_now();
+    // The disk watch's two readings of this volume, under one lock: its level, and the
+    // rebuildable budget, which the watch sizes on the home volume alone.
+    let (level, budget) = {
+        let board = crate::disk_board::SHELF.board_lock();
+        let row = board.row_at(&reading.mount);
+        (
+            row.map(|r| r.level.as_str().to_owned()),
+            board.budget_read(row.map(|r| &r.reading.key), now),
+        )
+    };
     Some(VolumeFacts {
         mount: reading.mount.display().to_string(),
         fs: reading.fs,
@@ -1478,6 +1537,7 @@ fn volume_facts(path: &std::path::Path) -> Option<VolumeFacts> {
         free: reading.free,
         reserved: reading.reserved,
         level,
+        budget,
     })
 }
 
@@ -1976,7 +2036,7 @@ impl crate::App {
         let age_ms = self.vitals.adopted_at.map_or(0, |at| {
             u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
         });
-        let view = fresh_jobs(view, now, self.vitals.reader_runs());
+        let view = fresh_jobs(view, now, self.vitals.jobs_view_continuous());
         let held = view.as_deref().filter(|_| cfg!(target_os = "macos"));
         format!(
             "{} {}",
@@ -1994,7 +2054,7 @@ impl crate::App {
         status_left(
             snap.and_then(|s| s.left.as_deref()),
             snap.and_then(|s| s.jobs.as_deref()),
-            self.vitals.reader_runs(),
+            self.vitals.jobs_view_continuous(),
             sid,
             aterm_time::unix_millis().unwrap_or(0),
         )

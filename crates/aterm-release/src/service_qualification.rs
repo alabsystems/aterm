@@ -21,7 +21,7 @@ pub fn validate_assets(
     version: &str,
     signed: bool,
     rostered: bool,
-    linux: &[String],
+    handoff: &[String],
 ) -> Result<()> {
     if names
         .iter()
@@ -38,7 +38,7 @@ pub fn validate_assets(
         .filter(|name| name.as_str() != REPORT_ASSET)
         .cloned()
         .collect();
-    crate::channel::validate_channel_asset_set(&base, version, signed, rostered, linux)
+    crate::channel::validate_channel_asset_set(&base, version, signed, rostered, handoff)
 }
 
 #[cfg(test)]

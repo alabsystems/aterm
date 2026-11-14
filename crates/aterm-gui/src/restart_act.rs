@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::accounts_pool;
 use aterm_agent::harness::restart_stamp::Cause;
 use aterm_agent::harness::restart_stamp::{self, Stamp, Wanted};
+use aterm_agent::harness::self_claimed::{self, Seen};
 
 use crate::SessionCtx;
 
@@ -458,6 +459,9 @@ pub(crate) fn begin<'a>(
     state: Option<&'a std::path::Path>,
     by: aterm_slog::Actor,
 ) -> Result<Stamped<'a>, String> {
+    // The person's last gesture to the program as the ask arrived: one after it refuses an
+    // account's signal ([`Stamped::signal`]).
+    let reached = ctx.human_input.counts().reached;
     let ask = parse(rest)?;
     // An asked account is judged against the pool's records, which are files: before the act's
     // lock, so no other tab's restart waits on that read, and reported after the fences below.
@@ -529,6 +533,27 @@ pub(crate) fn begin<'a>(
     {
         return Err(refuse(why));
     }
+    // A move ends the session only at its own rest, read last and before anything is written: a
+    // turn or an act that began while the pool was judged is not ended by it, and a program that
+    // ends during the read ends on its own, no stamp naming it. An ask that joins a standing
+    // stamp is not judged again: that stamp's act already signalled.
+    if ask.account.is_some() && standing.is_none() {
+        let unrest = judged.as_ref().map_or(Some("unjudged"), unrest);
+        // The read takes up to `ACCOUNT_REST`, so the act's own fence is read again after it: a
+        // hand that came meanwhile (another driver's lease or turn, a hold, the host's claim
+        // gone) answers its own word, as it would have just before the signal, and
+        // `account-busy` stays the last word.
+        if let Some(why) = unavailable(ctx, pgrp, &start, crate::metrics::now_us()) {
+            return Err(refuse(why));
+        }
+        if let Some(what) = unrest {
+            aterm_log::info!(
+                "restart @{sid}: pid {pgrp} is not at its own rest ({what}); nothing written or \
+                 sent"
+            );
+            return Err(refuse(ACCOUNT_BUSY));
+        }
+    }
     if let Some(stamp) = standing {
         // A plain restart that joins an account's stamp keeps that destination: the stamp is
         // the first act's, and its relaunch is the one both asked for.
@@ -540,6 +565,7 @@ pub(crate) fn begin<'a>(
             stamp,
             wrote: false,
             account: ask.account,
+            reached,
             by,
             _one_act: one_act,
         });
@@ -566,6 +592,7 @@ pub(crate) fn begin<'a>(
         stamp,
         wrote: true,
         account: ask.account,
+        reached,
         by,
         _one_act: one_act,
     })
@@ -579,6 +606,10 @@ pub(crate) const ACCOUNT_NOT_RESUMABLE: &str = "account-not-resumable";
 pub(crate) const ACCOUNT_RECOVERY_PENDING: &str = "account-recovery-pending";
 /// A restart of this process already stands and names another destination, or none.
 pub(crate) const ACCOUNT_RESTART_PENDING: &str = "account-restart-pending";
+/// The session was not found at its own rest when the act came to restart it: its record, read
+/// before the stamp ([`unrest`]), was not at its idle point or could not be read in time, or
+/// input it has not read or a person's gesture reached it after the ask arrived ([`stirred`]).
+pub(crate) const ACCOUNT_BUSY: &str = "account-busy";
 
 /// How long an account ask waits for the pool's records ([`bounded`]).
 const ACCOUNT_JUDGE: Duration = Duration::from_secs(5);
@@ -589,6 +620,13 @@ const ACCOUNT_JUDGE_TEST_FLOOR: Duration = Duration::from_millis(250);
 /// How many account judgements may run at once; one more is answered as unread.
 const ACCOUNT_JUDGES: usize = 4;
 
+/// How long an account ask waits, under the act's lock, for the session's own record of its rest
+/// ([`unrest`]): a home that does not answer holds every other tab's restart no longer than this.
+const ACCOUNT_REST: Duration = Duration::from_secs(1);
+
+/// Minimum test value of [`ACCOUNT_REST`].
+const ACCOUNT_REST_TEST_FLOOR: Duration = Duration::from_millis(250);
+
 /// What an account ask's judgement found, before the act's lock ([`judge_account`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Judged {
@@ -598,8 +636,97 @@ pub(crate) struct Judged {
     /// Whether the tab's validated self-claim copy is of that process: only a codex-alab that
     /// claimed its own session, on a line aterm validated, is moved.
     pub(crate) copied: bool,
+    /// The canonical `CODEX_HOME` that copy was read at, under which the act reads the process's
+    /// own record of its rest ([`unrest`]); `None` where no copy of it was read.
+    pub(crate) home: Option<std::path::PathBuf>,
     /// Why the pool's records refuse the move ([`accounts_pool::Moves::refusal`]).
     pub(crate) refusal: Option<&'static str>,
+}
+
+/// The read of the record of the process `pid` started at `start` under the `CODEX_HOME` given
+/// ([`self_claimed::read_seen`]): `None` where that process was not live across it. [`begin`]
+/// reads the act's own fence ([`unavailable`]) again after it.
+type RestRead = dyn Fn(&std::path::Path, u32, &str) -> Option<Seen> + Send + Sync;
+
+#[cfg(test)]
+thread_local! {
+    static REST_FOR_TEST: std::cell::RefCell<Option<(Arc<RestRead>, Duration)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// This test thread's read of a session's rest and how long an ask waits for it, until the guard
+/// drops, in place of [`self_claimed::read_seen`] and [`ACCOUNT_REST`].
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct RestForTest(Option<(Arc<RestRead>, Duration)>);
+
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn rest_for_test(read: Arc<RestRead>, wait: Duration) -> RestForTest {
+    RestForTest(REST_FOR_TEST.with(|slot| slot.replace(Some((read, wait)))))
+}
+
+#[cfg(test)]
+impl Drop for RestForTest {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        REST_FOR_TEST.with(|slot| *slot.borrow_mut() = before);
+    }
+}
+
+/// The read an ask on this thread judges a session's rest by and how long it waits for it.
+fn rest_read() -> (Arc<RestRead>, Duration) {
+    #[cfg(test)]
+    if let Some(read) = REST_FOR_TEST.with(|slot| slot.borrow().clone()) {
+        return read;
+    }
+    (
+        Arc::new(self_claimed::read_seen),
+        rest_wait(aterm_gui_timing::current()),
+    )
+}
+
+/// How long an ask waits for a session's own record under `timing`: [`ACCOUNT_REST`], never the
+/// pool's [`ACCOUNT_JUDGE`], since the read is made under the act's lock.
+fn rest_wait(timing: aterm_gui_timing::Timing) -> Duration {
+    timing.of_at_least(ACCOUNT_REST, ACCOUNT_REST_TEST_FLOOR)
+}
+
+/// Why the codex-alab process `judged` names is not at its own rest, as its session record says
+/// now: `None` only where that record, read at the home of the copy the judgement validated and
+/// within [`ACCOUNT_REST`] (counted apart from the pool's judgements), is that very process's,
+/// read while it lived before and after, and at its idle point ([`self_claimed::idle_point`]:
+/// `idle`, an empty draft, no exit). codex-alab writes `busy` there before any turn or act of its
+/// own proceeds. The reason is for `aterm.log`; the ask's refusal is [`ACCOUNT_BUSY`].
+fn unrest(judged: &Judged) -> Option<&'static str> {
+    static RESTING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(home) = judged.home.clone() else {
+        return Some("no-copy");
+    };
+    let (read, wait) = rest_read();
+    let (pid, start) = (judged.pid, judged.start.clone());
+    let Some(seen) = bounded_among(&RESTING, wait, move || read(&home, pid, &start)) else {
+        return Some("unanswered");
+    };
+    match seen {
+        None => Some("not-live"),
+        Some(Seen::Present(record)) if record.pid != pid => Some("another-pid"),
+        Some(Seen::Present(record)) if self_claimed::idle_point(&record) => None,
+        Some(Seen::Present(_)) => Some("not-idle"),
+        Some(Seen::Removed | Seen::Never) => Some("no-record"),
+        Some(Seen::Unreadable(why)) => Some(why),
+    }
+}
+
+/// What reached the session since its account ask arrived, the person's last gesture to the
+/// program then numbered `reached` ([`crate::human_input::HumanInputStamp::counts`]): input its
+/// program has not read ([`crate::input_stall::input_unread`]), which the signal would drop or
+/// end with it, or a person's gesture since. Read last before the signal, the gesture last of all.
+fn stirred(ctx: &SessionCtx, reached: u64) -> Option<&'static str> {
+    if crate::input_stall::input_unread(&ctx.sink) {
+        return Some("input-unread");
+    }
+    (ctx.human_input.counts().reached != reached).then_some("person")
 }
 
 /// The pool's word on moving the session `launch` started to `wanted` ([`judge_account`]).
@@ -735,14 +862,15 @@ fn judge_account(
     let pgrp = unsafe { libc::tcgetpgrp(master) };
     let pid = u32::try_from(pgrp).ok().filter(|pid| *pid > 0)?;
     let start = restart_stamp::kernel_start(pid)?;
-    let resume = crate::self_claim::copy_of_tab(ctx.self_id.as_str())
+    let copy = crate::self_claim::copy_of_tab(ctx.self_id.as_str())
         .filter(|copy| copy.pid == pid && copy.start == start)
-        .and_then(|copy| copy.resume.ok());
-    let Some(resume) = resume else {
+        .and_then(|copy| copy.resume.ok().map(|resume| (resume, copy.home)));
+    let Some((resume, home)) = copy else {
         return Some(Judged {
             pid,
             start,
             copied: false,
+            home: None,
             refusal: None,
         });
     };
@@ -761,6 +889,7 @@ fn judge_account(
         pid,
         start,
         copied: true,
+        home: Some(home),
         refusal,
     })
 }
@@ -770,7 +899,9 @@ fn judge_account(
 /// (`account-unmanaged`), no shell would type its relaunch (`account-not-resumable`), a renewal
 /// or exec handoff of it is in flight (`account-recovery-pending`), the pool's records refuse
 /// the move (`judged`, which must be of this very process: else `account-unread`), or a restart
-/// of it already stands for another destination or none (`account-restart-pending`).
+/// of it already stands for another destination or none (`account-restart-pending`). The
+/// session's own rest is no part of it: the act reads that after it ([`unrest`], [`stirred`]),
+/// so a schema 2 snapshot that offers the move by this fence offers it while a turn runs.
 pub(crate) fn account_fence(
     ctx: &SessionCtx,
     (pid, start): (u32, &str),
@@ -817,6 +948,8 @@ pub(crate) struct Stamped<'a> {
     /// The account this act asked for, which its reply names: the stamp's own where it asked
     /// for one ([`account_fence`]), none for a plain restart whatever stamp it joined.
     account: Option<Wanted>,
+    /// The person's last gesture to the program as the ask arrived ([`stirred`]).
+    reached: u64,
     /// Who asked for it.
     by: aterm_slog::Actor,
     _one_act: std::sync::MutexGuard<'static, ()>,
@@ -834,15 +967,23 @@ impl Stamped<'_> {
             stamp,
             wrote,
             account,
+            reached,
             by,
             _one_act,
         } = self;
         let sid = ctx.self_id.as_str();
         let cause = stamp.cause;
         if !restored_exit_owner_ready(ctx, pgrp, &stamp.start) {
-            let _ = take_back(state, sid, &stamp, wrote);
             crate::harness_host::ring();
-            return format!("ERR restart unavailable: {EXIT_OWNER_NOT_READY}\n");
+            return refused_after_stamp(
+                master,
+                pgrp,
+                state,
+                sid,
+                &stamp,
+                wrote,
+                EXIT_OWNER_NOT_READY,
+            );
         }
         if scoped_relaunch(ctx, pgrp) {
             record_restart(ctx, cause);
@@ -851,6 +992,16 @@ impl Stamped<'_> {
                 cause.word()
             );
             return format!("OK restarting pid {pgrp} cause={}\n", cause.word());
+        }
+        // A move that its own stamp would end is refused, the stamp taken back, where input waits
+        // unread or a person's gesture reached the program since the ask arrived: read before
+        // `term`, which would drop that input unread.
+        if wrote
+            && account.is_some()
+            && let Some(what) = stirred(ctx, reached)
+        {
+            aterm_log::info!("restart @{sid}: pid {pgrp} is not at its own rest ({what})");
+            return refused_after_stamp(master, pgrp, state, sid, &stamp, wrote, ACCOUNT_BUSY);
         }
         let asker = crate::session_log::EndAsker {
             timeline: &ctx.timeline,
@@ -895,6 +1046,35 @@ impl Stamped<'_> {
             }
         }
     }
+}
+
+/// The answer of an act refused after [`begin`] (`why`: `exit-owner-not-ready`, `account-busy`),
+/// which takes back the stamp it wrote and sends nothing. Where the leader stopped leading its
+/// tab under that stamp, a reader of its exit may already have taken the exit for this act's and
+/// begun its relaunch (on the asked account, for a move), so the refusal would be untrue: the act
+/// answers as one whose leader left before anything was sent (`OK restart gone pid <n>`, rule 6).
+/// The lead is read after the stamp is gone, so a leader still leading then left no exit for a
+/// reader to take for this act's.
+#[cfg(unix)]
+fn refused_after_stamp(
+    master: i32,
+    pgrp: i32,
+    state: &std::path::Path,
+    sid: &str,
+    stamp: &Stamp,
+    wrote: bool,
+    why: &str,
+) -> String {
+    let said = take_back(state, sid, stamp, wrote);
+    if wrote && !leads(master, pgrp, &stamp.start) {
+        aterm_log::info!(
+            "restart @{sid}: pid {pgrp} no longer leads its tab; refused ({why}), nothing sent, \
+             {said}"
+        );
+        return format!("OK restart gone pid {pgrp}\n");
+    }
+    aterm_log::info!("restart @{sid}: pid {pgrp} refused ({why}); nothing sent, {said}");
+    format!("ERR restart unavailable: {why}\n")
 }
 
 /// Renews a joined stamp once `SIGTERM` has been sent ([`KILL_READ_MARGIN`]).

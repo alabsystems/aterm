@@ -6,15 +6,15 @@
 use super::*;
 use aterm_types::land_trailer::{Checked, Interrupted, Row};
 
-/// The schema-1 bytes of [`judge_sample`]. A change to the encoding bumps [`SCHEMA`] and
-/// replaces this literal; no reader of an older schema is kept.
-const SCHEMA_1: &str = concat!(
+/// The schema-2 bytes of [`judge_sample`]. A change to the encoding bumps [`SCHEMA`] and
+/// replaces this literal.
+const SCHEMA_2: &str = concat!(
     r#"{"at":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
     r#""base":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","#,
     r#""branch":{"crates":["aterm-verify"]},"composes":0,"#,
     r#""cone":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","hop":1,"#,
     r#""image":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","#,
-    r#""rejudges":1,"root":"/scratch/checkout","schema":1,"#,
+    r#""root":"/scratch/checkout","schema":2,"#,
     r#""stated":"Aterm-Interrupted: dddddddddddddddddddddddddddddddddddddddd "#,
     r#"base=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee "#,
     r#"tip=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb secs=42\n","#,
@@ -39,7 +39,6 @@ fn judge_sample() -> Handoff {
         hop: 1,
         at: id('a', 40),
         base: id('b', 40),
-        rejudges: 1,
         composes: 0,
         cone: id('e', 40),
         branch: Some(Branch::Crates(["aterm-verify".to_owned()].into())),
@@ -61,7 +60,6 @@ fn recheck_sample() -> Handoff {
     Handoff {
         step: Step::Recheck,
         hop: 2,
-        rejudges: 0,
         composes: 2,
         branch: Some(Branch::Everything("a shared input changed".into())),
         stated: Stated {
@@ -91,22 +89,20 @@ fn edited(sample: &Handoff, edit: impl FnOnce(&mut Map)) -> Vec<u8> {
 /// The pinned bytes are the judgment sample's encoding and decode to it; a recheck's handoff,
 /// with its second hop, composition count, a branch reaching every crate and a composed
 /// receipt, round-trips too, as does a landing's first judgment (no receipt, no crates, its
-/// cone its base). So does a re-judge of a landing resumed from a kept judgment: a receipt of
-/// more judgments than its re-judges (the earlier run's) and no branch crates, which it reads
-/// over its cone. And so does a hop past [`super::super::HOPS`], another build's bound (the
+/// cone its base). So does a re-judge of a landing resumed from a kept judgment: the earlier
+/// run's receipt and no branch crates, which it reads over its cone. And so does a hop past [`super::super::HOPS`], another build's bound (the
 /// receiver hands it on no further).
 #[test]
 fn a_handoff_encodes_to_its_pinned_schema_bytes_and_reads_back() {
     let sample = judge_sample();
     assert_eq!(
         String::from_utf8(sample.encode().unwrap()).unwrap(),
-        SCHEMA_1
+        SCHEMA_2
     );
-    assert_eq!(Handoff::decode(SCHEMA_1.as_bytes()), Ok(sample));
+    assert_eq!(Handoff::decode(SCHEMA_2.as_bytes()), Ok(sample));
     let recheck = recheck_sample();
     assert_eq!(Handoff::decode(&recheck.encode().unwrap()), Ok(recheck));
     let first = Handoff {
-        rejudges: 0,
         cone: id('b', 40),
         branch: None,
         stated: Stated::default(),
@@ -129,12 +125,37 @@ fn a_handoff_encodes_to_its_pinned_schema_bytes_and_reads_back() {
     assert_eq!(Handoff::decode(&beyond.encode().unwrap()), Ok(beyond));
 }
 
-/// Each refusal names what it refuses: another schema, a missing or unknown field, a commit
+/// THE TRANSITION: a branch cut before this build reached main hands its landing over in
+/// schema 1, at the first merge that brings this build in. Its bytes, as that sender wrote
+/// them (this schema's fields and its count of re-judges), read as the same handoff with the
+/// count dropped, for a judgment and for a recheck alike: the landing goes on instead of
+/// failing once in every open worktree. NEGATIVE CONTROL: the same bytes under a schema this
+/// build does not read are refused by name.
+#[test]
+fn a_handoff_of_the_schema_before_reads_as_this_one_without_its_rejudge_count() {
+    for (sample, rejudges) in [(judge_sample(), 1_u64), (recheck_sample(), 0)] {
+        let earlier = edited(&sample, |map| {
+            map.insert("schema".into(), Value::from(1_u64));
+            map.insert("rejudges".into(), Value::from(rejudges));
+        });
+        assert_eq!(Handoff::decode(&earlier), Ok(sample.clone()));
+        let unread = edited(&sample, |map| {
+            map.insert("schema".into(), Value::from(0_u64));
+            map.insert("rejudges".into(), Value::from(rejudges));
+        });
+        let refused = Handoff::decode(&unread).unwrap_err();
+        assert!(refused.contains("handed over in schema 0"), "{refused}");
+    }
+}
+
+/// Each refusal names what it refuses: a schema this build does not read, a missing or unknown
+/// field (the earlier schema's re-judge count missing from it, no count, or held by this
+/// schema), a commit
 /// that is no object id, a relative root, an image that is no digest, an unknown step, a hop
-/// that is no count from 1, a re-judge count that is no count, branch crates before any
-/// judgment, a composition count at a judgment, a recheck with no passed judgment, a receipt of
-/// fewer judgments than the re-judges before the step need, a cone other than the base before
-/// any judgment, bytes that are not JSON and bytes that are not the handoff's own encoding.
+/// that is no count from 1, a composition count that is no count, branch crates before any
+/// judgment, a composition count at a
+/// judgment, a recheck with no passed judgment, a cone other than the base before any judgment,
+/// bytes that are not JSON and bytes that are not the handoff's own encoding.
 #[test]
 fn a_handoff_the_reader_cannot_honour_is_refused_by_name() {
     let judge = judge_sample();
@@ -148,8 +169,21 @@ fn a_handoff_the_reader_cannot_honour_is_refused_by_name() {
     );
     let cases: Vec<(Vec<u8>, &str)> = vec![
         (
-            edited(&judge, set("schema", Value::from(2_u64))),
-            "it was handed over in schema 2; this tree's verify land reads schema 1",
+            edited(&judge, set("schema", Value::from(3_u64))),
+            "it was handed over in schema 3; this tree's verify land reads schemas 1 and 2",
+        ),
+        // The earlier schema's own fields are held to it: its re-judge count is neither
+        // missing nor anything but a count, and this schema holds none.
+        (
+            edited(&judge, set("schema", Value::from(1_u64))),
+            "it lacks its `rejudges` field",
+        ),
+        (
+            edited(&judge, |map| {
+                map.insert("schema".into(), Value::from(1_u64));
+                map.insert("rejudges".into(), Value::from("0"));
+            }),
+            "its `rejudges` is not a count",
         ),
         (
             edited(&judge, |map| drop(map.remove("schema"))),
@@ -188,26 +222,21 @@ fn a_handoff_the_reader_cannot_honour_is_refused_by_name() {
             "its `cone` `main` is not a git object id",
         ),
         (
-            edited(&judge, set("rejudges", Value::from("0"))),
-            "its `rejudges` is not a count",
+            edited(&recheck, set("composes", Value::from("2"))),
+            "its `composes` is not a count",
+        ),
+        (
+            edited(&judge, set("rejudges", Value::from(1_u64))),
+            "it holds an unknown field `rejudges`",
         ),
         (
             edited(&judge, set("stated", Value::from(""))),
             "it carries branch crates, but its receipt holds no judgment",
         ),
         (
-            edited(&judge, set("rejudges", Value::from(2_u64))),
-            "its receipt holds 1 judgments, too few for 2 re-judges before its judge",
-        ),
-        (
-            edited(&recheck, set("rejudges", Value::from(1_u64))),
-            "its receipt holds 1 judgments, too few for 1 re-judges before its recheck",
-        ),
-        (
             edited(&judge, |map| {
                 drop(map.insert("branch".into(), Value::Null));
                 drop(map.insert("stated".into(), Value::from("")));
-                drop(map.insert("rejudges".into(), Value::from(0_u64)));
             }),
             &unjudged_cone,
         ),
@@ -237,11 +266,11 @@ fn a_handoff_the_reader_cannot_honour_is_refused_by_name() {
         (b"not json\n".to_vec(), "it is not JSON"),
         (b"[1]\n".to_vec(), "it is not a JSON object"),
         (
-            SCHEMA_1.replacen(",", ", ", 1).into_bytes(),
+            SCHEMA_2.replacen(",", ", ", 1).into_bytes(),
             "it is not in the handoff's own encoding",
         ),
         (
-            SCHEMA_1.trim_end().as_bytes().to_vec(),
+            SCHEMA_2.trim_end().as_bytes().to_vec(),
             "it is not in the handoff's own encoding",
         ),
     ];
@@ -260,9 +289,9 @@ fn a_handoff_is_taken_once_whether_or_not_it_reads() {
     write(&file, &judge_sample()).unwrap();
     assert_eq!(Handoff::take(&file), Ok(judge_sample()));
     assert!(!file.exists());
-    std::fs::write(&file, SCHEMA_1.replace(r#""schema":1"#, r#""schema":2"#)).unwrap();
+    std::fs::write(&file, SCHEMA_2.replace(r#""schema":2"#, r#""schema":3"#)).unwrap();
     let refused = Handoff::take(&file).unwrap_err();
-    assert!(refused.contains("schema 2"), "{refused}");
+    assert!(refused.contains("schema 3"), "{refused}");
     assert!(!file.exists());
     assert_eq!(Handoff::take(&file), Err("it is not there".into()));
 }

@@ -177,3 +177,22 @@ pub fn shape_with_plan(face: &ShapeFace, plan: &ShapePlan, buffer: UnicodeBuffer
     }
     GlyphBuffer(buffer)
 }
+
+/// Runs substitution only on `buffer` with `plan`, leaving [`GlyphBuffer::glyph_infos`] identical
+/// to [`shape_with_plan`] while skipping horizontal advances, `GPOS`, `kerx`, `kern` and mark
+/// positioning.
+#[inline]
+pub fn shape_substitute_only_with_plan(
+    face: &ShapeFace,
+    plan: &ShapePlan,
+    buffer: UnicodeBuffer,
+) -> GlyphBuffer {
+    let mut buffer = buffer.0;
+    buffer.guess_segment_properties();
+    buffer.direction = plan.direction;
+    buffer.script = plan.script;
+    if buffer.len > 0 {
+        pipeline::shape_substitute_only_internal(plan, face, &mut buffer);
+    }
+    GlyphBuffer(buffer)
+}

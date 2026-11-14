@@ -104,11 +104,17 @@ pub struct Row {
 /// relaunch and upgrade lanes stand down from a session whose proven claim takes those duties
 /// (`SupervisorClaim::takes` and `SupervisorAuthority::builtin_keeps` in aterm-gui's
 /// `session_timeline.rs`, held by its unit tests). `lab harness-proof muse-alab`
-/// (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step 2) does not measure that stand-down: it
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §9) does not measure that stand-down: it
 /// sees only that aterm logged no built-in act, which holds with no claim too, since in a tab
 /// the harness leads aterm sees no exit and its relaunch lane knows no conversation for the
-/// harness's pid. A harness whose agent aterm supervises joins in the change that teaches the
-/// built-in engine to stand down from the scopes its row allows (§8.3).
+/// harness's pid. Claude Code's built-in lanes stand down the same way under claude-code-alab's
+/// proven claim (§11 D53): the upgrade lane on `status supervisor_proven=1`, whatever the scope
+/// (`upgrade_drive::self_claimed_by_status`, D29); the relaunch lane and the restart act on a
+/// scope naming `relaunch` (`SupervisorAuthority::builtin_keeps`, and aterm-gui's `restart_act`,
+/// which then sends the harness `restart cause=` in place of a signal). Its tool is `claude-alab`
+/// (D19); the image rule reads the package, never the tool's name. A harness whose agent aterm
+/// supervises joins in the change that teaches the built-in engine to stand down from the scopes
+/// its row allows (§8.3).
 pub const ROSTER: &[Row] = &[
     Row {
         id: "grok-alab",
@@ -129,6 +135,13 @@ pub const ROSTER: &[Row] = &[
         program: Program::Kimi,
         package: "kimi-alab",
         vendor: "kimi",
+        allows: &[Scope::Relaunch, Scope::Upgrade],
+    },
+    Row {
+        id: "claude-code-alab",
+        program: Program::Claude,
+        package: "claude-code-alab",
+        vendor: "claude",
         allows: &[Scope::Relaunch, Scope::Upgrade],
     },
 ];

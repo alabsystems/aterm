@@ -77,7 +77,13 @@ fn full_details_targets_and_original_times_round_trip_on_one_line() {
         Some(Met {
             word: MetWord::BrowserControl,
             host: Some("https://must-not-appear.invalid/token".into()),
+            why: Some("/synthetic/must-not-appear someone@must-not-appear.invalid".into()),
         }),
+    );
+    assert!(
+        diagnostic.words().ends_with(": <path> <address>"),
+        "the opener's reason is kept as its closed form admits it: {}",
+        diagnostic.words()
     );
     progress.login_diagnostics.push(diagnostic.clone());
     let line = reply(Some(&progress));

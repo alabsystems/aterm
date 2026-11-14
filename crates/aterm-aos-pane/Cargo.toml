@@ -18,3 +18,10 @@ workspace = true
 aterm-aos = { workspace = true }
 # The terminal engine the task steps and its canonical checkpoint encoding.
 aterm-core = { workspace = true }
+
+[dev-dependencies]
+# The model of the pane task and its checker, for the Tier-1 conformance test
+# (src/model_conformance_tests.rs). Test-only: at run time the crate depends on aterm-aos and
+# aterm-core alone.
+aterm-spec = { workspace = true }
+aterm-models-aos = { workspace = true }

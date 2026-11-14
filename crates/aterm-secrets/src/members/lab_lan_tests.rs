@@ -269,3 +269,31 @@ fn a_point_to_point_route_is_no_lab_home() {
         }
     }
 }
+
+/// A lab home holds none of this Mac's own addresses inside the CIDR as another host: one with a
+/// second interface there (`192.168.1.21`) reaches its own desk from that address too.
+///
+/// NEGATIVE CONTROL: with `home_in` building the home from the route's address alone
+/// (`HomeNet::at`), the second address is held: `this Mac's second address`.
+#[test]
+fn a_lab_home_holds_none_of_this_macs_own_addresses() {
+    let cidr = Cidr::parse("192.168.1.0/24").unwrap();
+    let home = home_in(
+        &cidr,
+        &Here {
+            facts: route("en0", "192.168.1.20/24").facts,
+            point_to_point: false,
+            own: vec![
+                "192.168.1.20".parse().unwrap(),
+                "192.168.1.21".parse().unwrap(),
+            ],
+        },
+    )
+    .expect("a home");
+    assert!(!home.holds("192.168.1.20".parse().unwrap()));
+    assert!(
+        !home.holds("192.168.1.21".parse().unwrap()),
+        "this Mac's second address"
+    );
+    assert!(home.holds("192.168.1.40".parse().unwrap()), "CONTROL");
+}

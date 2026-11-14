@@ -149,6 +149,7 @@ fn card_outlook(env: &Env) -> outlook::Outlook {
         credits: policy.usage_credits,
         now: env.now,
         offset: |_| 0,
+        signing_in: None,
     })
 }
 

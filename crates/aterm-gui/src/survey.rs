@@ -490,14 +490,14 @@ impl Here {
     pub(crate) fn now() -> Here {
         refresh_home_repos();
         let node = node_id_opt();
+        let mut facts = aterm_agent::survey_facts::SwarmSurveyFacts::collect(0, true, node);
+        facts.update = Some(updater_fact());
         Here {
             host: aterm_uds::process::lan_host_name(),
             instances: 1 + crate::sibling_scan::live_siblings(),
             access: crate::control::fleet_access_now(),
             drive: false,
-            facts: Some(aterm_agent::survey_facts::SwarmSurveyFacts::collect(
-                0, true, node,
-            )),
+            facts: Some(facts),
         }
     }
 
@@ -540,6 +540,18 @@ impl Here {
     }
 }
 
+/// Where this Mac's updater stands, for its survey facts (`update*=`): as `aterm update status` on
+/// this Mac decides it, for the build installed in this copy's place where a window still runs an
+/// older one ([`aterm_update::fleet_fact`]), read with no network and no lock, so a window's and
+/// the node job's answers both say it.
+pub(crate) fn updater_fact() -> aterm_types::update_standing::UpdateFact {
+    aterm_update::fleet_fact(
+        crate::build_info::build_number()
+            .parse::<u64>()
+            .unwrap_or(0),
+    )
+}
+
 /// Whether the listener answers a survey at `now` with `cached`, the snapshot it took at `at`:
 /// within [`FACTS_CACHE_TTL`], for the node this Mac is now (`live_node`), and only where that
 /// snapshot read its swarm roster. One whose roster was unread (a vault writer held the state lock
@@ -571,12 +583,18 @@ pub(crate) fn cmd_survey(
     max: usize,
     here: &Here,
 ) -> String {
-    const USAGE: &str = "ERR usage: survey [facts|content] [holder=<pid>.<boot>.<start>]\n";
+    const USAGE: &str =
+        "ERR usage: survey [facts|content] [holder=<pid>.<boot>.<start>] [by=<sid>]\n";
     let (mut level, mut holder) = (None, None);
+    // The session that asked, which only the fleet activity record reads: it changes no answer.
+    let mut asker = false;
     for word in rest.split_ascii_whitespace() {
         match word {
             "content" if level.is_none() => level = Some(most),
             "facts" if level.is_none() => level = Some(SurveyLevel::Facts),
+            _ if !asker && aterm_types::fleet_activity::survey_asker(word).is_some() => {
+                asker = true;
+            }
             _ if holder.is_none() => match aterm_ctl::release_holder::Identity::of_arg(word) {
                 Some(identity) => holder = Some(identity),
                 None => return USAGE.to_string(),

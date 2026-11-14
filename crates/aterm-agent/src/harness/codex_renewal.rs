@@ -513,8 +513,8 @@ impl Candidate {
 mod attempts;
 pub use attempts::{
     Attempt, AttemptRef, Cancellation, CancellationKind, CompletionProgress, IndexKey,
-    NativeCancellationProof, ReceiptWriter, RootDriver, advance_root, read_active_attempt,
-    read_attempt, read_cancellation, with_receipt_writer,
+    NativeCancellationProof, NativeUnattachedProof, ReceiptWriter, RootDriver, advance_root,
+    read_active_attempt, read_attempt, read_cancellation, with_receipt_writer,
 };
 
 /// Durable metadata only. Native command and operation persistence are retained
@@ -1021,17 +1021,20 @@ pub fn drive_restart(
     sid: &str,
     prepare: &super::native_act::Prepare,
 ) -> Option<RestartCompletion> {
-    drive_admitted(opts, sid, prepare, true)
+    drive_admitted(opts, sid, prepare, true, None)
 }
 
 /// Drive a separately sealed continuation whose predecessor is already closed.
-/// The host owns the closure proof; this transport never sends Signal.
+/// The host owns the closure proof; this transport never sends Signal. `latched` is the
+/// phase the host admitted it in: Rollback when its predecessor closed in Rollback, whose
+/// Forward the host refuses, so this drive never asks for it.
 pub fn drive_resume_only(
     opts: &super::upgrade_drive::Opts,
     sid: &str,
     prepare: &super::native_act::Prepare,
+    latched: super::native_act::ImagePhase,
 ) -> Option<RestartCompletion> {
-    drive_admitted(opts, sid, prepare, false)
+    drive_admitted(opts, sid, prepare, false, Some(latched))
 }
 
 fn drive_admitted(
@@ -1039,30 +1042,131 @@ fn drive_admitted(
     sid: &str,
     prepare: &super::native_act::Prepare,
     signal_original: bool,
+    latched: Option<super::native_act::ImagePhase>,
 ) -> Option<RestartCompletion> {
-    use super::{native_restart, upgrade_drive};
+    use super::upgrade_drive;
     restart_wire(prepare)?;
     if opts.dry_run {
         return None;
     }
     let key = format!("renewal-{}", prepare.id);
-    let mut state = upgrade_drive::load_record(opts, &key).ok()??;
+    let state = upgrade_drive::load_record(opts, &key).ok()??;
     if state.native_completed_prepare.is_some() || state.native_noexec_prepare.is_some() {
         return recover_completion(opts, sid, prepare, &state);
     }
     if !matching_restart(&state, prepare) {
         return None;
     }
-    let mut client = upgrade_drive::connect(opts, sid).ok()?;
+    let client = upgrade_drive::connect(opts, sid).ok()?;
+    drive_recovered(
+        opts,
+        sid,
+        prepare,
+        state,
+        client,
+        signal_original,
+        latched,
+        &HostPace,
+    )
+}
+
+/// Replay the exact retained preparation on `client`, then drive it on `pace`'s clock from the
+/// phase the host latched for it: a record mirroring a Rollback latch never asks for Forward.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_recovered(
+    opts: &super::upgrade_drive::Opts,
+    sid: &str,
+    prepare: &super::native_act::Prepare,
+    mut state: super::upgrade_drive::St,
+    mut client: super::upgrade_drive::Client,
+    signal_original: bool,
+    latched: Option<super::native_act::ImagePhase>,
+    pace: &impl Pace,
+) -> Option<RestartCompletion> {
+    use super::{native_restart, upgrade_drive};
+    let key = format!("renewal-{}", prepare.id);
     native_restart::recover(opts, &key, &mut client, sid, &mut state).ok()?;
     if state.native_completed_prepare.is_some() || state.native_noexec_prepare.is_some() {
         // Even a terminal receipt without an observation must survive reload.
         upgrade_drive::save_checked(opts, &key, &state).ok()?;
         return completion_value(&state, sid, prepare);
     }
-    drive_connection(opts, sid, prepare, state, client, signal_original)
+    // The record mirrors the host's frozen phase; the drive saves it before any Resume.
+    if latched == Some(super::native_act::ImagePhase::Rollback) {
+        state.native_rollback = true;
+    }
+    drive_connection_paced(opts, sid, prepare, state, client, signal_original, pace)
 }
 
+/// The clock and the sleep a connection drive paces its host polls by ([`drive_connection_paced`]).
+pub(super) trait Pace {
+    /// This host's transaction clock ([`super::native_act::monotonic_us`]).
+    fn now_us(&self) -> Option<u64>;
+    fn sleep(&self, wait: std::time::Duration);
+}
+
+struct HostPace;
+
+impl Pace for HostPace {
+    fn now_us(&self) -> Option<u64> {
+        super::native_act::monotonic_us()
+    }
+
+    fn sleep(&self, wait: std::time::Duration) {
+        std::thread::sleep(wait);
+    }
+}
+
+/// The wait before a connection drive's next host poll: [`Backoff::FLOOR`] after a poll that
+/// moved (a Resume the host typed, the old agent's exit, a phase whose launch it reported
+/// unissued), doubling to [`Backoff::CAP`] while every answer is unknown or a refusal.
+pub(super) struct Backoff(std::time::Duration);
+
+impl Backoff {
+    pub(super) const FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+    pub(super) const CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+    pub(super) fn new() -> Self {
+        Self(Self::FLOOR)
+    }
+
+    pub(super) fn next(&mut self, moved: bool) -> std::time::Duration {
+        let wait = if moved { Self::FLOOR } else { self.0 };
+        self.0 = wait.saturating_mul(2).min(Self::CAP);
+        wait
+    }
+}
+
+/// How long a drive asks for its Forward phase before it asks for its rollback instead.
+const FORWARD_US: u64 = 60_000_000;
+
+/// [`drive_connection_paced`] on this host's clock, for the transport tests.
+#[cfg(test)]
+pub(super) fn drive_connection(
+    opts: &super::upgrade_drive::Opts,
+    sid: &str,
+    prepare: &super::native_act::Prepare,
+    state: super::upgrade_drive::St,
+    client: super::upgrade_drive::Client,
+    signal_original: bool,
+) -> Option<RestartCompletion> {
+    drive_connection_paced(
+        opts,
+        sid,
+        prepare,
+        state,
+        client,
+        signal_original,
+        &HostPace,
+    )
+}
+
+/// Drive one admitted operation to completion on `pace`'s clock. A phase the host answered
+/// Resumed for is not asked again: the host typed its line, and repeats are answered unknown
+/// until it proves that launch unissued, when it may be typed once more. Every other answer
+/// (unknown while an earlier image settles, a refusal, no answer) is asked again on the next
+/// poll. Between polls the drive backs off ([`Backoff`]), waking at once when the old agent's
+/// exit is first seen.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1071,13 +1175,14 @@ fn drive_admitted(
         project = "aterm_agent::harness::native_restart::transport_tests::replay_model::renewal_transition"
     )
 )]
-pub(super) fn drive_connection(
+pub(super) fn drive_connection_paced(
     opts: &super::upgrade_drive::Opts,
     sid: &str,
     prepare: &super::native_act::Prepare,
     mut state: super::upgrade_drive::St,
     mut client: super::upgrade_drive::Client,
     signal_original: bool,
+    pace: &impl Pace,
 ) -> Option<RestartCompletion> {
     use super::{native_act, native_restart, upgrade_drive};
     restart_wire(prepare)?;
@@ -1121,9 +1226,18 @@ pub(super) fn drive_connection(
         upgrade_drive::save_checked(opts, &key, &state).ok()?;
         return None;
     }
-    let started = std::time::Instant::now();
-    while native_act::monotonic_us().is_some_and(|now| now < prepare.deadline_us) {
-        if native_restart::complete(opts, &key, &mut client, sid, &mut state) {
+    let started = pace.now_us();
+    let exited = || {
+        native_act::Process::observe(process.pid)
+            .is_none_or(|current| current.birth != process.birth)
+    };
+    let mut backoff = Backoff::new();
+    let mut gone = false;
+    // The phase the host answered Resumed for: it typed that phase's line.
+    let mut typed: Option<native_act::ImagePhase> = None;
+    while pace.now_us().is_some_and(|now| now < prepare.deadline_us) {
+        let poll = native_restart::poll_completion(opts, &key, &mut client, sid, &mut state);
+        if poll.completed {
             // Preserve closure even when the host has no usable observation.
             // A later read must remain inert instead of replaying the operation.
             upgrade_drive::save_checked(opts, &key, &state).ok()?;
@@ -1140,19 +1254,30 @@ pub(super) fn drive_connection(
         if client.reply_unread() {
             return None;
         }
-        if native_act::Process::observe(process.pid)
-            .is_none_or(|current| current.birth != process.birth)
+        let mut moved = false;
+        if poll.unissued.is_some() && poll.unissued == typed {
+            // A launch the host proved unissued may be typed again at once.
+            typed = None;
+            moved = true;
+        }
+        if !gone && exited() {
+            gone = true;
+            moved = true;
+        }
+        let phase = if state.native_rollback
+            || started
+                .zip(pace.now_us())
+                .is_some_and(|(started, now)| now.saturating_sub(started) >= FORWARD_US)
+        {
+            native_act::ImagePhase::Rollback
+        } else {
+            native_act::ImagePhase::Forward
+        };
+        if gone
+            && typed != Some(phase)
             && let Some(screen) = upgrade_drive::screen(&mut client, sid)
             && let Some(generation) = screen.generation
-        {
-            let phase = if state.native_rollback
-                || started.elapsed() >= std::time::Duration::from_secs(60)
-            {
-                native_act::ImagePhase::Rollback
-            } else {
-                native_act::ImagePhase::Forward
-            };
-            if native_restart::resume(
+            && native_restart::resume(
                 &mut client,
                 sid,
                 &binding,
@@ -1161,8 +1286,10 @@ pub(super) fn drive_connection(
                 prepare.expected_human_seq?,
             )
             .is_ok()
-                && phase == native_act::ImagePhase::Rollback
-            {
+        {
+            typed = Some(phase);
+            moved = true;
+            if phase == native_act::ImagePhase::Rollback {
                 state.native_rollback = true;
                 let _saved = upgrade_drive::save_checked(opts, &key, &state);
             }
@@ -1170,7 +1297,15 @@ pub(super) fn drive_connection(
         if client.reply_unread() {
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut left = backoff.next(moved);
+        while !left.is_zero() {
+            let slice = left.min(Backoff::FLOOR);
+            pace.sleep(slice);
+            left = left.saturating_sub(slice);
+            if !gone && exited() {
+                break;
+            }
+        }
     }
     // The existing record retains the exact original command and operation for
     // recovery. An expired or ambiguous operation never becomes a fresh signal.

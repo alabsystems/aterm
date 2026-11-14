@@ -140,6 +140,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         credits: false,
         now,
         offset: |_| 0,
+        signing_in: None,
     });
     let own = Some(outlook::Figure::Exact(580));
     let view = forecast.quota("main", own, true);

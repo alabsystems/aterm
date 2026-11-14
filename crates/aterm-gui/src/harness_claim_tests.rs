@@ -69,6 +69,15 @@ fn only_the_rostered_peer_that_leads_the_foreground_on_its_build_proves() {
         proves("kimi-alab@500", facts(Some(500), 500, true)),
         Some(500)
     );
+    assert_eq!(
+        proves("claude-code-alab@500", facts(Some(500), 500, true)),
+        Some(500)
+    );
+    assert_eq!(
+        proves("claude-code-alab@500", facts(Some(500), 500, false)),
+        None
+    );
+    assert_eq!(proves("claude-alab@500", facts(Some(500), 500, true)), None);
     assert_eq!(proves("other-alab@500", facts(Some(500), 500, true)), None);
     let me = std::process::id();
     let proven = prove(
@@ -134,4 +143,46 @@ fn only_a_complete_store_build_or_the_dev_link_of_the_rows_program_proves() {
         !image_in(&layout, grok_alab(), &stray),
         "still nothing outside it"
     );
+}
+
+/// claude-code-alab's IMAGE (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D19, D53): its tool is
+/// `claude-alab`, and the rule reads the package's store, never the tool's name. A complete
+/// build of `claude-code-alab` proves its row; the vendor's own store, another harness's build
+/// and its build read under another row do not.
+#[test]
+fn claude_code_alabs_image_is_its_packages_build_whatever_its_tool_is_named() {
+    let row = contract::row_named("claude-code-alab").expect("rostered");
+    let dir = aterm_tempfile::TempDir::new().expect("dir");
+    let root = std::fs::canonicalize(dir.path()).expect("canonical");
+    let layout = atpkg::store::Layout {
+        prefix: root.join("pkg"),
+    };
+    let build = |program: &str, id: u64, tool: &str, ready: bool| {
+        let dir = layout.build_dir(program, id);
+        std::fs::create_dir_all(dir.join("bin")).expect("build dir");
+        let exe = dir.join("bin").join(tool);
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("exe");
+        if ready {
+            atpkg::store::mark_build_ready(&dir).expect("ready");
+        }
+        exe
+    };
+    let tool = build("claude-code-alab", 14275, "claude-alab", true);
+    assert!(image_in(&layout, row, &tool), "its package's build");
+    assert!(
+        !image_in(&layout, grok_alab(), &tool),
+        "one row's build proves no other row"
+    );
+    let vendor = build("claude", 2_001_310, "claude", true);
+    assert!(
+        !image_in(&layout, row, &vendor),
+        "Claude Code's own store is not the harness's"
+    );
+    let other = build("grok-alab", 412, "claude-alab", true);
+    assert!(
+        !image_in(&layout, row, &other),
+        "a tool of its name in another harness's store"
+    );
+    let unready = build("claude-code-alab", 14276, "claude-alab", false);
+    assert!(!image_in(&layout, row, &unready), "a build not ready");
 }

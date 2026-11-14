@@ -105,7 +105,7 @@ fn until_cancelled_after_connect(
 
 /// The successful connect (or pending-connect check) already proved this connection.
 /// A Unix peer can send its verdict and close before we return: on macOS getpeername then
-/// returns EINVAL even though the verdict remains readable. Do not discard that stream.
+/// can return EINVAL even though the verdict remains readable. Do not discard that stream.
 fn finish_unix_connect(
     stream: CtlStream,
     deadline: Instant,

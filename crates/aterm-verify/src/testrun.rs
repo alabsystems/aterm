@@ -17,6 +17,7 @@ use crate::test_plan::{self, Dispatcher, Plan, Planned};
 use crate::test_progress::{Phase, Progress};
 
 use crate::resource_waits as test_waits;
+use aterm_capacity::Machine as _;
 
 pub use crate::test_content::{
     CarryProof, Evidence, KeyParts, Passed, encode_passed, moved_parts, read_passed,
@@ -111,7 +112,12 @@ fn init_subprocess_pool_dir(dir: &Path, slots: usize) -> std::io::Result<()> {
     })()
 }
 
-fn subprocess_pool(scratch: &Path, slots: usize) -> std::io::Result<aterm_tempfile::TempDir> {
+/// A new subprocess pool of `slots` stack slots under `scratch`
+/// (`aterm_spec::subprocess_lane`'s layout).
+pub(crate) fn subprocess_pool(
+    scratch: &Path,
+    slots: usize,
+) -> std::io::Result<aterm_tempfile::TempDir> {
     std::fs::create_dir_all(scratch)?;
     let pool = aterm_tempfile::Builder::new()
         .prefix("test-subprocs.")
@@ -870,6 +876,7 @@ where
         memory,
         pool,
         None,
+        None,
         live,
         stop,
         &|| false,
@@ -878,6 +885,11 @@ where
     )
 }
 
+/// [`dispatch_pooled`] inside a run (`ctx`), whose binaries each claim their memory and cores
+/// as they start ([`binary_permit_noting`]), and, where the run has one, on its live share
+/// (`share`, [`crate::test_share`]): a binary the plan's share admits beside others starts only
+/// while the share as it is at that look covers it too, and waits as one the dispatcher's own
+/// rule held back does. One with none beside it asks its claim alone.
 #[expect(
     clippy::too_many_arguments,
     reason = "dispatch inputs and optional live resource admission"
@@ -888,6 +900,7 @@ fn dispatch_resources<F, E>(
     memory: Option<u64>,
     pool: Option<&aterm_capacity::Jobserver>,
     ctx: Option<&crate::Ctx>,
+    share: Option<&crate::test_share::Live>,
     live: &(dyn Fn() -> f64 + Sync),
     stop: &(dyn Fn() -> bool + Sync),
     idle: &(dyn Fn() -> bool + Sync),
@@ -934,13 +947,28 @@ where
                                 waiters.clear();
                             }
                         },
-                        &mut |generation, b, alone| {
+                        &mut |generation, b, held| {
+                            if let Some(share) = share {
+                                let rate = live();
+                                let (refused, moved) =
+                                    share.refuses(b.charge, held, rate, Instant::now());
+                                if let (Some(ctx), Some(moved)) = (ctx, moved) {
+                                    emit(ctx, &share_event(share.asked(), &moved));
+                                }
+                                if let Some(refused) = refused {
+                                    waits.change(
+                                        b.index,
+                                        Some(test_waits::Reason::share(b, held, rate, refused)),
+                                    );
+                                    return None;
+                                }
+                            }
                             let (permit, reason) = binary_permit_observed(
                                 ctx,
                                 pool,
                                 b,
                                 &waiters,
-                                alone && idle(),
+                                held == 0 && idle(),
                                 Some((&probes, generation)),
                             );
                             waits.change(b.index, reason);
@@ -956,12 +984,28 @@ where
                     };
                     // What it runs on is what its ledger claim or pool tokens grant.
                     let b = execution_grant(&state, &permit, planned);
+                    let source = if pool.is_some() {
+                        "release pool"
+                    } else {
+                        "capacity ledger"
+                    };
+                    if let (Some(ctx), Some(binary), Ok(permit)) =
+                        (ctx, bins.get(b.index), permit.as_ref())
+                        && (permit.tokens.is_some() || permit.claim.is_some())
+                    {
+                        emit(
+                            ctx,
+                            &core_grant_event(
+                                "binary",
+                                Some(&binary.spec),
+                                (planned.charge, b.charge),
+                                source,
+                                None,
+                                &aterm_capacity::Live.read(None),
+                            ),
+                        );
+                    }
                     if let (true, Some(binary)) = (b.charge < planned.charge, bins.get(b.index)) {
-                        let source = if pool.is_some() {
-                            "release pool"
-                        } else {
-                            "capacity ledger"
-                        };
                         eprintln!(
                             "verify: {} starts on {} of its {} requested cores: the {source} \
                              grant bounds its execution width",
@@ -1325,14 +1369,10 @@ fn binary_permit_noting<'a>(
     waiting: &mut Option<test_waits::Reason>,
 ) -> Option<Result<BinaryPermit<'a>, std::io::Error>> {
     let claim = if let Some(ctx) = ctx.filter(|ctx| ctx.memory.is_some()) {
-        let need = aterm_capacity::Need::new("verify test binary")
+        let need = aterm_capacity::Need::new(crate::test_share::BINARY_CLAIM)
             .mem(b.peak)
             .cores(if pool.is_some() { 0 } else { b.charge })
-            .rank(if ctx.background {
-                aterm_capacity::Rank::Background
-            } else {
-                aterm_capacity::Rank::Ordinary
-            })
+            .rank(binary_rank(ctx))
             .covers();
         let need = if ctx
             .memory
@@ -1385,6 +1425,15 @@ fn binary_permit_noting<'a>(
         }
     };
     Some(Ok(BinaryPermit { claim, tokens }))
+}
+
+/// The rank a run's test binaries claim at: behind ordinary work for a background run.
+const fn binary_rank(ctx: &crate::Ctx) -> aterm_capacity::Rank {
+    if ctx.background {
+        aterm_capacity::Rank::Background
+    } else {
+        aterm_capacity::Rank::Ordinary
+    }
 }
 
 /// A binary whose wait for the release's pool's tokens an interrupt or the FIFO ended: verify
@@ -1509,7 +1558,7 @@ fn admitted_holding_observed<T>(
     live: &(dyn Fn() -> f64 + Sync),
     stop: &(dyn Fn() -> bool + Sync),
     after_stop: &(impl Fn() + Sync),
-    acquire: &mut impl FnMut(u64, &Planned, bool) -> Option<T>,
+    acquire: &mut impl FnMut(u64, &Planned, u32) -> Option<T>,
     rejected: &mut impl FnMut(&Planned, test_plan::DispatchResources),
 ) -> Option<(Planned, T)> {
     loop {
@@ -1524,12 +1573,13 @@ fn admitted_holding_observed<T>(
         }
         let mut permit = None;
         let generation = d.generation();
-        // Whether no binary of this dispatch runs: `acquire` reads it under this lock.
-        let alone = d.held() == 0;
+        // The cores this dispatch's running binaries hold, none where none runs: `acquire`
+        // reads it under this lock.
+        let held = d.held();
         if let Some(b) = d.next_with_observed(
             live(),
             &mut |b| {
-                permit = acquire(generation, b, alone);
+                permit = acquire(generation, b, held);
                 permit.is_some()
             },
             rejected,
@@ -2504,10 +2554,125 @@ pub(crate) fn claim_both(
     Ok(Claims { resources, granted })
 }
 
+/// A test run's two core counts: what it asked, and what its recording pass was granted.
+///
+/// THE GRANT IS ONE LOOK AT THE LEDGER, taken as the run's own test compile ends: an ordinary
+/// run's compile claims memory and no cores, so the 5-minute load it left reads as work nobody
+/// claimed and the ledger shares the machine with it (12 cores at a load of 24 grant 4). It
+/// bounds the recording pass, and it is the share the binaries' widths, charges and peaks are
+/// planned on ([`Cores::planned_on`]): the widths their kept runs measured them at. How many of
+/// them run side by side follows the run's share as it is at each start
+/// ([`crate::test_share`]), within the cores asked ([`Cores::dispatch_share`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cores {
+    /// The share asked: [`crate::Ctx::test_share`], which `--test-cores` caps.
+    pub(crate) asked: u32,
+    /// What the recording pass's claim was granted ([`Claims::granted`]).
+    pub(crate) granted: u32,
+}
+
+impl Cores {
+    /// The share each binary's width, charge and peak are planned on ([`plan_from_history`]):
+    /// the recording pass's grant, at least one.
+    pub(crate) const fn planned_on(self) -> u32 {
+        if self.granted == 0 { 1 } else { self.granted }
+    }
+
+    /// The most cores the dispatch's running binaries hold together
+    /// ([`test_plan::Plan::share`]): the cores asked, at least one.
+    pub(crate) const fn dispatch_share(self) -> u32 {
+        if self.asked == 0 { 1 } else { self.asked }
+    }
+
+    /// The multi-process test stacks the run's pool is made for
+    /// ([`subprocess_slots_for_cores`]): those of the cores asked. A run on a live share holds
+    /// back the slots that share does not cover ([`crate::test_share::Slots`]).
+    pub(crate) const fn subprocess_slots(self) -> usize {
+        subprocess_slots_for_cores(self.dispatch_share())
+    }
+
+    /// Whether the recording pass was granted less than the run asked.
+    pub(crate) const fn held_back(self) -> bool {
+        self.granted < self.asked
+    }
+}
+
+/// The plan a run dispatches: each binary's width, charge and peak planned on the recording
+/// pass's grant ([`Cores::planned_on`]), dispatched within the cores the run asked
+/// ([`Cores::dispatch_share`], [`test_plan::Plan::within`]).
+fn dispatch_plan(
+    history: &crate::test_history::History,
+    bins: &[Binary],
+    cores: Cores,
+    ceiling: Option<u32>,
+    fallback_peak: u64,
+) -> Plan {
+    plan_from_history(history, bins, cores.planned_on(), ceiling, fallback_peak)
+        .within(cores.dispatch_share())
+}
+
+/// The `test-core-grant` event: what one claim of cores for the test run asked and was granted,
+/// and the machine's load as it was granted. `scope` is `recording` for the recording pass's
+/// claim ([`claim_both`]), with the subprocess slots open under it, or `binary` for one
+/// binary's own claim as it starts, with its rerun spec; `source` names who granted it. An
+/// observation only: it says why a grant was what it was (the ledger shares by the 5-minute
+/// load, [`aterm_capacity`]'s `grant_iter`), and decides nothing.
+fn core_grant_event(
+    scope: &str,
+    test: Option<&str>,
+    (asked, granted): (u32, u32),
+    source: &str,
+    subprocess_slots: Option<usize>,
+    machine: &aterm_capacity::Reading,
+) -> String {
+    format!(
+        "verify-event: {}",
+        crate::event_log::event_value(
+            crate::event_log::EventKind::TestCoreGrant,
+            aterm_json::json!({
+                "scope": scope, "test": test, "asked": asked, "granted": granted,
+                "source": source, "subprocess_slots": subprocess_slots,
+                "load1": machine.load1, "load5": machine.load5,
+                "machine_cores": machine.cores,
+            })
+        )
+    )
+}
+
+/// The `test-core-grant` event of scope `dispatch`: the run's live share
+/// ([`crate::test_share::Live`]) at a look that moved it, of the cores asked, with what the look
+/// read: the load, the cores other claims hold and the load they account for, the waiters
+/// ahead, the load this run's own binaries put in, and the subprocess slots left open. Its
+/// `source` is `recording grant` where the ledger could not be read.
+fn share_event(asked: u32, standing: &crate::test_share::Standing) -> String {
+    let look = standing.look.as_ref();
+    format!(
+        "verify-event: {}",
+        crate::event_log::event_value(
+            crate::event_log::EventKind::TestCoreGrant,
+            aterm_json::json!({
+                "scope": "dispatch", "test": None::<&str>, "asked": asked,
+                "granted": standing.share,
+                "source": if look.is_some() { "live share" } else { "recording grant" },
+                "subprocess_slots": standing.slots.map(|open| open[0]),
+                "load1": look.and_then(|l| l.machine.load1),
+                "load5": look.and_then(|l| l.machine.load5),
+                "machine_cores": look.map(|l| l.machine.cores),
+                "held_by_others": look.map(|l| l.others.held),
+                "others_in_load": look.map(|l| l.others.in_load),
+                "waiting_ahead": look.map(|l| l.others.waiting),
+                "own_load": standing.own_load,
+            })
+        )
+    )
+}
+
 /// Record Cargo's current test invocations and run them on the run's CPU share: each binary at
 /// the width its kept runs call for and charged the cores they used, as many at once as their
 /// charges fit in the share, in recorded-duration and peak-memory priority ([`crate::test_plan`]); and keep
-/// what each took for the next run ([`crate::test_history`]). Each binary that runs libtest's
+/// what each took for the next run ([`crate::test_history`]). A run whose binaries claim their
+/// cores in the ledger reads that share again at each start ([`crate::test_share`]), within the
+/// cores it asked ([`Cores`]). Each binary that runs libtest's
 /// harness runs in libtest's JSON format where libtest takes it ([`probe_json`]), so each failed
 /// case's block is read as the case ends. The first proven red ends the run when its halt is armed
 /// ([`crate::Ctx::halt`], named for `check`): a decisive failed case ends its binary there
@@ -2567,15 +2732,19 @@ pub fn run_tests(
         }
     };
     progress.enter(Phase::RecordingSetup);
-    let granted_cores = claims.granted;
+    let cores = Cores {
+        asked: asked_cores,
+        granted: claims.granted,
+    };
     let recording_resources = claims.resources.as_ref();
+    // The pin of the recording pass, which runs under the recording claim.
     let thread_override = (ctx.env.build_slot_held.is_some()
         || ctx.pool.is_some()
         || ctx.test_threads.is_some()
         || ctx.test_cores.is_some()
-        || granted_cores < asked_cores)
-        .then(|| ctx.test_threads_within(granted_cores));
-    let slots = match subprocess_pool(&ctx.scratch, subprocess_slots_for_cores(granted_cores)) {
+        || cores.held_back())
+    .then(|| ctx.test_threads_within(cores.granted));
+    let slots = match subprocess_pool(&ctx.scratch, cores.subprocess_slots()) {
         Ok(pool) => pool,
         Err(why) => {
             r.cannot_run(format!(
@@ -2584,6 +2753,52 @@ pub fn run_tests(
             return;
         }
     };
+    // A run whose binaries claim their cores in the ledger runs them on its live share. A
+    // release's pool is its share already, and a person's `--now` asked for no waiting.
+    let share = (recording_resources.is_some()
+        && ctx.pool.is_none()
+        && ctx.quiet != Some(aterm_capacity::Admit::Now))
+    .then(|| {
+        crate::test_share::Live::on_the_ledger(
+            cores.asked,
+            cores.granted,
+            binary_rank(ctx),
+            Some(crate::test_share::Slots::of(
+                slots.path(),
+                cores.subprocess_slots(),
+            )),
+        )
+    });
+    emit(
+        ctx,
+        &core_grant_event(
+            "recording",
+            None,
+            (cores.asked, cores.granted),
+            match (&ctx.pool, recording_resources) {
+                (Some(_), _) => "release pool",
+                (None, Some(_)) => "capacity ledger",
+                (None, None) => "unclaimed",
+            },
+            Some(if share.is_some() {
+                subprocess_slots_for_cores(cores.granted)
+            } else {
+                cores.subprocess_slots()
+            }),
+            &aterm_capacity::Live.read(None),
+        ),
+    );
+    if share.is_some() {
+        r.raw(format!(
+            "  test cores: the recording pass was granted {} of the {} asked; the binaries are \
+             planned on {}, and as many run at once as the run's share covers at each start, \
+             at most {}",
+            cores.granted,
+            cores.asked,
+            cores.planned_on(),
+            cores.dispatch_share()
+        ));
+    }
 
     let mut serial = thread_override.map_or_else(
         || serial.clone(),
@@ -2720,7 +2935,8 @@ pub fn run_tests(
         history,
         fallback_peak,
         claims,
-        granted_cores,
+        cores,
+        share,
         checkers,
         preface,
         rerun: rerun.clone(),
@@ -2744,10 +2960,15 @@ pub(crate) struct RunPlan {
     pub(crate) history: crate::test_history::History,
     /// The selection's heaviest peak, else cold bound, used where a binary has no peak.
     pub(crate) fallback_peak: u64,
-    /// The recording pass's memory and core claims, replaced by the dispatch's claims.
+    /// The recording pass's memory and core claims, which go back before the dispatch: each
+    /// binary then claims its own.
     pub(crate) claims: Claims,
-    /// The share the recording pass was granted, used for the full binary set's initial plan.
-    pub(crate) granted_cores: u32,
+    /// What the run asked and its recording pass was granted: the full binary set is planned on
+    /// the grant and dispatched within the ask ([`dispatch_plan`]).
+    pub(crate) cores: Cores,
+    /// The run's live share ([`crate::test_share`]), where its binaries claim their cores in
+    /// the ledger: none under a release's pool, with no capacity book, or under `--now`.
+    pub(crate) share: Option<crate::test_share::Live>,
     /// The run's checker policy ([`crate::stages::with_checkers`]).
     pub(crate) checkers: bool,
     /// The recording pass's log, its `Running` headers dropped, at the head of a whole run's
@@ -2770,7 +2991,11 @@ impl RunPlan {
                 resources: None,
                 granted: share,
             },
-            granted_cores: share,
+            cores: Cores {
+                asked: share,
+                granted: share,
+            },
+            share: None,
             checkers: false,
             preface: String::new(),
             rerun: crate::findings::Rerun::default(),
@@ -2857,6 +3082,30 @@ fn project_plan(plan: &Plan, full: &[Binary], kept: &[Binary]) -> Plan {
         target: plan.target,
         order,
     }
+}
+
+/// Each binary's rerun spec with the width and the charge it ran at ([`Ran::planned`]): what
+/// its ledger claim or pool tokens granted where that was less than the plan
+/// ([`execution_grant`]). A run that keys each binary's content on its command (`fixed`) runs
+/// every one at the plan's width whatever it was granted, and a binary the run left unstarted
+/// has the plan's too.
+fn ran_widths(
+    bins: &[Binary],
+    plan: &Plan,
+    ran: &[Option<Ran>],
+    fixed: bool,
+) -> Vec<(String, u32, u32)> {
+    plan.order
+        .iter()
+        .filter_map(|planned| {
+            let at = ran
+                .get(planned.index)
+                .and_then(Option::as_ref)
+                .filter(|ran| ran.started && !fixed)
+                .map_or(*planned, |ran| ran.planned);
+            Some((bins.get(planned.index)?.spec.clone(), at.width, at.charge))
+        })
+        .collect()
 }
 
 /// The memory claim for the binaries `plan` can run at once.
@@ -3154,7 +3403,8 @@ fn run_planned_observed(
         history,
         fallback_peak,
         claims,
-        granted_cores,
+        cores,
+        share,
         checkers,
         preface,
         rerun,
@@ -3167,13 +3417,7 @@ fn run_planned_observed(
     let listed = bins.len();
     // Plan the complete recorded set. A carry may remove work, but cannot change any
     // peer's width or charge after that peer's content key has committed to its command.
-    let mut plan = plan_from_history(
-        &history,
-        &bins,
-        granted_cores,
-        ctx.test_threads,
-        fallback_peak,
-    );
+    let mut plan = dispatch_plan(&history, &bins, cores, ctx.test_threads, fallback_peak);
     let predicted_peak = plan_claim(&plan).unwrap_or(0);
     r.raw(format!("  test binaries: {} predicted concurrent recorded bytes; reservations are per binary, released at completion; unrecorded bound {}",
         predicted_peak, fallback_peak));
@@ -3301,7 +3545,7 @@ fn run_planned_observed(
                     |proof| candidate_for(binary, proof.json),
                 )
             },
-            usize::try_from(granted_cores).unwrap_or(1),
+            usize::try_from(cores.planned_on()).unwrap_or(1),
         );
         plan = project_plan(&plan, &all, &run);
         for binary in &run {
@@ -3446,13 +3690,6 @@ fn run_planned_observed(
             }
         }
     };
-    let rerun = rerun_base.at_widths(plan.order.iter().map(|planned| {
-        (
-            bins[planned.index].spec.clone(),
-            planned.width,
-            planned.charge,
-        )
-    }));
     if let Some(probe) = &probe {
         r.raw(json_ladder(probe));
     }
@@ -3551,6 +3788,7 @@ fn run_planned_observed(
         memory,
         ctx.pool.as_deref(),
         Some(ctx),
+        share.as_ref(),
         &live,
         &stop,
         &exec::no_child_runs,
@@ -3688,8 +3926,17 @@ fn run_planned_observed(
     // What the binaries' memory claim was, what the run carried and what hashing the
     // executables cost, how the binaries used their charges and whether their history was kept,
     // in a halted run's report as in a whole one's.
+    // A failed test reruns at the width its binary ran at and the grant it ran under.
+    let rerun = rerun_base.at_widths(ran_widths(&bins, &plan, &ran, content_evidence));
     let accounted = |r: &mut Report| {
         r.raw(summary(&plan, &ran));
+        if let Some((least, most)) = share.as_ref().and_then(crate::test_share::Live::range) {
+            r.raw(format!(
+                "  test cores: the run's share was {least} to {most} of the {} asked, read at \
+                 each start",
+                plan.share
+            ));
+        }
         if content_evidence {
             r.raw(format!(
                 "  test binaries: {} of {listed} carried (prior ok, executable and complete \

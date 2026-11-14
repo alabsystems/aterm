@@ -2378,6 +2378,13 @@ fn dev_build_reuses_the_typed_test_builds_dependencies() {
     c.scratch = scratch.path().to_owned();
     c.tools.targo = PathBuf::from(env!("CARGO"));
     c.main_build_dir = None;
+    // Obtaining sources is network work, not a hang: fetch them first with no ceiling, so the
+    // one-minute hang detector times only the graph reads. A lock that added crates made the
+    // graph's own download outrun it (2026-11-13).
+    c.child_ceiling = None;
+    let fetch = ["fetch", "--locked"].map(str::to_owned);
+    let fetched = exec::run(&targo(&c, fetch.to_vec()), c.exec_env());
+    assert!(fetched.ok, "{}", fetched.output);
     c.child_ceiling = Some(std::time::Duration::from_secs(60));
     let machine = Machine {
         root: None,
@@ -2390,8 +2397,8 @@ fn dev_build_reuses_the_typed_test_builds_dependencies() {
     };
     let mut interner = crate::unitgraph::Interner::default();
     let mut graph = |args: Vec<String>| {
-        // A cached compile need not retain registry archives. Keep resolution
-        // pinned while Cargo obtains any sources needed to inspect the graph.
+        // A cached compile need not retain registry archives; the fetch above obtained them.
+        // Keep resolution pinned.
         let out = exec::run(
             &targo(&c, args).args(UNIT_GRAPH).arg("--locked"),
             c.exec_env(),
@@ -3872,9 +3879,19 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
             assert_ne!(prior.content_key, env_drift.content_key);
         }
         drop(prior_runtime);
-        // A crashed earlier run's private residue is removed before the runtime is re-keyed.
-        aterm_uds::private_file::create_private_dir(&runtime_cwd).expect("stale cwd");
-        std::fs::write(runtime_cwd.join("stale"), b"not an input").expect("stale entry");
+        // Arrange crashed-run residue under the same lock as the real runtime: another
+        // concurrent group may otherwise clear it, or observe it in its own empty cwd.
+        {
+            let _stale_fixture_lock = aterm_uds::private_file::PrivateLock::take(
+                runtime_cwd.parent().expect("runtime parent"),
+                "windowed.lock",
+                std::time::Duration::from_secs(60),
+                "another AppKit verifier still owns the stale-fixture runtime",
+            )
+            .expect("stale-fixture lock");
+            aterm_uds::private_file::create_private_dir(&runtime_cwd).expect("stale cwd");
+            std::fs::write(runtime_cwd.join("stale"), b"not an input").expect("stale entry");
+        }
         c.passed_appkit_groups = Some(BTreeMap::from([(prior.group.clone(), prior)]));
         let mut report = Report::new("redraw conformance");
         redraw_conformance(&c, &mut report);
@@ -3895,7 +3912,19 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
                 runtime_cwd.display().to_string()
             );
         }
-        assert!(!runtime_cwd.exists(), "the stable group cwd is cleaned");
+        // Read the stable cwd under the lock the runtime held: a concurrent AppKit group may
+        // take it the moment ours is released and recreate the same cwd, which it removes
+        // before releasing the lock in turn.
+        {
+            let _cleaned_lock = aterm_uds::private_file::PrivateLock::take(
+                runtime_cwd.parent().expect("runtime parent"),
+                "windowed.lock",
+                std::time::Duration::from_secs(60),
+                "another AppKit verifier still owns the runtime",
+            )
+            .expect("cleaned-cwd lock");
+            assert!(!runtime_cwd.exists(), "the stable group cwd is cleaned");
+        }
         std::fs::remove_dir_all(root).ok();
     }
 }
@@ -3923,7 +3952,7 @@ fn appkit_group_replacement_after_a_drive_fails_closed() {
         crate::appkit_content::REDRAW_GROUP,
         &paths,
     )
-    .expect("runtime");
+    .unwrap_or_else(|| panic!("{}", prepared.render()));
     let before = appkit_group_proof(&c, crate::appkit_content::REDRAW_GROUP, &paths, &runtime);
     assert!(before.is_some());
     std::fs::write(&binary, b"after").expect("replace");
@@ -3940,7 +3969,11 @@ fn appkit_group_replacement_after_a_drive_fails_closed() {
         report.outcomes().next().map(|(outcome, _)| outcome),
         Some(Outcome::Fail(Severity::CouldNotRun))
     );
-    assert!(report.render().contains("changed while the group ran"));
+    assert!(
+        report.render().contains("changed while the group ran"),
+        "{}",
+        report.render()
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

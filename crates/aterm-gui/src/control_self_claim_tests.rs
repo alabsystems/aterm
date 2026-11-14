@@ -4511,8 +4511,107 @@ fn a_rostered_harness_claims_its_scope_through_meta_proven_or_refused_whole() {
     );
 }
 
-/// A scoped renewal publishes semantic scope and version changes through MetaChanged, while an
-/// identical renewal wakes nothing. The holder row is not duplicated for those changes.
+/// claude-code-alab THROUGH THE REAL `meta` DISPATCH (`docs/DESIGN-harness-repos-2026-10-24.md`
+/// §11 D53): now it is rostered, its claim without `contract=` (the v2 grammar, a lease included)
+/// is `ERR usage` and stores nothing, as is a duty outside its row; its `scope=upgrade` claim,
+/// the one its launch makes, is proven or refused whole, replaces the window host's claim, keeps
+/// its scope and versions and reads `supervisor_proven=1` on `meta`; the same connection widens
+/// it to `relaunch,upgrade`.
+#[test]
+fn claude_code_alab_claims_through_meta_under_contract_three_alone() {
+    use crate::session_timeline::SupervisorClaim;
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7521, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    let host = format!("aterm-harness@{}", std::process::id());
+    claim_supervisor_as(
+        ctx,
+        &host,
+        None,
+        None,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the host's claim");
+    let me = format!("claude-code-alab@{}", stand_in());
+    let serve = |rest: &str, proves: bool| {
+        let prove = move |_: &str| proves.then(running);
+        super::meta_wakes_proving_for_test(&store, &h.term, 7521, &h.ctx, rest, Some(4), &prove).0
+    };
+    let scoped_now = || {
+        let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = crate::metrics::now_us();
+        (
+            meta.live_claim(now)
+                .and_then(|c: &SupervisorClaim| c.scoped.as_ref())
+                .map(|s| (s.claim.scopes.words(), s.claim.versions())),
+            meta.claim_proven(now),
+        )
+    };
+    for bad in [
+        format!("set supervisor {me}"),
+        format!("set supervisor {me} ttl=500"),
+        format!("set supervisor {me} scope=upgrade"),
+        format!("set supervisor {me} contract=2 scope=upgrade"),
+        format!("set supervisor {me} contract=3 scope=upgrade,turn-end"),
+        format!("set supervisor {me} contract=3 scope=walls"),
+    ] {
+        let reply = serve(&bad, true);
+        assert!(reply.starts_with("ERR usage"), "{bad}: {reply}");
+        assert_eq!(shown(ctx), (Some(host.clone()), false), "{bad}");
+        assert_eq!(scoped_now(), (None, false), "{bad}");
+    }
+    let launch =
+        format!("set supervisor {me} contract=3 scope=upgrade version=0.2.0 vendor=2.1.310");
+    let reply = serve(&launch, false);
+    assert!(reply.starts_with("ERR unproven:"), "{reply}");
+    assert_eq!(
+        shown(ctx),
+        (Some(host.clone()), false),
+        "refused whole: the host still holds"
+    );
+    assert_eq!(serve(&launch, true), "OK\n");
+    assert_eq!(shown(ctx), (Some(me.clone()), false));
+    assert_eq!(
+        scoped_now(),
+        (
+            Some((
+                "upgrade".to_string(),
+                "claude-code-alab 0.2.0 (claude 2.1.310)".to_string()
+            )),
+            true
+        )
+    );
+    let read = serve("", true);
+    assert!(
+        read.contains(&format!(" supervisor={me} supervisor_proven=1 ")),
+        "{read}"
+    );
+    assert!(
+        serve(&format!("set supervisor {host}"), false).starts_with("ERR busy"),
+        "the host cannot take a proven claim back"
+    );
+    assert_eq!(
+        serve(
+            &format!(
+                "set supervisor {me} contract=3 scope=relaunch,upgrade version=0.2.0 \
+                 vendor=2.1.310"
+            ),
+            true
+        ),
+        "OK\n"
+    );
+    assert_eq!(
+        scoped_now().0.map(|(scope, _)| scope).as_deref(),
+        Some("relaunch,upgrade")
+    );
+}
+
+/// A scoped renewal publishes semantic scope and version changes through MetaChanged and moves the
+/// claim's revision, while an identical renewal wakes nothing and keeps it. The holder row is not
+/// duplicated for those changes.
 #[test]
 fn a_scoped_renewal_wakes_for_scope_version_and_vendor_changes() {
     let store = crate::session_store::new_store();
@@ -4539,6 +4638,7 @@ fn a_scoped_renewal_wakes_for_scope_version_and_vendor_changes() {
         "scope=relaunch",
     ];
     for words in claims {
+        let earlier = ctx.meta.lock().unwrap().supervisor_revision;
         let (reply, wakes) = serve(words);
         assert_eq!(reply, "OK\n");
         assert!(
@@ -4549,6 +4649,10 @@ fn a_scoped_renewal_wakes_for_scope_version_and_vendor_changes() {
             "a semantic claim change wakes the window: {words}: {wakes:?}"
         );
         let before = ctx.meta.lock().unwrap().supervisor_revision;
+        assert_ne!(
+            before, earlier,
+            "a semantic claim change is a new revision: {words}"
+        );
         let (reply, wakes) = serve(words);
         assert_eq!(reply, "OK\n");
         assert!(
@@ -4556,7 +4660,10 @@ fn a_scoped_renewal_wakes_for_scope_version_and_vendor_changes() {
             "an identical renewal wakes nothing: {wakes:?}"
         );
         let meta = ctx.meta.lock().unwrap();
-        assert_eq!(meta.supervisor_revision, before.wrapping_add(1));
+        assert_eq!(
+            meta.supervisor_revision, before,
+            "an identical renewal keeps the revision: {words}"
+        );
         assert_eq!(
             meta.live_scoped(crate::metrics::now_us())
                 .expect("scoped")
@@ -4688,5 +4795,83 @@ fn a_renewal_wakes_meta_changed_when_it_changes_proven_identity_or_lapses_a_wait
             .attention_owners
             .kinds_field(),
         "-"
+    );
+}
+
+/// A RECONFIRMATION IN PLACE IS NO CLAIM TRANSITION: codex-alab's same-holder `meta set
+/// supervisor` on its claim connection under the same proven birth, which it sends at the top of
+/// every follow tick, leaves the authority a sealed rotation's Prepare and receipt were bound to
+/// (the identity and revision `Seal::admits` reads, the revision native admission compares, the
+/// whole snapshot its Signal compares) exactly as it was, so the replayed prepare after a commit is
+/// still admitted. The same holder on another connection, or under a new birth, is a new authority
+/// and ends it.
+#[test]
+fn a_reconfirmation_in_place_keeps_the_sealed_authority_and_a_moved_claim_ends_it() {
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7556, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    let me = format!("codex-alab@{}", stand_in());
+    let serve = |rest: &str, conn: u64, proof: &Proven| {
+        let proof = proof.clone();
+        let prove = move |_: &str| Some(proof.clone());
+        super::meta_wakes_proving_for_test(&store, &h.term, 7556, &h.ctx, rest, Some(conn), &prove)
+            .0
+    };
+    let reconfirm = |conn: u64, proof: &Proven| serve(&format!("set supervisor {me}"), conn, proof);
+    let authority = || {
+        ctx.meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .supervisor_authority(crate::metrics::now_us())
+    };
+    let first = running();
+    assert_eq!(reconfirm(4, &first), "OK\n");
+    let sealed = authority();
+    assert_eq!(sealed.identity(), Some(&first));
+    assert_eq!(sealed.connection(), Some(4));
+    assert_eq!(
+        serve(
+            "set harness_activity reason=person wait_ms=120000 seq=1",
+            4,
+            &first
+        ),
+        "OK\n"
+    );
+    assert_eq!(reconfirm(4, &first), "OK\n");
+    assert_eq!(
+        authority(),
+        sealed,
+        "a reconfirmation in place keeps the sealed authority, its revision included"
+    );
+    let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(
+        meta.continuation_activity
+            .as_ref()
+            .map(|(revision, _)| *revision),
+        Some(meta.supervisor_revision),
+        "the continuation it reported still reads as the standing claim's"
+    );
+    drop(meta);
+
+    assert_eq!(reconfirm(5, &first), "OK\n");
+    let moved = authority();
+    assert_eq!(moved.connection(), Some(5));
+    assert_ne!(
+        moved.revision(),
+        sealed.revision(),
+        "the claim moved to another connection is a new authority"
+    );
+    let reborn = Proven {
+        pid: first.pid,
+        start: format!("{} (reborn)", first.start),
+    };
+    assert_eq!(reconfirm(5, &reborn), "OK\n");
+    let renewed = authority();
+    assert_eq!(renewed.identity(), Some(&reborn));
+    assert_ne!(
+        renewed.revision(),
+        moved.revision(),
+        "the claim under a new birth is a new authority"
     );
 }

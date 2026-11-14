@@ -3,19 +3,6 @@
 
 use super::*;
 
-fn set_meta(app: &mut App, session: u64, field: &str, value: &str) {
-    {
-        let store = app.store.read().unwrap_or_else(|p| p.into_inner());
-        let h = store.by_local(session).expect("registered session");
-        h.ctx
-            .meta
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set(field, Some(value.to_string()));
-    }
-    app.on_meta_changed(session);
-}
-
 #[cfg(unix)]
 fn publish_meta(app: &mut App, session: u64, field: &str, value: &str) {
     {
@@ -57,14 +44,14 @@ fn a_codex_terminal_keeps_its_program_icon_while_busy() {
     }
 }
 
-/// A CODEX TAB AT REST RESTS ON THE GLANCE, AND ONE AT A BOX NEEDS YOU: where its reader
-/// names no state (`agent=unknown`), the glance buckets the tab by the survey's word for the
+/// A CODEX TAB AT REST RESTS ON ITS ROW, AND ONE AT A BOX NEEDS ITS PERSON: where its reader
+/// names no state (`agent=unknown`), the row is classed by the survey's word for the
 /// program's own shown report (`program_state::survey_word`), so an `idle`, `done` or
 /// `error` report is resting and a `working` one, or none, working; a `blocked` one is
 /// published as the tab's need (`needs::program_need`, through `publish_need` as every
-/// presence refresh does) and counted need-you, except under a proven self-claim, which
-/// speaks for the tab: there it works. A word its reader names stands over any report.
-/// `NeedAges::observe` sees the bucket move, so the menu bar is rebuilt.
+/// presence refresh does), except under a proven self-claim, which speaks for the tab: there
+/// it works. A word its reader names stands over any report. `NeedAges::observe` sees the
+/// class move.
 #[test]
 fn a_codex_tabs_own_report_rests_it_only_where_its_reader_names_no_state() {
     use aterm_core::terminal::program_state::{
@@ -101,10 +88,22 @@ fn a_codex_tabs_own_report_rests_it_only_where_its_reader_names_no_state() {
         );
     };
     let report = |state: Option<W>| report_kind(state, None);
+    // The row's class as (needs its person, rests, works), one of them 1.
     let here = |app: &mut App| {
         app.publish_need(0);
-        let g = app.status_glance();
-        (g.here.need_you, g.here.resting, g.here.working)
+        let handle = app
+            .store
+            .read()
+            .unwrap()
+            .by_local(0)
+            .cloned()
+            .expect("registered");
+        let row = app.status_session_row(&handle);
+        match (row.need.is_some(), row.glance_word()) {
+            (true, _) => (1, 0, 0),
+            (false, "idle") => (0, 1, 0),
+            (false, _) => (0, 0, 1),
+        }
     };
     let claim = |proven: Option<bool>| {
         ctx.meta.lock().unwrap().supervisor =
@@ -200,7 +199,7 @@ fn a_codex_tabs_own_report_rests_it_only_where_its_reader_names_no_state() {
     assert!(app.presence.need_ages.observe(0, Some(&resting), now));
     assert!(
         app.presence.need_ages.observe(0, Some(&working), now),
-        "the bucket moved with the report alone"
+        "the class moved with the report alone"
     );
     assert!(
         !app.presence.need_ages.observe(0, Some(&working), now),
@@ -216,44 +215,146 @@ fn a_codex_tabs_own_report_rests_it_only_where_its_reader_names_no_state() {
     assert_eq!(app.status_session_row(&handle).program, None);
 }
 
+/// A fleet glance over a book that says this Mac is in a fleet, read by no thread.
+fn in_a_fleet() -> crate::fleet_glance::FleetGlance {
+    let mut slot = crate::fleet_glance::FleetSlot::default();
+    slot.book.in_fleet = true;
+    crate::fleet_glance::FleetGlance::over(slot)
+}
+
 #[test]
 fn chrome_reads_the_status_menu_as_its_builder_composes_it() {
+    let now = aterm_time::unix_millis().unwrap_or(0);
     let mut app = App::headless_for_test();
-    let needs = |app: &App| {
-        app.status_item_chrome_lines()
-            .iter()
-            .any(|line| line.starts_with("statusmenu \"Needs you (1)\""))
-    };
-    assert!(!needs(&app));
-    set_meta(&mut app, 0, "attention", "wedged on CI");
-    let drawn = (
-        app.status_gen,
-        app.status_drawn.len(),
-        app.status_painted.is_some(),
-    );
-    let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
     let lines = app.status_item_chrome_lines_at(now);
     assert!(
-        lines[0].starts_with("statusitem title=\u{276f} "),
+        lines[0].starts_with("statusitem title=\u{276f} fleet=off ")
+            && lines[0].ends_with(" blocked=no"),
         "{lines:#?}"
     );
+    assert_eq!(lines.len(), 2, "out of a fleet the menu is one line");
+    assert!(
+        lines[1].ends_with("not in a fleet\" enabled=no at=0"),
+        "{lines:#?}"
+    );
+
+    app.fleet_glance = Some(in_a_fleet());
+    let hour = crate::status_item::a_blocked_hour(now);
+    assert!(
+        app.fleet_traffic
+            .set(Some(crate::fleet_traffic::FleetTraffic::over(
+                Some(hour),
+                0
+            )))
+            .is_ok(),
+        "no reader in a unit test"
+    );
+    let lines = app.status_item_chrome_lines_at(now);
+    assert!(lines[0].ends_with(" blocked=yes"), "{lines:#?}");
+    let glance = app.status_glance();
     assert_eq!(
         lines[1..],
-        crate::status_item::menu_lines(
-            &crate::status_item::compose_status_menu(&app.status_glance(), now),
-            &[],
-        )[..],
+        crate::status_item::menu_lines(&crate::status_item::compose_status_menu(&glance, now))[..],
     );
-    assert!(needs(&app), "{lines:#?}");
     assert_eq!(
-        (
-            app.status_gen,
-            app.status_drawn.len(),
-            app.status_painted.is_some()
-        ),
-        drawn,
-        "a read changes nothing of the menu"
+        lines.iter().filter(|l| l.contains(" checked=yes")).count(),
+        1,
+        "the level in force: {lines:#?}"
     );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains(" blocked=yes")).count(),
+        3,
+        "the bar, the headline and the Mac this one refused: {lines:#?}"
+    );
+}
+
+/// THE BAR'S BLOCKED MARK CLEARS WHEN A MENU THAT SHOWS THE REFUSAL OPENS: the open states what
+/// the painted menu showed the person, the menu still lists it, and reading the menu as text
+/// opens nothing. A menu painted before the refusal arrived showed none of it: its open leaves
+/// the mark. NEGATIVE CONTROL: an open that clears the mark up to now, whatever was painted,
+/// fails the second assertion after the first open.
+#[test]
+fn opening_the_menu_clears_the_bars_blocked_mark_and_keeps_the_refusal_listed() {
+    let now = aterm_time::unix_millis().unwrap_or(0);
+    let mut app = App::headless_for_test();
+    app.fleet_glance = Some(in_a_fleet());
+    let hour = crate::status_item::a_blocked_hour(now);
+    let _ = app
+        .fleet_traffic
+        .set(Some(crate::fleet_traffic::FleetTraffic::over(
+            Some(hour.clone()),
+            0,
+        )));
+    assert!(app.status_glance().blocked);
+    let _ = app.status_item_chrome_lines();
+    assert!(app.status_glance().blocked, "a read as text is no open");
+    let _ = app.take_status_rebuild();
+    app.on_status_menu_opening(None);
+    assert!(app.take_status_rebuild(), "the open owes the bar a rebuild");
+    assert!(
+        app.status_glance().blocked,
+        "the menu that opened was painted before the refusal: not seen"
+    );
+    let painted = app.status_glance().blocked_shown_ms();
+    assert_eq!(painted, hour.last_blocked_in_ms);
+    assert!(painted.is_some());
+    app.on_status_menu_opening(painted);
+    let glance = app.status_glance();
+    assert!(!glance.blocked, "seen");
+    assert!(!glance.button_face().blocked);
+    assert_eq!(
+        glance.traffic.as_ref().map(|t| t.blocked_in),
+        Some(2),
+        "the menu still says what was refused"
+    );
+
+    // Out of a fleet nothing is marked, whatever the record holds, and its menu shows none.
+    let alone = App::headless_for_test();
+    let _ = alone
+        .fleet_traffic
+        .set(Some(crate::fleet_traffic::FleetTraffic::over(
+            Some(crate::status_item::a_blocked_hour(now)),
+            0,
+        )));
+    assert!(!alone.status_glance().blocked);
+    assert_eq!(alone.status_glance().blocked_shown_ms(), None);
+}
+
+/// THE MENU'S OPEN READS NO FILE: it shows the level the last change notification brought
+/// (`Wake::FleetAccessChanged`, `reread_fleet_access`). The level here moves under the App with
+/// no notification, which nothing in aterm does; the open leaves the face as it was, and the
+/// re-read a notification makes brings the new level. NEGATIVE CONTROL: an open that reads the
+/// level again shows Full after it. Unix, as the seam that sets a test thread's level is.
+#[cfg(unix)]
+#[test]
+fn opening_the_menu_reads_no_level_and_shows_the_one_last_brought() {
+    use aterm_types::fleet_access::FleetAccess;
+    let mut app = App::headless_for_test();
+    app.fleet_glance = Some(in_a_fleet());
+    app.reread_fleet_access();
+    assert_eq!(app.status_glance().access, FleetAccess::ReadOnly);
+    let _level = crate::control::FleetAccessForTest::set(FleetAccess::Full);
+    app.on_status_menu_opening(None);
+    assert_eq!(
+        app.status_glance().access,
+        FleetAccess::ReadOnly,
+        "the open read nothing"
+    );
+    app.reread_fleet_access();
+    assert_eq!(app.status_glance().access, FleetAccess::Full);
+}
+
+/// ALL ACTIVITY… RUNS `aterm fleet activity` INTO A TAB, RAISED: the menu's one row that opens
+/// anything opens the record its traffic lines are summed from.
+#[cfg(target_os = "macos")]
+#[test]
+fn all_activity_runs_the_fleet_activity_read_raised() {
+    let mut app = App::headless_for_test();
+    assert!(app.last_cli_plan.is_none());
+    app.dispatch_status_action(crate::status_item::StatusAction::AllActivity);
+    let plan = app.last_cli_plan.as_ref().expect("the read's plan");
+    assert_eq!(plan.argv, ["fleet", "activity"]);
+    assert!(plan.raise, "its tab comes to the front");
 }
 
 #[test]
@@ -275,124 +376,33 @@ fn hand_back_all_lifts_every_person_hold_and_nothing_else() {
         })
     ));
     app.refresh_presence_session(2);
-    let held = |app: &App| -> Vec<HoldWord> {
-        let mut held: Vec<HoldWord> = app.status_glance().held.iter().map(|h| h.hold).collect();
-        held.sort();
-        held
+    let held = |app: &App, session: u64| {
+        let handle = app
+            .store
+            .read()
+            .unwrap()
+            .by_local(session)
+            .cloned()
+            .expect("registered");
+        app.status_session_row(&handle).held
     };
     assert_eq!(
-        held(&app),
-        [HoldWord::Person, HoldWord::Person, HoldWord::Local]
+        [0, 1, 2].map(|session| held(&app, session)),
+        [
+            Some(HoldWord::Person),
+            Some(HoldWord::Person),
+            Some(HoldWord::Local)
+        ]
     );
+    assert!(app.any_person_hold(), "the Agents menu's row is live");
     app.hand_back_all();
     assert!(app.person_holds().is_empty(), "every person hold lifted");
+    assert!(!app.any_person_hold());
     assert!(ctx(&app, 2).fabric.holds().is_held(), "the client's stands");
-    assert_eq!(held(&app), [HoldWord::Local]);
-}
-
-#[test]
-fn a_write_the_persons_hold_refused_reaches_the_you_hold_row() {
-    let mut app = App::headless_for_test();
-    app.take_over_session(0).expect("the person takes tab 1");
-    let ctx = app.pool.get(0).expect("pooled").ctx.clone();
-    let _ = app.take_status_rebuild();
-    app.note_person_refusals();
-    assert!(!app.take_status_rebuild(), "nothing refused yet");
-    assert_eq!(app.status_glance().held[0].refused, 0);
-    assert_eq!(crate::fabric::halt_refusal(&ctx, "status"), None);
-    app.note_person_refusals();
-    assert!(!app.take_status_rebuild(), "a read moves nothing");
-    assert_eq!(app.status_glance().held[0].refused, 0);
-    let refusal = crate::fabric::halt_refusal(&ctx, "send").expect("halted");
-    assert!(refusal.contains("origin=person"), "{refusal}");
-    app.note_person_refusals();
-    assert!(
-        app.take_status_rebuild(),
-        "the count moved: one rebuild owed"
+    assert_eq!(
+        [0, 1, 2].map(|session| held(&app, session)),
+        [None, None, Some(HoldWord::Local)]
     );
-    assert_eq!(app.status_glance().held[0].refused, 1);
-    app.note_person_refusals();
-    assert!(!app.take_status_rebuild(), "and only once");
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn the_status_items_overview_opens_the_card_raised() {
-    let mut app = App::headless_for_test();
-    let wid = app.frontmost_window.expect("the test App's window");
-    let _ = take_raised_windows();
-    app.open_overview().expect("the Agents row opens it");
-    assert!(app.windows[&wid].overview().is_some());
-    assert_eq!(take_raised_windows(), Vec::new(), "control: no raise");
-    app.overview_exit(wid);
-    assert!(app.windows[&wid].overview().is_none());
-    app.dispatch_status_action(crate::status_item::StatusAction::Overview);
-    assert!(app.windows[&wid].overview().is_some(), "the card is open");
-    assert_eq!(take_raised_windows(), vec![wid], "and its window raised");
-}
-
-#[test]
-fn a_stale_pick_resolves_to_nothing() {
-    let mut app = App::headless_for_test();
-    set_meta(&mut app, 0, "attention", "look");
-    let first = app.status_glance();
-    let first = app.status_drawn_next(first);
-    let second = app.status_glance();
-    let second = app.status_drawn_next(second);
-    let pick = |generation, index| crate::status_item::Pick { generation, index };
-    assert!(app.status_pick(pick(first.generation, 0)).is_some());
-    assert!(app.status_pick(pick(second.generation, 0)).is_some());
-    let third = app.status_glance();
-    let third = app.status_drawn_next(third);
-    assert!(
-        app.status_pick(pick(first.generation, 0)).is_none(),
-        "a generation no longer kept"
-    );
-    let g = app.status_pick(pick(third.generation, 7)).expect("kept");
-    assert!(g.go.get(7).is_none(), "an index past the table");
-}
-
-#[test]
-fn an_open_menu_s_clicks_survive_the_hand_overs_it_causes() {
-    let pick = |generation, index| crate::status_item::Pick { generation, index };
-    for keep in [true, false] {
-        let mut app = App::headless_for_test();
-        set_meta(&mut app, 0, "attention", "look");
-        let before = app.status_glance();
-        let before = app.status_drawn_next(before);
-        let painted = app.status_glance();
-        let painted = app.status_drawn_next(painted);
-        if keep {
-            app.note_status_painted(Some(painted.clone()));
-        }
-        let began = app.status_glance();
-        let _ = app.status_drawn_next(began);
-        let ended = app.status_glance();
-        let ended = app.status_drawn_next(ended);
-        let go = app
-            .status_pick(pick(painted.generation, 0))
-            .and_then(|g| g.go.first().copied());
-        if !keep {
-            assert_eq!(go, None, "the control: the painted glance is gone");
-            continue;
-        }
-        assert_eq!(go, Some(0), "the painted glance's Go still lands");
-        assert!(app.status_pick(pick(ended.generation, 0)).is_some());
-        assert!(
-            app.status_pick(pick(before.generation, 0)).is_none(),
-            "drawn before that open"
-        );
-        app.note_status_painted(None);
-        assert!(
-            app.status_pick(pick(painted.generation, 0)).is_some(),
-            "an open with no paint keeps the last"
-        );
-        app.note_status_painted(Some(ended.clone()));
-        assert!(
-            app.status_pick(pick(painted.generation, 0)).is_none(),
-            "the next open's paint replaces it"
-        );
-    }
 }
 
 #[cfg(unix)]
@@ -456,13 +466,24 @@ fn an_adopted_standing_need_keeps_its_age_and_its_read_done() {
         app.age_session_need(1);
         app
     };
+    // Whether session 1's done is one its owner looked at, as its row says.
+    let done_seen = |app: &App| {
+        let handle = app
+            .store
+            .read()
+            .unwrap()
+            .by_local(1)
+            .cloned()
+            .expect("registered");
+        app.status_session_row(&handle).task.map(|task| task.seen)
+    };
     let mut adopted = successor(true);
     assert_eq!(
         adopted.presence.need_ages.need_since(1),
         Some(1_000),
         "the carried age"
     );
-    assert!(adopted.status_glance().done.is_empty(), "read before it");
+    assert_eq!(done_seen(&adopted), Some(true), "read before it");
     assert!(adopted.status_carry.is_empty(), "spent");
     publish_meta(&mut adopted, 1, "attention", "a new question");
     adopted.age_session_need(1);
@@ -474,7 +495,7 @@ fn an_adopted_standing_need_keeps_its_age_and_its_read_done() {
 
     let fresh = successor(false);
     assert_ne!(fresh.presence.need_ages.need_since(1), Some(1_000));
-    assert_eq!(fresh.status_glance().done.len(), 1, "no carry: unread");
+    assert_eq!(done_seen(&fresh), Some(false), "no carry: unread");
 }
 
 #[test]

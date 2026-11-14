@@ -3,6 +3,7 @@
 
 use super::*;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 /// One recorded tool launch: program, argv, extra env.
 type Run = (PathBuf, Vec<String>, Vec<(String, String)>);
@@ -64,9 +65,6 @@ impl Host for Fake {
             .find(|(dir, _)| win_path(dir) == want)
             .map(|(_, names)| names.clone())
             .unwrap_or_default()
-    }
-    fn read_to_string(&self, path: &Path) -> Result<String, String> {
-        Err(format!("no such file {}", path.display()))
     }
     fn write(&self, path: &Path, text: &str) -> Result<(), String> {
         self.written
@@ -331,7 +329,6 @@ fn sign_args_per_lane_carry_a_sha256_digest_and_a_timestamp() {
         endpoint: "https://eus.codesigning.azure.net".into(),
         account: "acct".into(),
         profile: "prof".into(),
-        dlib: None,
     };
     let a = sign_args(
         &ts,
@@ -380,63 +377,33 @@ fn metadata_json_escapes_what_a_name_could_carry() {
 }
 
 #[test]
-fn precedence_is_flag_then_env_then_profile_and_the_lane_is_inferred() {
-    let mut flag = Values::new();
-    flag.insert("timestamp".into(), "http://flag".into());
-    let mut env = Values::new();
-    env.insert("timestamp".into(), "http://env".into());
-    env.insert("thumbprint".into(), "ab".repeat(20));
-    let prof = values_from_profile(
-        "# comment\nsigning_key = \"ignored-by-us\"\nwinsign_timestamp = \"http://profile\"\nwinsign_signtool = \"C:\\st.exe\"\n",
-    )
-    .unwrap();
-    let c = resolve_config(&[&flag, &env, &prof]).unwrap();
-    assert_eq!(c.timestamp.as_deref(), Some("http://flag"));
-    assert_eq!(c.lane, Some(Lane::Thumbprint("AB".repeat(20))));
-    assert_eq!(c.signtool.as_deref(), Some(Path::new(r"C:\st.exe")));
-
-    let mut ts = Values::new();
-    ts.insert("endpoint".into(), "https://e".into());
-    ts.insert("account".into(), "a".into());
-    ts.insert("profile".into(), "p".into());
-    let c = resolve_config(&[&ts]).unwrap();
-    assert!(matches!(c.lane, Some(Lane::TrustedSigning { .. })));
-
-    let e = resolve_config(&[&ts, &env]).unwrap_err();
-    assert!(e.contains("--lane"), "{e}");
-    let mut pick = Values::new();
-    pick.insert("lane".into(), "thumbprint".into());
-    let c = resolve_config(&[&pick, &ts, &env]).unwrap();
-    assert!(matches!(c.lane, Some(Lane::Thumbprint(_))));
-
-    let mut partial = Values::new();
-    partial.insert("account".into(), "a".into());
+fn metadata_json_excludes_the_interactive_browser_credential() {
+    let m = trusted_signing_metadata("https://x", "a", "p");
     assert!(
-        resolve_config(&[&partial])
-            .unwrap_err()
-            .contains("endpoint")
+        m.contains(r#""ExcludeCredentials": ["InteractiveBrowserCredential"]"#),
+        "{m}"
     );
-    let mut bad = Values::new();
-    bad.insert("thumbprint".into(), "nope".into());
-    assert!(resolve_config(&[&bad]).unwrap_err().contains("40 hex"));
-    assert_eq!(resolve_config(&[]).unwrap().lane, None);
 }
 
 #[test]
-fn the_profile_grammar_refuses_what_the_release_cutter_refuses() {
-    assert!(values_from_profile("winsign_thumbprint = unquoted\n").is_err());
-    assert!(values_from_profile("winsign_thumbprint = \"\"\n").is_err());
-    assert!(values_from_profile("winsign_bogus = \"x\"\n").is_err());
-    assert!(values_from_profile("garbage line\n").is_err());
-    assert!(
-        values_from_profile("notary_profile = \"n\"\n")
-            .unwrap()
-            .is_empty()
+fn the_lane_is_the_committed_identity_whole_or_none() {
+    assert!(pinned_lane().is_ok(), "{:?}", pinned_lane());
+    assert_eq!(lane_from(["", "", ""], ""), Ok(None));
+    assert_eq!(
+        lane_from(["https://e", "a", "p"], ""),
+        Ok(Some(Lane::TrustedSigning {
+            endpoint: "https://e".into(),
+            account: "a".into(),
+            profile: "p".into(),
+        }))
     );
-    let v = values_from_profile("winsign_signtool = \"C:\\st.exe\"\n").unwrap();
-    assert_eq!(v.get("signtool").map(String::as_str), Some(r"C:\st.exe"));
-    let v = values_from_profile("winsign_signtool = \"C:\\\\st.exe\"\n").unwrap();
-    assert_eq!(v.get("signtool").map(String::as_str), Some(r"C:\\st.exe"));
+    assert_eq!(
+        lane_from(["", "", ""], &"ab".repeat(20)),
+        Ok(Some(Lane::Thumbprint("AB".repeat(20))))
+    );
+    assert!(lane_from(["", "a", ""], "").is_err(), "a partial Lane A");
+    assert!(lane_from(["https://e", "a", "p"], &"ab".repeat(20)).is_err());
+    assert!(lane_from(["", "", ""], "nope").is_err());
 }
 
 #[test]
@@ -550,27 +517,35 @@ fn versions_sort_numerically() {
 fn sign_without_a_lane_refuses_by_name_and_help_exits_zero() {
     let mut h = Fake::new();
     h.files.push(PathBuf::from(r"C:\d\aterm.exe"));
-    assert_eq!(run_with_tier(vec!["help".into()], &h, &Tier::Inactive), 0);
+    assert_eq!(run_with(vec!["help".into()], &h, &Tier::Inactive, None), 0);
     assert_eq!(
-        run_with_tier(
+        run_with(
             vec!["sign".into(), r"C:\d\aterm.exe".into()],
             &h,
-            &Tier::Inactive
+            &Tier::Inactive,
+            None
         ),
         2
     );
     assert_eq!(
-        run_with_tier(
+        run_with(
             vec!["sign".into(), r"C:\d\aterm.exe".into()],
             &h,
-            &tier_from("Andrew Yates")
+            &tier_from("Andrew Yates"),
+            None
         ),
         2
     );
-    assert_eq!(run_with_tier(vec!["bogus".into()], &h, &Tier::Inactive), 2);
+    assert_eq!(run_with(vec!["bogus".into()], &h, &Tier::Inactive, None), 2);
     assert_eq!(
-        run_with_tier(vec!["sign".into(), "--nope".into()], &h, &Tier::Inactive),
-        2
+        run_with(
+            vec!["sign".into(), "--thumbprint".into(), "cd".repeat(20)],
+            &h,
+            &Tier::Inactive,
+            None
+        ),
+        2,
+        "the identity is committed, never a flag"
     );
     assert!(h.runs.borrow().is_empty(), "nothing was executed");
 }
@@ -582,15 +557,17 @@ fn sign_with_a_thumbprint_runs_signtool_then_reads_the_signature_back() {
     let st = PathBuf::from(r"C:\sdk\signtool.exe");
     h.files.push(exe.clone());
     h.files.push(st.clone());
-    h.env
-        .insert("ATERM_WINSIGN_THUMBPRINT".into(), "cd".repeat(20));
-    h.env
-        .insert("ATERM_WINSIGN_SIGNTOOL".into(), st.display().to_string());
     h.reply = ran(0, VERIFIED);
-    let code = run_with_tier(
-        vec!["sign".into(), exe.display().to_string()],
+    let code = run_with(
+        vec![
+            "sign".into(),
+            "--signtool".into(),
+            st.display().to_string(),
+            exe.display().to_string(),
+        ],
         &h,
         &Tier::Inactive,
+        Some(&Lane::Thumbprint("CD".repeat(20))),
     );
     assert_eq!(code, 0);
     let runs = h.runs.borrow();
@@ -645,21 +622,22 @@ fn a_signtool_that_ran_and_refused_is_exit_one_not_two() {
     let st = PathBuf::from(r"C:\sdk\signtool.exe");
     let mut h = Fake::new();
     h.files.extend([exe.clone(), st.clone()]);
-    h.env
-        .insert("ATERM_WINSIGN_SIGNTOOL".into(), st.display().to_string());
-    h.env.insert(
-        "ATERM_WINSIGN_THUMBPRINT".into(),
-        "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4".into(),
-    );
+    let lane = Lane::Thumbprint("A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4".into());
     h.reply = ran(
         1,
         "SignTool Error: An unexpected internal error has occurred.",
     );
     assert_eq!(
-        run_with_tier(
-            vec!["sign".into(), exe.display().to_string()],
+        run_with(
+            vec![
+                "sign".into(),
+                "--signtool".into(),
+                st.display().to_string(),
+                exe.display().to_string(),
+            ],
             &h,
             &Tier::Inactive,
+            Some(&lane),
         ),
         1,
         "a refused signature must not wear the missing-tool code"
@@ -668,15 +646,12 @@ fn a_signtool_that_ran_and_refused_is_exit_one_not_two() {
 
     let mut gone = Fake::new();
     gone.files.push(exe.clone());
-    gone.env.insert(
-        "ATERM_WINSIGN_THUMBPRINT".into(),
-        "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4".into(),
-    );
     assert_eq!(
-        run_with_tier(
+        run_with(
             vec!["sign".into(), exe.display().to_string()],
             &gone,
             &Tier::Inactive,
+            Some(&lane),
         ),
         2,
         "nothing to sign with is still exit 2"
@@ -690,29 +665,31 @@ fn a_trusted_signing_sign_passes_dotnet_root_for_a_user_local_runtime() {
     let st = PathBuf::from(r"C:\sdk\signtool.exe");
     let dlib = PathBuf::from(r"C:\n\Azure.CodeSigning.Dlib.dll");
     h.files.extend([exe.clone(), st.clone(), dlib.clone()]);
-    h.env
-        .insert("ATERM_WINSIGN_SIGNTOOL".into(), st.display().to_string());
-    h.env
-        .insert("ATERM_WINSIGN_DLIB".into(), dlib.display().to_string());
-    h.env.insert(
-        "ATERM_WINSIGN_ENDPOINT".into(),
-        "https://eus.codesigning.azure.net".into(),
-    );
-    h.env.insert("ATERM_WINSIGN_ACCOUNT".into(), "acct".into());
-    h.env.insert("ATERM_WINSIGN_PROFILE".into(), "prof".into());
+    let lane = Lane::TrustedSigning {
+        endpoint: "https://eus.codesigning.azure.net".into(),
+        account: "acct".into(),
+        profile: "prof".into(),
+    };
+    let sign = vec![
+        "sign".into(),
+        "--signtool".into(),
+        st.display().to_string(),
+        "--dlib".into(),
+        dlib.display().to_string(),
+        exe.display().to_string(),
+    ];
     h.env
         .insert("LOCALAPPDATA".into(), r"C:\Users\u\AppData\Local".into());
+    for k in ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"] {
+        h.env.insert(k.into(), "x".into());
+    }
     h.dirs.insert(
         PathBuf::from(r"C:\Users\u\AppData\Local\Microsoft\dotnet\shared\Microsoft.NETCore.App"),
         vec!["8.0.31".into()],
     );
     h.reply = ran(0, VERIFIED);
     assert_eq!(
-        run_with_tier(
-            vec!["sign".into(), exe.display().to_string()],
-            &h,
-            &tier_from("Andrew Yates"),
-        ),
+        run_with(sign.clone(), &h, &tier_from("Andrew Yates"), Some(&lane)),
         0
     );
     assert_eq!(
@@ -738,6 +715,12 @@ fn a_trusted_signing_sign_passes_dotnet_root_for_a_user_local_runtime() {
     assert!(runs[0].1.contains(&"/dlib".to_string()));
     let child_env = &runs[0].2;
     assert_eq!(child_env.len(), 1, "one variable, and only that one");
+    assert!(
+        h.written.borrow()[0]
+            .1
+            .contains("InteractiveBrowserCredential"),
+        "the metadata shuts the browser sign-in out"
+    );
     assert_eq!(child_env[0].0, "DOTNET_ROOT");
     assert_eq!(
         win_path(Path::new(&child_env[0].1)),
@@ -746,10 +729,16 @@ fn a_trusted_signing_sign_passes_dotnet_root_for_a_user_local_runtime() {
     assert!(runs[1].2.is_empty(), "verify needs no runtime");
     drop(runs);
     assert_eq!(
-        run_with_tier(
-            vec!["verify".into(), exe.display().to_string()],
+        run_with(
+            vec![
+                "verify".into(),
+                "--signtool".into(),
+                st.display().to_string(),
+                exe.display().to_string(),
+            ],
             &h,
             &tier_from("Someone Else"),
+            None,
         ),
         1,
         "active tier refuses a verified exe signed by a different publisher"
@@ -758,14 +747,7 @@ fn a_trusted_signing_sign_passes_dotnet_root_for_a_user_local_runtime() {
     none.files.extend([exe.clone(), st.clone(), dlib.clone()]);
     none.env = h.env.clone();
     none.env.remove("LOCALAPPDATA");
-    assert_eq!(
-        run_with_tier(
-            vec!["sign".into(), exe.display().to_string()],
-            &none,
-            &Tier::Inactive,
-        ),
-        2
-    );
+    assert_eq!(run_with(sign, &none, &Tier::Inactive, Some(&lane)), 2);
     assert!(none.runs.borrow().is_empty());
 }
 
@@ -776,26 +758,16 @@ fn verify_reports_an_untrusted_chain_with_exit_one_even_when_inactive() {
     let st = PathBuf::from(r"C:\sdk\signtool.exe");
     h.files.push(exe.clone());
     h.files.push(st.clone());
-    h.env
-        .insert("ATERM_WINSIGN_SIGNTOOL".into(), st.display().to_string());
+    let verify = vec![
+        "verify".into(),
+        "--signtool".into(),
+        st.display().to_string(),
+        exe.display().to_string(),
+    ];
     h.reply = ran(1, UNTRUSTED);
-    assert_eq!(
-        run_with_tier(
-            vec!["verify".into(), exe.display().to_string()],
-            &h,
-            &Tier::Inactive,
-        ),
-        1
-    );
+    assert_eq!(run_with(verify.clone(), &h, &Tier::Inactive, None), 1);
     h.reply = ran(0, VERIFIED);
-    assert_eq!(
-        run_with_tier(
-            vec!["verify".into(), exe.display().to_string()],
-            &h,
-            &Tier::Inactive,
-        ),
-        0
-    );
+    assert_eq!(run_with(verify.clone(), &h, &Tier::Inactive, None), 0);
 }
 
 #[test]
@@ -814,12 +786,12 @@ fn find_signtool_resolves_windows_semicolon_path_on_every_host() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let regular = dir.path().join("meta.json");
     RealHost.write(&regular, "{}").expect("write regular file");
-    assert_eq!(RealHost.read_to_string(&regular).expect("read"), "{}");
+    assert_eq!(std::fs::read_to_string(&regular).expect("read"), "{}");
     RealHost
         .write(&regular, "{\"replaced\":true}")
         .expect("atomic overwrite regular file");
     assert_eq!(
-        RealHost.read_to_string(&regular).expect("read replaced"),
+        std::fs::read_to_string(&regular).expect("read replaced"),
         "{\"replaced\":true}"
     );
     #[cfg(unix)]
@@ -829,7 +801,62 @@ fn find_signtool_resolves_windows_semicolon_path_on_every_host() {
         let link = dir.path().join("link.json");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         assert!(RealHost.write(&link, "clobber").is_err());
-        assert!(RealHost.read_to_string(&link).is_err());
         assert_eq!(std::fs::read_to_string(&target).expect("intact"), "keep");
     }
+}
+
+#[test]
+fn a_trusted_signing_sign_without_an_azure_principal_refuses_before_signtool() {
+    let mut h = Fake::new();
+    let exe = PathBuf::from(r"C:\d\aterm.exe");
+    let st = PathBuf::from(r"C:\sdk\signtool.exe");
+    let dlib = PathBuf::from(r"C:\n\Azure.CodeSigning.Dlib.dll");
+    h.files.extend([exe.clone(), st.clone(), dlib.clone()]);
+    let lane = Lane::TrustedSigning {
+        endpoint: "https://eus.codesigning.azure.net".into(),
+        account: "acct".into(),
+        profile: "prof".into(),
+    };
+    let sign = vec![
+        "sign".into(),
+        "--signtool".into(),
+        st.display().to_string(),
+        "--dlib".into(),
+        dlib.display().to_string(),
+        exe.display().to_string(),
+    ];
+    assert_eq!(
+        run_inner(&sign, &h, &Tier::Inactive, Ok(Some(&lane))),
+        Err(NO_PRINCIPAL.to_string())
+    );
+    assert!(h.runs.borrow().is_empty(), "nothing was executed");
+    assert!(h.written.borrow().is_empty(), "no metadata written");
+}
+
+#[test]
+fn an_invalid_pin_fails_only_the_verbs_that_sign() {
+    let mut h = Fake::new();
+    let exe = PathBuf::from(r"C:\d\aterm.exe");
+    let st = PathBuf::from(r"C:\sdk\signtool.exe");
+    h.files.extend([exe.clone(), st.clone()]);
+    h.reply = ran(0, VERIFIED);
+    let why = "THUMBPRINT is a certificate's 40 hex digits (SHA-1); got `x`";
+    let bad = Err(why);
+    assert_eq!(run_inner(&["help".into()], &h, &Tier::Inactive, bad), Ok(0));
+    let verify = vec![
+        "verify".into(),
+        "--signtool".into(),
+        st.display().to_string(),
+        exe.display().to_string(),
+    ];
+    assert_eq!(run_inner(&verify, &h, &Tier::Inactive, bad), Ok(0));
+    let sign = vec!["sign".into(), exe.display().to_string()];
+    assert_eq!(
+        run_inner(&sign, &h, &Tier::Inactive, bad),
+        Err(why.to_string())
+    );
+    assert_eq!(
+        run_inner(&["doctor".into()], &h, &Tier::Inactive, bad),
+        Ok(2)
+    );
 }

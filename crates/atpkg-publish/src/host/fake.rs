@@ -884,7 +884,13 @@ impl ReleaseHost for FakeHost {
         git(crate::testkit::git()
             .arg("-C")
             .arg(dir)
-            .args(["fetch", "--quiet", "--tags", "--force"])
+            .args([
+                "fetch",
+                "--quiet",
+                "--tags",
+                "--force",
+                "--recurse-submodules=no",
+            ])
             .arg(&source)
             .arg("+refs/heads/*:refs/remotes/origin/*"))
     }
@@ -896,7 +902,13 @@ impl ReleaseHost for FakeHost {
         git(crate::testkit::git()
             .arg("-C")
             .arg(dir)
-            .args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"])
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--recurse-submodules=no",
+            ])
             .arg(&source)
             .arg(format!("+refs/heads/main:{into}")))
     }

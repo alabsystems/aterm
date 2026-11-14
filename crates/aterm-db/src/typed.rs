@@ -6,9 +6,9 @@
 //! envelope, the descriptor or repair. A collection declares one of three kinds:
 //!
 //! - **cells**, for owner data: one causal register per column, keyed `<pk>.<col>` (or
-//!   `<pk>.<col>.<elem>` for one element of a set), valued `{"r": version, "x": value}`, so
-//!   edits to different columns never collide and an edit replaces only the candidates it
-//!   observed ([`cell`]);
+//!   `<pk>.<col>.<elem>` for one element of a set, a text set's `<elem>` a digest of its text),
+//!   valued `{"r": version, "x": value}`, so edits to different columns or elements never
+//!   collide and an edit replaces only the candidates it observed ([`cell`]);
 //! - **owned**, for what a Mac states about itself: a whole row at the signer's own machine
 //!   uuid, inert at any other key ([`owned`]);
 //! - **log**, append-only per writer, read through the eligible operations, never cells.
@@ -26,7 +26,8 @@ pub mod check;
 pub mod claim;
 pub(crate) mod claim_activity;
 pub mod grid;
-pub mod guard;
+/// The text guard, shared with aterm-file's outbox.
+pub use aterm_value_guard as guard;
 pub mod keys;
 pub mod owned;
 pub mod secret;
@@ -202,6 +203,15 @@ pub enum Ty {
 }
 
 impl Ty {
+    /// A text set's longest element, for `Set(&Text(max))`: free-text members whose element key
+    /// is a digest of the text and whose element cell carries it (`cell::element`).
+    pub const fn text_set(&self) -> Option<usize> {
+        match self {
+            Self::Set(Self::Text(max)) => Some(*max),
+            _ => None,
+        }
+    }
+
     /// Whether a value of this type can hold an address, so every surface masks it.
     pub const fn pii(&self) -> bool {
         match self {

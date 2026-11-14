@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 #
-# aterm-core's lint config: the workspace clippy.toml's rows that can resolve in a
-# crate with no libc, winit or windows dependency (clippy reads only the nearest
-# file, so they are repeated here; the root file says why each exists) and THE
-# INJECTED CLOCK.
+# aterm-core's lint config: the workspace clippy.toml's rows of std and core, and of libc,
+# which its macOS tests link (clippy reads only the nearest file, so they are repeated here
+# word for word, as census guard `clippy-mirror` holds; the root file says why each exists),
+# and THE INJECTED CLOCK.
 #
 # The injected clock. `Terminal::process` is a pure function of (bytes, injected clock
 # reading), so a hydrated buffer replays exactly: every state-affecting clock read goes through
@@ -13,14 +13,33 @@
 # `aterm_time::Instant::now` is `std::time::Instant::now` on native targets, so the std row
 # names it too; `elapsed` reads the clock as well.
 disallowed-methods = [
+  { path = "std::net::TcpListener::accept", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)" },
+  { path = "std::net::TcpListener::incoming", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)" },
+  { path = "std::os::unix::net::UnixListener::accept", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)", allow-invalid = true },
+  { path = "std::os::unix::net::UnixListener::incoming", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)", allow-invalid = true },
+  { path = "libc::pipe", reason = "make a pipe with aterm_uds::pipe, which keeps both ends out of every child it is not handed to (clippy.toml: kept-out pipes)" },
+  { path = "libc::pipe2", reason = "make a pipe with aterm_uds::pipe, which keeps both ends out of every child it is not handed to (clippy.toml: kept-out pipes)", allow-invalid = true },
+  { path = "std::io::pipe", reason = "make a pipe with aterm_uds::pipe, which keeps both ends out of every child it is not handed to (clippy.toml: kept-out pipes)" },
   { path = "std::fs::File::lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
   { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
   { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "libc::fsync", reason = "flush through aterm-durable (aterm_durable::primitive::fsync for a plain flush), which astream-sys counts in flush_tally and times in flush_times (clippy.toml: a chosen flush)" },
+  { path = "libc::fdatasync", reason = "flush through aterm-durable (aterm_durable::durable_data, or primitive::fsync for a plain flush), which astream-sys counts in flush_tally and times in flush_times (clippy.toml: a chosen flush)", allow-invalid = true },
+  { path = "libc::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "libc::forkpty", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "libc::openpty", reason = "openpty leaves both ends inheritable and loses XNU's ptmx allocation race (EREDRIVEOPEN): use aterm_pty::open_pty_pair (clippy.toml: the confined shell)", allow-invalid = true },
+  { path = "libc::execvp", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
   { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::raise", reason = "a raised core signal writes a crash report: die by SIGKILL (clippy.toml: no core-dump death)" },
   { path = "std::os::windows::process::CommandExt::creation_flags", reason = "set a child's console with aterm_uds::spawn (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "core::option::Option::map_or_default", reason = "spell it .map(..).unwrap_or_default(): it is unstable on the stable Rust the foreign cells build with (clippy.toml: stable spellings)" },
+  { path = "core::result::Result::map_or_default", reason = "spell it .map(..).unwrap_or_default(): it is unstable on the stable Rust the foreign cells build with (clippy.toml: stable spellings)" },
+  { path = "std::thread::yield_now", reason = "wait on a wake: a Condvar, a channel, pause_for_handover or a bounded sleep slice; a test's poll pauses with aterm_uds::deadline::poll_yield (clippy.toml: a wait that wakes)" },
+  { path = "std::thread::available_parallelism", reason = "size a pool with aterm_cores::available_parallelism, bounded by the cores verify grants a test (clippy.toml: a granted pool)" },
   { path = "std::time::Instant::now", reason = "the engine reads no clock: take the instant process_at was given (clippy.toml: the injected clock)" },
   { path = "std::time::SystemTime::now", reason = "the engine reads no clock: take the instant process_at was given (clippy.toml: the injected clock)" },
   { path = "std::time::Instant::elapsed", reason = "the engine reads no clock: take the instant process_at was given (clippy.toml: the injected clock)" },

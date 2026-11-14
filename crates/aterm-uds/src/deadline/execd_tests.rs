@@ -80,18 +80,23 @@ fn a_shell_pid_line_does_not_prove_its_background_child_execd() {
         "negative control: the old immediate image assertion fails"
     );
     let mut released = false;
-    wait_execd(pid, &sleep, || {
-        if !released {
-            owned
-                .0
-                .stdin
-                .as_mut()
-                .expect("gate")
-                .write_all(b"go\n")
-                .expect("release exec");
-            released = true;
-        }
-    });
+    wait_execd(
+        pid,
+        &sleep,
+        || {
+            if !released {
+                owned
+                    .0
+                    .stdin
+                    .as_mut()
+                    .expect("gate")
+                    .write_all(b"go\n")
+                    .expect("release exec");
+                released = true;
+            }
+        },
+        crate::process::read_process_argv,
+    );
     assert!(released, "the helper must wait on the pre-exec fork");
     assert_eq!(crate::process::read_process_path(pid), Some(expected));
     assert_eq!(
@@ -101,6 +106,58 @@ fn a_shell_pid_line_does_not_prove_its_background_child_execd() {
     );
     execd(pid, &sleep);
     eprintln!("gated adopted orphan: immediate image fixture 0/1; shared helper 1/1");
+}
+
+/// XNU answers `KERN_PROCARGS2` with `EINVAL` for a moment after an exec's flag, path and first
+/// user time all read set. The reader here refuses the record of the image three times, as the
+/// kernel does in that moment: the wait asks again each time and ends only on an answer. A wait
+/// that never asks for the record (the rule before this one) returns with it unread, and a
+/// fixture's first argument read then fails about once in 1,400 execs.
+#[test]
+fn the_wait_holds_until_the_images_argument_record_reads() {
+    let sleep = super::super::stand_in(Path::new("/bin/sleep"));
+    struct Owned(crate::spawnfd::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let owned = Owned(
+        crate::spawnfd::command(&sleep)
+            .arg("600")
+            .spawn()
+            .expect("the sleeping fixture"),
+    );
+    let pid = owned.0.id() as i32;
+    let expected = std::fs::canonicalize(&sleep).expect("sleep");
+    const REFUSALS: u32 = 3;
+    let (mut asked, mut asked_of_another_image) = (0_u32, false);
+    wait_execd(
+        pid,
+        &sleep,
+        || {},
+        |pid| {
+            asked += 1;
+            asked_of_another_image |=
+                crate::process::read_process_path(pid).as_deref() != Some(expected.as_path());
+            if asked <= REFUSALS {
+                None
+            } else {
+                crate::process::read_process_argv(pid)
+            }
+        },
+    );
+    assert!(
+        asked > REFUSALS,
+        "the wait ended on a refused argument record ({asked} asked)"
+    );
+    assert!(
+        !asked_of_another_image,
+        "the record was asked of a process that did not yet name the image"
+    );
+    let words = crate::process::read_process_argv(pid).expect("the record the wait ended on");
+    assert_eq!(words.last().and_then(|word| word.to_str()), Some("600"));
 }
 
 fn marked(pid: i32) -> Option<bool> {

@@ -252,8 +252,12 @@ fn nested_build_reuses_artifacts_across_launcher_metadata() {
             .env("CARGO_BUILD_BUILD_DIR", root.join("build.noindex"))
             .env("CARGO_MANIFEST_DIR", root.join(launcher))
             .env("OUT_DIR", root.join(launcher).join("out"));
-        let output = aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
-            .expect("the nested Cargo test completed");
+        let output = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+            &mut cmd,
+            aterm_spec::wait::MUST_HAPPEN,
+            "nested Cargo launcher reuse fixture",
+        )
+        .expect("the nested Cargo test completed");
         assert!(
             output.status.success(),
             "{launcher}: {}",

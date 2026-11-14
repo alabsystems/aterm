@@ -135,6 +135,25 @@ impl Drop for Sleeper {
     }
 }
 
+/// One read of `read` once `KERN_PROC_ALL` answers: `kproc::records` bounds each wait to 1 s
+/// so an `exec` in progress never stalls a sweep, while a sibling test's `exec` under load can
+/// hold the kernel table past 1 s and make `read` return empty. Once a non-empty snapshot
+/// arrives, the caller judges that one snapshot with no retry.
+fn table_read<T>(read: fn() -> Vec<T>) -> Vec<T> {
+    let bound = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let rows = read();
+        if !rows.is_empty() {
+            return rows;
+        }
+        assert!(
+            std::time::Instant::now() < bound,
+            "the kernel held KERN_PROC_ALL past a minute"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// The table, a command line, a terminal, a `comm` and a resident set read in this process
 /// say what `/bin/ps` says of the same live process.
 #[test]
@@ -142,19 +161,19 @@ fn the_in_process_readers_say_what_ps_says() {
     let me = i32::try_from(std::process::id()).expect("own pid");
     let parent = i32::try_from(std::os::unix::process::parent_id()).expect("parent pid");
     assert!(
-        table().contains(&(me, parent)),
+        table_read(table).contains(&(me, parent)),
         "this process and its parent"
     );
     let sleep = Sleeper::start();
     assert!(
-        table().contains(&(sleep.0, me)),
+        table_read(table).contains(&(sleep.0, me)),
         "the child, under this process"
     );
     assert_eq!(command_line(sleep.0), "/bin/sleep 600");
     assert_eq!(command_line(sleep.0), ps("command=", sleep.0));
     assert_eq!(command_line(me), ps("command=", me));
     assert!(
-        commands().contains(&(sleep.0, me, "/bin/sleep 600".to_string())),
+        table_read(commands).contains(&(sleep.0, me, "/bin/sleep 600".to_string())),
         "one read of every process names the child"
     );
     assert_eq!(tty_of(sleep.0), "??", "a child in a session of its own");
@@ -224,7 +243,7 @@ fn a_process_whose_thread_has_not_run_has_its_arguments_left_unread() {
     let pid = i32::try_from(held.id()).expect("pid");
     assert_eq!(aterm_uds::process::thread_ran(pid), Some(false));
     assert_eq!(command_line(pid), "");
-    assert!(commands().contains(&(pid, me, String::new())));
+    assert!(table_read(commands).contains(&(pid, me, String::new())));
     assert_eq!(rows_of(&[pid]), [(pid, me, String::new())]);
     drop(held);
 }

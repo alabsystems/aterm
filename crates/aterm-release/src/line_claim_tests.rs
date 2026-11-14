@@ -1021,15 +1021,35 @@ fn native_fleet_status_reads_the_actual_claim_without_changing_its_holder() {
     let Write::Written(sha) = replace(&writer, &name, "", &initial) else {
         panic!("fixture claim must be written");
     };
+    let next_name = reference("0.157.0").unwrap();
+    let mut next = state("next-holder", 456);
+    next.line.version = "0.157.0".into();
+    assert!(matches!(
+        replace(&writer, &next_name, "", &next),
+        Write::Written(_)
+    ));
     let reader = repository(dir.path(), "reader", &origin);
     let root = dir.path().join("reader");
-    let remote = crate::github_remote::tests::local(&root, &origin);
+    let effects = Arc::new(agh::Fx::simulated(agh::Fx::live().wall_secs().unwrap()));
+    let remote = crate::github_remote::tests::local_with_fx(&root, &origin, effects.clone());
     assert_eq!(
         status_rows(&remote).unwrap(),
         [
-            "v0.156.0 original-holder original-holder step=verify boundary=test-binary-finished at=123 head=base"
+            "v0.156.0 original-holder original-holder step=verify boundary=test-binary-finished at=123 head=base",
+            "v0.157.0 next-holder next-holder step=verify boundary=test-binary-finished at=456 head=base"
         ]
     );
+    let children = effects.children_run();
+    for (verb, expected) in [("ls-remote", 1), ("fetch", 1)] {
+        assert_eq!(
+            children
+                .iter()
+                .filter(|child| child.args.iter().any(|arg| arg == verb))
+                .count(),
+            expected,
+            "fleet status must import one advertised snapshot: {verb}"
+        );
+    }
     assert_eq!(
         crate::ledger::rev_parse(&GitCli::new(&origin), &name).unwrap(),
         sha
@@ -1042,10 +1062,55 @@ fn native_fleet_status_reads_the_actual_claim_without_changing_its_holder() {
             .all(|name| name.starts_with("refs/agh/"))
     );
     assert!(!root.join(".git/FETCH_HEAD").exists());
+    // Move the real fixture ref after Git has produced the namespace advertisement.
+    // The report must keep that advertisement's immutable record rather than mix in
+    // the holder that a later exact ref lookup would see.
+    let advertisement = children
+        .iter()
+        .find(|child| child.args.iter().any(|arg| arg == "ls-remote"))
+        .unwrap();
+    let moving_writer = repository(dir.path(), "moving-writer", &origin);
+    moving_writer.import(&sha).unwrap();
+    let moved_name = name.clone();
+    let moved_from = sha.clone();
+    let moved = state("moved-holder", 789);
+    let race = agh::Fx::simulated(agh::Fx::live().wall_secs().unwrap())
+        .with_git_intercept_once_for_tests(
+            advertisement.program.clone(),
+            advertisement.args.clone(),
+            || {},
+            move |_| {
+                let written = replace(&moving_writer, &moved_name, &moved_from, &moved);
+                assert!(matches!(written, Write::Written(_)), "{written:?}");
+            },
+        );
+    let racing = crate::github_remote::tests::local_with_fx(&root, &origin, Arc::new(race));
+    assert_eq!(
+        status_rows(&racing).unwrap(),
+        [
+            "v0.156.0 original-holder original-holder step=verify boundary=test-binary-finished at=123 head=base",
+            "v0.157.0 next-holder next-holder step=verify boundary=test-binary-finished at=456 head=base"
+        ]
+    );
+    // Negative control: a fresh exact lookup really sees the concurrent replacement.
+    let moved_to = racing.get(&name).unwrap().unwrap();
+    assert_ne!(moved_to, sha);
+    let moved_bytes = racing
+        .fetch_exact(&moved_to)
+        .and_then(|()| racing.blob(&moved_to, Path::new("line.toml")))
+        .unwrap();
+    assert_eq!(
+        parse_state(std::str::from_utf8(&moved_bytes).unwrap(), &name)
+            .unwrap()
+            .holder
+            .host,
+        "moved-holder"
+    );
+    writer.import(&moved_to).unwrap();
     let mut wrong = initial;
     wrong.line.version = "0.155.0".into();
     assert!(matches!(
-        replace(&writer, &name, &sha, &wrong),
+        replace(&writer, &name, &moved_to, &wrong),
         Write::Written(_)
     ));
     assert!(
@@ -1053,6 +1118,21 @@ fn native_fleet_status_reads_the_actual_claim_without_changing_its_holder() {
             .unwrap_err()
             .contains("version does not match")
     );
+    git_ok(&GitCli::new(&origin), &["update-ref", "-d", &name]).unwrap();
+    git_ok(&GitCli::new(&origin), &["update-ref", "-d", &next_name]).unwrap();
+    let before = effects.children_run().len();
+    assert!(status_rows(&remote).unwrap().is_empty());
+    let children = effects.children_run();
+    for (verb, expected) in [("ls-remote", 1), ("fetch", 0)] {
+        assert_eq!(
+            children[before..]
+                .iter()
+                .filter(|child| child.args.iter().any(|arg| arg == verb))
+                .count(),
+            expected,
+            "an empty namespace needs no object transfer: {verb}"
+        );
+    }
 }
 
 #[cfg(unix)]

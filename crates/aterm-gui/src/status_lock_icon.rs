@@ -14,9 +14,16 @@
 //! Each step up opens both cues a notch, the shackle and the fill, so any two levels differ in
 //! both and a level reads at a glance and at one pixel a point. As template images AppKit tints
 //! them for a light bar, a dark bar and the highlighted button.
+//!
+//! Each level has a second image, the same lock with a bar through it: the blocked mark, which
+//! the bar shows while this Mac's lock has refused a request its person has not seen
+//! (`status_item::blocked_unseen`). The bar runs from the upper left to the lower right inside a
+//! clear band, so it reads on a solid body as on an empty one, and it stays clear of the right
+//! leg and the lower body, which say the level. The closed lock with the bar is also the menu's
+//! own mark, on a traffic row and on its header where a request was blocked.
 
 use aterm_template_icon::Pt;
-use aterm_template_icon::sdf::{ring, round_rect};
+use aterm_template_icon::sdf::{ring, round_rect, segment};
 use aterm_types::fleet_access::FleetAccess;
 
 /// The icon's width and height in points.
@@ -45,15 +52,32 @@ const ARCH_RAISED: f64 = 5.0;
 const AJAR_LEG_END: f64 = 8.0;
 /// Where the open shackle's right leg ends: a stub under the arch.
 const OPEN_LEG_END: f64 = 5.5;
+/// The blocked mark's bar, by its centre line: from the upper left to the lower right at 45
+/// degrees, through pixel centres at one pixel a point, where a diagonal draws cleanest.
+const BAR: [Pt; 2] = [Pt::new(2.5, 5.5), Pt::new(11.5, 14.5)];
+/// The clear band on each side of the bar, which parts it from the lock.
+const BAR_CLEAR: f64 = 1.0;
 
-/// What accessibility says each image is.
-pub(crate) const fn description(level: FleetAccess) -> &'static str {
-    match level {
-        FleetAccess::ReadOnly => "lock closed",
-        FleetAccess::ReadWrite => "lock half open",
-        FleetAccess::Full => "lock open",
+/// What accessibility says each image is: the lock, and with the bar through it that a request
+/// was blocked.
+pub(crate) const fn description(level: FleetAccess, blocked: bool) -> &'static str {
+    match (level, blocked) {
+        (FleetAccess::ReadOnly, false) => "lock closed",
+        (FleetAccess::ReadWrite, false) => "lock half open",
+        (FleetAccess::Full, false) => "lock open",
+        (FleetAccess::ReadOnly, true) => "lock closed, a request blocked",
+        (FleetAccess::ReadWrite, true) => "lock half open, a request blocked",
+        (FleetAccess::Full, true) => "lock open, a request blocked",
     }
 }
+
+/// The level whose lock, with the bar, is the menu's blocked mark: the closed one, since a
+/// block is a lock that stayed shut. The menu is macOS's.
+#[cfg(target_os = "macos")]
+pub(crate) const ROW_MARK: FleetAccess = FleetAccess::ReadOnly;
+/// What accessibility says the menu's blocked mark is.
+#[cfg(target_os = "macos")]
+pub(crate) const ROW_MARK_DESCRIPTION: &str = "blocked";
 
 /// The pixels of the icon at `scale` pixels a point, as `(width, height)`.
 pub(crate) fn pixels(scale: u32) -> (u32, u32) {
@@ -62,18 +86,39 @@ pub(crate) fn pixels(scale: u32) -> (u32, u32) {
     (w as u32 * scale, h as u32 * scale)
 }
 
-/// `level`'s lock at `scale` pixels a point: one coverage byte per pixel (0 clear, 255 ink).
-pub(crate) fn coverage(level: FleetAccess, scale: u32) -> Vec<u8> {
-    aterm_template_icon::coverage(pixels(scale), SIZE_POINTS, |p| ink(level, p))
+/// `level`'s lock at `scale` pixels a point, with the bar through it where `blocked`: one
+/// coverage byte per pixel (0 clear, 255 ink).
+pub(crate) fn coverage(level: FleetAccess, blocked: bool, scale: u32) -> Vec<u8> {
+    aterm_template_icon::coverage(pixels(scale), SIZE_POINTS, |p| {
+        if blocked {
+            barred(lock(level, p), p)
+        } else {
+            lock(level, p)
+        }
+    })
 }
 
 /// [`coverage`] as a template PNG.
-pub(crate) fn png(level: FleetAccess, scale: u32) -> Vec<u8> {
+pub(crate) fn png(level: FleetAccess, blocked: bool, scale: u32) -> Vec<u8> {
     let (w, h) = pixels(scale);
-    aterm_template_icon::png(&coverage(level, scale), w, h)
+    aterm_template_icon::png(&coverage(level, blocked, scale), w, h)
 }
 
-fn ink(level: FleetAccess, p: Pt) -> bool {
+/// The icon's canvas with nothing drawn, as a template PNG: what a menu row with no mark holds
+/// where another row has one, so their words start at the same place.
+pub(crate) fn blank_png(scale: u32) -> Vec<u8> {
+    let (w, h) = pixels(scale);
+    aterm_template_icon::png(&vec![0; (w * h) as usize], w, h)
+}
+
+/// `lock` with the bar through it: the bar is ink, and the band beside it is clear.
+fn barred(lock: bool, p: Pt) -> bool {
+    let [from, to] = BAR;
+    let bar = segment(p, from, to) - STROKE / 2.0;
+    bar <= 0.0 || (lock && bar > BAR_CLEAR)
+}
+
+fn lock(level: FleetAccess, p: Pt) -> bool {
     let body = round_rect(p, BODY, [BODY_RADIUS; 4]);
     let outline = body.max(-(body + STROKE));
     let filled = match level {

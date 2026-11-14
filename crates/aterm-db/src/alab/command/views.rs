@@ -1,14 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm db emails|computers|phones|ai-accounts`: the owner's tables as registry views
-//! (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §4.8, §11 A7), under the names the owner
-//! learned from fleet_db.
+//! `aterm db emails|computers|phones|ai-accounts`: the owner's tables under the names the owner
+//! learned from fleet_db (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §4.8, §11 A7), now
+//! aliases of the shared files (docs/DESIGN-shared-files-2026-11-11.md §3). None of them reads
+//! fleet_db, whatever this Mac's registry holds or refuses.
 //!
-//! - **The view.** Every row of the collection, each live column as the grid shows it: an
-//!   address masked unless `--show-addresses`, a conflict as `⚠ a ‖ b`, a `Secret` cell as
-//!   `••••••` when set and empty when not. `computers` is the `machine` rows joined with the
-//!   Commons seats, so a seat with no row and a row with no seat both show.
+//! - **The view.** Every row, each column as the grid shows it, with the state word of the
+//!   answer (`live`, `held`, `never`, `off`) and why. `ai-accounts` is the shared file
+//!   `ai/accounts` and `computers` is `lab/machines`: each is read from that file's snapshot on
+//!   this Mac ([`aterm_file::File::read`]), so it answers the last materialized rows whatever
+//!   this Mac's custody is doing, and opens none. `emails` and `phones` hold a `Secret` column,
+//!   which no shared file may (their files wait for LT-04), so their view is still projected
+//!   from the registry; where that read refuses, the answer is no rows and `never` with the
+//!   reason. An address is masked unless `--show-addresses`, a conflict shows as `⚠ a ‖ b`, a
+//!   `Secret` cell as `••••••` when set and empty when not.
+//! - **`--registry`** (`ai-accounts`, `computers`) is the noun's own projection of the
+//!   registry, read through this Mac's Commons custody, so it refuses where custody does. It
+//!   carries what the snapshot does not hold yet: for `ai-accounts` the `seen_on` and
+//!   `last_seen` columns and the observed `status` (from every Mac's `account-obs` rows and the
+//!   journal's `seen` events, judged against this Mac's clock), for `computers` each live seat
+//!   no machine row binds. It stays until the observation files `ai/logins` and `ai/usage`
+//!   (shared-files slice SF-08) carry those facts.
 //! - **`--show-passwords`** (`emails`) and **`--show-numbers`** (`phones`) show the `Secret`
 //!   column in plaintext, each cell through the audited reveal (`att::open_secrets`), and only
 //!   when the session may ([`super::session`]). In a person's aterm tab they print no value: text
@@ -26,10 +39,6 @@
 //! - **`set <row> <column> [--stdin]`** writes one cell as the owner. A `Secret` value comes
 //!   only from standard input, never argv, with one trailing newline from a pipe removed; it is
 //!   not session-gated, since writing a value shows none: it is how an agent edits.
-//!
-//! Until any Mac's import fills this Mac's registry, a Mac that holds a fleet_db replica keeps
-//! fleet_db's views under these names ([`kept`]), so the owner edits on that Mac as before until
-//! the import there; fleet_db's own writes refuse once this Mac's import recorded it covered.
 
 use super::{named_row, verbs};
 use crate::{
@@ -47,6 +56,7 @@ use crate::{
         secret::Secret,
     },
 };
+use aterm_file::{Why, Word};
 use aterm_json::{Map, Value, json};
 use aterm_secrets::client::Paths;
 use std::collections::BTreeMap;
@@ -94,6 +104,16 @@ impl Noun {
         }
     }
 
+    /// The shared file this noun is an alias of, when its collection may be one: `emails` and
+    /// `phones` hold a `Secret` column, so theirs wait for LT-04.
+    const fn file(self) -> Option<&'static crate::file::Type> {
+        match self {
+            Self::AiAccounts => Some(&crate::file::ACCOUNTS),
+            Self::Computers => Some(&crate::file::MACHINES),
+            Self::Emails | Self::Phones => None,
+        }
+    }
+
     /// The flag that shows this table's `Secret` column, and that column, with the surface a
     /// reveal journals.
     fn shown(self) -> Option<(&'static str, &'static str, Surface)> {
@@ -110,6 +130,8 @@ impl Noun {
 struct Opts {
     show_addresses: bool,
     show_secrets: bool,
+    /// The noun's own registry projection rather than its shared file's snapshot.
+    registry: bool,
     digest: bool,
     edit: bool,
     /// `set <row> <column> [<value>]`, and whether the value comes from stdin.
@@ -117,16 +139,24 @@ struct Opts {
     stdin: bool,
 }
 
-const USAGE: &str =
-    "aterm db emails|computers|phones|ai-accounts — the owner's tables (registry views)
+const USAGE: &str = "aterm db emails|computers|phones|ai-accounts — the owner's tables
 
   aterm db <table> [--show-addresses]
                     every row, each column as the grid shows it: addresses masked, a password
-                    or number as •••••• when set, a conflict as ⚠ a ‖ b
-                    (`ai-accounts` adds seen_on, the Macs a tab ran it on in the last two
-                    hours, and last_seen, from every Mac's account-obs rows and the journal's
-                    seen events; a pending account a Mac runs reads `signed in · on <mac>`,
-                    and a paused, broken or banned one `<status> · signed in on <mac>`)
+                    or number as •••••• when set, a conflict as ⚠ a ‖ b; with `state` (live,
+                    held, never or off) and `why`, which say how current the answer is and are
+                    never an error. `ai-accounts` is the shared file ai/accounts and
+                    `computers` is lab/machines (`aterm file cat <name>`): read from this Mac's
+                    snapshot, whatever its Commons custody is doing. `emails` and `phones` are
+                    read from the registry; where that refuses they answer no rows and `never`
+  aterm db ai-accounts --registry | aterm db computers --registry
+                    the table's own view of the registry, read through this Mac's Commons
+                    custody (it refuses where custody does), with what the snapshot does not
+                    hold yet. `ai-accounts` adds seen_on, the Macs a tab ran it on in the last
+                    two hours, and last_seen, from every Mac's account-obs rows and the
+                    journal's seen events; a pending account a Mac runs reads `signed in · on
+                    <mac>`, and a paused, broken or banned one `<status> · signed in on <mac>`.
+                    `computers` adds each live seat no machine row binds
   aterm db emails --show-passwords | aterm db phones --show-numbers
                     the same with the secret column in plaintext: only in a person's own aterm
                     tab or terminal (not one `aterm ctl spawn` started, held, driven, or running
@@ -150,6 +180,7 @@ fn parse(noun: Noun, words: &[String]) -> Result<Opts> {
     for word in words {
         match word.as_str() {
             "--show-addresses" => opts.show_addresses = true,
+            "--registry" if noun.file().is_some() => opts.registry = true,
             "--digest" => opts.digest = true,
             "--edit" => opts.edit = true,
             "--stdin" => opts.stdin = true,
@@ -196,6 +227,9 @@ fn parse(noun: Noun, words: &[String]) -> Result<Opts> {
             "choose one of --show-passwords/--show-numbers, --digest, --edit and set",
         ));
     }
+    if opts.registry && modes > 0 {
+        return Err(Error::new("--registry goes with the plain view only"));
+    }
     if opts.stdin && opts.set.is_none() {
         return Err(Error::new("--stdin goes with set"));
     }
@@ -234,48 +268,6 @@ pub struct ViewIo<'a> {
     pub now_ms: u64,
 }
 
-/// Why fleet_db's replica, not the registry, answers the four nouns on this Mac ([`kept`]).
-#[derive(Debug)]
-pub enum Kept {
-    /// The registry could not be read.
-    Unread(Error),
-    /// The registry reads and holds no source row: no Mac's import has filled it.
-    Empty,
-}
-
-impl std::fmt::Display for Kept {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unread(error) => write!(f, "the registry could not be read ({error})"),
-            Self::Empty => f.write_str("the registry holds no rows yet: no Mac's import filled it"),
-        }
-    }
-}
-
-/// Why fleet_db keeps the four nouns on this Mac, none where the registry serves them. The
-/// registry serves them unless this Mac holds a fleet_db replica, its own import recorded
-/// nothing beside it, and the registry cannot be read here or no Mac's import has filled it
-/// yet. Once this Mac's import ran, a registry that cannot be read says so rather than handing
-/// the nouns back to the replica. A rekey cut short right after its rename holds the replica in
-/// its kept folder, and fleet_db's refusal names it.
-#[must_use]
-pub fn kept(paths: &Paths) -> Option<Kept> {
-    let dir = super::replica_dir(paths);
-    if std::fs::symlink_metadata(dir.join("database.json")).is_err()
-        && crate::fleet_db::refuse_unfinished(&dir).is_ok()
-    {
-        return None;
-    }
-    if !matches!(crate::alab::import::covered::read(&dir), Ok(None)) {
-        return None;
-    }
-    match Handle::at(paths.clone(), &att::REGISTRY).view() {
-        Ok(view) if !view.project(&registry::SOURCE).rows.is_empty() => None,
-        Ok(_) => Some(Kept::Empty),
-        Err(error) => Some(Kept::Unread(error)),
-    }
-}
-
 /// Run one view: `words` after the noun.
 ///
 /// # Errors
@@ -286,6 +278,17 @@ pub fn run(paths: &Paths, noun: Noun, words: &[String], io: &mut ViewIo<'_>) -> 
         return Ok(json!({"usage": USAGE}));
     }
     let opts = parse(noun, words)?;
+    if let Some(file) = noun.file()
+        && opts.set.is_none()
+        && !opts.digest
+        && !opts.edit
+        && !opts.registry
+    {
+        // An alias of `aterm file cat`: this Mac's snapshot, read before anything here reaches
+        // for the registry, so no custody is opened.
+        let root = crate::file::root(&crate::generation::original(paths));
+        return Ok(from_snapshot(&root, noun, file, opts.show_addresses));
+    }
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     if let Some((row, column, value)) = &opts.set {
         return set(&handle, noun, row, column, value.as_deref(), opts.stdin, io);
@@ -304,14 +307,10 @@ pub fn run(paths: &Paths, noun: Noun, words: &[String], io: &mut ViewIo<'_>) -> 
     }
     let view = match handle.view() {
         Ok(view) => view,
-        Err(error) => {
-            return super::unread(
-                paths,
-                error,
-                "aterm db alab import --fleet-db --authoritative --apply on the Mac whose replica \
-                 the owner edits",
-            );
-        }
+        // `--registry` asks for the registry itself: where custody refuses, so does it. The
+        // noun's plain view still answers, from the snapshot.
+        Err(error) if opts.registry => return Err(error),
+        Err(error) => return Ok(unread(paths, noun, &error)),
     };
     let collection = noun.collection();
     let projection = view.project(collection);
@@ -325,18 +324,123 @@ pub fn run(paths: &Paths, noun: Noun, words: &[String], io: &mut ViewIo<'_>) -> 
         .iter()
         .map(|(pk, row)| shown_row(collection, pk, row, opts.show_addresses, &revealed))
         .collect();
-    if noun == Noun::Computers {
+    if opts.registry && noun == Noun::Computers {
         let unbound = seats(paths, &view, &mut rows)?;
         rows.extend(unbound);
     }
-    if noun == Noun::AiAccounts {
+    if opts.registry && noun == Noun::AiAccounts {
         seen_columns(paths, &view, &mut rows, io.now_ms);
     }
+    // The records of a home an unfinished succession fences are held, never live; nor are
+    // those of a home whose standing could not be judged.
+    let (word, why) = crate::file::materialize::standing(paths, crate::admission::deadline());
     let mut out = Map::new();
     out.insert("complete".to_owned(), json!(view.complete));
     out.insert("table".to_owned(), json!(noun.word()));
+    out.insert("state".to_owned(), json!(word.as_str()));
+    out.insert("why".to_owned(), json!(why.map(Why::as_str)));
     out.insert(noun.word().to_owned(), Value::Array(rows));
     Ok(Value::Object(out))
+}
+
+/// What a noun with no shared file yet answers where its registry read refused: no rows, the
+/// word `never`, and why. Never an error, and never a read of fleet_db.
+fn unread(paths: &Paths, noun: Noun, error: &Error) -> Value {
+    let why = if error.is_busy() {
+        Why::Busy
+    } else if error.is_awaiting_membership() || error.is_enrollment_pending() {
+        Why::Membership
+    } else if matches!(
+        crate::alab::Registry::at(paths.clone()).declared(),
+        Ok(false)
+    ) {
+        Why::Catalog
+    } else {
+        Why::Custody
+    };
+    let mut out = Map::new();
+    out.insert("table".to_owned(), json!(noun.word()));
+    out.insert("state".to_owned(), json!(Word::Never.as_str()));
+    out.insert("why".to_owned(), json!(why.as_str()));
+    out.insert("detail".to_owned(), json!(error.to_string()));
+    out.insert(noun.word().to_owned(), Value::Array(Vec::new()));
+    Value::Object(out)
+}
+
+/// `text` with every address in it masked ([`grid::mask`]), as the views show one unless the
+/// owner asks for addresses.
+fn masked(text: &str) -> String {
+    if !text.contains('@') {
+        return text.to_owned();
+    }
+    text.split(' ')
+        .map(|word| {
+            if word.contains('@') {
+                grid::mask(word.trim_start_matches(['"', '(', '[', '<']))
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A noun that is a shared file's alias, from that file's snapshot under `root`: its rows as
+/// the last pass left them, with the file's state word. It reads local files only.
+fn from_snapshot(
+    root: &aterm_file::Root,
+    noun: Noun,
+    file: &crate::file::Type,
+    show_addresses: bool,
+) -> Value {
+    let shared = aterm_file::File::at(root, &file.file());
+    let read = shared.read();
+    let rows: Vec<Value> = read
+        .rows()
+        .iter()
+        .map(|row| {
+            let mut out = Map::new();
+            out.insert(noun.collection().prefix.to_owned(), json!(row.pk));
+            for column in read
+                .columns()
+                .iter()
+                .filter(|column| column.source != aterm_file::Source::Pk)
+            {
+                let cell = row.cell(&column.name);
+                out.insert(
+                    column.name.clone(),
+                    if cell.is_empty() {
+                        Value::Null
+                    } else if show_addresses {
+                        json!(cell)
+                    } else {
+                        json!(masked(cell))
+                    },
+                );
+            }
+            Value::Object(out)
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert(
+        "complete".to_owned(),
+        json!(
+            read.status
+                .state
+                .as_ref()
+                .is_some_and(|state| state.complete)
+        ),
+    );
+    out.insert("table".to_owned(), json!(noun.word()));
+    out.insert("file".to_owned(), json!(file.name));
+    out.insert("state".to_owned(), json!(read.status.word.as_str()));
+    out.insert("why".to_owned(), json!(read.status.why.map(Why::as_str)));
+    out.insert("rev".to_owned(), json!(read.status.rev()));
+    if let Some(problem) = &read.status.problem {
+        out.insert("problem".to_owned(), json!(problem));
+    }
+    out.insert(noun.word().to_owned(), Value::Array(rows));
+    Value::Object(out)
 }
 
 /// One row as the view shows it: its key and each live column, by name.
@@ -544,9 +648,10 @@ fn mac_name(lab: &LabView, uuid: &str) -> String {
     }
 }
 
-/// `ai-accounts`: the derived `seen_on` and `last_seen` columns, never typed, from every Mac's
-/// `account-obs` rows and the journal's heard `seen` events ([`seen_on`]); and where a Mac runs
-/// the account now, `status` says so ahead of a catalog `pending`: observation wins over belief.
+/// `ai-accounts --registry`: the derived `seen_on` and `last_seen` columns, never typed, from
+/// every Mac's `account-obs` rows and the journal's heard `seen` events ([`seen_on`]); and where
+/// a Mac runs the account now, `status` says so ahead of a catalog `pending`: observation wins
+/// over belief.
 fn seen_columns(paths: &Paths, view: &att::View, rows: &mut [Value], now_ms: u64) {
     let empty = crate::typed::owned::OwnedRead::default();
     let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
@@ -618,8 +723,8 @@ fn shown_seen(rows: &mut [Value], seen: &BTreeMap<String, SeenOn>, now_ms: u64) 
     }
 }
 
-/// `computers`: each machine row with the Commons seats bound to it, then each live seat no
-/// machine row binds.
+/// `computers --registry`: each machine row with the Commons seats bound to it, then each live
+/// seat no machine row binds.
 fn seats(paths: &Paths, view: &att::View, rows: &mut [Value]) -> Result<Vec<Value>> {
     let empty = crate::typed::owned::OwnedRead::default();
     let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
@@ -942,37 +1047,38 @@ fn set(
     Ok(Value::Object(out))
 }
 
-/// What the command line says on standard error before fleet_db answers `noun` in the registry's
-/// place: which store answers and why ([`Kept`]). Until this was said, a reader took a replica
-/// last written days before for the registry (ATERM-KI-1112-140). Nothing where no replica is
-/// at its path (a rekey cut short): fleet_db's own refusal names that.
-fn handed_back(paths: &Paths, noun: Noun, kept: &Kept) -> Option<String> {
-    let dir = super::replica_dir(paths);
-    std::fs::symlink_metadata(dir.join("database.json")).ok()?;
-    Some(format!(
-        "aterm db {}: read from this Mac's fleet_db replica ({}), not the registry: {kept}",
-        noun.word(),
-        dir.display()
-    ))
-}
-
-/// `aterm db emails|computers|phones|ai-accounts …` from the command line: `None` where `words`
-/// name none of them or fleet_db keeps them on this Mac ([`kept`]), which it says on standard
-/// error first ([`handed_back`]); standard output stays the answering store's own.
+/// `aterm db emails|computers|phones|ai-accounts …` from the command line: `None` only where
+/// `words` name none of them. A noun never falls through to fleet_db.
 #[must_use]
 pub fn main_entry(words: &[String]) -> Option<std::process::ExitCode> {
     use std::io::Write as _;
     let noun = Noun::parse(words.first()?)?;
-    let paths = Paths::live().ok()?;
-    if let Some(kept) = kept(&paths) {
-        if let Some(line) = handed_back(&paths, noun, &kept) {
-            let _ = writeln!(std::io::stderr(), "{line}");
-        }
-        return None;
-    }
     let report = |error: &Error| {
         let _ = writeln!(std::io::stderr(), "aterm db {}: {error}", noun.word());
         std::process::ExitCode::from(1)
+    };
+    // The plain view of a shared file's alias reads this Mac's snapshot and nothing of the
+    // vault: it is answered before any vault path is even located for writing.
+    if let (Some(file), Ok(opts), Some(root)) = (
+        noun.file(),
+        parse(noun, &words[1..]),
+        aterm_file::Root::live(),
+    ) && opts
+        == (Opts {
+            show_addresses: opts.show_addresses,
+            ..Opts::default()
+        })
+        && !words.iter().any(|word| word == "--help" || word == "-h")
+    {
+        let value = from_snapshot(&root, noun, file, opts.show_addresses);
+        return Some(match aterm_json::to_string(&value) {
+            Ok(text) => aterm_uds::stdout::answer_exit("aterm db", &format!("{text}\n"), 0),
+            Err(_) => std::process::ExitCode::from(1),
+        });
+    }
+    let paths = match Paths::live() {
+        Ok(paths) => paths,
+        Err(error) => return Some(report(&Error::new(&error.to_string()))),
     };
     let journal = match Journal::local() {
         Ok(journal) => journal,

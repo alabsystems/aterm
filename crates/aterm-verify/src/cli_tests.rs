@@ -446,3 +446,92 @@ fn values_parse_into_their_types() {
         atpkg::admit_disk::Admit::Now
     );
 }
+
+/// A round of `verify land` names the judged commit and the file of its shared paths beside
+/// `--base`: the dev set, whose crates the run reads from those paths. Each flag needs the
+/// other and `--base`, and `-p`, `--all` and `release` replace the cone they select, so each
+/// such command is usage. CONTROL: the same words without the two flags parse as a judgment.
+#[test]
+fn a_round_names_its_judged_commit_and_shared_paths_beside_the_base() {
+    let round = ok(&["--base", "tip", "--judged", "judged", "--shared", "/s"]);
+    assert_eq!(round.checks, DEV);
+    assert_eq!(
+        (
+            round.base.as_deref(),
+            round.judged.as_deref(),
+            round.shared.as_deref()
+        ),
+        (
+            Some("tip"),
+            Some("judged"),
+            Some(std::path::Path::new("/s"))
+        )
+    );
+    assert!(round.narrows() && !round.all);
+    let judgment = ok(&["--base", "tip"]);
+    assert_eq!((judgment.judged, judgment.shared), (None, None));
+    for refused in [
+        &["--base", "tip", "--judged", "judged"][..],
+        &["--base", "tip", "--shared", "/s"],
+        &["--judged", "judged", "--shared", "/s"],
+        &["--judged", "judged", "--shared", "/s", "--all"],
+        &["--judged", "judged", "--shared", "/s", "-p", "aterm-grid"],
+        &[
+            "--base", "tip", "--judged", "judged", "--shared", "/s", "--all",
+        ],
+        &[
+            "--base", "tip", "--judged", "judged", "--shared", "/s", "-p", "x",
+        ],
+        &["release", "--tree", "--judged", "judged", "--shared", "/s"],
+        &["--base", "tip", "--judged", "--shared", "/s"],
+        &["--base", "tip", "--judged", "judged", "--shared"],
+    ] {
+        assert!(parse(refused.iter().copied()).is_err(), "{refused:?}");
+    }
+    let alone = parse(["--base", "tip", "--judged", "judged"]).unwrap_err();
+    assert!(
+        alone.message().contains("go together"),
+        "{}",
+        alone.message()
+    );
+    let baseless = parse(["--judged", "judged", "--shared", "/s"]).unwrap_err();
+    assert!(
+        baseless
+            .message()
+            .contains("select a round's cone since --base"),
+        "{}",
+        baseless.message()
+    );
+}
+
+/// A round of a merge a person made says so (`--by-hand`), and the word means nothing without
+/// the round it describes. CONTROL: a round without it is of the merge Git made.
+#[test]
+fn a_round_of_a_hand_merge_says_so_and_the_word_needs_its_round() {
+    let round = ["--base", "tip", "--judged", "judged", "--shared", "/s"];
+    assert!(!ok(&round).by_hand);
+    let by_hand = ok(&[
+        "--base",
+        "tip",
+        "--judged",
+        "judged",
+        "--shared",
+        "/s",
+        "--by-hand",
+    ]);
+    assert!(by_hand.by_hand && by_hand.narrows() && !by_hand.all);
+    assert_eq!(by_hand.checks, DEV);
+    for refused in [
+        &["--by-hand"][..],
+        &["--base", "tip", "--by-hand"],
+        &["--all", "--by-hand"],
+        &["-p", "aterm-grid", "--by-hand"],
+    ] {
+        let refusal = parse(refused.iter().copied()).unwrap_err();
+        assert!(
+            refusal.message().contains("it needs --judged and --shared"),
+            "{refused:?}: {}",
+            refusal.message()
+        );
+    }
+}

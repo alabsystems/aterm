@@ -27,10 +27,10 @@ pub const WATCH_SEAM: &str = "ATERM_DEBUG_DISK_WATCH";
 
 /// The volume's lines (the warning, the floor, the emergency) are one definition, which the tools that admit a disk need read too (`aterm_capacity::floor`, `docs/DESIGN-adaptive-build-2026-10-24.md` CAP-1); [`Config`] carries the owner's knobs into it.
 pub use aterm_capacity::floor::{
-    AUTO_FREE_PCT, AUTO_FREE_SHARE_MAX_GIB, DEFAULT_AUTO_FREE_GIB, DEFAULT_WARN_FREE_GIB,
-    EMERGENCY_FILES_FREE, EMERGENCY_FREE_GIB, EMERGENCY_FREE_PCT, EMERGENCY_FREE_SHARE_MAX_GIB,
-    PRESSURE_MARGIN_GIB, SMALL_FLOOR_MAX_PCT, SMALL_WARN_MAX_PCT, WARN_FREE_PCT,
-    WARN_FREE_SHARE_MAX_GIB, Written,
+    AUTO_FREE_PCT, AUTO_FREE_SHARE_MAX_GIB, Budget, CAP_USED_PCT, DEFAULT_AUTO_FREE_GIB,
+    DEFAULT_WARN_FREE_GIB, EMERGENCY_FILES_FREE, EMERGENCY_FREE_GIB, EMERGENCY_FREE_PCT,
+    EMERGENCY_FREE_SHARE_MAX_GIB, PRESSURE_MARGIN_GIB, SMALL_FLOOR_MAX_PCT, SMALL_WARN_MAX_PCT,
+    WARN_FREE_PCT, WARN_FREE_SHARE_MAX_GIB, Written,
 };
 
 /// The `CACHEDIR.TAG` signature every cargo-compatible build tool writes into a target directory (the Cache Directory Tagging Specification's fixed line, which cargo emits verbatim).
@@ -72,9 +72,17 @@ pub mod fence;
 #[path = "disk_fill.rs"]
 pub mod fill;
 
+/// The look's worktree step: a merged, clean worktree no session uses goes, with its branch.
+#[path = "disk_worktree.rs"]
+pub mod worktree;
+
 /// The pressure scheduling rule shared by automatic watches.
 #[path = "disk_cadence.rs"]
 pub mod cadence;
+
+/// The rebuildable budget's sizing and its shared record (`aterm ctl sys disk`'s `budget`).
+#[path = "disk_budget.rs"]
+pub mod budget;
 
 /// The daily automatic managed-cache schedule shared with the GUI watch.
 #[cfg(target_os = "macos")]
@@ -192,6 +200,35 @@ impl Delegate {
     }
 }
 
+/// `disk.cap_used_gib`: the cap on the volume's used bytes written in aterm.toml, which the
+/// rebuildable budget is counted against ([`Self::budget`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Cap {
+    /// Not written (or written negative): the cap is [`CAP_USED_PCT`] of the volume.
+    #[default]
+    Unwritten,
+    /// Written, in GiB above 0: read as written, and held to [`CAP_USED_PCT`] of the volume.
+    Written(u64),
+    /// The budget is off: written `0` (as `disk.auto_free_gib = 0` turns removal off), a value
+    /// that is no whole number, or an aterm.toml that cannot be read.
+    Off,
+}
+
+impl Cap {
+    /// The rebuildable budget of a volume of `total` bytes with `used` of them used and
+    /// `rebuildable` of those sized as rebuildable ([`aterm_capacity::floor::budget`]) under
+    /// this cap; `None` where the budget is off.
+    #[must_use]
+    pub fn budget(self, total: u64, used: u64, rebuildable: u64) -> Option<Budget> {
+        let cap = match self {
+            Cap::Unwritten => None,
+            Cap::Written(gib) => Some(gib),
+            Cap::Off => return None,
+        };
+        Some(aterm_capacity::floor::budget(cap, total, used, rebuildable))
+    }
+}
+
 /// The `[disk]` knobs of design §5.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -211,6 +248,8 @@ pub struct Config {
     pub idle_build_dirs: bool,
     /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]).
     pub idle_build_days: i64,
+    /// `disk.cap_used_gib`: the cap the rebuildable budget is counted against ([`Self::budget`]). No line, level or removal reads it, and a pass's discovery cycle is scoped on [`Self::removal_view`], which leaves it out.
+    pub cap_used_gib: Cap,
 }
 
 impl Default for Config {
@@ -224,6 +263,7 @@ impl Default for Config {
             room_gib: None,
             idle_build_dirs: DEFAULT_IDLE_BUILD_DIRS,
             idle_build_days: idle::DEFAULT_IDLE_BUILD_DAYS,
+            cap_used_gib: Cap::Unwritten,
         }
     }
 }
@@ -238,6 +278,7 @@ pub const KEYS: &[&str] = &[
     "room_gib",
     "idle_build_dirs",
     "idle_build_days",
+    "cap_used_gib",
 ];
 
 impl Config {
@@ -256,6 +297,7 @@ impl Config {
             }
             "idle_build_dirs" => d.idle_build_dirs.to_string(),
             "idle_build_days" => format!("{} (below 1: tier 3 off)", d.idle_build_days),
+            "cap_used_gib" => format!("unset ({CAP_USED_PCT}% of the volume; 0: budget off)"),
             _ => return None,
         })
     }
@@ -391,6 +433,24 @@ impl Config {
     #[must_use]
     pub fn quiet_s(&self) -> i64 {
         self.target_stale_days.max(1).saturating_mul(DAY_S)
+    }
+
+    /// The rebuildable budget under `disk.cap_used_gib` ([`Cap::budget`]); `None` where it is
+    /// off. A reading: no threshold ([`Self::thresholds_with`]) and no knob in force
+    /// ([`Self::on_volume_with`]) reads the cap.
+    #[must_use]
+    pub fn budget(&self, total: u64, used: u64, rebuildable: u64) -> Option<Budget> {
+        self.cap_used_gib.budget(total, used, rebuildable)
+    }
+
+    /// These knobs as removal reads them: the cap left unwritten, so an edit of
+    /// `disk.cap_used_gib` alone does not start a pass's discovery cycle again.
+    #[must_use]
+    pub fn removal_view(self) -> Config {
+        Config {
+            cap_used_gib: Cap::Unwritten,
+            ..self
+        }
     }
 }
 
@@ -587,6 +647,16 @@ impl Survey {
             projected: None,
         }
     }
+}
+
+/// The rebuildable bytes a sizing counted ([`budget::size`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rebuildable {
+    /// The bytes, each directory counted once.
+    pub bytes: u64,
+    /// `true` when a size walk stopped at its bound or the survey's input was cut: the figure
+    /// is a floor.
+    pub partial: bool,
 }
 
 /// Why a row is safe to remove.
@@ -2856,6 +2926,77 @@ pub fn sweep_row(
     o.insert("text".to_owned(), Value::from(text));
     aterm_json::to_string(&Value::Object(o))
         .unwrap_or_else(|_| format!("{{\"kind\":\"{SWEEP_ROW_KIND}\"}}"))
+}
+
+/// The `kind` of the worktree step's rows in the disk ledger ([`worktree_row`]).
+pub const WORKTREE_ROW_KIND: &str = "worktree";
+
+/// What one `worktree` row of the disk ledger says of its worktree ([`worktree_row`]).
+#[derive(Debug, Clone, Copy)]
+pub struct WorktreeRow<'a> {
+    /// The worktree.
+    pub path: &'a Path,
+    /// Its main checkout.
+    pub checkout: &'a Path,
+    /// Its branch (the full `refs/heads/…`), when it is on one.
+    pub branch: Option<&'a str>,
+    /// The commit its HEAD names.
+    pub head: &'a str,
+    /// Its bytes: as walked before its removal (the intent), or as freed (an outcome).
+    pub bytes: u64,
+    /// Why it goes, or what kept it.
+    pub text: &'a str,
+    /// What became of its branch, on a `removed` row: deleted, or why it stays.
+    pub branch_deleted: Option<&'a Result<(), String>>,
+}
+
+/// One `worktree` row of the disk ledger ([`worktree::step`]): the write-ahead intent
+/// ([`SweepAction::Removing`], `bytes` as walked), or the outcome that closes it
+/// ([`SweepAction::Removed`], `freed_bytes`, and `branch_deleted`: `true` or why the branch
+/// stays; [`SweepAction::Kept`], `bytes` 0 and what kept it in `text`).
+#[must_use]
+pub fn worktree_row(now: i64, action: SweepAction, row: &WorktreeRow<'_>) -> String {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert("sid".to_owned(), Value::from(String::new()));
+    o.insert("kind".to_owned(), Value::from(WORKTREE_ROW_KIND.to_owned()));
+    o.insert("action".to_owned(), Value::from(action.as_str().to_owned()));
+    o.insert("path".to_owned(), Value::from(path_text(row.path)));
+    o.insert("checkout".to_owned(), Value::from(path_text(row.checkout)));
+    o.insert(
+        "branch".to_owned(),
+        Value::from(
+            row.branch
+                .map(|b| truncate_bytes(b, ROW_TEXT_CAP).to_owned()),
+        ),
+    );
+    o.insert("head".to_owned(), Value::from(row.head.to_owned()));
+    match action {
+        SweepAction::Removing => {
+            o.insert("bytes".to_owned(), Value::from(row.bytes));
+        }
+        SweepAction::Removed => {
+            o.insert("freed_bytes".to_owned(), Value::from(row.bytes));
+            if let Some(deleted) = row.branch_deleted {
+                o.insert(
+                    "branch_deleted".to_owned(),
+                    match deleted {
+                        Ok(()) => Value::from(true),
+                        Err(why) => Value::from(truncate_bytes(why, ROW_TEXT_CAP).to_owned()),
+                    },
+                );
+            }
+        }
+        SweepAction::Kept => {
+            o.insert("bytes".to_owned(), Value::from(0u64));
+        }
+    }
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(row.text, ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| format!("{{\"kind\":\"{WORKTREE_ROW_KIND}\"}}"))
 }
 
 /// One `poke` row of the disk ledger.

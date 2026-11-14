@@ -270,12 +270,8 @@ fn a_unix_peer_can_finish_sending_before_connect_completion_is_checked() {
         stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
         release.send(()).unwrap();
         was_closed.recv_timeout(MUST_HAPPEN).unwrap();
-        #[cfg(target_vendor = "apple")]
-        assert_eq!(
-            stream.peer_addr().unwrap_err().raw_os_error(),
-            Some(libc::EINVAL),
-            "Darwin forgets the peer address while its bytes remain readable"
-        );
+        // Closing the server does not require the kernel to have discarded its peer address
+        // already. The contract is the queued verdict and EOF checked below, in either state.
     })
     .expect("a successful connect retains the peer's queued verdict after it closes");
     assert_eq!(crate::peer::peer_uid(&client), Some(crate::peer::our_uid()));

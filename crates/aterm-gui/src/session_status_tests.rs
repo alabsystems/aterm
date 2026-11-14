@@ -1616,7 +1616,7 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     assert!(
         record.contains(
             " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- \
-             end_cheered=- goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 log_base=1 run=- \
+             end_cheered=- done_unseen=0 goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 log_base=1 run=- \
              turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
@@ -1770,7 +1770,7 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     let record = status(&app);
     assert!(
         record.contains(&format!(
-            " task=- pause={AT} land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- \
+            " task=- pause={AT} land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- done_unseen=0 \
              goal=- task_state=- task_rev=0 log_seq="
         )),
         "{record}"
@@ -2363,7 +2363,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              journal journal_off integration_rev born render \
              resizes flaps land_at task pause land_held land_nudges land_since held waiting \
              land_asked landed_head landed_on landed_leg landed_repo end \
-             end_seen end_cheered goal task_state task_rev \
+             end_seen end_cheered done_unseen goal task_state task_rev \
              log_seq log_ep log_base run turn step need need_since_ms rollout rollout_asks \
              log_journal log_journal_why exec_watch exec_watch_why editing editor \
              bells bells_sounded last_bell gen seq hash"
@@ -3679,7 +3679,7 @@ fn the_status_record_carries_the_task_record() {
     let none = app.session_status_record(0).expect("live session");
     assert!(
         none.contains(
-            " pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- \
+            " pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- done_unseen=0 \
              goal=- task_state=- task_rev=0 log_seq="
         ),
         "{none}"
@@ -3690,7 +3690,7 @@ fn the_status_record_carries_the_task_record() {
     let record = app.session_status_record(0).expect("live session");
     assert!(
         record.contains(
-            " task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- \
+            " task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- done_unseen=0 \
              goal=- task_state=done task_rev=2 log_seq="
         ),
         "{record}"
@@ -4027,7 +4027,7 @@ fn a_codex_box_needs_you_on_every_reader() {
         .find(|line| line.starts_with("session ") && line.contains(ctx.self_id.as_str()))
         .expect("the session's survey row");
     assert_eq!(field(row, "needs").as_deref(), Some("approval"), "{row}");
-    assert_eq!(app.status_glance().need_count(), 1);
+    assert_eq!(app.local_needs().len(), 1);
     let boxed = need().expect("the program-claim need");
     assert_eq!(boxed.what, crate::needs::CODEX_APPROVAL_WORDS);
     crate::term_lock(&term).process(BLOCKED);
@@ -4176,7 +4176,7 @@ fn a_program_notification_passes_a_box_the_sweep_published() {
     rig.sweep();
     assert!(rig.need().is_some(), "PRECONDITION: the box stands");
     assert_eq!(
-        rig.app.status_glance().need_count(),
+        rig.app.local_needs().len(),
         1,
         "PRECONDITION: the glance lists it"
     );

@@ -1031,6 +1031,12 @@ fn front_door_main(
         return aterm_gui::run_reopen_after(rest.get(1..).unwrap_or(&[]));
     }
 
+    // The window a sign-in on this Mac shows its provider's page in: hidden, off the roster,
+    // started only by that sign-in's opener, which drives it over its pipes.
+    if first == aterm_signin_window::VERB {
+        return aterm_signin_window::main_entry(rest.get(1..).unwrap_or(&[]));
+    }
+
     // aCaffeine's name before 0.145.0: an old login job runs `caffeine serve` at every login.
     if first == aterm_acaffeine::legacy::VERB {
         return aterm_acaffeine::legacy::main_entry(rest.get(1..).unwrap_or(&[]));
@@ -10653,7 +10659,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             // A check can download a whole release.
             if std::io::IsTerminal::is_terminal(&std::io::stderr())
                 && aterm_update::status(build).is_some_and(|st| {
-                    st.enabled && st.installable && !linux_install_waits_for_a_start(&st)
+                    st.enabled && st.installable && !st.linux_install_waits_for_a_start()
                 })
             {
                 eprintln!("Checking for updates\u{2026}");
@@ -10686,8 +10692,9 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         lane.as_ref(),
         now,
         aterm_update_core::settings::update_auto_apply(),
-        // Off only where a read said so: one with no answer says nothing of the setting.
-        aterm_update::automatic_at_launch() != Some(false),
+        // Off only where a read said so: one with no answer says nothing of the setting. The
+        // saved setting, which a fleet survey of this Mac says too (`aterm_update::fleet_fact`).
+        aterm_update::automatic_as_saved() != Some(false),
         &DevCopy::of_this_copy(checking),
         &update_log_hint(),
     );
@@ -10746,8 +10753,10 @@ const UPDATE_HELP_WINDOWS: &[&str] = &[
     "  apply      install the staged build over this copy; nothing is stopped, open",
     "             windows keep running until they are restarted",
     "  --restart  with apply: save the open windows, install, and start aterm again",
-    "On Windows nothing is downloaded: status and check read the build that",
-    "`aterm-winship update` staged on this machine.",
+    "On Windows check reads the signed release channel now: the newest release's",
+    "zip is verified (roster, appcast, SHA-256) and staged, never installed. A",
+    "window checks it every 30 minutes while [update] enabled is on. A build",
+    "`aterm-winship update` staged on this machine is weighed against it.",
 ];
 
 /// `aterm update status|check|apply` on Windows, where the update is a build staged on this
@@ -10785,6 +10794,13 @@ fn windows_update_verb(rest: &[OsString], build: u64) -> Option<ExitCode> {
         commit: aterm_stamp::current().git_commit,
         build_number: build,
     };
+    // `check` reads the release channel first, so the standing below weighs what it staged and
+    // its last line is this check's outcome. A check that failed says why on stderr: it may
+    // have failed before the lane recorded it (another check holding the lane, say).
+    let channel = (sub == "check").then(|| staged::check_channel_now(running));
+    if let Some(Err(why)) = &channel {
+        eprintln!("aterm update: release channel: {why}");
+    }
     let here = staged::here(running);
     if sub == "apply" {
         let exe = match std::env::current_exe() {
@@ -10832,7 +10848,10 @@ fn windows_update_verb(rest: &[OsString], build: u64) -> Option<ExitCode> {
         println!("{line}");
     }
     Some(
-        if sub == "check" && matches!(here.standing, staged::Standing::Unreadable(_)) {
+        if sub == "check"
+            && (matches!(here.standing, staged::Standing::Unreadable(_))
+                || matches!(channel, Some(Err(_))))
+        {
             ExitCode::FAILURE
         } else {
             ExitCode::SUCCESS
@@ -10963,11 +10982,6 @@ fn update_log_hint_for(log: Option<&std::path::Path>, home: Option<&std::path::P
     format!("Details are in Settings \u{25b8} Messages, and in {shown}.")
 }
 
-fn staged_tries(staged: u64, lane: Option<&aterm_update::ApplyLaneReport>) -> u32 {
-    lane.filter(|lane| staged > 0 && lane.last_failure_target_build == staged)
-        .map_or(0, |lane| lane.failures_for_target)
-}
-
 fn downloaded_update_line(
     running_version: &str,
     running_build: u64,
@@ -11002,148 +11016,154 @@ fn update_summary(
     dev: &DevCopy,
     log_hint: &str,
 ) -> (String, Option<String>) {
+    use aterm_update::StatusArm;
     const CHECKS_OFF: &str =
         " \u{b7} automatic checks are configured off (Settings \u{25b8} Software Update)";
     const CHECKS_ON: &str = "; automatic checks are configured on";
-    if !st.enabled {
-        let remedy = st.outcome.trim();
-        return (
-            format!("This copy of aterm {version} doesn\u{2019}t update itself"),
-            (!remedy.is_empty()).then(|| remedy.to_string()),
-        );
-    }
-    if let Some((staged_build, staged_version)) = st
-        .linux
-        .as_ref()
-        .and_then(|native| {
-            native
-                .staged_build
-                .map(|b| (b, native.staged_version.as_deref()))
-        })
-        .filter(|(b, _)| *b > build)
-    {
-        let downloaded = downloaded_update_line(version, build, staged_version, staged_build);
-        return (
-            format!("{downloaded} \u{2014} `aterm update apply` installs it"),
-            None,
-        );
-    }
-    if let Some(native) = st
-        .linux
-        .as_ref()
-        .filter(|_| linux_install_waits_for_a_start(st))
-    {
-        let installed: std::borrow::Cow<'_, str> = if !native.installed_version.is_empty() {
-            std::borrow::Cow::Borrowed(native.installed_version.as_str())
-        } else if native.installed_build == build {
-            std::borrow::Cow::Borrowed(version)
-        } else {
-            std::borrow::Cow::Owned(format!("build {}", native.installed_build))
-        };
-        return (
-            format!(
-                "aterm {installed} is installed \u{2014} the next aterm you start finishes it; \
-                 update checks wait until then"
-            ),
-            None,
-        );
-    }
-    if !st.installable {
-        use aterm_update::which_copy::InstallPosture;
-        let line = match dev {
-            DevCopy::Marked { lag, shared_writes } => {
-                let standing = lag
-                    .as_ref()
-                    .map(|lag| format!(", {}", lag.words()))
-                    .unwrap_or_default();
-                return (
-                    format!(
-                        "This copy of aterm {version} is a dev build{standing} \u{2014} the \
-                         updater leaves it alone"
-                    ),
-                    shared_writes.map(dev_shared_writes_line),
-                );
-            }
-            DevCopy::Inert(InstallPosture::MountedImage) => format!(
-                "aterm {version} is running from a mounted volume \u{2014} drag aterm to \
-                 Applications and open it from there"
-            ),
-            DevCopy::Inert(InstallPosture::Translocated) => format!(
-                "aterm {version} is running from a temporary read-only copy \u{2014} move \
-                 aterm into Applications and open it again"
-            ),
-            DevCopy::Inert(InstallPosture::NotABundle) => format!(
-                "aterm {version} is a plain binary, not an app bundle \u{2014} it never \
-                 updates itself"
-            ),
-            DevCopy::Inert(InstallPosture::Installed) | DevCopy::No => {
-                format!("This copy of aterm {version} can\u{2019}t update itself")
-            }
-        };
-        return (line, None);
-    }
-    // A live hold outranks a download of the build it holds: the gates refuse it until it lapses.
-    if let Some(hold) = st.hold.as_ref().filter(|hold| hold.live) {
-        return held_update_line(version, hold, now);
-    }
-    if let Some(staged) = st.staged_build.filter(|staged| *staged > build) {
-        let downloaded =
-            downloaded_update_line(version, build, st.staged_version.as_deref(), staged);
-        if let Some(refusal) = lane
-            .map(|lane| lane.last_refusal.trim())
-            .filter(|refusal| !refusal.is_empty())
-        {
+    let next = if automatic_checks {
+        CHECKS_ON
+    } else {
+        CHECKS_OFF
+    };
+    let checked_words = || {
+        aterm_update_core::pkg_check::rfc3339_to_unix(&st.updated_at)
+            .map(|checked| format!(" \u{b7} checked {}", ago_words(checked, now)))
+            .unwrap_or_default()
+    };
+    // The arm is the one a fleet survey says this copy's standing by (`UpdateStatus::arm`).
+    let mut line = match st.arm(build, lane) {
+        StatusArm::Off => {
+            let remedy = st.outcome.trim();
+            return (
+                format!("This copy of aterm {version} doesn\u{2019}t update itself"),
+                (!remedy.is_empty()).then(|| remedy.to_string()),
+            );
+        }
+        StatusArm::LinuxDownloaded {
+            build: staged,
+            version: staged_version,
+        } => {
+            let downloaded = downloaded_update_line(version, build, staged_version, staged);
+            return (
+                format!("{downloaded} \u{2014} `aterm update apply` installs it"),
+                None,
+            );
+        }
+        StatusArm::Installed(native) => {
+            let installed: std::borrow::Cow<'_, str> = if !native.installed_version.is_empty() {
+                std::borrow::Cow::Borrowed(native.installed_version.as_str())
+            } else if native.installed_build == build {
+                std::borrow::Cow::Borrowed(version)
+            } else {
+                std::borrow::Cow::Owned(format!("build {}", native.installed_build))
+            };
+            return (
+                format!(
+                    "aterm {installed} is installed \u{2014} the next aterm you start finishes it; \
+                     update checks wait until then"
+                ),
+                None,
+            );
+        }
+        StatusArm::Cannot => {
+            use aterm_update::which_copy::InstallPosture;
+            let line = match dev {
+                DevCopy::Marked { lag, shared_writes } => {
+                    let standing = lag
+                        .as_ref()
+                        .map(|lag| format!(", {}", lag.words()))
+                        .unwrap_or_default();
+                    return (
+                        format!(
+                            "This copy of aterm {version} is a dev build{standing} \u{2014} the \
+                             updater leaves it alone"
+                        ),
+                        shared_writes.map(dev_shared_writes_line),
+                    );
+                }
+                DevCopy::Inert(InstallPosture::MountedImage) => format!(
+                    "aterm {version} is running from a mounted volume \u{2014} drag aterm to \
+                     Applications and open it from there"
+                ),
+                DevCopy::Inert(InstallPosture::Translocated) => format!(
+                    "aterm {version} is running from a temporary read-only copy \u{2014} move \
+                     aterm into Applications and open it again"
+                ),
+                DevCopy::Inert(InstallPosture::NotABundle) => format!(
+                    "aterm {version} is a plain binary, not an app bundle \u{2014} it never \
+                     updates itself"
+                ),
+                DevCopy::Inert(InstallPosture::Installed) | DevCopy::No => {
+                    format!("This copy of aterm {version} can\u{2019}t update itself")
+                }
+            };
+            return (line, None);
+        }
+        // A live hold outranks a download of the build it holds: the gates refuse it until it lapses.
+        StatusArm::Held(hold) => return held_update_line(version, hold, now),
+        // Bytes a window here saw fail to start: only a window launches them until this lapses.
+        StatusArm::StartFailed(hold) => return start_failed_update_line(version, hold, now),
+        StatusArm::Refused {
+            build: staged,
+            version: staged_version,
+            refusal,
+        } => {
+            let downloaded = downloaded_update_line(version, build, staged_version, staged);
             return (
                 format!("{downloaded}; the last install was refused"),
                 Some(refusal.to_string()),
             );
         }
-        let failed = staged_tries(staged, lane);
-        return if failed > 0 {
+        StatusArm::NotInstalling {
+            build: staged,
+            version: staged_version,
+            tries: failed,
+        } => {
+            let downloaded = downloaded_update_line(version, build, staged_version, staged);
             let tries = if failed == 1 {
                 "1 try".to_string()
             } else {
                 format!("{failed} tries")
             };
-            (
+            return (
                 format!("{downloaded} but didn\u{2019}t install ({tries})"),
                 Some(log_hint.to_string()),
-            )
-        } else if automatic_install_configured {
-            (
-                format!("{downloaded}; automatic installation is configured on"),
-                None,
-            )
-        } else {
-            (
-                format!(
-                    "{downloaded} \u{2014} install it from Settings \u{25b8} \
-                     Software Update"
-                ),
-                None,
-            )
-        };
-    }
-    if st.channel_unreadable {
-        let remedy = st.outcome.trim();
-        return (
-            format!("aterm {version} can\u{2019}t check for updates on this machine"),
-            Some(if remedy.is_empty() {
-                log_hint.to_string()
+            );
+        }
+        StatusArm::Downloaded {
+            build: staged,
+            version: staged_version,
+        } => {
+            let downloaded = downloaded_update_line(version, build, staged_version, staged);
+            return if automatic_install_configured {
+                (
+                    format!("{downloaded}; automatic installation is configured on"),
+                    None,
+                )
             } else {
-                remedy.to_string()
-            }),
-        );
-    }
-    let class = if st.failing_checks_kind.is_empty() {
-        st.failing_kind.as_str()
-    } else {
-        st.failing_checks_kind.as_str()
-    };
-    if st.failing_persistent {
-        // The one failure a person has to act on: a build that predates the channel's
-        // keys, whose ledger sentence prescribes the reinstall.
-        if class == "manifest" && st.outcome.contains("reinstall") {
+                (
+                    format!(
+                        "{downloaded} \u{2014} install it from Settings \u{25b8} \
+                         Software Update"
+                    ),
+                    None,
+                )
+            };
+        }
+        StatusArm::Unreadable => {
+            let remedy = st.outcome.trim();
+            return (
+                format!("aterm {version} can\u{2019}t check for updates on this machine"),
+                Some(if remedy.is_empty() {
+                    log_hint.to_string()
+                } else {
+                    remedy.to_string()
+                }),
+            );
+        }
+        // The one failure a person has to act on: a build that predates the channel's keys,
+        // whose ledger sentence prescribes the reinstall.
+        StatusArm::TooOld => {
             return (
                 format!("aterm {version} is too old to check for updates"),
                 Some(
@@ -11152,65 +11172,52 @@ fn update_summary(
                 ),
             );
         }
-        let trouble = if class == "apply" {
-            "the last updates didn\u{2019}t install".to_string()
-        } else {
-            match check_trouble_words(class) {
-                Some(words) => format!("update checks keep failing: {words}"),
-                None => "update checks keep failing".to_string(),
-            }
-        };
-        let next = if automatic_checks {
-            CHECKS_ON
-        } else {
-            CHECKS_OFF
-        };
-        return (
-            format!("aterm {version} \u{b7} {trouble}{next}"),
-            Some(log_hint.to_string()),
-        );
-    }
-    if st.failing_checks > 0 {
-        let why = check_trouble_words(class)
-            .map(|words| format!(": {words}"))
-            .unwrap_or_default();
-        let next = if automatic_checks {
-            CHECKS_ON
-        } else {
-            CHECKS_OFF
-        };
-        return (
-            format!("aterm {version} \u{b7} the last check didn\u{2019}t finish{why}{next}"),
-            Some(log_hint.to_string()),
-        );
-    }
-    let checked = aterm_update_core::pkg_check::rfc3339_to_unix(&st.updated_at);
-    let checked_words = checked
-        .map(|checked| format!(" \u{b7} checked {}", ago_words(checked, now)))
-        .unwrap_or_default();
-    // Never "up to date" while a newer build is held (a lapsed hold is tried again) or offered.
-    let mut line = if let Some(hold) = &st.hold {
-        let again = if hold.peer_lifted {
-            ": it started on another Mac"
-        } else {
-            ""
-        };
-        format!(
-            "aterm {version} \u{b7} trying {} again{again}{checked_words}",
-            hold.name()
-        )
-    } else if st.behind {
-        format!(
+        StatusArm::Failing { class } => {
+            let trouble = if class == "apply" {
+                "the last updates didn\u{2019}t install".to_string()
+            } else {
+                match check_trouble_words(class) {
+                    Some(words) => format!("update checks keep failing: {words}"),
+                    None => "update checks keep failing".to_string(),
+                }
+            };
+            return (
+                format!("aterm {version} \u{b7} {trouble}{next}"),
+                Some(log_hint.to_string()),
+            );
+        }
+        StatusArm::CheckFailed { class } => {
+            let why = check_trouble_words(class)
+                .map(|words| format!(": {words}"))
+                .unwrap_or_default();
+            return (
+                format!("aterm {version} \u{b7} the last check didn\u{2019}t finish{why}{next}"),
+                Some(log_hint.to_string()),
+            );
+        }
+        // Never "up to date" while a newer build is held (a lapsed hold is tried again) or offered.
+        StatusArm::Retrying(hold) => {
+            let again = if hold.peer_lifted {
+                ": it started on another Mac"
+            } else {
+                ""
+            };
+            format!(
+                "aterm {version} \u{b7} trying {} again{again}{}",
+                hold.name(),
+                checked_words()
+            )
+        }
+        StatusArm::Behind => format!(
             "aterm {version} \u{b7} a newer release is out and not installed yet; the next \
-             check downloads it{checked_words}"
-        )
-    } else if let Some(checked) = checked {
-        format!(
+             check downloads it{}",
+            checked_words()
+        ),
+        StatusArm::Current { at } => format!(
             "aterm {version} is up to date \u{b7} checked {}",
-            ago_words(checked, now)
-        )
-    } else {
-        format!("aterm {version} hasn\u{2019}t checked for updates yet")
+            ago_words(at, now)
+        ),
+        StatusArm::Unchecked => format!("aterm {version} hasn\u{2019}t checked for updates yet"),
     };
     if !automatic_checks {
         line.push_str(CHECKS_OFF);
@@ -11243,6 +11250,26 @@ fn held_update_line(
         hold.tries
     );
     let why = hold.why.trim();
+    (line, (!why.is_empty()).then(|| why.to_string()))
+}
+
+/// The line for a live window-start failure of the staged build's bytes: what no start without a
+/// window installs, for how long more, why, which try, and the verb that ends it now; how the
+/// window saw it fail goes to stderr.
+fn start_failed_update_line(
+    version: &str,
+    failed: &aterm_update::HoldView,
+    now: i64,
+) -> (String, Option<String>) {
+    let line = format!(
+        "aterm {version} \u{b7} {} is held for {} more from every start with no window ({}, try \
+         {}) \u{b7} `aterm update retry` ends that now",
+        failed.name(),
+        left_words(failed.until, now),
+        failed.cause.words(),
+        failed.tries
+    );
+    let why = failed.why.trim();
     (line, (!why.is_empty()).then(|| why.to_string()))
 }
 
@@ -11407,26 +11434,9 @@ fn trial_launches_words(starts: u32) -> String {
     }
 }
 
-fn linux_install_waits_for_a_start(st: &aterm_update::UpdateStatus) -> bool {
-    st.linux.as_ref().is_some_and(|native| {
-        native.trial_phase.as_deref() == Some("Installed") && !native.trial_healthy
-    })
-}
-
-fn ago_words(at: i64, now: i64) -> String {
-    let age = now.saturating_sub(at);
-    if age < 60 {
-        "just now".to_string()
-    } else if age < 3600 {
-        format!("{} min ago", age / 60)
-    } else if age < 86_400 {
-        format!("{} h ago", age / 3600)
-    } else if age < 2 * 86_400 {
-        "1 day ago".to_string()
-    } else {
-        format!("{} days ago", age / 86_400)
-    }
-}
+// How long before `now` the instant `at` was: the one copy a fleet reader of a peer's last check
+// shares.
+use aterm_types::update_standing::ago_words;
 
 fn print_update_detail(
     st: &aterm_update::UpdateStatus,
@@ -11441,7 +11451,7 @@ fn print_update_detail(
                 None => println!("  staged: build {staged}"),
             }
         }
-        if linux_install_waits_for_a_start(st) {
+        if st.linux_install_waits_for_a_start() {
             println!(
                 "  waiting for aterm to start from it{}",
                 trial_launches_words(native.trial_starts)
@@ -11464,7 +11474,7 @@ fn print_update_detail(
     }
     let failed = st
         .staged_build
-        .map_or(0, |staged| staged_tries(staged, lane));
+        .map_or(0, |staged| aterm_update::staged_tries(staged, lane));
     if failed > 0 {
         println!(
             "  failing applies: {failed} — a verified build is staged but didn\u{2019}t install"

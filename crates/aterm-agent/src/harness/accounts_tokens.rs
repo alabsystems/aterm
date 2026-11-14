@@ -1069,6 +1069,15 @@ impl Account {
         }
     }
 
+    /// How a run nobody asked for names it (a token made by itself in aterm's sign-in window,
+    /// whose lines reach a log or a captured standard error): its row's label, never its
+    /// address.
+    fn quietly(&self) -> String {
+        self.label
+            .clone()
+            .unwrap_or_else(|| "this account".to_owned())
+    }
+
     /// What the outcome adds for a row another Mac holds: launches here refuse it.
     fn held_note(&self) -> String {
         match (&self.holder, &self.label) {
@@ -1195,11 +1204,17 @@ fn run_with_clock(
         let _ = writeln!(err, "aterm harness accounts token: {why}");
         ExitCode::from(1)
     };
-    if !super::cli::person_at_terminal(host) {
+    // On macOS, at this Mac's own desk, the token's page opens in aterm's own sign-in window,
+    // which authorizes it by itself; anywhere else it is a person's to authorize in their
+    // browser, at a terminal of their own.
+    let window = host.opens_sign_in_window();
+    if !window && !super::cli::person_at_terminal(host) {
         return refuse(
             err,
-            "a token is made only for a person at this Mac's terminal (an agent's shell has \
-             none): run it in a terminal of your own",
+            "a token is made in aterm's own sign-in window on this Mac's own desktop, or by a \
+             person at this Mac's terminal (an SSH session, another Mac's request and a tab \
+             another Mac's drive started or typed into have neither): run it in a terminal of \
+             your own on this Mac",
         );
     }
     let logins = host.session_logins(env);
@@ -1227,7 +1242,14 @@ fn run_with_clock(
         Ok(None) => {
             return refuse(
                 err,
-                &format!("a token for {} is being made in another tab", account.email),
+                &format!(
+                    "a token for {} is being made in another tab",
+                    if window {
+                        account.quietly()
+                    } else {
+                        account.email.clone()
+                    }
+                ),
             );
         }
         Err(why) => return refuse(err, &format!("the account's lock: {why}")),
@@ -1306,26 +1328,160 @@ fn run_with_clock(
             ),
         );
     };
+    if window {
+        // The opener answers in two files of a private folder this run alone holds.
+        let route = match super::cli::opener_link(&store, host) {
+            Ok(opener) => aterm_tempfile::tempdir().ok().map(|dir| {
+                (
+                    setup_token::WindowRoute {
+                        opener,
+                        outcome: dir.path().join("outcome"),
+                        code: dir.path().join("outcome.code"),
+                    },
+                    dir,
+                )
+            }),
+            Err(why) => return refuse(err, &format!("{why}; nothing was made")),
+        };
+        let Some((route, _held)) = route else {
+            return refuse(
+                err,
+                "no private folder could be made for the sign-in window",
+            );
+        };
+        // The window's route ends by itself: its bound is the window's own, not the wait for
+        // a person at a browser.
+        return mint(
+            (
+                &store,
+                vault.as_ref(),
+                &setup_token::WindowWaiter::new(&route),
+            ),
+            (&account, &program, cli_version, &env_vars, Some(&route)),
+            (
+                host.token_hang().min(super::open_url::WINDOW_ROUTE_WITHIN),
+                host.token_write_wait(),
+                now,
+            ),
+            (out, err),
+        );
+    }
     let Some(person) = host.token_person() else {
         return refuse(err, "this host has no terminal to sign in at");
     };
     mint(
         (&store, vault.as_ref(), person.as_ref()),
-        (&account, &program, cli_version, &env_vars),
+        (&account, &program, cli_version, &env_vars, None),
         (host.token_hang(), host.token_write_wait(), now),
         (out, err),
     )
 }
 
+/// MAKES AN ACCOUNT'S YEAR-LONG TOKEN IN THE RUN THAT JUST SIGNED IT IN: where `label`'s account
+/// has no token in use here and this run could make one ([`due_after_sign_in`]), the bare verb
+/// runs ([`run`]) with every refusal of its own, and its exit is the answer; `None` where no
+/// token is due, with nothing written. The caller holds no sign-in lock (§4.6: a token is made
+/// under its account's lock, never `signin.lock`), and calls this only after the row's own
+/// sign-in in aterm's sign-in window: the token's page opens there too, in the account's own
+/// store, whose session is the row's, with nobody asked ([`setup_token::WindowRoute`]; one
+/// window at a time, so it waits for another sign-in's). Every other sign-in left no session
+/// aterm knows to be the row's, and is offered the step instead ([`offer_after_sign_in`]):
+/// Claude Code's success names no account, and only the browser's own session says whose
+/// token it made.
+pub fn after_sign_in(
+    env: &Env,
+    host: &dyn AccountsHost,
+    label: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Option<ExitCode> {
+    if !due_after_sign_in(env, host, label) {
+        return None;
+    }
+    let _ = writeln!(
+        out,
+        "{label}: it has no year-long token in use here, so this run makes one, as `aterm \
+         harness accounts token {label}` does"
+    );
+    let _ = out.flush();
+    Some(run(env, host, label, TokenMode::Make, out, err))
+}
+
+/// OFFERS THE STEP WHERE THE RUN THAT SIGNED AN ACCOUNT IN MAKES NO TOKEN: where `label`'s
+/// token is due ([`due_after_sign_in`]) and its sign-in was not made in aterm's sign-in
+/// window, no browser session is known to be the account's, and a token made now could be
+/// another account's (Claude Code's success names none). The step is said once, on `out`, and
+/// nothing is run or written.
+pub fn offer_after_sign_in(env: &Env, host: &dyn AccountsHost, label: &str, out: &mut dyn Write) {
+    if !due_after_sign_in(env, host, label) {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "{label}: it has no year-long token in use here; this run did not sign it in in aterm's \
+         sign-in window, so it makes none: run `{}`",
+        Step::Token {
+            label: label.to_owned(),
+            replace: false,
+        }
+    );
+}
+
+/// Whether [`after_sign_in`] makes `label`'s token: this Mac may open its sign-in window or a
+/// person is at its terminal, this is macOS on the default route, this Mac writes its vault,
+/// and the account's state offers a bare run ([`TokenState::offer`]: no token in use here,
+/// and none made here still waiting). A quick look ([`STANDING_LOOK`]) that reads and writes
+/// nothing else; anything it cannot read is not due, and the verb's own surface still offers
+/// the step.
+fn due_after_sign_in(env: &Env, host: &dyn AccountsHost, label: &str) -> bool {
+    if !(host.opens_sign_in_window() || super::cli::person_at_terminal(host))
+        || !host.on_macos()
+        || setup_token::route_in(&host.verb_env()).is_some()
+    {
+        return false;
+    }
+    let Ok(account) = account_of(env, label, &host.session_logins(env)) else {
+        return false;
+    };
+    let (Some(store), Some(vault)) = (env.accounts_store_for(Cli::Claude), host.token_vault())
+    else {
+        return false;
+    };
+    let by = || Instant::now() + STANDING_LOOK;
+    if !vault
+        .route(by())
+        .is_ok_and(|route| route_refusal(route).is_none())
+    {
+        return false;
+    }
+    let Ok(found) = vault.standing(&account.key, by()) else {
+        return false;
+    };
+    let row = read_table(&store)
+        .ok()
+        .and_then(|mut table| table.rows.remove(account.key.as_str()));
+    let now = u64::try_from(host.now().max(env.now)).unwrap_or(0);
+    let pending = vault.waiting_here(&account.key).unwrap_or(true);
+    matches!(
+        TokenState::of(&found, row.as_ref(), now).offer(label, pending),
+        Some(Step::Token { replace: false, .. })
+    )
+}
+
+/// What [`mint`] makes a token of: the account, the Claude Code build and its version, the
+/// verb's environment, and aterm's sign-in window where the capture's page opens there.
+type MintInputs<'a> = (
+    &'a Account,
+    &'a Program,
+    String,
+    &'a [(std::ffi::OsString, std::ffi::OsString)],
+    Option<&'a setup_token::WindowRoute>,
+);
+
 /// The steps after the preflight: the capture, the write, the row, the journal, the outcome.
 fn mint(
     (store, vault, person): (&Store, &dyn TokenVault, &dyn Person),
-    (account, program, cli_version, env_vars): (
-        &Account,
-        &Program,
-        String,
-        &[(std::ffi::OsString, std::ffi::OsString)],
-    ),
+    (account, program, cli_version, env_vars, window): MintInputs<'_>,
     (hang, write_wait, now): (Duration, Option<Duration>, u64),
     (out, err): (&mut dyn Write, &mut dyn Write),
 ) -> ExitCode {
@@ -1334,11 +1490,18 @@ fn mint(
         ExitCode::from(1)
     };
     let deadline = WakeDeadline::after(hang);
-    person.say(&format!(
-        "making a Claude Code token for {}: sign in as {}",
-        account.named(),
-        account.email
-    ));
+    person.say(&if window.is_some() {
+        format!(
+            "making a Claude Code token for {} in aterm's sign-in window",
+            account.quietly()
+        )
+    } else {
+        format!(
+            "making a Claude Code token for {}: sign in as {}",
+            account.named(),
+            account.email
+        )
+    });
     let root = store
         .shared_dir()
         .join(TOKENS_DIR)
@@ -1349,6 +1512,7 @@ fn mint(
             store: &root,
             sign_in_as: &account.email,
             env: env_vars,
+            window,
             deadline,
         },
         person,
@@ -1366,10 +1530,18 @@ fn mint(
             note(TokenNote::WrongAccount, &account.key, now);
             return refuse(
                 err,
-                &format!(
-                    "Claude Code made a token for another account; sign in as {}",
-                    account.email
-                ),
+                &if window.is_some() {
+                    format!(
+                        "Claude Code made a token for another account than {}'s; nothing was \
+                         stored",
+                        account.quietly()
+                    )
+                } else {
+                    format!(
+                        "Claude Code made a token for another account; sign in as {}",
+                        account.email
+                    )
+                },
             );
         }
         Err(why) => return refuse(err, &capture_words(&why)),
@@ -1550,6 +1722,11 @@ fn capture_words(why: &setup_token::Error) -> String {
                 .to_owned()
         }
         Error::Stopped => "stopped; nothing was made".to_owned(),
+        Error::Window(why) => {
+            format!(
+                "the sign-in in aterm's sign-in window did not complete: {why}; nothing was made"
+            )
+        }
         Error::NoToken => "Claude Code ended without showing a token".to_owned(),
         Error::TwoTokens => "Claude Code showed two different tokens; nothing was kept".to_owned(),
         Error::Unchecked => {

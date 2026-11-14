@@ -18,6 +18,17 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(unix)]
+#[path = "codex_source_owned_launch.rs"]
+mod owned_launch;
+#[cfg(unix)]
+pub use owned_launch::{OwnedLaunchReservation, OwnedSpawnFailure, OwnedWorker};
+#[cfg(unix)]
+#[path = "codex_source_owned_environment.rs"]
+mod owned_environment;
+#[cfg(unix)]
+pub use owned_environment::OwnedLaunchEnvironment;
+
 #[path = "codex_source_restart.rs"]
 mod restart;
 pub use restart::RestartReservation;
@@ -234,12 +245,35 @@ impl Drop for InitialSourcePermit {
     }
 }
 
+enum LaunchBinding {
+    Consumer,
+    #[cfg(unix)]
+    Native(Arc<owned_launch::Binding>),
+}
+impl LaunchBinding {
+    fn entry(&self) -> Result<(), Error> {
+        match self {
+            Self::Consumer => Ok(()),
+            #[cfg(unix)]
+            Self::Native(binding) => binding.entry(),
+        }
+    }
+    fn revoked(&self) -> bool {
+        match self {
+            Self::Consumer => false,
+            #[cfg(unix)]
+            Self::Native(binding) => binding.revoked(),
+        }
+    }
+}
+
 struct Launch {
     sid: String,
     image: Image,
     expected_env: Vec<(String, String)>,
     expected_unset: Vec<&'static str>,
     process: Option<Process>,
+    binding: LaunchBinding,
     typed: bool,
     gate: Option<Arc<SourceWorkLease>>,
     _scope: Option<super::account_work::Scope>,
@@ -418,6 +452,9 @@ impl LaunchReservation {
     /// typed. A late SourceV1 child must fail before loading any credentials.
     /// This does not assert that a process exited or that its task completed.
     pub fn revoke_unclaimed(self) -> Result<(), Error> {
+        self.revoke_unclaimed_inner()
+    }
+    fn revoke_unclaimed_inner(&self) -> Result<(), Error> {
         let state = self.state.upgrade().ok_or(Error::Stale)?;
         // Owned launcher cleanup runs off the GUI thread and must not lose a
         // revocation merely because a short registry transition is in flight.
@@ -1251,6 +1288,47 @@ impl Registry {
         admitted: &worker::Admitted,
         scope: &super::account_work::Scope,
     ) -> Result<LaunchReservation, Error> {
+        self.reserve_launch(env, sid, admitted, scope, LaunchBinding::Consumer)
+    }
+
+    /// Reserve an independently admitted constructor for a native-owned child.
+    /// The consumer cannot claim it until its launcher binds actual child custody.
+    /// This does not inherit a parent's SDK member or authorize provider use.
+    ///
+    /// # Errors
+    /// As [`Self::reserve_worker`]; the native child must additionally be bound
+    /// through [`OwnedLaunchReservation::bind`] before it can open a member.
+    /// An unreadable/changed source environment or an incomplete admission view
+    /// also refuses. The selected environment is sealed through native spawn.
+    #[cfg(unix)]
+    pub fn reserve_owned_worker(
+        &self,
+        env: &Env,
+        sid: &str,
+        admitted: &worker::Admitted,
+        scope: &super::account_work::Scope,
+        environment: OwnedLaunchEnvironment,
+    ) -> Result<OwnedLaunchReservation, Error> {
+        let environment = environment.admit(admitted.starter())?;
+        let binding = Arc::new(owned_launch::Binding::default());
+        self.reserve_launch(
+            env,
+            sid,
+            admitted,
+            scope,
+            LaunchBinding::Native(binding.clone()),
+        )
+        .map(|inner| OwnedLaunchReservation::new(inner, binding, environment))
+    }
+
+    fn reserve_launch(
+        &self,
+        env: &Env,
+        sid: &str,
+        admitted: &worker::Admitted,
+        scope: &super::account_work::Scope,
+        binding: LaunchBinding,
+    ) -> Result<LaunchReservation, Error> {
         if scope.cancelled() {
             return Err(Error::Denied);
         }
@@ -1330,6 +1408,7 @@ impl Registry {
                     })
                     .collect(),
                 process: None,
+                binding,
                 typed: false,
                 gate: Some(Arc::new(gate)),
                 _scope: Some(scope.clone()),
@@ -1370,6 +1449,9 @@ impl Registry {
         {
             return Err(Error::Denied);
         }
+        // An owned child retries its existing constructor operation; possession
+        // of the launch environment cannot substitute for native spawn custody.
+        launch.binding.entry()?;
         if let Some(gate) = &launch.gate {
             gate.current().map_err(|_| Error::Stale)?;
         }
@@ -1918,11 +2000,12 @@ impl Registry {
         let mut state = lock(&self.state)?;
         let before = state.launches.len();
         state.launches.retain(|_, launch| {
-            !(launch.process.is_none()
-                && launch
-                    ._scope
-                    .as_ref()
-                    .is_some_and(|scope| scope.cancelled()))
+            !(launch.binding.revoked()
+                || (launch.process.is_none()
+                    && launch
+                        ._scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.cancelled())))
         });
         let retired = reservation::target::resources::refuse_cancelled(&mut state);
         let removed = before - state.launches.len() + retired.len();
@@ -2074,7 +2157,8 @@ impl Registry {
             .launches
             .iter()
             .filter(|(_, item)| {
-                item.process.as_ref().is_some_and(is_gone)
+                item.binding.revoked()
+                    || item.process.as_ref().is_some_and(is_gone)
                     || item
                         .native_restart
                         .as_ref()

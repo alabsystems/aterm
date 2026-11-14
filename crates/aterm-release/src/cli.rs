@@ -184,6 +184,7 @@ USAGE
   targo --unverified ship release [--bump | --commit REV [--supersede] | --fix COMMIT...]
                  (--mac-only | --linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]...)
+                 [--windows-artifacts DIRECTORY] [--windows-sha256 HEX]
                  [--release-credentials <profile.toml>] [--engine DIRECTORY]
                  [--dry-run] [--verbose] [--prepare | --qualify] [--forget | --abandon vX.Y.Z]
       The way to release aterm, from a clean clone of its own on main. Steps:
@@ -225,6 +226,13 @@ USAGE
         --mac-only / --linux-artifacts …
                            the Linux declaration the cut requires (see `cut`);
                            journaled, so a bare re-run keeps it
+        --windows-artifacts DIRECTORY
+                           ship the Windows zip from this handoff directory (see
+                           `cut`); optional, journaled like the Linux declaration
+        --windows-sha256 HEX
+                           the Windows zip's SHA-256 as release-build printed it
+                           on the Windows host (see `cut`); journaled, so it may
+                           come on the run after the cut stopped for the pair
         --release-credentials <profile.toml>
                            the cut's signing profile (default
                            ~/.aterm/release-ring/release-credentials.toml)
@@ -299,10 +307,20 @@ USAGE
       digest, that serves other bytes, or that the channel no longer serves (a
       prerelease, or below the head's floor); then nothing is written.
 
+  targo --unverified ship pin-verifier --windows --from-release vX.Y.Z
+      The same for get-aterm.ps1: pin the release's Windows bootstrap verifier
+      as apps/aterm-win/get-aterm.ps1's pin and
+      crates/aterm-bootstrap-verify/pinned-windows.toml, to commit together,
+      from the windows_verifier fields its signed appcast carries, by the
+      same checks, the served file held to an x86-64 console executable.
+      There is no record form: get-aterm.ps1's pin comes only from what a
+      release signed.
+
   targo --unverified ship cut [--dry-run] [--resume] [--sign] [--abandon vX.Y.Z]
                  [--min-build N] [--release-credentials <profile.toml>]
                  [--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]... | --mac-only]
+                 [--windows-artifacts DIRECTORY [--windows-sha256 HEX]]
       The cut step `ship release` runs; release with `ship release`. Gates, the
       claim of the release's reserved build, a byte copy of the verified bundle
       signed, notarized and packaged (the cut never builds), the tag, and one
@@ -344,13 +362,26 @@ USAGE
                            copy its pair into --linux-artifacts, checked like a
                            hand-carried one
         --mac-only         ship no Linux build, on purpose
+        --windows-artifacts DIRECTORY
+                           ship the Windows zip: the handoff directory holding
+                           exactly the zip and receipt `aterm-winship
+                           release-build` made at this cut's commit, required
+                           before signing (a missing pair pauses the cut and
+                           names the command); without it the release carries
+                           no Windows zip
+        --windows-sha256 HEX
+                           the zip's SHA-256 as release-build printed it on the
+                           Windows host, read there and not off the carried
+                           files: the pair comes by hand, and its receipt binds
+                           nothing a writer of the carry cannot set, so no pair
+                           is admitted without it or with another digest
         --release-credentials <profile.toml>
                            the signing profile: a rostered, unrevoked machine key
                            and its notary credential (`provision` writes
                            ~/.aterm/release-ring/release-credentials.toml). Without one the
                            cut refuses before it claims
 
-  targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>]
+  targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>] [--mint-developer-id]
                            make this machine a publisher (without the Trust
                            toolchain, run `aterm pkg install trust` first). Seeds
                            the newest master-signed roster pair from the channel
@@ -359,7 +390,9 @@ USAGE
                            publishing stack (the toolchains and Apple SDK, the
                            base and develop layers, LibreSSL, the publication
                            engine, the site checkout and its deployer key,
-                           the Apple identity, a live-tested notary credential,
+                           the Apple identity (held, else imported from the vault
+                           registry, else filed as `aterm secrets need
+                           developer-id:<id>`), a live-tested notary credential,
                            the credentials profile, the channel token) and prints
                            every gap with its remedy. Only a clean pass mints
                            this machine's key, by the join ceremony: the paper
@@ -368,6 +401,11 @@ USAGE
                            provisioned machine is audited, never re-minted. Ends
                            READY TO CUT (ROSTERED on a host that cannot cut,
                            such as a non-Mac)
+        --mint-developer-id
+                           on the release machine only: generate (or resume) this
+                           machine's own Developer ID request, spending one of the
+                           team's five permanent certificate slots, and wait for
+                           the certificate Apple issues for it
         --cert-dir <folder>
                            the one visible folder the Apple certificate errand
                            may use: the request is copied there and the issued
@@ -588,6 +626,7 @@ USAGE
   targo --unverified ship yank <build> [--release-credentials <profile.toml>]
                  (--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]... | --mac-only)
+                 [--windows-artifacts DIRECTORY [--windows-sha256 HEX]]
                            publish and verify a successor first (a real cut with
                            min_build = <build>+1, signed with
                            --release-credentials, declaring Linux as any cut
@@ -622,6 +661,9 @@ pub enum Cmd {
     /// pin from a cut's receipts ([`crate::buildplan::linux::pin_verifier`]) or from the
     /// public release ([`crate::buildplan::linux::from_release::pin_from_release`]).
     PinVerifier(PinSource),
+    /// `pin-verifier --windows --from-release <tag>`: get-aterm.ps1's verifier pin from the
+    /// public release ([`crate::buildplan::linux::from_release::windows_pin_from_release`]).
+    PinWindowsVerifier(String),
     /// `build`: the release bundle, or HEAD's provisional bundle ([`crate::artifact::run_build`]).
     Build,
     Cut {
@@ -634,6 +676,8 @@ pub enum Cmd {
         roster: Option<std::path::PathBuf>,
         /// `--cert-dir`: the visible folder the browser errand may use.
         cert_dir: Option<std::path::PathBuf>,
+        /// `--mint-developer-id`: mint (or resume) this machine's own Developer ID request.
+        mint: bool,
     },
     NotaryOnly {
         check: bool,
@@ -830,16 +874,21 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             }
             Ok(Cmd::AcceptMeasure { report, reason })
         }
-        "pin-verifier" => match (it.next(), it.next(), it.next()) {
-            (Some("--from-release"), Some(tag), None) if !tag.starts_with('-') => {
+        "pin-verifier" => match (it.next(), it.next(), it.next(), it.next()) {
+            (Some("--from-release"), Some(tag), None, None) if !tag.starts_with('-') => {
                 Ok(Cmd::PinVerifier(PinSource::Release(tag.to_string())))
             }
-            (Some(record), None, None) if !record.starts_with('-') => Ok(Cmd::PinVerifier(
+            (Some("--windows"), Some("--from-release"), Some(tag), None)
+                if !tag.starts_with('-') =>
+            {
+                Ok(Cmd::PinWindowsVerifier(tag.to_string()))
+            }
+            (Some(record), None, None, None) if !record.starts_with('-') => Ok(Cmd::PinVerifier(
                 PinSource::Record(std::path::PathBuf::from(record)),
             )),
             _ => Err(format!(
-                "pin-verifier takes `--from-release vX.Y.Z`, or the one record a cut wrote \
-                 (dist/{})",
+                "pin-verifier takes `--from-release vX.Y.Z`, the one record a cut wrote \
+                 (dist/{}), or `--windows --from-release vX.Y.Z`",
                 crate::buildplan::linux::PIN_RECORD
             )),
         },
@@ -889,6 +938,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             let mut roster_only = false;
             let mut roster = None;
             let mut cert_dir: Option<std::path::PathBuf> = None;
+            let mut mint = false;
             while let Some(flag) = it.next() {
                 match flag {
                     "--id" => {
@@ -909,6 +959,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                         notary_only = true;
                     }
                     "--roster-only" => roster_only = true,
+                    "--mint-developer-id" => mint = true,
                     "--roster" => {
                         if roster.is_some() {
                             return Err("--roster given twice".into());
@@ -937,7 +988,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                 }
             }
             if notary_only {
-                if id.is_some() || roster_only || roster.is_some() || cert_dir.is_some() {
+                if id.is_some() || roster_only || roster.is_some() || cert_dir.is_some() || mint {
                     return Err("--notary-only takes only --check; no identity, roster or certificate options".into());
                 }
                 return Ok(Cmd::NotaryOnly { check });
@@ -949,14 +1000,21 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             if roster_only != roster.is_some() {
                 return Err("--roster-only requires --roster <public roster path>; --roster requires --roster-only".into());
             }
-            if roster_only && cert_dir.is_some() {
-                return Err("--roster-only cannot acquire certificates (--cert-dir)".into());
+            if roster_only && (cert_dir.is_some() || mint) {
+                return Err(
+                    "--roster-only cannot acquire certificates (--cert-dir, --mint-developer-id)"
+                        .into(),
+                );
+            }
+            if check && mint {
+                return Err("--check writes nothing; --mint-developer-id mints".into());
             }
             Ok(Cmd::Provision {
                 id,
                 check,
                 roster,
                 cert_dir,
+                mint,
             })
         }
         "stage-local" => Ok(Cmd::StageLocal(it.map(str::to_string).collect())),
@@ -1100,10 +1158,12 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                     "--linux-artifacts" | "--linux-worker" | "--mac-only" | "--linux-target" => {
                         yank_linux(&mut opts).take(flag, &mut it)?;
                     }
+                    "--windows-artifacts" => take_windows(&mut opts.windows_artifacts, &mut it)?,
+                    "--windows-sha256" => take_windows_sha256(&mut opts.windows_sha256, &mut it)?,
                     extra => {
                         return Err(format!(
                             "yank takes one build number, optionally --release-credentials \
-                             <profile.toml>, and the cut's Linux flags (got {extra:?})"
+                             <profile.toml>, and the cut's Linux and Windows flags (got {extra:?})"
                         ));
                     }
                 }
@@ -1113,6 +1173,10 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             if !linux.declared() {
                 return Err(format!("yank publishes a cut first; {MAC_ONLY_REFUSAL}"));
             }
+            windows_sha256_needs_artifacts(
+                opts.windows_sha256.as_deref(),
+                opts.windows_artifacts.as_deref(),
+            )?;
             Ok(Cmd::Yank { build, opts })
         }
         "harness-bump" => match it.next() {
@@ -1206,6 +1270,8 @@ fn parse_release<'a>(
                 }
                 .take(flag, &mut it)?;
             }
+            "--windows-artifacts" => take_windows(&mut opts.windows, &mut it)?,
+            "--windows-sha256" => take_windows_sha256(&mut opts.windows_sha256, &mut it)?,
             "--release-credentials" => {
                 let p = path(flag, it.next())?;
                 if opts.release_credentials.replace(p).is_some() {
@@ -1245,6 +1311,8 @@ fn parse_release<'a>(
             || opts.linux.declared()
             || !opts.linux.workers.is_empty()
             || !opts.linux.targets.is_empty()
+            || opts.windows.is_some()
+            || opts.windows_sha256.is_some()
             || opts.release_credentials.is_some())
     {
         return Err("--prefreeze builds only the clean origin/main cutter and takes no cut or credential flags".into());
@@ -1322,7 +1390,9 @@ fn parse_release<'a>(
             || opts.forget
             || opts.linux.declared()
             || !opts.linux.workers.is_empty()
-            || !opts.linux.targets.is_empty())
+            || !opts.linux.targets.is_empty()
+            || opts.windows.is_some()
+            || opts.windows_sha256.is_some())
     {
         return Err(
             "--abandon withdraws a claimed cut and takes no other release flag (but \
@@ -1339,7 +1409,9 @@ fn parse_release<'a>(
             || opts.qualify
             || opts.linux.declared()
             || !opts.linux.workers.is_empty()
-            || !opts.linux.targets.is_empty())
+            || !opts.linux.targets.is_empty()
+            || opts.windows.is_some()
+            || opts.windows_sha256.is_some())
     {
         return Err(
             "--forget drops this clone's release journal and exits; it takes no other release \
@@ -1374,6 +1446,53 @@ fn parse_release<'a>(
         );
     }
     Ok(opts)
+}
+
+/// `--windows-artifacts DIRECTORY` into `slot`, the optional Windows handoff directory: given at
+/// most once, with a directory.
+fn take_windows<'a>(
+    slot: &mut Option<std::path::PathBuf>,
+    it: &mut impl Iterator<Item = &'a str>,
+) -> std::result::Result<(), String> {
+    let dir = it
+        .next()
+        .filter(|dir| !dir.is_empty() && !dir.starts_with('-'))
+        .ok_or("--windows-artifacts needs a directory")?;
+    if slot.replace(std::path::PathBuf::from(dir)).is_some() {
+        return Err("--windows-artifacts given twice".into());
+    }
+    Ok(())
+}
+
+/// `--windows-sha256 HEX` into `slot`: the Windows zip's SHA-256 as `release-build` printed it
+/// on the Windows host, given at most once, read in either case as the lowercase digest.
+fn take_windows_sha256<'a>(
+    slot: &mut Option<String>,
+    it: &mut impl Iterator<Item = &'a str>,
+) -> std::result::Result<(), String> {
+    let text = it
+        .next()
+        .ok_or("--windows-sha256 needs the zip's SHA-256")?;
+    if slot
+        .replace(aterm_winship::handoff::carried_sha256(text)?)
+        .is_some()
+    {
+        return Err("--windows-sha256 given twice".into());
+    }
+    Ok(())
+}
+
+/// A cut's `--windows-sha256` names the zip of its `--windows-artifacts` directory.
+fn windows_sha256_needs_artifacts(
+    sha256: Option<&str>,
+    artifacts: Option<&std::path::Path>,
+) -> std::result::Result<(), String> {
+    if sha256.is_some() && artifacts.is_none() {
+        return Err(
+            "--windows-sha256 names the zip of a --windows-artifacts directory; give both".into(),
+        );
+    }
+    Ok(())
 }
 
 struct LinuxFlags<'o> {
@@ -1471,6 +1590,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
                 }
                 .take(flag, it)?;
             }
+            "--windows-artifacts" => take_windows(&mut opts.windows_artifacts, it)?,
+            "--windows-sha256" => take_windows_sha256(&mut opts.windows_sha256, it)?,
             "--release-credentials" => {
                 if opts.release_credentials.is_some() {
                     return Err("--release-credentials given twice".to_string());
@@ -1503,6 +1624,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.linux_artifacts.is_some()
             || !opts.linux_workers.is_empty()
             || opts.mac_only
+            || opts.windows_artifacts.is_some()
+            || opts.windows_sha256.is_some()
             || opts.min_build.is_some())
     {
         return Err("--abandon combines with no other cut flag".to_string());
@@ -1512,6 +1635,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.linux_artifacts.is_some()
             || !opts.linux_workers.is_empty()
             || opts.mac_only
+            || opts.windows_artifacts.is_some()
+            || opts.windows_sha256.is_some()
             || opts.min_build.is_some())
     {
         return Err(
@@ -1527,6 +1652,10 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
         mac_only: &mut opts.mac_only,
     }
     .check()?;
+    windows_sha256_needs_artifacts(
+        opts.windows_sha256.as_deref(),
+        opts.windows_artifacts.as_deref(),
+    )?;
     if abandon.is_none()
         && !opts.sign
         && !opts.resume
@@ -1600,6 +1729,20 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             );
             Ok(())
         }
+        Cmd::PinWindowsVerifier(tag) => {
+            let root = repo_root()?;
+            let pin = crate::buildplan::linux::from_release::windows_pin_from_release(&root, &tag)
+                .map_err(Error::new)?;
+            println!(
+                "pinned {}'s Windows bootstrap verifier from {} into {} and {}; commit both:\n{}",
+                pin.tag,
+                pin.repo,
+                aterm_bootstrap_verify::pin::WINDOWS_SCRIPT,
+                aterm_bootstrap_verify::pin::WINDOWS_RECORD,
+                pin.lines()
+            );
+            Ok(())
+        }
         Cmd::StageLocal(args) => crate::stage_local::run(&args),
         Cmd::Build => crate::artifact::run_build(&repo_root()?),
         Cmd::AcceptMeasure { report, reason } => {
@@ -1616,9 +1759,16 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             check,
             roster,
             cert_dir,
+            mint,
         } => match roster {
             Some(path) => crate::provision::run_roster_only(&repo_root()?, &id, check, &path),
-            None => crate::provision::run_provision(&repo_root()?, &id, check, cert_dir.as_deref()),
+            None => crate::provision::run_provision(
+                &repo_root()?,
+                &id,
+                check,
+                cert_dir.as_deref(),
+                mint,
+            ),
         },
         Cmd::Release(opts) => match &opts.abandon {
             Some(version) => verify::run_abandon(&repo_root()?, version),

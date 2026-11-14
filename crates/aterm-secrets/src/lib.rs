@@ -151,6 +151,10 @@ pub enum LabMark {
     /// A build running inside a virtual machine made it (macOS's `kern.hv_vmm_present` reads
     /// 1): the other `lab mac nux` guests run a release app, so only this catches them.
     VirtualMachine,
+    /// A process whose home is not its login's account home made it: a scratch `HOME` a check, an
+    /// installer run or an agent gave a release app. Its vault key, fleet node key and node id are
+    /// all new there, so nothing ties what it asks as to the Mac's own seat.
+    ForeignHome,
     /// A build after this one marked it for a reason this one does not name: marked all the same.
     Unnamed,
 }
@@ -164,6 +168,7 @@ impl LabMark {
             Self::DebugBuild => "debug-build",
             Self::LabLane => "lab-lane",
             Self::VirtualMachine => "virtual-machine",
+            Self::ForeignHome => "foreign-home",
             Self::Unnamed => "unnamed",
         }
     }
@@ -176,6 +181,7 @@ impl LabMark {
             Self::DebugBuild,
             Self::LabLane,
             Self::VirtualMachine,
+            Self::ForeignHome,
         ]
         .into_iter()
         .find(|mark| mark.word() == word)
@@ -184,8 +190,8 @@ impl LabMark {
 }
 
 /// What a process making a vault identity knows of itself ([`lab_identity`]): the live reading is
-/// `Making::now` (Unix), whose virtual-machine probe is inert in every test binary; a test states
-/// each fact instead.
+/// `Making::now` (Unix), whose virtual-machine and home probes are inert in every test binary; a
+/// test states each fact instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Making {
     /// It is a test binary.
@@ -196,11 +202,13 @@ pub struct Making {
     pub lab_lane: bool,
     /// It runs inside a virtual machine.
     pub virtual_machine: bool,
+    /// Its home is a folder other than its login's account home.
+    pub foreign_home: bool,
 }
 
 /// The lab mark an identity made by a process that is `making` carries, or `None` for a release
-/// build on a Mac's own hardware, the one kind of process whose new identity may join the live
-/// ALab. The first fact that holds names the mark. A process this says `None` for that finds a
+/// build on a Mac's own hardware in its login's own home, the one kind of process whose new
+/// identity may join the live ALab. The first fact that holds names the mark. A process this says `None` for that finds a
 /// lab-marked identity in this Mac's vault folder sets that folder aside and starts as a new Mac
 /// (A16, `client::Paths::for_home`).
 #[must_use]
@@ -213,6 +221,8 @@ pub const fn lab_identity(making: Making) -> Option<LabMark> {
         Some(LabMark::LabLane)
     } else if making.virtual_machine {
         Some(LabMark::VirtualMachine)
+    } else if making.foreign_home {
+        Some(LabMark::ForeignHome)
     } else {
         None
     }

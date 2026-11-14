@@ -151,7 +151,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.200.0"
+version = "0.201.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -171,6 +171,7 @@ dependencies = [
  "aterm-db",
  "aterm-digest",
  "aterm-durable",
+ "aterm-file",
  "aterm-gui",
  "aterm-gui-fabric",
  "aterm-json",
@@ -194,6 +195,7 @@ dependencies = [
  "aterm-secrets",
  "aterm-session",
  "aterm-shell-integration",
+ "aterm-signin-window",
  "aterm-slog",
  "aterm-spec",
  "aterm-spec-anchor",
@@ -288,6 +290,7 @@ dependencies = [
  "aterm-secrets",
  "aterm-serde",
  "aterm-shell-integration",
+ "aterm-signin-window",
  "aterm-slog",
  "aterm-spec",
  "aterm-spec-anchor",
@@ -333,6 +336,8 @@ version = "0.0.0"
 dependencies = [
  "aterm-aos",
  "aterm-core",
+ "aterm-models-aos",
+ "aterm-spec",
 ]
 
 [[package]]
@@ -646,6 +651,7 @@ dependencies = [
  "aterm-db-core",
  "aterm-digest",
  "aterm-durable",
+ "aterm-file",
  "aterm-heap-count",
  "aterm-http",
  "aterm-journal",
@@ -667,6 +673,7 @@ dependencies = [
  "aterm-types",
  "aterm-uds",
  "aterm-update-core",
+ "aterm-value-guard",
  "ring",
  "zeroize",
 ]
@@ -764,6 +771,20 @@ dependencies = [
  "aterm-toml",
  "aterm-types",
  "libc",
+]
+
+[[package]]
+name = "aterm-file"
+version = "0.0.0"
+dependencies = [
+ "aterm-codec",
+ "aterm-digest",
+ "aterm-json",
+ "aterm-spec-anchor",
+ "aterm-tempfile",
+ "aterm-types",
+ "aterm-uds",
+ "aterm-value-guard",
 ]
 
 [[package]]
@@ -1111,6 +1132,7 @@ dependencies = [
  "aterm-spec-anchor",
  "aterm-tempfile",
  "aterm-uds",
+ "trust-resource-provenance",
 ]
 
 [[package]]
@@ -1758,6 +1780,7 @@ dependencies = [
  "aterm-update",
  "aterm-update-core",
  "aterm-verify",
+ "aterm-winship",
  "atpkg",
  "atpkg-keys",
  "libc",
@@ -2025,6 +2048,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-signin-window"
+version = "0.0.0"
+dependencies = [
+ "aterm-json",
+ "aterm-macos-ui",
+ "aterm-objc",
+]
+
+[[package]]
 name = "aterm-sixel"
 version = "0.0.0"
 
@@ -2274,6 +2306,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-value-guard"
+version = "0.0.0"
+
+[[package]]
 name = "aterm-verify"
 version = "0.0.0"
 dependencies = [
@@ -2452,10 +2488,16 @@ version = "0.0.0"
 name = "aterm-winship"
 version = "0.0.0"
 dependencies = [
+ "aterm-codec",
+ "aterm-digest",
  "aterm-json",
  "aterm-png",
+ "aterm-serde",
  "aterm-tempfile",
+ "aterm-toml",
+ "aterm-toolchain",
  "aterm-uds",
+ "aterm-update-core",
 ]
 
 [[package]]

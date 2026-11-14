@@ -46,6 +46,7 @@ struct Changing {
     may_send: AtomicBool,
     withdraw_on_receive: bool,
     received: Mutex<Vec<Vec<u8>>>,
+    lookups: Mutex<Vec<usize>>,
 }
 
 impl Changing {
@@ -56,6 +57,7 @@ impl Changing {
             may_send: AtomicBool::new(true),
             withdraw_on_receive,
             received: Mutex::new(Vec::new()),
+            lookups: Mutex::new(Vec::new()),
         })
     }
 
@@ -73,7 +75,8 @@ impl Changing {
         vec![Verdict::Applied; wires.len()]
     }
 
-    fn wires(&self, wanted: impl Fn(&[u8]) -> bool) -> Vec<Vec<u8>> {
+    fn wires(&self, count: usize, wanted: impl Fn(&[u8]) -> bool) -> Vec<Vec<u8>> {
+        self.lookups.lock().unwrap().push(count);
         if !self.may_send.load(Ordering::Acquire) {
             return Vec::new();
         }
@@ -183,7 +186,7 @@ impl Stores for Changing {
 
     fn table_wires(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
         assert_eq!(table, TABLE);
-        Ok(self.wires(|wire| ids.contains(&crate::stores::digest(wire))))
+        Ok(self.wires(ids.len(), |wire| ids.contains(&crate::stores::digest(wire))))
     }
 
     fn table_proofs(&self, table: Digest) -> io::Result<Option<BTreeSet<ProofKey>>> {
@@ -198,7 +201,7 @@ impl Stores for Changing {
 
     fn table_proof_wires(&self, table: Digest, keys: &[ProofKey]) -> io::Result<Vec<Vec<u8>>> {
         assert_eq!(table, TABLE);
-        Ok(self.wires(|wire| keys.contains(&proof_key(wire))))
+        Ok(self.wires(keys.len(), |wire| keys.contains(&proof_key(wire))))
     }
 
     fn members_inventory(&self) -> io::Result<BTreeSet<Digest>> {
@@ -213,8 +216,113 @@ impl Stores for Changing {
     }
 
     fn members_wires(&self, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
-        Ok(self.wires(|wire| ids.contains(&crate::stores::digest(wire))))
+        Ok(self.wires(ids.len(), |wire| ids.contains(&crate::stores::digest(wire))))
     }
+}
+
+struct WithdrawAfterWrite<'a> {
+    stores: &'a Changing,
+    withdraw: bool,
+    bytes: Vec<u8>,
+}
+
+impl Write for WithdrawAfterWrite<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        if self.withdraw {
+            self.stores.may_send.store(false, Ordering::Release);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn inventory_fetches_bounded_payloads_again_after_each_network_batch() {
+    for unit in [Unit::Members, Unit::Proofs(TABLE), Unit::Table(TABLE)] {
+        for withdraw in [false, true] {
+            let stores = Changing::new(unit, b"first", false);
+            stores
+                .received
+                .lock()
+                .unwrap()
+                .extend((0..crate::ingest::BATCH).map(|id| id.to_le_bytes().to_vec()));
+            let records = stores.records();
+            let ids = records
+                .iter()
+                .map(|wire| crate::stores::digest(wire))
+                .collect();
+            let offer = match unit {
+                Unit::Members => Offer::Members(ids),
+                Unit::Proofs(table) => {
+                    Offer::Proofs(table, records.iter().map(|wire| proof_key(wire)).collect())
+                }
+                Unit::Table(table) => Offer::Table(table, ids),
+            };
+            let mut writer = WithdrawAfterWrite {
+                stores: &stores,
+                withdraw,
+                bytes: Vec::new(),
+            };
+            let expected = crate::ingest::BATCH + usize::from(!withdraw);
+            assert_eq!(offer.send(stores.as_ref(), &mut writer).unwrap(), expected);
+            assert_eq!(*stores.lookups.lock().unwrap(), [crate::ingest::BATCH, 1]);
+            let mut input = std::io::Cursor::new(writer.bytes);
+            assert_eq!(read_u32(&mut input).unwrap() as usize, crate::ingest::BATCH);
+            for wire in records.iter().take(crate::ingest::BATCH) {
+                assert_eq!(read_frame(&mut input, 1024).unwrap(), *wire);
+            }
+            if !withdraw {
+                assert_eq!(read_u32(&mut input).unwrap(), 1);
+                assert_eq!(
+                    read_frame(&mut input, 1024).unwrap(),
+                    *records.last().unwrap()
+                );
+            }
+            assert_eq!(read_u32(&mut input).unwrap(), 0);
+            assert_eq!(input.position() as usize, input.get_ref().len());
+        }
+    }
+}
+
+#[test]
+fn an_empty_payload_selection_does_not_end_later_inventory_batches() {
+    let mut bytes = Vec::new();
+    assert_eq!(
+        send(&mut bytes, [Ok(Vec::new()), Ok(vec![b"later".to_vec()])]).unwrap(),
+        1
+    );
+    let mut input = std::io::Cursor::new(bytes);
+    assert_eq!(read_u32(&mut input).unwrap(), 1);
+    assert_eq!(read_frame(&mut input, 1024).unwrap(), b"later");
+    assert_eq!(read_u32(&mut input).unwrap(), 0);
+    assert_eq!(input.position() as usize, input.get_ref().len());
+}
+
+#[test]
+fn streamed_inventory_preserves_records_across_link_frame_boundaries() {
+    let large = vec![5; aterm_net::fleet::link::FRAME_MAX + 1];
+    let batches = [
+        vec![b"before".to_vec(), large.clone(), b"after".to_vec()],
+        vec![large],
+    ];
+    let mut bytes = Vec::new();
+    assert_eq!(
+        send(&mut bytes, batches.iter().cloned().map(Ok)).unwrap(),
+        4
+    );
+    let mut input = std::io::Cursor::new(bytes);
+    for batch in &batches {
+        assert_eq!(read_u32(&mut input).unwrap() as usize, batch.len());
+        for wire in batch {
+            assert_eq!(read_frame(&mut input, RECORD_MAX).unwrap(), *wire);
+        }
+    }
+    assert_eq!(read_u32(&mut input).unwrap(), 0);
+    assert_eq!(input.position() as usize, input.get_ref().len());
 }
 
 #[test]

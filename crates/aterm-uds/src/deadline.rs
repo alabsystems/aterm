@@ -556,6 +556,10 @@ const SLOW_READER: Duration = Duration::from_secs(60);
 
 struct Grace {
     by: Instant,
+    /// Past `by`, when a drain stops reading a pipe only something outside the child's process
+    /// group holds: the reap plus its wait's post-reap `left` ([`drained_owned`]'s or
+    /// `complete::collect_started_with`'s), a tick for a process-progress collector
+    /// ([`ProgressWindow::exited`]).
     #[cfg_attr(not(unix), allow(dead_code))]
     until: Instant,
     /// The exited child's pid, which led its process group.
@@ -829,7 +833,10 @@ fn deadline_now() -> Instant {
 
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 /// The m16 descendant-progress detector's cadence: frequent enough inside a one-minute evidence
-/// window without turning a network operation into a continuous process-table sweep.
+/// window without turning a network operation into a continuous process-table sweep. A
+/// [`ProgressWindow`] reads the tree once per tick however often its collector wakes (one that
+/// holds a stop wakes every [`STOP_TICK`]), and between ticks only to judge a window that would
+/// close before the next reading.
 const PROCESS_PROGRESS_TICK: Duration = Duration::from_millis(500);
 
 /// More descendants than this make a process-tree reading incomplete. Ordinary Git and local
@@ -971,6 +978,8 @@ impl ProcessProgressProbe {
 
 /// Evidence window over captured bytes and a complete descendant-tree progress generation.
 /// An unread or incomparable tree disarms the window until another complete baseline exists.
+/// [`ProgressWindow::observe`] reads the tree once a tick, and afresh before it judges the
+/// window closed.
 #[derive(Clone, Copy, Debug)]
 struct ProgressWindow {
     window: Duration,
@@ -978,6 +987,8 @@ struct ProgressWindow {
     bytes: u64,
     work: u64,
     armed: bool,
+    /// When [`ProgressWindow::observe`] last read the tree; `None` before its first reading.
+    read_at: Option<Instant>,
 }
 
 impl ProgressWindow {
@@ -988,13 +999,69 @@ impl ProgressWindow {
             bytes: 0,
             work: 0,
             armed: false,
+            read_at: None,
+        }
+    }
+
+    /// How often the tree is read: [`PROCESS_PROGRESS_TICK`], or a quarter of a shorter window.
+    fn tick(&self) -> Duration {
+        PROCESS_PROGRESS_TICK
+            .min(self.window / 4)
+            .max(Duration::from_millis(1))
+    }
+
+    /// How long until the collector looks again: what is left of the window at `now`, but at
+    /// most a tick, and between readings no later than the next reading is due. The tree is read
+    /// through `read` only when a tick has passed since its last reading or the window would
+    /// close without one: a collector that wakes more often (one holding a stop) does not sweep
+    /// the process table on each wake, one that waits the whole answer (one without a stop)
+    /// wakes when the next reading is due, and a stall is never named on a stale reading.
+    /// Between readings captured bytes still count.
+    fn observe(
+        &mut self,
+        now: Instant,
+        bytes: u64,
+        read: impl FnOnce() -> Option<u64>,
+    ) -> Duration {
+        if let Some(at) = self.read_at {
+            let tick = self.tick();
+            let since = now.saturating_duration_since(at);
+            if since < tick {
+                let left = self.remaining(now, bytes, self.armed.then_some(self.work));
+                if !left.is_zero() {
+                    return left.min(tick.saturating_sub(since));
+                }
+            }
+        }
+        self.read_at = Some(now);
+        self.remaining(now, bytes, read())
+    }
+
+    /// How long past a reaped child's exit its streams are read on when only something outside
+    /// its process group holds a pipe ([`Grace`]'s `until`): a tick, wherever the last reading
+    /// fell. A reaped root has no tree left to read, so none is read.
+    fn exited(&self) -> Duration {
+        self.tick()
+    }
+
+    /// A process-progress collector's `left` ([`drained_owned`]'s, and the complete-stdout
+    /// collector's): over a window opened at `now()`, [`ProgressWindow::observe`] at `now()`
+    /// while the child runs (`Some(pid)`), reading its tree through `work`, and
+    /// [`ProgressWindow::exited`] once it is reaped (`None`). Both collectors build theirs here.
+    fn collector<'a>(
+        window: Duration,
+        now: &'a mut dyn FnMut() -> Instant,
+        work: &'a mut dyn FnMut(u32) -> Option<u64>,
+    ) -> impl FnMut(Option<u32>, u64) -> Duration + 'a {
+        let mut progress = Self::new(window, now());
+        move |pid, bytes| match pid {
+            Some(pid) => progress.observe(now(), bytes, || work(pid)),
+            None => progress.exited(),
         }
     }
 
     fn remaining(&mut self, now: Instant, bytes: u64, work: Option<u64>) -> Duration {
-        let tick = PROCESS_PROGRESS_TICK
-            .min(self.window / 4)
-            .max(Duration::from_millis(1));
+        let tick = self.tick();
         let Some(work) = work else {
             self.armed = false;
             self.last = now;
@@ -1148,8 +1215,7 @@ fn output_from_while_process_progressing_with(
     work: &mut dyn FnMut(u32) -> Option<u64>,
     stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Output, ProgressError> {
-    let mut progress = ProgressWindow::new(window, now());
-    let mut left = |pid, bytes| progress.remaining(now(), bytes, work(pid));
+    let mut left = ProgressWindow::collector(window, now, work);
     let (child, pipes, group) = started(cmd, stdin)?;
     drained_owned(
         child,
@@ -1272,15 +1338,17 @@ impl Late {
 }
 
 /// `child`, started with `pipes` (its stdout and stderr), waited on with its output drained until
-/// it ends or `left()` reads zero; `group` is its process group when it leads one. Past its time
-/// `overrun` ends it while it still runs, and the answer is [`Late`]; on a failure it is
-/// [`Waited::end`]ed. Ordinary captures also keep their child on unwind; the silent lab selects
-/// its explicit bounded cleanup policy instead.
+/// it ends or `left(Some(pid), bytes)` reads zero, `bytes` being what both streams have captured;
+/// once it is reaped, `left(None, bytes)` is how long past the reap a pipe only something
+/// outside its group holds is read on ([`Grace`]). `group` is its process group when it leads
+/// one. Past its time `overrun` ends it while it still runs, and the answer is [`Late`]; on a
+/// failure it is [`Waited::end`]ed. Ordinary captures also keep their child on unwind; the silent
+/// lab selects its explicit bounded cleanup policy instead.
 fn drained_owned<C: Waited>(
     child: C,
     pipes: Pipes,
     group: Option<u32>,
-    left: &mut dyn FnMut(u32, u64) -> Duration,
+    left: &mut dyn FnMut(Option<u32>, u64) -> Duration,
     overrun: &mut dyn FnMut(&mut C),
     settle_on_unwind: bool,
     mut stopped: Option<&mut dyn FnMut() -> bool>,
@@ -1332,7 +1400,7 @@ fn drained_owned<C: Waited>(
                 let remaining = if stopped.as_mut().is_some_and(|stop| stop()) {
                     Duration::ZERO
                 } else {
-                    left(child.pid(), captured(&stdout, &stderr))
+                    left(Some(child.pid()), captured(&stdout, &stderr))
                 };
                 if remaining.is_zero() {
                     overrun(child);
@@ -1357,10 +1425,7 @@ fn drained_owned<C: Waited>(
     };
     let grace = Grace {
         by: saturating_after(Instant::now(), DRAIN_GRACE),
-        until: saturating_after(
-            Instant::now(),
-            left(child.pid(), captured(&stdout, &stderr)),
-        ),
+        until: saturating_after(Instant::now(), left(None, captured(&stdout, &stderr))),
         group,
     };
     let mut collect = |drain: Option<Drain>| {

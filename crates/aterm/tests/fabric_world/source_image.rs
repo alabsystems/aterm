@@ -3,7 +3,7 @@
 
 //! Consumers in an actual debug frontend after its executable pathname changes.
 
-use aterm_spec::wait::{MUST_HAPPEN, until_within};
+use aterm_spec::wait::{FIRST_EXEC, MUST_HAPPEN, until_within};
 use aterm_uds::spawnfd::{Child, command};
 
 struct Owned(Child);
@@ -18,7 +18,14 @@ fn qualify(change: &str) {
     let scratch = aterm_tempfile::tempdir().unwrap().keep();
     let world = std::fs::canonicalize(&scratch).unwrap();
     let mut kept = aterm_uds::deadline::KeptUntilRan::new(&world);
-    let mut bystander = Owned(command("/bin/sleep").arg("600").spawn().unwrap());
+    // Cover original/replacement/retained preparation and the consumer/retirement windows.
+    let parked = FIRST_EXEC * 3 + MUST_HAPPEN * 6;
+    let mut bystander = Owned(
+        command("/bin/sleep")
+            .arg(parked.as_secs().to_string())
+            .spawn()
+            .unwrap(),
+    );
     let image = world.join("aterm");
     // The package's debug frontend, never the installed app or a release with fresh HOME.
     std::fs::copy(super::harness::aterm(), &image).unwrap();
@@ -43,10 +50,17 @@ fn qualify(change: &str) {
             .spawn()
             .unwrap(),
     );
-    until_within(MUST_HAPPEN, "original frontend execution", || {
-        std::fs::read_to_string(world.join("ready"))
+    until_within(FIRST_EXEC, "original frontend execution", || {
+        let ready = std::fs::read_to_string(world.join("ready"))
             .ok()
-            .filter(|s| s == "original producer executed\n")
+            .filter(|s| s == "original producer executed\n");
+        if ready.is_none() {
+            assert!(
+                front.0.try_wait().unwrap().is_none(),
+                "frontend exited before proving its execution"
+            );
+        }
+        ready
     });
     match change {
         "replace" | "lost" => {
@@ -55,7 +69,7 @@ fn qualify(change: &str) {
             std::fs::rename(&replacement, &image).unwrap();
             let mut control = command(&image);
             control.arg("replacement executed");
-            let output = aterm_uds::deadline::output_within(&mut control, MUST_HAPPEN).unwrap();
+            let output = aterm_uds::deadline::output_within(&mut control, FIRST_EXEC).unwrap();
             assert!(output.status.success());
             assert_eq!(output.stdout, b"replacement executed\n");
         }
@@ -64,6 +78,20 @@ fn qualify(change: &str) {
         _ => unreachable!(),
     }
     std::fs::write(world.join("go"), "go\n").unwrap();
+    until_within(FIRST_EXEC, "late retained helper execution", || {
+        if std::fs::read_to_string(world.join("consumer-ready"))
+            .ok()
+            .is_some_and(|line| line == "retained helper executed\n")
+        {
+            return Some(());
+        }
+        assert!(
+            front.0.try_wait().unwrap().is_none(),
+            "frontend exited before its retained helper was ready"
+        );
+        None
+    });
+    std::fs::write(world.join("consume"), "consume\n").unwrap();
     let result = until_within(MUST_HAPPEN, "native consumer result", || {
         std::fs::read_to_string(world.join("result")).ok()
     });

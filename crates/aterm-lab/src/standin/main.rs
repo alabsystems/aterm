@@ -4,7 +4,7 @@
 //! `aterm-lab-standin`: the stand-in vendor agent `lab harness-proof` lays into its scratch atpkg
 //! store as two builds (`<prefix>/store/<program>/<build>/bin/<cmd>`), so a harness runs it as its
 //! child exactly as it runs the vendor's CLI, and no vendor byte, account or server is involved
-//! (`docs/DESIGN-harness-repos-2026-10-24.md` §3.7, §9 step 2). Dev-only: never packed or shipped.
+//! (`docs/DESIGN-harness-repos-2026-10-24.md` §3.7, §9). Dev-only: never packed or shipped.
 //!
 //! It plays the vendor its name says (`argv[0]`'s file name; `unix::Dialect`); Muse Code is the one
 //! dialect so far. As Muse Code it keeps a session the way the real one does, so both the harness

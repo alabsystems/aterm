@@ -39,13 +39,13 @@ const PROGRAM: i32 = 502;
 const TERMINAL: i32 = 601;
 const PERSON: i32 = 701;
 
-const PROJECTED: [&str; 25] = [
-    "rec", "held", "handed", "live", "win", "term", "own", "quitting", "tries", "fin", "prior",
-    "pheld", "phanded", "plive", "due", "pdue", "fdue", "sd", "psd", "said", "ends", "ever",
-    "early", "cutend", "cutno",
+const PROJECTED: [&str; 26] = [
+    "rec", "tries", "dec", "fin", "due", "fdue", "we", "wd", "te", "td", "oe", "od", "cut", "cd",
+    "win", "term", "own", "quitting", "said", "ends", "decls", "ever", "early", "beside", "cutend",
+    "cutno",
 ];
 
-const ANCHORED: [&str; 20] = [
+const ANCHORED: [&str; 21] = [
     "ClaimT",
     "ClaimW",
     "ClosedW",
@@ -56,6 +56,7 @@ const ANCHORED: [&str; 20] = [
     "DoneT",
     "DoneW",
     "ExplicitO",
+    "ExplicitW",
     "Hand",
     "InterruptedT",
     "Lift",
@@ -68,7 +69,7 @@ const ANCHORED: [&str; 20] = [
     "UnfinishedW",
 ];
 
-const MUTANTS: [&str; 12] = [
+const MUTANTS: [&str; 14] = [
     "CutOffReadsDeclined",
     "ClaimBesideLive",
     "ClaimThroughDecline",
@@ -78,6 +79,8 @@ const MUTANTS: [&str; 12] = [
     "RetryEndDropsAsk",
     "ReleaseCountsATry",
     "EndForgetsFinish",
+    "ThirdDropsOldest",
+    "ReleaseForgetsDecline",
     "InterruptionDeclines",
     "QuitDropsFinish",
     "HangupDeclinesT",
@@ -132,8 +135,12 @@ struct Rig {
     own: Option<Claim>,
     said: bool,
     ends: i64,
+    /// Declines written in a row since the last finish, unfinished end or lift.
+    decls: i64,
     ever: bool,
     early: bool,
+    /// An automatic claim went while another asker asked.
+    beside: bool,
     cutend: bool,
     /// A terminal's end decided a decline for what its hangup or a `SIGTERM` stopped it with.
     cutno: bool,
@@ -156,8 +163,10 @@ impl Rig {
             own: None,
             said: false,
             ends: 0,
+            decls: 0,
             ever: false,
             early: false,
+            beside: false,
             cutend: false,
             cutno: false,
         };
@@ -185,13 +194,14 @@ impl Rig {
         self.files.running.borrow_mut().remove(&(pid, birth));
     }
 
-    /// The record's one line, as the code reads it.
-    fn line(&self) -> Option<Line> {
+    /// What the record keeps, as the code reads it.
+    fn kept(&self) -> Kept {
         self.files
             .text
             .borrow()
             .as_deref()
             .map(|text| state(text).expect("the record reads"))
+            .unwrap_or_default()
     }
 
     /// Whether a reading now says a person's decline holds.
@@ -223,8 +233,18 @@ impl Rig {
         }
         if took.held() {
             match how {
-                End::Unfinished => self.ends += 1,
-                End::Done | End::Declined => self.ends = 0,
+                End::Unfinished => {
+                    self.ends += 1;
+                    self.decls = 0;
+                }
+                End::Done => {
+                    self.ends = 0;
+                    self.decls = 0;
+                }
+                End::Declined => {
+                    self.ends = 0;
+                    self.decls += 1;
+                }
                 End::Released => {}
             }
         }
@@ -328,12 +348,15 @@ impl Rig {
     /// An automatic claim by the process `pid` born `birth`.
     fn automatic(&mut self, pid: i32, birth: u64, action: &'static str, ev: &mut StepEvidence) {
         let declined = self.declined();
+        let asking =
+            self.win.is_some() || self.asks_in_tab || self.term.is_some() || self.own.is_some();
         let asker = Self::asker(pid, birth);
         let claimed = ev.step(action, || {
             claim(&self.files, Self::path(), &asker, self.now).expect("the claim is recorded")
         });
         let claimed = claimed.unwrap_or_else(|| panic!("{action} claims"));
         self.early |= declined;
+        self.beside |= asking;
         if pid == WINDOW {
             self.win = Some(claimed);
         } else {
@@ -359,115 +382,90 @@ impl Rig {
     }
 }
 
-/// The asker `asker` is, as the model names it: 1 the window or its tab's program, 2 the
-/// terminal, 3 the person.
-fn role(asker: &Asker) -> i64 {
-    match asker.pid {
-        WINDOW | PROGRAM => 1,
-        TERMINAL => 2,
-        PERSON => 3,
-        other => panic!("no asker is pid {other}"),
-    }
-}
-
-/// The kind of line `line` is, as the model numbers it.
-fn kind(line: &Line) -> i64 {
-    match line {
-        Line::Asking { .. } => 1,
-        Line::Unfinished { .. } => 2,
-        Line::Done { .. } => 3,
-        Line::Declined { .. } => 4,
-        Line::Opened => panic!("the rig writes no historical line"),
-    }
-}
-
 fn project(rig: &Rig, model_state: &State) -> State {
     let mut state = model_state.clone();
     let now = rig.now;
     let over = |due: u64| i64::from(due <= now);
-    let runs = |claim: &Claim| i64::from(rig.files.runs(claim.asker.pid, claim.asker.birth));
-    // When the line's own pause is over: a cut-off claim's, as it reads once its asker is gone.
-    let due = |line: &Line| match line {
-        Line::Asking {
-            claim,
-            tries,
-            since,
-            ..
-        } => over(ASK_AGAIN.due_by(claim.at.max(*since), *tries, now)),
-        Line::Unfinished { at, tries, .. } => over(ASK_AGAIN.due_by(*at, *tries, now)),
-        Line::Done { at, .. } => over(ASK_AGAIN.due_by(*at, 1, now)),
-        Line::Declined { at, declines, .. } => over(DECLINE_AGAIN.due_by(*at, *declines, now)),
-        Line::Opened => panic!("the rig writes no historical line"),
-    };
-    // When the schedule of the unfinished tries an asking line carries is over.
-    let schedule = |line: &Line| match line {
-        Line::Asking { tries, since, .. } if *tries > 0 => {
-            over(ASK_AGAIN.due_by(*since, *tries, now))
+    let kept = rig.kept();
+    let (tries, since, finished) = carried(kept.ended.as_ref());
+    // When the pause from an attempt's claim, or the unfinished end under it if later, is over.
+    let paused = |claim: &Claim| over(ASK_AGAIN.due_by(claim.at.max(since), tries, now));
+    let (mut we, mut wd, mut te, mut td, mut oe, mut od, mut cut, mut cd) =
+        (0, 1, 0, 1, 0, 1, 0, 1);
+    for claim in &kept.asking {
+        if !rig.files.runs(claim.asker.pid, claim.asker.birth) {
+            cut = 1;
+            cd = cd.min(paused(claim));
+            continue;
         }
-        _ => 1,
-    };
-    let line = rig.line();
-    let prior = match &line {
-        Some(Line::Asking { prior, .. }) => prior.as_deref().cloned(),
-        _ => None,
-    };
-    let asking = |line: Option<&Line>| match line {
-        Some(Line::Asking { claim, .. }) => (
-            role(&claim.asker),
-            i64::from(claim.asker.pid == PROGRAM),
-            runs(claim),
+        match claim.asker.pid {
+            WINDOW | PROGRAM => {
+                we = if claim.asker.pid == WINDOW { 1 } else { 2 };
+                wd = paused(claim);
+            }
+            TERMINAL => (te, td) = (1, paused(claim)),
+            PERSON => (oe, od) = (1, paused(claim)),
+            other => panic!("no asker is pid {other}"),
+        }
+    }
+    let (rec, due, dec) = match &kept.ended {
+        None => (0, 1, 0),
+        Some(Line::Unfinished { at, tries, .. }) => {
+            (2, over(ASK_AGAIN.due_by(*at, *tries, now)), 0)
+        }
+        Some(Line::Done { at, .. }) => (3, over(ASK_AGAIN.due_by(*at, 1, now)), 0),
+        Some(Line::Declined { at, declines, .. }) => (
+            4,
+            over(DECLINE_AGAIN.due_by(*at, *declines, now)),
+            i64::from(*declines),
         ),
-        _ => (0, 0, 0),
+        Some(Line::Opened) => panic!("the rig writes no historical line"),
     };
-    let (held, handed, live) = asking(line.as_ref());
-    let (pheld, phanded, plive) = asking(prior.as_ref());
-    let finished = line.as_ref().map_or(0, Line::finished);
-    state.insert("rec", line.as_ref().map_or(0, kind));
-    state.insert("held", held);
-    state.insert("handed", handed);
-    state.insert("live", live);
-    state.insert(
-        "win",
-        match (&rig.win, rig.asks_in_tab, rig.orphan) {
-            (None, true, true) => 3,
-            (None, _, _) => 0,
-            (Some(_), false, _) => 1,
-            (Some(_), true, _) => 2,
-        },
-    );
-    state.insert("term", i64::from(rig.term.is_some()));
-    state.insert("own", i64::from(rig.own.is_some()));
-    state.insert("quitting", i64::from(rig.quitting));
-    state.insert(
-        "tries",
-        match &line {
-            Some(Line::Asking { tries, .. } | Line::Unfinished { tries, .. }) => i64::from(*tries),
-            _ => 0,
-        },
-    );
-    state.insert("fin", i64::from(finished > 0));
-    state.insert("prior", prior.as_ref().map_or(0, kind));
-    state.insert("pheld", pheld);
-    state.insert("phanded", phanded);
-    state.insert("plive", plive);
-    state.insert("due", line.as_ref().map_or(1, due));
-    state.insert("pdue", prior.as_ref().map_or(1, due));
-    state.insert(
-        "fdue",
-        if finished == 0 {
-            1
-        } else {
-            over(ASK_AGAIN.due_by(finished, 1, now))
-        },
-    );
-    state.insert("sd", line.as_ref().map_or(1, schedule));
-    state.insert("psd", prior.as_ref().map_or(1, schedule));
-    state.insert("said", i64::from(rig.said));
-    state.insert("ends", rig.ends);
-    state.insert("ever", i64::from(rig.ever));
-    state.insert("early", i64::from(rig.early));
-    state.insert("cutend", i64::from(rig.cutend));
-    state.insert("cutno", i64::from(rig.cutno));
+    for (var, value) in [
+        ("rec", rec),
+        ("tries", i64::from(tries)),
+        ("dec", dec),
+        ("fin", i64::from(finished > 0)),
+        ("due", due),
+        (
+            "fdue",
+            if finished == 0 {
+                1
+            } else {
+                over(ASK_AGAIN.due_by(finished, 1, now))
+            },
+        ),
+        ("we", we),
+        ("wd", wd),
+        ("te", te),
+        ("td", td),
+        ("oe", oe),
+        ("od", od),
+        ("cut", cut),
+        ("cd", cd),
+        (
+            "win",
+            match (&rig.win, rig.asks_in_tab, rig.orphan) {
+                (None, true, true) => 3,
+                (None, _, _) => 0,
+                (Some(_), false, _) => 1,
+                (Some(_), true, _) => 2,
+            },
+        ),
+        ("term", i64::from(rig.term.is_some())),
+        ("own", i64::from(rig.own.is_some())),
+        ("quitting", i64::from(rig.quitting)),
+        ("said", i64::from(rig.said)),
+        ("ends", rig.ends),
+        ("decls", rig.decls),
+        ("ever", i64::from(rig.ever)),
+        ("early", i64::from(rig.early)),
+        ("beside", i64::from(rig.beside)),
+        ("cutend", i64::from(rig.cutend)),
+        ("cutno", i64::from(rig.cutno)),
+    ] {
+        state.insert(var, value);
+    }
     state
 }
 
@@ -522,6 +520,14 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
             rig.start(TERMINAL, rig.terminal);
             let terminal = rig.terminal;
             rig.automatic(TERMINAL, terminal, action, ev);
+        }
+        // The window's Install…: its own claim, whatever the record says.
+        "ExplicitW" => {
+            let asker = Rig::asker(WINDOW, rig.window);
+            let claimed = ev.step(action, || {
+                explicit(&rig.files, Rig::path(), &asker, rig.now).expect("the press claims")
+            });
+            rig.win = Some(claimed);
         }
         "ExplicitO" => {
             rig.person += 1;
@@ -584,6 +590,7 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
                     .expect("the lift is recorded")),
                 "a decline to lift"
             );
+            rig.decls = 0;
         }
         other => panic!("no real step for `{other}`"),
     }
@@ -635,6 +642,12 @@ fn mutant_step(rig: &mut Rig, action: &str, ev: &mut StepEvidence) -> bool {
             let (exit, closed) = window_exit(step);
             planted(defect, || rig.window_ends(exit, closed, step, ev));
         }
+        "ThirdDropsOldest" => planted(Defect::ThirdDropsOldest, || {
+            drive(rig, "ExplicitO", ev);
+        }),
+        "ReleaseForgetsDecline" => planted(Defect::ReleaseForgetsDecline, || {
+            drive(rig, "ReleasedO", ev);
+        }),
         "RetryEndDropsAsk" => {
             let claim = rig.own.clone().expect("the person asks");
             planted(Defect::EndDropsRunningAsk, || {
@@ -809,7 +822,7 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_record() {
     let buggy = interp::with_buggy(&clt_episode_model(), 1);
     let committed = interp::with_buggy(&clt_episode_model(), 0);
     let mut ev = StepEvidence::new("CltEpisode");
-    let cases: [(&[&'static str], &str, &[&'static str]); 13] = [
+    let cases: [(&[&'static str], &str, &[&'static str]); 15] = [
         (
             &["ClaimW", "WindowGoes", "CutOffReadsDeclined"],
             "OnlyADeclineReadsDeclined",
@@ -817,7 +830,7 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_record() {
         ),
         (
             &["ClaimW", "ClaimBesideLive"],
-            "OneAutomaticAsk",
+            "NoAutomaticAskBeside",
             &["ClaimW", "WindowGoes", "ClaimT"],
         ),
         (
@@ -827,12 +840,11 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_record() {
         ),
         (
             &["ClaimW", "HandLeavesWindow", "WindowGoes", "ClaimT"],
-            "OneAutomaticAsk",
+            "NoAutomaticAskBeside",
             &["ClaimW", "Hand", "WindowGoes", "Read"],
         ),
         // The stall the review found: a hand the record refused under a person's retry left the
-        // window holding no claim, and the retry's release gave back a line naming the window
-        // that nobody would end.
+        // window holding no claim, and the record named the window, which nobody would end.
         (
             &["ClaimW", "ExplicitO", "HandDropsClaim", "ReleasedO"],
             "EveryNamedAskIsHeld",
@@ -847,7 +859,7 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_record() {
         // second automatic ask went beside it.
         (
             &["ClaimW", "ExplicitO", "RetryEndDropsAsk", "Tick", "ClaimT"],
-            "OneAutomaticAsk",
+            "NoAutomaticAskBeside",
             &["ClaimW", "ExplicitO", "DoneO", "Tick", "Read"],
         ),
         (
@@ -876,6 +888,46 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_record() {
             &["ClaimW", "ExplicitO", "HandDropsClaim"],
             "EveryNamedAskIsHeld",
             &["ClaimW", "ExplicitO", "Hand"],
+        ),
+        // The record kept two attempts, so a typed `aterm init` over the
+        // window's Install… over a terminal's automatic ask dropped that ask, which then wrote
+        // nowhere, and once the newer two gave the episode back an automatic claim went beside
+        // it.
+        (
+            &["ClaimT", "ExplicitW", "Hand", "ThirdDropsOldest"],
+            "EveryAskIsNamed",
+            &[
+                "ClaimT",
+                "ExplicitW",
+                "Hand",
+                "ExplicitO",
+                "ReleasedO",
+                "ReleasedW",
+            ],
+        ),
+        // A release over a release gave back only the tries and finish the
+        // claims carried, so the decline under them and its count were lost.
+        (
+            &[
+                "ClaimT",
+                "DeclinedT",
+                "Tick",
+                "ClaimW",
+                "ExplicitO",
+                "ReleaseForgetsDecline",
+            ],
+            "DeclinesCountDeclines",
+            &[
+                "ClaimT",
+                "DeclinedT",
+                "Tick",
+                "ClaimW",
+                "ExplicitO",
+                "ReleasedO",
+                "ReleasedW",
+                "ClaimT",
+                "DeclinedT",
+            ],
         ),
         // A terminal `aterm init` read every stop it caught as the person's decline: a logout's
         // SIGTERM or its terminal's hangup at the password prompt held the ask for a month.
@@ -913,8 +965,8 @@ fn negative_control_each_mutant_breaks_its_invariant_on_the_real_record() {
 /// claimed over the window's claim before its tab's program started, and gave the record back
 /// unused. Before, the hand was refused, the window kept no claim, and the record went back to
 /// a line naming the live window, which nobody ended: every reading said another aterm was
-/// asking for the window's whole life, and no automatic ask came. Now the line the retry kept
-/// names the program, so the window's end is the record's.
+/// asking for the window's whole life, and no automatic ask came. Now the attempt the record
+/// keeps under the retry names the program, so the window's end is the record's.
 /// NEGATIVE CONTROL: with the old hand planted (`HandDropsClaim`), the record reads asking
 /// after the program's end.
 #[test]

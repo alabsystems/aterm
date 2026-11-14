@@ -779,7 +779,7 @@ impl Host {
     }
 
     /// The status last published to System State (`system_state_access`'s
-    /// menu line reads it).
+    /// signal line reads it).
     pub(crate) const fn latest_status(&self) -> &SetupStatus {
         &self.latest_status
     }
@@ -811,7 +811,7 @@ impl Host {
             hands_off_keys,
         );
         // The join's own asking turns into the card's Allow once it has asked long enough: one
-        // wake, at that moment, shown page or not, so the menu line and the tab say it then too.
+        // wake, at that moment, shown page or not, so the signal line and the tab say it then too.
         let asking_long = self
             .asking_since
             .filter(|_| !self.asking_long)
@@ -1011,7 +1011,7 @@ impl App {
     }
 
     /// The launch's offer still waits for the page's answer at its first tick: its headline is
-    /// the page's one signal, so the menu line and tab's diamond stay quiet (§3.3, §3.6).
+    /// the page's one signal, so the signal line and tab's diamond stay quiet (§3.3, §3.6).
     pub(crate) fn system_state_launch_offer_waits(&self) -> bool {
         self.system_state_host
             .pending
@@ -1178,7 +1178,7 @@ impl App {
         let (status, _) =
             self.project_system_state_status(self.system_state_host.latest_status.clone());
         let changed = self.native_runtime.publish_system_state(status);
-        self.refresh_system_state_menu_line();
+        self.refresh_system_state_signal_line();
         self.refresh_system_state_tab_indicators();
         if changed {
             self.request_redraw_system_state_windows();
@@ -1336,7 +1336,7 @@ impl App {
         if !self.system_state_host.showing_fixture() {
             self.system_state_host.track(&status, Instant::now());
         }
-        // The page and the menu line read where the Command Line Tools install stands, which
+        // The page and the signal line read where the Command Line Tools install stands, which
         // the window alone knows (its tab, Apple's installer); a scenario keeps its own.
         if !self.system_state_host.showing_fixture() {
             self.settle_missing_tools_exception();
@@ -1361,7 +1361,7 @@ impl App {
         self.system_state_host.access_step = step;
         self.system_state_host.walk_page = status.walk;
         self.system_state_host.asking_long = status.asking_long;
-        self.refresh_system_state_menu_line();
+        self.refresh_system_state_signal_line();
         // Setup that finished, or that a person cancelled, says nothing more by itself while no
         // page shows it: the reader is let go. A worker's own publication, a page opening or a
         // person's press asks for a read again, which starts a reader.
@@ -1393,7 +1393,7 @@ impl App {
     /// Whether the worker's status is read again by itself, a second after each read
     /// (init-on-by-default design §5.6): only while something moves between the worker's
     /// publications: a run, a Check or a Restore going, an accepted plan whose run has not
-    /// shown up yet, or an offer waiting for its answer, which the page, the menu line and the
+    /// shown up yet, or an offer waiting for its answer, which the page, the signal line and the
     /// tab's diamond follow. Anything else reaches them as an event (a worker's publication, a
     /// write this process made, a focus, file or network signal), so neither a settled page nor
     /// an unfinished setup that waits wakes the loop.
@@ -1490,8 +1490,8 @@ impl App {
     }
 
     fn refresh_system_state_tab_indicators(&mut self) -> bool {
-        // The menu line says what the diamond says, the review's end or start included.
-        self.refresh_system_state_menu_line();
+        // The signal line says what the diamond says, the review's end or start included.
+        self.refresh_system_state_signal_line();
         let mut tabs = Vec::new();
         for (wid, window) in &self.windows {
             for tab in window.tab_set.tabs() {

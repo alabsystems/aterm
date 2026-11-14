@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Drives `toolbar.rs`'s declared classes and binding sites on a real `NSWindow`, then reads
-//! the menu bar's This Mac row off a real status item.
+//! the menu-bar menu off a real status item.
 
 /// The drive could not execute here; not a pass.
 #[cfg(not(target_os = "macos"))]

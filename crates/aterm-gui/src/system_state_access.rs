@@ -4,7 +4,7 @@
 //! The window's side of System State's Permissions group
 //! (`docs/DESIGN-system-state-2026-10-21.md` §3.6, §6): the access steps of an
 //! approved setup revision, which macOS gesture is up, a press on a Needs-you
-//! row, and the one quiet signal in aterm's menu-bar menu.
+//! row, and the one quiet signal `aterm ctl chrome` prints.
 //!
 //! * The admitted plan's access revision ([`App::access_revision`]; a change to another group
 //!   keeps it) is the standing yes. It runs, once per revision, the Full Disk Access page, the
@@ -23,8 +23,8 @@
 //!   ([`App::open_access_from_system_state`]).
 //! * Each step appends `<revision> <row> <outcome>` to `<state>/system-state-access`
 //!   ([`aterm_types::macos_setup::access_record`]), which System State reads.
-//! * The menu line ([`menu_line`]) is the only signal posted; the digest entries it replaced
-//!   are withdrawn ([`RETIRED_KEYS`]).
+//! * The signal line ([`signal_line`]) is the only signal composed, and `aterm ctl chrome` prints
+//!   it; the digest entries it replaced are withdrawn ([`RETIRED_KEYS`]).
 //! * A `[privacy]` switch off, and a debugger the person turned off, are told to the setup
 //!   worker as the row's wanted state ([`App::publish_access_opt_outs`]).
 
@@ -35,7 +35,6 @@ use aterm_types::macos_setup::{
     Access, AccessOutcome, MacosDialog, Observation, Selection, Setting, Standing, Subject,
 };
 
-use crate::status_item::SystemStateLine;
 use crate::system_state::ToolsWait;
 use crate::{App, SetupStatus, devtools_helper};
 
@@ -79,7 +78,7 @@ pub(crate) const RETIRED_KEYS: [&str; 9] = [
     "fleet.unreadable.no-route",
 ];
 
-/// The menu line's note under a verified Full Disk Access grant an update left off
+/// The signal line's note under a verified Full Disk Access grant an update left off
 /// ([`App::note_fda_off_after_update`]).
 pub(crate) const FDA_AFTER_UPDATE: &str = "The update needs Full Disk Access re-allowed.";
 
@@ -188,7 +187,7 @@ pub(crate) struct AccessSteps {
     /// Access step is declined ([`App::fda_declined_in_revision`]).
     fda_regressed: bool,
     /// The regressed grant reads off in a build newer than the one that verified it
-    /// ([`App::note_fda_off_after_update`]): a menu line that names it says the update needs it
+    /// ([`App::note_fda_off_after_update`]): a signal line that names it says the update needs it
     /// re-allowed.
     fda_after_update: bool,
     /// Whether the window's own Full Disk Access step is declined under the
@@ -197,7 +196,7 @@ pub(crate) struct AccessSteps {
     fda_declined: Option<(String, bool)>,
     /// Held while one of the window's own macOS gestures is up.
     dialog: Option<MacosDialog>,
-    /// The menu line as last composed.
+    /// The signal line as last composed.
     line: Option<SystemStateLine>,
     /// The latest completed outcome for each revision and row, including a
     /// failed save owed another try. A later outcome replaces the earlier one.
@@ -768,6 +767,18 @@ pub(crate) fn setup_status_answer(fields: &str) -> String {
     )
 }
 
+/// System State's one quiet signal, as a line: `System State: Needs you: <row>` (or `<row>
+/// failed`, `N need you`, `N failed`), and a note under it (a waiting vault approval code, or
+/// that an update needs Full Disk Access re-allowed). `aterm ctl chrome` prints it
+/// ([`App::system_state_chrome_line`]); no menu shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SystemStateLine {
+    /// The line's words.
+    pub label: String,
+    /// A note under it.
+    pub note: Option<String>,
+}
+
 /// The one quiet signal (§3.6, pure): `System State: Needs you: <row>`, from the managed rows
 /// that wait for a person, as their readings say: a verified Full Disk Access grant that reads
 /// off is read again ([`App::note_fda_regression`]), and its row's reading says whether it needs
@@ -780,7 +791,7 @@ pub(crate) fn setup_status_answer(fields: &str) -> String {
 /// while it needs you (a waiting vault approval code, or a move to Applications), else the
 /// GitHub repositories row's while it needs you (its token's remedy, in the page's words).
 /// `None` when nothing does.
-pub(crate) fn menu_line(status: &SetupStatus) -> Option<SystemStateLine> {
+pub(crate) fn signal_line(status: &SetupStatus) -> Option<SystemStateLine> {
     let selection = status
         .plan
         .as_ref()
@@ -1276,12 +1287,12 @@ impl App {
     pub(crate) fn rearm_retired_keys(&mut self) {
         self.access_steps.retired = false;
         self.access_steps.join_pending_retired = false;
-        self.refresh_system_state_menu_line();
+        self.refresh_system_state_signal_line();
     }
 
     /// Whether the approved revision's own Full Disk Access step is declined (its panel's Not
     /// now under the revision's key, `devtools_helper::declined_for`): that holds the window's
-    /// page back and keeps a regressed grant off the menu line for the revision. Read once per
+    /// page back and keeps a regressed grant off the signal line for the revision. Read once per
     /// key and again after a decline this process notes; never without an approved revision.
     /// Local answers precede that marker cache, so a failed save still holds
     /// and a later local outcome replaces only that local hold.
@@ -1309,23 +1320,23 @@ impl App {
         declined
     }
 
-    /// A Full Disk Access decline was noted in this process: the menu line reads
+    /// A Full Disk Access decline was noted in this process: the signal line reads
     /// the marker again.
     fn fda_decline_noted(&mut self) {
         self.access_steps.fda_declined = None;
-        self.refresh_system_state_menu_line();
+        self.refresh_system_state_signal_line();
     }
 
-    /// Compose the menu line again from the latest status and the regression flag (dark while
+    /// Compose the signal line again from the latest status and the regression flag (dark while
     /// the revision's Full Disk Access step is declined): called where either changes, never
     /// per park. An older aterm's vault-join entry ends once the selected Secrets row has a
     /// usable reading for this vault; a waiting row counts only once it carries its guidance,
     /// which replaces the entry's approval code.
-    pub(crate) fn refresh_system_state_menu_line(&mut self) {
+    pub(crate) fn refresh_system_state_signal_line(&mut self) {
         let regressed = self.access_steps.fda_regressed && !self.fda_declined_in_revision();
         let status = self.system_state_host.latest_status();
         // While the launch's offer waits for the page's answer at its first tick, its headline
-        // is the one signal: no menu line, as no diamond (§3.3, §3.6).
+        // is the one signal: no signal line, as no diamond (§3.3, §3.6).
         // The update's note goes under a line that names the grant as its reading needs the
         // person, never under one about another row.
         let fda_needs_you = status.plan.as_ref().is_some_and(|plan| {
@@ -1340,7 +1351,7 @@ impl App {
         let line = if self.system_state_launch_offer_waits() {
             None
         } else {
-            menu_line(status).map(|mut line| {
+            signal_line(status).map(|mut line| {
                 if regressed
                     && fda_needs_you
                     && self.access_steps.fda_after_update
@@ -1376,7 +1387,6 @@ impl App {
         }
         if line != self.access_steps.line {
             self.access_steps.line = line;
-            self.mark_status_dirty();
         }
     }
 
@@ -1468,8 +1478,8 @@ impl App {
     }
 
     /// A verified Full Disk Access grant reads off (`true`), or that ended: as it goes off the
-    /// worker reads the Access rows again, so the page, `setup=` and the menu line say what is
-    /// read now, never `done` on the grant an earlier reading saw (§3.5), and the menu line's
+    /// worker reads the Access rows again, so the page, `setup=` and the signal line say what is
+    /// read now, never `done` on the grant an earlier reading saw (§3.5), and the signal line's
     /// update note follows. It never opens a page by itself (§3.6).
     pub(crate) fn note_fda_regression(&mut self, regressed: bool) {
         if !regressed {
@@ -1484,72 +1494,34 @@ impl App {
             if regressed {
                 self.notify_initial_setup_fda_off();
             }
-            self.refresh_system_state_menu_line();
+            self.refresh_system_state_signal_line();
         }
     }
 
     /// A verified Full Disk Access grant still reads off once this process settled, in a build
-    /// newer than the one that verified it: a regression the menu line names says, under it,
+    /// newer than the one that verified it: a regression the signal line names says, under it,
     /// that the update needs it re-allowed ([`FDA_AFTER_UPDATE`]), until the regression ends.
     pub(crate) fn note_fda_off_after_update(&mut self) {
         if !self.access_steps.fda_after_update {
             self.access_steps.fda_after_update = true;
-            self.refresh_system_state_menu_line();
+            self.refresh_system_state_signal_line();
         }
     }
 
-    /// The menu line the status item shows, as last composed.
-    pub(crate) fn system_state_menu_line(&self) -> Option<SystemStateLine> {
+    /// The signal line, as last composed.
+    pub(crate) fn system_state_signal_line(&self) -> Option<SystemStateLine> {
         self.access_steps.line.clone()
     }
 
-    /// The status item's menu line press: System State in the frontmost window (else the
-    /// first), raised. With every window closed, a new window (Cmd-N's) shows it once made
-    /// ([`Self::system_state_once_landed`]). `true` when System State is up now; a window on its
-    /// way answers `false`.
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn open_system_state_from_status_item(&mut self) -> bool {
-        let window = self
-            .frontmost_window
-            .filter(|wid| self.windows.contains_key(wid))
-            .or_else(|| self.windows.keys().next().copied());
-        if let Some(wid) = window {
-            let opened = self.open_system_state_tab_in_window(wid);
-            self.raise_window(wid);
-            return opened;
-        }
-        if self.headless {
-            return false;
-        }
-        aterm_log::info!("status item: no window; System State opens in a new one");
-        self.open_window_off_loop(
-            crate::tab_spawn::SpawnAsk::default(),
-            None,
-            Self::system_state_once_landed(),
-        );
-        false
-    }
-
-    /// What a new window the status item asked for does once its first shell
-    /// lands: System State shown in the window that shell is in, raised. A
-    /// window that never came says why in its own message row.
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn system_state_once_landed() -> crate::tab_spawn::TabSpawnThen {
-        crate::tab_spawn::TabSpawnThen::Run(Box::new(|app, landed| {
-            let local = landed.ok().and_then(|sid| {
-                let store = app.store.read().unwrap_or_else(|p| p.into_inner());
-                store
-                    .by_sid(&aterm_session::SessionId::new(sid))
-                    .map(|handle| handle.local_id)
-            });
-            let Some(wid) = local.and_then(|id| app.window_of_session(id)) else {
-                aterm_log::info!("status item: the new window for System State did not come");
-                return;
-            };
-            if app.open_system_state_tab_in_window(wid) {
-                app.raise_window(wid);
-            }
-        }))
+    /// The signal line as `aterm ctl chrome` prints it: `systemstate "<label>"`, and
+    /// ` note="<note>"` where it has one; no line while nothing waits for a person or failed.
+    pub(crate) fn system_state_chrome_line(&self) -> Option<String> {
+        self.system_state_signal_line().map(|line| {
+            let note = line
+                .note
+                .map_or_else(String::new, |note| format!(" note={note:?}"));
+            format!("systemstate {:?}{note}", line.label)
+        })
     }
 
     /// The access step whose macOS gesture is up, or about to start, for the

@@ -221,6 +221,7 @@ pub fn run_provision(
     _id: &str,
     _check_only: bool,
     _cert_dir: Option<&std::path::Path>,
+    _mint_developer_id: bool,
 ) -> crate::ledger::Result<()> {
     Err(crate::ledger::Error::new(
         "provision is POSIX-only: the provisioning engine reads the master phrase from /dev/tty",
@@ -233,6 +234,7 @@ pub fn run_provision(
     id: &str,
     check_only: bool,
     cert_dir: Option<&Path>,
+    mint_developer_id: bool,
 ) -> Result<()> {
     atpkg_keys::provision::vet_machine_id(id).map_err(Error::new)?;
 
@@ -472,8 +474,15 @@ pub fn run_provision(
         "Apple certificate",
         "this machine's own Developer ID identity",
     );
-    let (apple_check, apple_sha1) =
-        apple_identity_check(id, !check_only, leave(check_only), cert_dir);
+    let (apple_check, apple_sha1) = apple_identity_check(
+        id,
+        crate::apple::Change {
+            may_change: !check_only,
+            leave: leave(check_only),
+            mint: mint_developer_id,
+        },
+        cert_dir,
+    );
     record(crate::apple::APPLE_LABEL, apple_check, &mut checks);
     record(
         KEYCHAIN_LABEL,
@@ -1544,15 +1553,30 @@ fn apple_clt_check() -> Check {
     }
 }
 
-/// This machine's own Developer ID identity, acquired rather than copied ([`crate::apple`]).
+/// This machine's Developer ID identity: held, else imported from the vault registry, else
+/// filed with the lab as `developer-id:<id>` ([`crate::apple`]). A run that may change things
+/// moves the need either way.
 #[cfg(unix)]
 fn apple_identity_check(
     id: &str,
-    may_change: bool,
-    leave: crate::release_keychain::Leave,
+    change: crate::apple::Change,
     cert_dir: Option<&Path>,
 ) -> (Check, Option<String>) {
-    match crate::apple::acquire(id, may_change, leave, cert_dir) {
+    let want = || Want::DeveloperId(id.to_owned());
+    let outcome = crate::apple::acquire(id, change.may_change, change.leave, cert_dir, change.mint);
+    if change.may_change && matches!(outcome, crate::apple::Outcome::Ready { .. }) {
+        match aterm_secrets::client::Paths::live().and_then(|paths| {
+            aterm_secrets::need::satisfied(&paths, &want(), Purpose::ReleaseDeveloperId)
+        }) {
+            Ok(Some(need)) => step("developer-id need", &need.line),
+            Ok(None) => {}
+            Err(error) => step(
+                "developer-id need",
+                &format!("could not record the request: {error}"),
+            ),
+        }
+    }
+    match outcome {
         crate::apple::Outcome::Ready { ids, note } => {
             let mut msg = match ids.len() {
                 0 => {
@@ -1579,6 +1603,19 @@ fn apple_identity_check(
         crate::apple::Outcome::Waiting { what, next }
         | crate::apple::Outcome::Todo { what, next } => (Check::Todo { what, next }, None),
         crate::apple::Outcome::Blocked { what, fix } => (Check::Fail { what, fix }, None),
+        // Only a run that may change things yields it (a read-only one reports a to-do).
+        crate::apple::Outcome::Unheld(what) => (
+            filed(
+                Check::Fail {
+                    what,
+                    fix: String::new(),
+                },
+                aterm_secrets::client::Paths::live(),
+                want(),
+                Purpose::ReleaseDeveloperId,
+            ),
+            None,
+        ),
         crate::apple::Outcome::Skipped(why) => (Check::Skip(why), None),
     }
 }
@@ -1722,7 +1759,15 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
     found.push(("rust shims", rust_shim_check()));
     found.push(("x86 slice", x86_slice_check()));
     found.push(("apple sdk", apple_clt_check()));
-    let (apple, apple_sha1) = apple_identity_check(id, false, leave(dry), None);
+    let (apple, apple_sha1) = apple_identity_check(
+        id,
+        crate::apple::Change {
+            may_change: false,
+            leave: leave(dry),
+            mint: false,
+        },
+        None,
+    );
     found.push((crate::apple::APPLE_LABEL, apple));
     found.push((KEYCHAIN_LABEL, keychain_check(id, leave(dry))));
     found.push(("notary", notary_check_recording(!dry)));
@@ -1794,6 +1839,38 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
             state: audited(check),
         })
         .collect()
+}
+
+/// What `ship release` proves at step 1 of the writes its publish, cut and after-cut steps make
+/// from this Mac ([`layer::distribution`]): the site checkout, the deployer's key and Google's
+/// grant to it, the site checkout's push, and the routed identities' push to the repositories
+/// and the Homebrew tap, each by a read or a dry run. A real run asks the lab's vault for a
+/// deployer key missing where the vault delivers it; a dry run (`dry`) writes nothing.
+#[cfg(unix)]
+#[must_use]
+pub fn distribution(repo: &Path, dry: bool) -> Vec<Finding> {
+    let Ok(home) = std::env::var("HOME") else {
+        return vec![Finding {
+            label: "release.site",
+            state: Audited::CouldNotRun("HOME is not set".into()),
+        }];
+    };
+    let host: std::sync::Arc<dyn layer::ReleaseHost> =
+        std::sync::Arc::new(layer::System::new(repo, Path::new(&home)));
+    layer::distribution(&host, dry)
+        .into_iter()
+        .map(|(label, check)| Finding {
+            label,
+            state: audited(check),
+        })
+        .collect()
+}
+
+/// [`distribution`] off unix, where [`audit`] already refuses the release.
+#[cfg(not(unix))]
+#[must_use]
+pub fn distribution(_repo: &std::path::Path, _dry: bool) -> Vec<Finding> {
+    Vec::new()
 }
 
 /// The release audit's roster decision, separated from machine and provider probes.
@@ -1971,6 +2048,13 @@ fn notary_acquire_with(
             },
             crate::apple::Outcome::Blocked { what, fix } => NotaryProbe {
                 check: Check::Fail { what, fix },
+                need: initial.need,
+            },
+            crate::apple::Outcome::Unheld(what) => NotaryProbe {
+                check: Check::Fail {
+                    what,
+                    fix: format!("`aterm secrets need {}`", Want::Notary.key()),
+                },
                 need: initial.need,
             },
             crate::apple::Outcome::Skipped(why) => NotaryProbe {

@@ -949,10 +949,10 @@ fn a_waiting_row_always_says_why_and_never_in_the_engines_words() {
 }
 
 /// An aterm run from a disk image cannot keep the vault in sync: the Secrets row needs the person
-/// and says the move in its note, the headline names and shows the row, and the menu line carries
+/// and says the move in its note, the headline names and shows the row, and the signal line carries
 /// the note (§3.6). The run's own `blocked` row for the step is no note on the page.
 #[test]
-fn a_disk_image_vault_wait_is_said_on_the_row_the_headline_and_the_menu_line() {
+fn a_disk_image_vault_wait_is_said_on_the_row_the_headline_and_the_signal_line() {
     let secrets = Subject::Setting(Setting::Secrets);
     // As `macos_doctor`'s vault observation reads a member whose aterm runs
     // from a disk image.
@@ -1002,7 +1002,7 @@ fn a_disk_image_vault_wait_is_said_on_the_row_the_headline_and_the_menu_line() {
         "the stage's own line is the run's, not the page's"
     );
     assert!(app.needs_attention());
-    let line = crate::system_state_access::menu_line(&status).expect("a menu line");
+    let line = crate::system_state_access::signal_line(&status).expect("a signal line");
     assert_eq!(line.label, "System State: Needs you: Secrets vault");
     assert_eq!(line.note.as_deref(), Some(move_it));
 }
@@ -1032,7 +1032,7 @@ fn a_restore_failure_is_visible_even_when_its_group_is_left_as_is() {
         Standing::InPlace
     );
     // The failure names Restore and its row, never setup in general (§3.4): the headline
-    // shows the row, the note says why, and the menu line says the same.
+    // shows the row, the note says why, and the signal line says the same.
     let plan = status.plan.clone().unwrap();
     let head = headline(&status, &rows(&status, plan.selection), Some(&plan));
     assert_eq!(
@@ -1051,7 +1051,7 @@ fn a_restore_failure_is_visible_even_when_its_group_is_left_as_is() {
         ]
     );
     assert_eq!(
-        crate::system_state_access::menu_line(&status).map(|line| line.label),
+        crate::system_state_access::signal_line(&status).map(|line| line.label),
         Some("System State: Restore failed for Widgets".to_owned())
     );
 }
@@ -1060,7 +1060,7 @@ fn a_restore_failure_is_visible_even_when_its_group_is_left_as_is() {
 /// in its own row names, with the settings that load at the next login folded into it; the groups
 /// it put back are left as is, so nothing is a change to make; the Caps Lock key and the scroll
 /// direction read their live values until that login, and Trackpad scrolling its saved one; and
-/// nothing failed: no menu line, no attention mark, no preference key anywhere.
+/// nothing failed: no signal line, no attention mark, no preference key anywhere.
 #[test]
 fn a_restore_is_one_calm_line_in_row_names_and_no_failure() {
     let status = status_of("restore-at-login");
@@ -1082,7 +1082,7 @@ fn a_restore_is_one_calm_line_in_row_names_and_no_failure() {
     );
     assert!(!app.needs_attention());
     assert_eq!(status.failed_steps(Some(&plan)).count(), 0);
-    assert!(crate::system_state_access::menu_line(&status).is_none());
+    assert!(crate::system_state_access::signal_line(&status).is_none());
     // The groups Restore put back are left as is, and so are no change to make.
     for group in [Group::Input, Group::Desktop] {
         for setting in group.settings() {
@@ -1223,7 +1223,7 @@ fn a_restore_names_its_rows_and_each_setting_it_could_not_put_back() {
 
 /// What a Restore could not change is no failure (§3.4): a value macOS hid stays as it is, and
 /// one in another app's container is put back once aterm has Full Disk Access. Each is part of
-/// the calm line, and nothing says setup needs attention: no headline, no menu line, no mark.
+/// the calm line, and nothing says setup needs attention: no headline, no signal line, no mark.
 #[test]
 fn a_value_restore_could_not_reach_is_part_of_the_calm_line_and_no_failure() {
     let mut status = status_of("restore-at-login");
@@ -1246,7 +1246,7 @@ fn a_value_restore_could_not_reach_is_part_of_the_calm_line_and_no_failure() {
         "{line}"
     );
     assert_eq!(status.failed_steps(Some(&plan)).count(), 0);
-    assert!(crate::system_state_access::menu_line(&status).is_none());
+    assert!(crate::system_state_access::signal_line(&status).is_none());
     let mut app = SystemStateApp::new(plan);
     app.publish(status);
     assert!(!app.needs_attention());
@@ -1313,7 +1313,7 @@ fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
         )
     );
     assert_eq!(
-        crate::system_state_access::menu_line(&status).map(|line| line.label),
+        crate::system_state_access::signal_line(&status).map(|line| line.label),
         Some("System State: 2 failed".to_owned()),
         "the change log's refusal is no failure"
     );
@@ -1470,7 +1470,7 @@ fn accounts_accessibility_remains_actionable_with_permissions_left_as_is() {
             .unwrap()
             .enabled
     );
-    let baseline_menu = crate::system_state_access::menu_line(&all_permissions)
+    let baseline_menu = crate::system_state_access::signal_line(&all_permissions)
         .unwrap()
         .label;
 
@@ -1489,7 +1489,7 @@ fn accounts_accessibility_remains_actionable_with_permissions_left_as_is() {
         Some(Access::Accessibility)
     );
     assert_eq!(
-        crate::system_state_access::menu_line(&status)
+        crate::system_state_access::signal_line(&status)
             .unwrap()
             .label,
         baseline_menu
@@ -2265,10 +2265,10 @@ fn failed_repository_check(managed: bool) -> SetupStatus {
 fn check_result_subject_is_counted_once_with_its_observed_failure() {
     let status = failed_repository_check(true);
     let repository = Subject::Setting(Setting::Repositories);
-    let line = crate::system_state_access::menu_line(&status).unwrap();
+    let line = crate::system_state_access::signal_line(&status).unwrap();
     let mut observed_only = status.clone();
     observed_only.check = None;
-    let baseline = crate::system_state_access::menu_line(&observed_only).unwrap();
+    let baseline = crate::system_state_access::signal_line(&observed_only).unwrap();
     assert_eq!(
         line.label, baseline.label,
         "one failure, however it was read"
@@ -2289,7 +2289,7 @@ fn check_result_subject_is_counted_once_with_its_observed_failure() {
 #[test]
 fn check_result_subject_left_unmanaged_is_a_note_without_attention() {
     let status = failed_repository_check(false);
-    assert!(crate::system_state_access::menu_line(&status).is_none());
+    assert!(crate::system_state_access::signal_line(&status).is_none());
     assert!(status.failed_steps(status.plan.as_ref()).next().is_none());
     let mut app = SystemStateApp::opened();
     app.publish(status);
@@ -2304,7 +2304,7 @@ fn check_result_subject_left_unmanaged_is_a_note_without_attention() {
 }
 
 /// A Check again that failed as a whole is the page's note alone (§3.6): it only read, and
-/// pressing it again is its remedy, so neither the menu line nor the tab's diamond says it, and
+/// pressing it again is its remedy, so neither the signal line nor the tab's diamond says it, and
 /// the headline, which names no failure, says the rows are as aterm last read them.
 #[test]
 fn a_failed_check_again_is_a_page_note_only() {
@@ -2326,7 +2326,7 @@ fn a_failed_check_again_is_a_page_note_only() {
             [format!("Check again failed. {CHECK_FAILED_NOTE}")]
         );
         assert!(status.failed_steps(Some(&plan)).next().is_none());
-        assert!(crate::system_state_access::menu_line(&status).is_none());
+        assert!(crate::system_state_access::signal_line(&status).is_none());
         let mut app = SystemStateApp::new(plan.clone());
         app.publish(status.clone());
         assert!(!app.needs_attention(), "{words}");
@@ -2747,7 +2747,7 @@ fn unknown_plan_join_keeps_its_draft_until_the_saved_plan_is_known() {
 
 /// A saved setup aterm cannot read just now (a transient read error, or a record it has not set
 /// aside yet) is no failure (§3.6): aterm reads it again by itself, so the page says so in one
-/// calm line, with no failure headline, tab attention or menu line, across a reopen and while
+/// calm line, with no failure headline, tab attention or signal line, across a reopen and while
 /// the readings it cached stay, until a read succeeds.
 #[test]
 fn a_saved_setup_unread_just_now_is_said_calmly_until_a_read_succeeds() {
@@ -2772,7 +2772,7 @@ fn a_saved_setup_unread_just_now_is_said_calmly_until_a_read_succeeds() {
     let calm = |app: &crate::App| {
         let (_, view) = app.active_native_view(wid).unwrap();
         let page = page_in(&app.native_runtime, view).0;
-        !page.needs_attention() && crate::system_state_access::menu_line(&page.status).is_none()
+        !page.needs_attention() && crate::system_state_access::signal_line(&page.status).is_none()
     };
     let loading = label(&compiled(&app), HEADLINE);
     let unread = SetupStatus {
@@ -3378,7 +3378,7 @@ fn page_app(
 /// A Cancel an older aterm's review recorded (§3.3; no review is offered since design revision 4)
 /// reads only as those groups turned off: each shows Leave as is, the page says nothing of a
 /// review or a Cancel, the headline is the one for groups left as is with no Set up now, nothing
-/// lights (no Needs you, no diamond, no menu line), and a group's switch turns it back on.
+/// lights (no Needs you, no diamond, no signal line), and a group's switch turns it back on.
 #[test]
 fn an_older_cancel_reads_off_with_no_review_words() {
     let mut app = SystemStateApp::new(Plan::default());
@@ -3419,9 +3419,9 @@ fn an_older_cancel_reads_off_with_no_review_words() {
     );
     assert!(!app.needs_attention(), "no diamond");
     assert_eq!(
-        crate::system_state_access::menu_line(&cancelled),
+        crate::system_state_access::signal_line(&cancelled),
         None,
-        "no menu line"
+        "no signal line"
     );
     // A group's switch turns it back on, as the person's own choice.
     app.gesture(true);
@@ -3472,9 +3472,9 @@ fn an_older_cancel_after_a_restore_keeps_the_restores_line_alone() {
     assert!(!headline.start, "no Set up now");
     assert!(!app.needs_attention(), "no diamond");
     assert_eq!(
-        crate::system_state_access::menu_line(&status),
+        crate::system_state_access::signal_line(&status),
         None,
-        "no menu line"
+        "no signal line"
     );
 }
 
@@ -3544,7 +3544,7 @@ fn only_a_join_names_a_typed_vault() {
 }
 
 /// A Join aterm cannot make because it cannot read this Mac's vault settings is said in one
-/// calm line, never a failure: no Set up now, menu line or tab attention. Refused as a press on
+/// calm line, never a failure: no Set up now, signal line or tab attention. Refused as a press on
 /// the page, it leaves the typed vault and its password in their fields; the launch's answer,
 /// admitted without its Join, keeps the typed vault in its field. Either way the person Joins
 /// once the settings read.
@@ -3596,7 +3596,7 @@ fn a_join_aterm_cannot_make_for_unread_vault_settings_is_said_calmly() {
         );
         assert!(!app.headline().start, "refused {refused}");
         assert!(!app.needs_attention(), "refused {refused}");
-        assert!(crate::system_state_access::menu_line(&app.status).is_none());
+        assert!(crate::system_state_access::signal_line(&app.status).is_none());
         assert_eq!(app.url.value(), TYPED, "refused {refused}");
         assert_eq!(app.password.value.is_some(), refused);
     }
@@ -5121,7 +5121,7 @@ fn every_scenarios_notes_are_sentences_in_the_pages_words() {
 }
 
 /// Changes aterm made and could not log are a fact for later, never a signal (design §3.6):
-/// one calm note on the page, no menu line, no attention, no failure headline; the exceptions
+/// one calm note on the page, no signal line, no attention, no failure headline; the exceptions
 /// digest's entry carries it.
 /// The setup's facts for later are entries the exceptions digest can show: a launch's setup
 /// that has not started for ten minutes, and records aterm set aside; each keeps its detail
@@ -5175,7 +5175,7 @@ fn a_journal_refusal_is_no_signal() {
         app.publish(status.clone());
         let line = headline(&status, &rows(&status, plan.selection), Some(&plan));
         assert_eq!(
-            crate::system_state_access::menu_line(&status).map(|line| line.label),
+            crate::system_state_access::signal_line(&status).map(|line| line.label),
             None
         );
         assert!(!app.needs_attention());
@@ -5335,13 +5335,13 @@ fn all_in_place() -> SetupStatus {
 
 /// A saved setup aterm cannot read is no failure (§3.6): aterm reads it again by itself, and
 /// sets aside a record that stays unreadable, so nothing a person could press would change the
-/// outcome. The tab's attention and the menu line stay dark however few buttons are live.
+/// outcome. The tab's attention and the signal line stay dark however few buttons are live.
 #[test]
 fn an_unread_saved_setup_signals_nothing() {
     let mut app = SystemStateApp::opened();
     app.publish(status_of("plan-unread"));
     assert!(!app.needs_attention());
-    assert!(crate::system_state_access::menu_line(&app.status).is_none());
+    assert!(crate::system_state_access::signal_line(&app.status).is_none());
     assert_eq!(app.headline().text, CHECKING);
     assert_eq!(app.status.notes(&Plan::default()), [STATE_UNREAD_NOTE]);
     // A page that knew the plan claims nothing of it while aterm cannot read it.
@@ -5356,19 +5356,19 @@ fn an_unread_saved_setup_signals_nothing() {
     assert!(!known.needs_attention());
 }
 
-/// The menu line never counts a saved setup aterm cannot read as a failed step: no setup ran
+/// The signal line never counts a saved setup aterm cannot read as a failed step: no setup ran
 /// to fail.
 #[test]
-fn an_unread_saved_setup_is_no_failed_step_on_the_menu_line() {
+fn an_unread_saved_setup_is_no_failed_step_on_the_signal_line() {
     let status = status_of("plan-unread");
     assert!(status.failed_steps(None).next().is_none());
     assert!(status.failed_steps(Some(&Plan::default())).next().is_none());
-    assert!(crate::system_state_access::menu_line(&status).is_none());
+    assert!(crate::system_state_access::signal_line(&status).is_none());
 }
 
 /// A choice made while another setup holds this Mac's setup records (another aterm, `aterm
 /// doctor` in a terminal) waits for it (§3.3): the page keeps the choice showing, headlined as
-/// waiting, says why once in a calm note, and shows no meter, failure, tab attention or menu line.
+/// waiting, says why once in a calm note, and shows no meter, failure, tab attention or signal line.
 /// It offers Stop, or only that setup's end would clear it. A later press goes at once as the
 /// person's latest intent, the earlier group with it; a waiting Restore says so in its own words,
 /// and it and the ALab profile's widening offer no Stop.
@@ -5399,7 +5399,7 @@ fn a_choice_waiting_for_another_setup_says_why_once_and_calmly() {
     assert!(!headline.start);
     assert_eq!(waiting.notes(&app.reviewed_plan()), [QUEUED_CHOICE_NOTE]);
     assert!(!app.needs_attention());
-    assert!(crate::system_state_access::menu_line(&waiting).is_none());
+    assert!(crate::system_state_access::signal_line(&waiting).is_none());
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
     assert!(
         compiled
@@ -5468,7 +5468,7 @@ fn a_choice_waiting_for_another_setup_says_why_once_and_calmly() {
 }
 
 /// After aterm set aside a saved setup it could not read (§3.5), the page says so in one calm
-/// note under the plan it went on with: no failure, tab attention or menu line, and every
+/// note under the plan it went on with: no failure, tab attention or signal line, and every
 /// group's buttons stay live.
 #[test]
 fn a_set_aside_setup_is_one_calm_note_with_every_group_live() {
@@ -5481,7 +5481,7 @@ fn a_set_aside_setup_is_one_calm_note_with_every_group_live() {
         "{notes:?}"
     );
     assert!(!app.needs_attention());
-    assert!(crate::system_state_access::menu_line(&status).is_none());
+    assert!(crate::system_state_access::signal_line(&status).is_none());
     app.gesture(true);
     act(&mut app, "system-state/group/2/set-up");
     let (plan, _, _) = submitted(app.take_action());
@@ -5490,7 +5490,7 @@ fn a_set_aside_setup_is_one_calm_note_with_every_group_live() {
 
 /// A Restore that failed as a whole is headlined as the Restore it is (§3.4), never as a setup
 /// that needs attention, with its reason as the page's note; the button that tries it again is
-/// beside it, so the tab's attention and the menu line stay dark.
+/// beside it, so the tab's attention and the signal line stay dark.
 #[test]
 fn a_whole_restore_failure_is_headlined_as_restore() {
     for reason in [RESTORE_FAILED_NOTE, RESTORE_BACKUP_UNREAD_NOTE] {
@@ -5507,7 +5507,7 @@ fn a_whole_restore_failure_is_headlined_as_restore() {
         assert_eq!(app.headline().text, "Restore previous settings failed");
         assert_eq!(status.notes(&Plan::default()), [reason]);
         assert!(!app.needs_attention());
-        assert!(crate::system_state_access::menu_line(&status).is_none());
+        assert!(crate::system_state_access::signal_line(&status).is_none());
         let mut unknown = SystemStateApp::opened();
         unknown.publish(SetupStatus {
             plan: None,
@@ -5557,7 +5557,7 @@ fn a_step_aterm_retries_by_itself_waits_and_is_no_failure() {
         );
         assert!(notes.iter().all(|note| !note.contains("fail")), "{notes:?}");
         assert!(status.failed_steps(Some(&plan)).next().is_none());
-        assert!(crate::system_state_access::menu_line(&status).is_none());
+        assert!(crate::system_state_access::signal_line(&status).is_none());
         let mut app = SystemStateApp::new(plan);
         app.publish(status);
         assert!(!app.needs_attention(), "retrying {retrying}");
@@ -5577,7 +5577,7 @@ fn a_step_aterm_retries_by_itself_waits_and_is_no_failure() {
             "2 steps waiting: Secrets vault, GitHub repositories"
         );
         assert_eq!(
-            crate::system_state_access::menu_line(&held),
+            crate::system_state_access::signal_line(&held),
             None,
             "retrying {retrying}"
         );
@@ -5587,7 +5587,7 @@ fn a_step_aterm_retries_by_itself_waits_and_is_no_failure() {
         );
     }
     // Once the tries stop (a run that no longer retries), the step failed, and the headline,
-    // the menu line and the diamond say so.
+    // the signal line and the diamond say so.
     step.retrying = false;
     assert_eq!(line(&step).text, "1 step failed: GitHub repositories");
 }
@@ -5682,18 +5682,18 @@ fn a_headline_claims_no_more_than_was_confirmed() {
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("check-unconfirmed"));
     assert!(!app.needs_attention());
-    assert!(crate::system_state_access::menu_line(&app.status).is_none());
+    assert!(crate::system_state_access::signal_line(&app.status).is_none());
 }
 
-/// The menu line's label for `status`, if one (design §3.6).
+/// The signal line's label for `status`, if one (design §3.6).
 fn menu(status: &SetupStatus) -> Option<String> {
-    crate::system_state_access::menu_line(status).map(|line| line.label)
+    crate::system_state_access::signal_line(status).map(|line| line.label)
 }
 
 /// A setup run that did not finish as a whole, which the run tries again by itself, is no
 /// failure (design §3.5): the headline waits for that try, before and after the page knows the
 /// plan, beside the one calm note saying what aterm does next, and nothing signals it. Once the
-/// tries stop, `Setup needs attention` with Set up now, the menu line and the diamond say it
+/// tries stop, `Setup needs attention` with Set up now, the signal line and the diamond say it
 /// together.
 #[test]
 fn a_setup_run_aterm_retries_waits_and_is_no_failure() {
@@ -5748,13 +5748,13 @@ fn a_startup_aterm_retries_waits_with_no_set_up_now() {
     assert!(!app.needs_attention());
 }
 
-/// The headline, the menu line and the tab's diamond signal a failure together or not at all
+/// The headline, the signal line and the tab's diamond signal a failure together or not at all
 /// (design §3.6). A step that failed with its own reason while the run still tries again by
 /// itself waits for that try (`1 step waiting`), its row or note keeping the reason under the
 /// waiting chip, never `Failed`, and its line marks it waiting; once the tries stop, all of
 /// them say it failed at once.
 #[test]
-fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
+fn a_failure_signals_in_the_headline_the_signal_line_and_the_diamond_together() {
     let agree = |status: &SetupStatus| {
         let plan = status.plan.clone().unwrap();
         let line = headline(status, &rows(status, plan.selection), Some(&plan));
@@ -5764,7 +5764,7 @@ fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
         assert_eq!(
             (menu(status).is_some(), app.needs_attention()),
             (fails, fails),
-            "headline {:?}, menu line {:?}, notes {:?}",
+            "headline {:?}, signal line {:?}, notes {:?}",
             line.text,
             menu(status),
             status.notes(&plan)
@@ -5834,7 +5834,7 @@ fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
 }
 
 /// What every signal says of one row (design §3.6): the headline, the row's chip, its line's
-/// mark, the menu line and the tab's diamond.
+/// mark, the signal line and the tab's diamond.
 fn signals(
     status: &SetupStatus,
     subject: Subject,
@@ -5854,7 +5854,7 @@ fn signals(
 }
 
 /// Every failure has one kind, and each signal says it alike (design §3.6): the headline, the
-/// row's chip, its line's mark, the menu line and the tab's diamond agree for a transient
+/// row's chip, its line's mark, the signal line and the tab's diamond agree for a transient
 /// failure while aterm tries it again (waiting, calm) and once no worker goes on (failed), and
 /// for one only a person ends (needs you, at once, whether or not the run retries).
 #[test]
@@ -5914,7 +5914,7 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_line_the_menu_an
             needs_you(github),
             "retrying {retrying}"
         );
-        let line = crate::system_state_access::menu_line(&sign_in).unwrap();
+        let line = crate::system_state_access::signal_line(&sign_in).unwrap();
         assert_eq!(line.note.as_deref(), Some(GITHUB_OTHER_ACCOUNT));
         let row = row_view(repositories, &sign_in, Selection::all());
         // The row says the setting's remedy (§3.6).
@@ -5976,7 +5976,7 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_line_the_menu_an
 }
 
 /// No fixture's signals contradict one another (design §3.6): wherever a row's chip says
-/// `Failed` the headline says a step failed, the diamond and the menu line show, and the
+/// `Failed` the headline says a step failed, the diamond and the signal line show, and the
 /// row's line marks it failed, and wherever the headline counts a step waiting no row reads
 /// `Failed` and nothing signals.
 #[test]
@@ -6340,7 +6340,7 @@ fn a_vault_the_row_explains_is_not_said_again_under_the_headline() {
 
 /// The `failed` scenario is a failure aterm reaches and a person can act on (design §3.6): the
 /// run's GitHub repositories step, which aterm no longer tries by itself, said by the headline,
-/// the row, the diamond and the menu line together, the headline offering Set up now, its
+/// the row, the diamond and the signal line together, the headline offering Set up now, its
 /// remedy; no note says it again.
 #[test]
 fn the_failed_scenario_names_its_remedy() {
@@ -6405,7 +6405,7 @@ fn a_widen_to_the_base_plan_names_sync_not_the_alab_profile() {
 /// asks the window for, and a note that says why.
 #[test]
 fn the_command_line_tools_row_reads_what_their_install_does() {
-    use crate::system_state_access::menu_line;
+    use crate::system_state_access::signal_line;
     let repositories = Subject::Setting(Setting::Repositories);
     let page = |name: &str| {
         let status = status_of(name);
@@ -6413,7 +6413,7 @@ fn the_command_line_tools_row_reads_what_their_install_does() {
         app.publish(status.clone());
         let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
         let button = compiled.semantic(&UiKey::new(INSTALL_TOOLS)).is_some();
-        (app, menu_line(&status), button)
+        (app, signal_line(&status), button)
     };
 
     let (mut app, line, button) = page("clt-password");
@@ -6483,7 +6483,7 @@ fn the_command_line_tools_row_reads_what_their_install_does() {
 /// Install…; and a press whose tab did not open says why on the row, with Install… there again.
 #[test]
 fn the_command_line_tools_row_says_where_a_press_or_apples_window_stands() {
-    use crate::system_state_access::menu_line;
+    use crate::system_state_access::signal_line;
     let repositories = Subject::Setting(Setting::Repositories);
     let page = |name: &str| {
         let status = status_of(name);
@@ -6491,7 +6491,7 @@ fn the_command_line_tools_row_says_where_a_press_or_apples_window_stands() {
         app.publish(status.clone());
         let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
         let button = compiled.semantic(&UiKey::new(INSTALL_TOOLS)).is_some();
-        (app, menu_line(&status), button)
+        (app, signal_line(&status), button)
     };
 
     let (app, line, button) = page("clt-apple-window");
@@ -6570,12 +6570,12 @@ fn the_apple_window_card_goes_to_the_installer_and_a_stale_press_goes_nowhere() 
 }
 
 /// Low Data Mode holding the tools' download back is a wait that ends by itself (§3.3): calm,
-/// with no menu line, and Install… there for a person who turned it off. An account that may not
+/// with no signal line, and Install… there for a person who turned it off. An account that may not
 /// install them is told so on the row, with no Install… that would only say it again, and no
-/// menu line, since nothing here changes it.
+/// signal line, since nothing here changes it.
 #[test]
 fn the_command_line_tools_row_reads_low_data_mode_and_a_non_administrator() {
-    use crate::system_state_access::menu_line;
+    use crate::system_state_access::signal_line;
     let repositories = Subject::Setting(Setting::Repositories);
     let page = |name: &str| {
         let status = status_of(name);
@@ -6583,7 +6583,7 @@ fn the_command_line_tools_row_reads_low_data_mode_and_a_non_administrator() {
         app.publish(status.clone());
         let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
         let button = compiled.semantic(&UiKey::new(INSTALL_TOOLS)).is_some();
-        (app, menu_line(&status), button)
+        (app, signal_line(&status), button)
     };
 
     let (app, line, button) = page("clt-low-data");
@@ -6622,7 +6622,7 @@ fn a_profile_aterm_adds_by_itself_waits_in_its_own_words() {
     );
     assert_eq!(status.notes(&app.reviewed_plan()), [QUEUED_WIDEN_NOTE]);
     assert!(!app.needs_attention());
-    assert!(crate::system_state_access::menu_line(&status).is_none());
+    assert!(crate::system_state_access::signal_line(&status).is_none());
     let choice = SetupStatus {
         queued_widen: false,
         queued_held: true,
@@ -6690,7 +6690,7 @@ fn a_restored_command_line_tools_tab_continues_before_another_install_is_offered
     );
     assert!(app.needs_attention());
     assert_eq!(
-        crate::system_state_access::menu_line(&status).and_then(|line| line.note),
+        crate::system_state_access::signal_line(&status).and_then(|line| line.note),
         Some(TOOLS_RECOVERED_HEADLINE.to_owned())
     );
     app.by_person = true;
@@ -6707,7 +6707,7 @@ fn a_restored_command_line_tools_tab_continues_before_another_install_is_offered
     assert_eq!(row.note.as_deref(), Some(TOOLS_QUEUED_NOTE));
     assert!(!row.install_tools);
     assert!(!app.needs_attention());
-    assert!(crate::system_state_access::menu_line(&status).is_none());
+    assert!(crate::system_state_access::signal_line(&status).is_none());
 
     // The live process probe can confirm installation after recovery without requiring a
     // person, even though the persisted receipt alone did not say the command started.
@@ -6718,7 +6718,7 @@ fn a_restored_command_line_tools_tab_continues_before_another_install_is_offered
     assert_eq!(row.note.as_deref(), Some(INSTALLING_TOOLS_NOTE));
     assert!(!row.install_tools);
     assert!(!app.needs_attention());
-    assert!(crate::system_state_access::menu_line(&status).is_none());
+    assert!(crate::system_state_access::signal_line(&status).is_none());
 
     status.developer_tools = None;
     app.publish(status);
@@ -6820,7 +6820,7 @@ fn a_newer_aterms_page_keeps_row_notes_and_reads_the_vault_as_it_stands() {
 /// words): the rows it changes say so, calm, with no Will change chip, and the headline names the
 /// step waiting. The run's worker begins the stage again by itself at the end of the park's
 /// pause, so the page checks nothing by itself for it; a press of Check again reads the rows
-/// again and lifts the park at once. Nothing signals: no diamond, no menu line.
+/// again and lifts the park at once. Nothing signals: no diamond, no signal line.
 #[test]
 fn a_parked_stage_says_so_on_the_page() {
     let repositories = Subject::Setting(Setting::Repositories);
@@ -7037,7 +7037,7 @@ fn a_step_aterm_retries_reads_waiting_as_voiceover_hears_it() {
 /// A vault try after two that failed waits, calm, for its next try, which comes by itself, less
 /// often, or at once when this Mac's network or vault changes (§3.5): its row says why and what
 /// comes next, the headline counts it waiting with no Set up now, and neither the diamond nor
-/// the menu line says it failed.
+/// the signal line says it failed.
 #[test]
 fn a_vault_try_after_two_failures_waits_calmly() {
     let status = status_of("vault-held");

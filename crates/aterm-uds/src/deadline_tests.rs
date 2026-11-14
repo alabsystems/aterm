@@ -1131,6 +1131,119 @@ fn process_progress_stalls_after_one_whole_quiet_window() {
     assert!(progress.remaining(start + window, 7, Some(11)).is_zero());
 }
 
+/// THE TREE IS READ ONCE A TICK, AND AFRESH BEFORE A STALL: wakes a [`super::STOP_TICK`] apart,
+/// as a collector holding a stop makes them, read the tree only once per
+/// [`super::PROCESS_PROGRESS_TICK`], and each wake between readings answers when the next one is
+/// due, so a collector that waits its whole answer (one without a stop) wakes then; a window that
+/// would close between readings is judged on a fresh one, which names a stall only when it too
+/// shows nothing new; and bytes captured between readings restart the window, so the old close
+/// reads no tree and names nothing. NEGATIVE CONTROLS: a window that read on every wake, or whose
+/// wakes between readings answered what was left of the window, answers a whole tick at the first
+/// wake after a reading (500 ms, not 400); one that judged the close on its last reading reads
+/// the tree three times, not four, and would name the stall the fresh reading's progress rules
+/// out; one that ignored bytes between readings answers the old close's remainder at the bytes'
+/// wake (50 ms, not 450).
+#[test]
+fn the_process_tree_is_read_once_a_tick_and_afresh_before_a_stall() {
+    fn wake(
+        progress: &mut super::ProgressWindow,
+        at: Instant,
+        bytes: u64,
+        reading: u64,
+        reads: &std::cell::Cell<u32>,
+    ) -> Duration {
+        progress.observe(at, bytes, || {
+            reads.set(reads.get() + 1);
+            Some(reading)
+        })
+    }
+    let start = Instant::now();
+    let window = Duration::from_secs(60);
+    let tick = super::PROCESS_PROGRESS_TICK;
+    let stop = super::STOP_TICK;
+    for (fresh, stalls) in [(0, true), (1, false)] {
+        let reads = std::cell::Cell::new(0);
+        let mut progress = super::ProgressWindow::new(window, start);
+        let mut at = start;
+        while at < start + tick {
+            assert_eq!(
+                wake(&mut progress, at, 0, 0, &reads),
+                tick - (at - start),
+                "a wake {:?} past a reading looks again when the next is due",
+                at - start
+            );
+            at += stop;
+        }
+        assert_eq!(reads.get(), 1, "one reading in the first tick's wakes");
+        assert_eq!(wake(&mut progress, start + tick, 0, 0, &reads), tick);
+        assert_eq!(reads.get(), 2, "a reading a tick after the last");
+        assert_eq!(
+            wake(&mut progress, start + window - stop, 0, 0, &reads),
+            stop,
+            "what is left of the window"
+        );
+        assert_eq!(reads.get(), 3);
+        let closed = wake(&mut progress, start + window, 0, fresh, &reads);
+        assert_eq!(reads.get(), 4, "the close is judged on a fresh reading");
+        assert_eq!(closed.is_zero(), stalls, "a fresh reading of {fresh}");
+    }
+    let reads = std::cell::Cell::new(0);
+    let mut progress = super::ProgressWindow::new(window, start);
+    wake(&mut progress, start, 0, 0, &reads);
+    assert_eq!(
+        wake(&mut progress, start + window - stop, 0, 0, &reads),
+        stop
+    );
+    assert_eq!(reads.get(), 2);
+    let between = start + window - stop / 2;
+    assert_eq!(
+        wake(&mut progress, between, 1, 0, &reads),
+        tick - stop / 2,
+        "new bytes restart the window, and the next look is when the next reading is due"
+    );
+    assert_eq!(reads.get(), 2, "bytes between readings read no tree");
+    assert_eq!(
+        wake(&mut progress, start + window, 1, 0, &reads),
+        tick - stop,
+        "the old close is no close"
+    );
+    assert_eq!(reads.get(), 2, "the old close reads no tree");
+}
+
+/// A REAPED CHILD IS READ ON A TICK, WHEREVER THE LAST READING FELL: a collector's call once its
+/// child is reaped (`None`) reads no tree and answers a whole tick, even in the last tick of a
+/// quiet window just after a reading, so the grace past the exit ([`super::Grace`]'s `until`)
+/// does not depend on where the exit fell between readings. NEGATIVE CONTROL: a reaped call
+/// observed like a running one answers what is left of the window there, less than a tick.
+#[test]
+fn a_reaped_child_is_read_on_a_tick_wherever_the_last_reading_fell() {
+    let start = Instant::now();
+    let window = Duration::from_secs(60);
+    let tick = super::PROCESS_PROGRESS_TICK;
+    let last = start + window - Duration::from_millis(400);
+    let mut wakes = [start, start, last, last + Duration::from_millis(150)].into_iter();
+    let mut now = || wakes.next().expect("a planned wake");
+    let mut reads = 0u32;
+    let mut work = |_| {
+        reads += 1;
+        Some(0)
+    };
+    let mut left = super::ProgressWindow::collector(window, &mut now, &mut work);
+    assert_eq!(left(Some(7), 0), tick, "the first reading");
+    assert_eq!(
+        left(Some(7), 0),
+        Duration::from_millis(400),
+        "the window's last stretch"
+    );
+    assert_eq!(
+        left(None, 0),
+        tick,
+        "a reaped child is read on a whole tick"
+    );
+    drop(left);
+    assert_eq!(reads, 2, "a reaped child's tree is not read");
+}
+
 /// The collector uses the same injected clock/probe evidence to end and reap a stalled
 /// process group, and preserves the caller's safe operation label. NEGATIVE CONTROL: a
 /// collector that only returns the finding without `settle_child` leaves the sleep alive.
@@ -1181,6 +1294,163 @@ fn stalled_process_progress_is_named_and_the_owned_group_ends() {
         !crate::process::pid_alive(child),
         "stalled child {child} outlived the progress collector"
     );
+}
+
+/// A process-progress collector under test: it runs `cmd` with a one-minute window on the clock
+/// `now`, reading the child's tree through `work` and holding the stop `stopped`, and answers the
+/// child's stdout or its error's text.
+#[cfg(unix)]
+pub(super) type StopCollector = fn(
+    &mut crate::spawnfd::Command,
+    &mut dyn FnMut() -> Instant,
+    &mut dyn FnMut(u32) -> Option<u64>,
+    &mut dyn FnMut() -> bool,
+) -> Result<Vec<u8>, String>;
+
+/// A COLLECTOR HOLDING A STOP READS THE TREE ONCE A TICK: `run` starts `cmd` under the
+/// collector being judged, with a one-minute window, the clock `now`, the tree reading `work` and
+/// a stop that never comes, and answers its stdout. The collector wakes every
+/// [`super::STOP_TICK`] to read its stop and the injected clock moves one STOP_TICK per read, so
+/// the probe is read on the first wake (clock reading 1) and then on every fifth
+/// ([`super::PROCESS_PROGRESS_TICK`]): exactly at readings 1, 6, 11, …. The child answers once
+/// the probe's third read drops its flag. NEGATIVE CONTROLS: a collector that read the probe on
+/// every wake reads it at 1, 2, 3; one that let a reading stand a whole tick (`since <= tick`)
+/// answers zero at reading 6 and names a false stall on that stale reading. The probe stops
+/// advancing after [`HANG`], so a child that never answers stalls rather than hangs the test, and
+/// the stop drops the flag after [`HANG`], so a collector that never reads the probe (one handed
+/// `None` while its child runs) lets the child answer and fails the third-read check rather than
+/// hangs the test.
+#[cfg(unix)]
+pub(super) fn a_collector_holding_a_stop_reads_once_a_tick(name: &str, run: StopCollector) {
+    let dir = scratch(name);
+    let flag = dir.join("flag");
+    let mut cmd = sh(
+        "while [ ! -e \"$0\" ]; do sleep 0.02; done; printf done",
+        &[&flag],
+    );
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(0u32);
+    let mut now = || {
+        let at = start + super::STOP_TICK * clock.get();
+        clock.set(clock.get() + 1);
+        at
+    };
+    let mut reads = Vec::new();
+    let mut probe = |_| {
+        if start.elapsed() < HANG {
+            reads.push(clock.get().saturating_sub(1));
+        }
+        if reads.len() == 3 && !flag.exists() {
+            std::fs::write(&flag, b"").expect("the flag");
+        }
+        Some(u64::try_from(reads.len()).expect("a small count"))
+    };
+    let mut stopped = || {
+        if start.elapsed() >= HANG && !flag.exists() {
+            std::fs::write(&flag, b"").expect("the flag");
+        }
+        false
+    };
+    let result = run(&mut cmd, &mut now, &mut probe, &mut stopped);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(result.expect("an advancing probe is no stall"), b"done");
+    let per = u32::try_from(super::PROCESS_PROGRESS_TICK.as_nanos() / super::STOP_TICK.as_nanos())
+        .expect("a small ratio");
+    let due: Vec<u32> = (0..).map(|k| 1 + k * per).take(reads.len()).collect();
+    assert!(
+        reads.len() >= 3,
+        "the probe's third read dropped the flag, not the hang detector: {reads:?}"
+    );
+    assert_eq!(reads, due, "the clock readings the probe was read at");
+}
+
+/// A COLLECTOR READS NO REAPED CHILD'S TREE: `run` starts `cmd` under the collector being judged,
+/// as in [`a_collector_holding_a_stop_reads_once_a_tick`], but the injected clock moves a whole
+/// [`super::PROCESS_PROGRESS_TICK`] per read, so every look while the child runs reads its tree,
+/// and so would any look after the reap. The probe notes whether the pid it is handed is
+/// unreaped (`kill(pid, 0)` succeeds: a zombie's does, a reaped pid's does not), and its first
+/// read drops the flag the child waits for. NEGATIVE CONTROL: a collector whose post-reap `left`
+/// is handed the pid (`Some`) rather than `None` reads the reaped pid's tree. The stop drops the
+/// flag after [`HANG`], so a collector that never reads the probe fails rather than hangs the
+/// test.
+#[cfg(unix)]
+pub(super) fn a_collector_reads_no_reaped_tree(name: &str, run: StopCollector) {
+    let dir = scratch(name);
+    let flag = dir.join("flag");
+    let mut cmd = sh(
+        "while [ ! -e \"$0\" ]; do sleep 0.02; done; printf done",
+        &[&flag],
+    );
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(0u32);
+    let mut now = || {
+        let at = start + super::PROCESS_PROGRESS_TICK * clock.get();
+        clock.set(clock.get() + 1);
+        at
+    };
+    let mut unreaped = Vec::new();
+    let mut probe = |pid: u32| {
+        let pid = i32::try_from(pid).expect("a pid");
+        // SAFETY: a plain syscall; signal 0 delivers nothing.
+        unreaped.push(unsafe { libc::kill(pid, 0) } == 0);
+        if !flag.exists() {
+            std::fs::write(&flag, b"").expect("the flag");
+        }
+        Some(u64::try_from(unreaped.len()).expect("a small count"))
+    };
+    let mut stopped = || {
+        if start.elapsed() >= HANG && !flag.exists() {
+            std::fs::write(&flag, b"").expect("the flag");
+        }
+        false
+    };
+    let result = run(&mut cmd, &mut now, &mut probe, &mut stopped);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(result.expect("an advancing probe is no stall"), b"done");
+    assert!(!unreaped.is_empty(), "the running child's tree was read");
+    assert!(
+        unreaped.iter().all(|&unreaped| unreaped),
+        "every tree read was of an unreaped pid: {unreaped:?}"
+    );
+}
+
+/// The captured-output collector ([`super::output_from_while_process_progressing_with`]) as a
+/// [`StopCollector`].
+#[cfg(unix)]
+fn captured_output_collector(
+    cmd: &mut crate::spawnfd::Command,
+    now: &mut dyn FnMut() -> Instant,
+    work: &mut dyn FnMut(u32) -> Option<u64>,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Vec<u8>, String> {
+    super::output_from_while_process_progressing_with(
+        cmd,
+        crate::spawnfd::Stdio::null(),
+        Duration::from_secs(60),
+        "the collector fixture".to_owned(),
+        now,
+        work,
+        Some(stopped),
+    )
+    .map(|out| out.stdout)
+    .map_err(|error| error.to_string())
+}
+
+/// [`a_collector_holding_a_stop_reads_once_a_tick`] for the captured-output collector.
+#[cfg(unix)]
+#[test]
+fn a_collector_holding_a_stop_reads_the_tree_once_a_tick() {
+    a_collector_holding_a_stop_reads_once_a_tick(
+        "process-progress-stop-cadence",
+        captured_output_collector,
+    );
+}
+
+/// [`a_collector_reads_no_reaped_tree`] for the captured-output collector.
+#[cfg(unix)]
+#[test]
+fn the_captured_output_collector_reads_no_reaped_tree() {
+    a_collector_reads_no_reaped_tree("process-progress-reaped", captured_output_collector);
 }
 
 /// NEGATIVE CONTROL of [`stalled_process_progress_is_named_and_the_owned_group_ends`]: the same

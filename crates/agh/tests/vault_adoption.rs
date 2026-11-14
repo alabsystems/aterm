@@ -746,12 +746,12 @@ fn only_the_dev_file_adopts_dev_alone() {
     };
     let public = next("alabsystems/aterm");
     assert!(
-        public.contains(vault::RELEASE_TOKEN_FILE),
+        public.contains(&vault::Slot::Release.pointer()),
         "the public owner's writer is the vault's release file: {public}"
     );
     let other = next("fixture-ext/lib");
     assert!(
-        other.contains("fixture-ext") && !other.contains(vault::DEV_TOKEN_FILE),
+        other.contains("fixture-ext") && !other.contains(&vault::Slot::Dev.pointer()),
         "another owner's writer is a profile of its own, never a vault file: {other}"
     );
 }
@@ -1641,12 +1641,12 @@ fn an_agh_toml_naming_the_vault_files_comes_to_adoption_by_its_drafts_step() {
     let text = format!(
         "# provisioned before vault adoption\n\
          [profiles.dev]\n\
-         token_file = \"~/{dev_file}\"\n\
+         token_file = \"{dev_file}\"\n\
          tier = \"dev\"\n\
          login = \"{DEV_LOGIN}\"\n\
          drafts_fp = \"{dev_fp}\"\n\n\
          [profiles.release]\n\
-         token_file = \"~/{release_file}\"\n\
+         token_file = \"{release_file}\"\n\
          tier = \"release\"\n\
          login = \"{RELEASE_LOGIN}\"\n\
          drafts_fp = \"{release_fp}\"\n\n\
@@ -1667,8 +1667,8 @@ fn an_agh_toml_naming_the_vault_files_comes_to_adoption_by_its_drafts_step() {
          name = \"fixture-mirror\"\n\
          tier = \"external\"\n\
          read = [\"anonymous\"]\n",
-        dev_file = vault::DEV_TOKEN_FILE,
-        release_file = vault::RELEASE_TOKEN_FILE,
+        dev_file = vault::Slot::Dev.pointer(),
+        release_file = vault::Slot::Release.pointer(),
         dev_fp = identity::fingerprint(dev.as_bytes()),
         release_fp = identity::fingerprint(release.as_bytes()),
     );

@@ -1386,6 +1386,311 @@ fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
     assert_eq!(gathered, (a, ab, Vec::new()));
 }
 
+/// The round fixture: `c` with its dependent `d`, and `y`, which nothing depends on.
+fn round_workspace(prefix: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    workspace(
+        prefix,
+        &[
+            ("c", "", vec![("src/lib.rs", C_BASE.to_string())]),
+            (
+                "d",
+                "[dependencies]\nc={path='../c'}\n",
+                vec![("src/lib.rs", D_BASE.to_string())],
+            ),
+            ("y", "", vec![("src/lib.rs", Y_BASE.to_string())]),
+        ],
+        &[("docs/notes.md", "1\n2\n3\n4\n5\n6\n7\n8\n")],
+    )
+}
+
+const C: &str = "crates/c/src/lib.rs";
+const D: &str = "crates/d/src/lib.rs";
+const Y: &str = "crates/y/src/lib.rs";
+const NOTES: &str = "docs/notes.md";
+const C_BASE: &str = "pub fn c() {}\n\n\n\n\n\n\n// end\n";
+const D_BASE: &str = "pub fn d() {}\n";
+const Y_BASE: &str = "pub fn y() {}\n\n\n\n\n\n\npub fn z() {}\n";
+/// `c` with its function's signature changed: a change every dependent's build reads.
+const C_OURS: &str = "pub fn c() -> u8 {\n    1\n}\n\n\n\n\n\n\n// end\n";
+/// `d` with a call of `c` as main still has it.
+const D_THEIRS: &str = "pub fn d() {\n    c::c()\n}\n";
+
+/// A ROUND JUDGES EVERY CRATE OF THE MERGE'S CONE THAT MAIN'S CHANGE REACHES, not only the
+/// cone of the shared paths: the branch changes `c`'s signature, main adds a call of the old one
+/// in `c`'s dependent `d`, each side passes alone and the merge is clean, so only a build of `d`
+/// on the merge finds the break. Whatever file the two sides happen to share (an unrelated
+/// crate's, or `c`'s own where main's hunk is a comment, which judges `c` alone), `d` is judged.
+/// What is left out is a crate main's change does not reach, whose files are the judged tree's:
+/// `c` itself where main touched nothing of it. The seeds stay the judgment's, for the cells.
+/// NEGATIVE CONTROL: where main changed no file of `d`, `d` builds from what the judgment ran
+/// on and is left out; the cone of the shared path alone, the selection this replaced, never
+/// holds `d` in the first case.
+#[test]
+fn a_round_judges_each_crate_of_the_merges_cone_that_mains_change_reaches() {
+    let y_ours = Y_BASE.replacen("pub fn y() {}", "pub fn y() -> u8 {\n    2\n}", 1);
+    let y_theirs = Y_BASE.replacen("pub fn z() {}", "pub fn z() -> u8 {\n    3\n}", 1);
+    let c_theirs = C_BASE.replacen("// end", "// the end", 1);
+    let (made, root) = round_workspace("atv-changed-round-meet");
+    let fixture = Committed::new(&root);
+
+    // An unrelated shared file: `y`'s, which each side changed in its own hunk.
+    let (judged, tip) = fixture.merged(
+        "unrelated",
+        &[(C, C_OURS), (Y, &y_ours)],
+        &[(D, D_THEIRS), (Y, &y_theirs)],
+        None,
+    );
+    let round = fixture.round(&tip, &judged, &[Y], true);
+    assert_eq!(
+        picked(round),
+        (paths(&["c", "y"]), paths(&["d", "y"]), Vec::new())
+    );
+    // The selection this replaced: the shared path's cone holds no build of `d`.
+    assert_eq!(
+        picked(resolve_paths(
+            &root,
+            &fixture.tools,
+            &fixture.path,
+            &judged,
+            paths(&[Y]),
+            Some(&judged)
+        ))
+        .1,
+        paths(&["y"])
+    );
+
+    // The shared file is `c`'s own, and main's hunk in it a comment: `c` alone by its share.
+    let (judged, tip) = fixture.merged(
+        "same-crate",
+        &[(C, C_OURS)],
+        &[(C, &c_theirs), (D, D_THEIRS)],
+        None,
+    );
+    let round = fixture.round(&tip, &judged, &[C], true);
+    assert_eq!(
+        picked(round),
+        (paths(&["c"]), paths(&["c", "d"]), Vec::new())
+    );
+
+    // CONTROL: main changed nothing of `d`, so its build reads only the judged tree's files.
+    let (judged, tip) = fixture.merged("unreached", &[(C, C_OURS)], &[(C, &c_theirs)], None);
+    let round = fixture.round(&tip, &judged, &[C], true);
+    assert_eq!(picked(round), (paths(&["c"]), paths(&["c"]), Vec::new()));
+    let _ = std::fs::remove_dir_all(&made);
+}
+
+/// A round over a merge a person made judges no shared path's member alone, and never more
+/// than a judgment of the merge would. A shared path may be a change of main's that the merge
+/// dropped, so its file is the judged commit's own: compared with that commit it changed
+/// nothing, and its member would be read as reaching no dependent. Here main added a function
+/// to `c`, the branch changed `c`'s signature, and the person kept the branch's file: told the
+/// merge was made by hand, the round holds `c`'s dependent; told Git made it, `c` alone.
+/// NEGATIVE CONTROL (the bound): a hand merge whose shared path is a test file of `c`, where
+/// the branch changed nothing else of `c`, judges `c` alone as a judgment of the merge does,
+/// though the shared path's own cone, with no member alone, holds `d`.
+#[test]
+fn a_round_over_a_hand_merge_judges_no_shared_member_alone_within_the_merges_cone() {
+    let c_theirs = C_BASE.replacen("// end", "pub fn g() {}", 1);
+    let (made, root) = round_workspace("atv-changed-round-hand");
+    let fixture = Committed::new(&root);
+    let (judged, tip) = fixture.merged(
+        "dropped",
+        &[(C, C_OURS)],
+        &[(C, &c_theirs)],
+        Some(&[(C, C_OURS)]),
+    );
+    let c = paths(&["c"]);
+    assert_eq!(
+        picked(fixture.round(&tip, &judged, &[C], false)),
+        (c.clone(), paths(&["c", "d"]), Vec::new())
+    );
+    assert_eq!(
+        picked(fixture.round(&tip, &judged, &[C], true)),
+        (c.clone(), c.clone(), Vec::new())
+    );
+
+    const TEST: &str = "crates/c/tests/t.rs";
+    let (judged, tip) = fixture.merged(
+        "test-file",
+        &[(TEST, "#[test]\nfn ours() {}\n")],
+        &[(TEST, "#[test]\nfn theirs() {}\n")],
+        Some(&[(TEST, "#[test]\nfn ours() {}\n#[test]\nfn theirs() {}\n")]),
+    );
+    assert_eq!(
+        picked(fixture.round(&tip, &judged, &[TEST], false)),
+        (c.clone(), c.clone(), c.clone())
+    );
+    assert_eq!(
+        picked(resolve_paths(
+            &root,
+            &fixture.tools,
+            &fixture.path,
+            &judged,
+            paths(&[TEST]),
+            None
+        ))
+        .1,
+        paths(&["c", "d"]),
+        "the shared path's own cone, with no member alone"
+    );
+    let _ = std::fs::remove_dir_all(&made);
+}
+
+/// SHARED MARKDOWN NO CONE HOLDS IS A ROUND OF NO CRATE WHERE GIT MADE THE MERGE: the two
+/// sides' code is disjoint, as in a composition, so the source readers alone answer, though
+/// main's change reaches a crate of the branch's cone. NEGATIVE CONTROLS: the same merge made
+/// by hand, after the Markdown conflicted, judges `d`, which main changed and the branch's
+/// change reaches, as the full judgment a conflict used to bring did; and the same two sides
+/// where they also share a file a crate owns judge that crate and `d`.
+#[test]
+fn a_round_of_shared_markdown_no_cone_holds_judges_no_crate() {
+    let ours = "one\n2\n3\n4\n5\n6\n7\n8\n";
+    let theirs = "1\n2\n3\n4\n5\n6\n7\neight\n";
+    let (made, root) = round_workspace("atv-changed-round-md");
+    let fixture = Committed::new(&root);
+    let (judged, tip) = fixture.merged(
+        "markdown",
+        &[(C, C_OURS), (NOTES, ours)],
+        &[(D, D_THEIRS), (NOTES, theirs)],
+        None,
+    );
+    assert_eq!(
+        picked(fixture.round(&tip, &judged, &[NOTES], true)),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+    assert_eq!(
+        picked(fixture.round(&tip, &judged, &[NOTES], false)).1,
+        paths(&["d"]),
+        "a hand merge of the same Markdown"
+    );
+    assert_eq!(
+        picked(fixture.round(&tip, &judged, &[D, NOTES], true)).1,
+        paths(&["d"])
+    );
+    let _ = std::fs::remove_dir_all(&made);
+}
+
+/// THE ROUND'S WORDS REACH ITS SELECTION: `--judged`, `--shared` and `--by-hand`, as
+/// `verify land` composes them and this build parses them, select through the one function a
+/// run selects by. The shared file names the path main's dropped change sits in: without
+/// `--by-hand` its member is judged alone, with it the member's dependent is judged too, and
+/// with neither word the run is a judgment of the whole cone since the base. NEGATIVE CONTROL:
+/// a shared file that is not there stops the run with a usage line naming it.
+#[test]
+fn a_rounds_words_select_what_the_round_judges() {
+    let c_theirs = C_BASE.replacen("// end", "pub fn g() {}", 1);
+    let (made, root) = round_workspace("atv-changed-round-words");
+    let fixture = Committed::new(&root);
+    let (judged, tip) = fixture.merged(
+        "dropped",
+        &[(C, C_OURS), (Y, "pub fn y() -> u8 {\n    2\n}\n")],
+        &[(C, &c_theirs)],
+        Some(&[(C, C_OURS)]),
+    );
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let shared = scratch.path().join("verify.shared");
+    std::fs::write(&shared, format!("{C}\0")).expect("the shared paths");
+    let select = |words: &[&str]| {
+        let parsed = crate::cli::parse(words.iter().copied()).expect("the words parse");
+        let round = crate::round_of(&parsed, &root).expect("the shared file reads");
+        picked(crate::cone_selection(
+            &parsed,
+            round,
+            &root,
+            &fixture.tools,
+            &fixture.path,
+            &tip,
+        ))
+        .1
+    };
+    let file = shared.to_str().expect("UTF-8");
+    let round = ["--base", &tip, "--judged", &judged, "--shared", file];
+    assert_eq!(select(&round), paths(&["c"]));
+    let mut by_hand = round.to_vec();
+    by_hand.push("--by-hand");
+    assert_eq!(select(&by_hand), paths(&["c", "d"]));
+    assert_eq!(select(&["--base", &tip]), paths(&["c", "d", "y"]));
+
+    let absent = scratch.path().join("absent");
+    let words = [
+        "--base",
+        &tip,
+        "--judged",
+        &judged,
+        "--shared",
+        absent.to_str().expect("UTF-8"),
+    ];
+    let parsed = crate::cli::parse(words.iter().copied()).expect("the words parse");
+    let refused = crate::round_of(&parsed, &root).unwrap_err();
+    assert!(
+        refused.starts_with("verify: --shared ") && refused.contains("absent"),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(&made);
+}
+
+/// [`meet`] leaves of a judgment's selection the crates one of the other selections holds,
+/// under the judgment's own seeds. NEGATIVE CONTROLS: a widened judgment, a widened reach, and
+/// a reach that holds none of the judgment's crates each leave the judgment whole, since
+/// nothing then says which of its crates the others reach.
+#[test]
+fn a_meet_keeps_the_judgments_seeds_and_only_the_crates_reached() {
+    let narrowed = |seeds: &[&str], crates: &[&str], alone: &[&str]| Selection::Narrowed {
+        seeds: paths(seeds),
+        crates: paths(crates),
+        any_lib: true,
+        all_targets: paths(crates),
+        unlinted: Vec::new(),
+        direct_dependents: Vec::new(),
+        alone: paths(alone),
+    };
+    let whole = narrowed(&["a", "b"], &["a", "b", "c@1.0.0", "d"], &["b"]);
+    let asked = std::cell::RefCell::new(Vec::new());
+    let no_lib = |names: &[String]| {
+        asked.borrow_mut().push(names.to_vec());
+        false
+    };
+    let met = meet(
+        whole.clone(),
+        &[
+            narrowed(&["c"], &["c", "x"], &[]),
+            narrowed(&["d"], &["d"], &[]),
+        ],
+        &no_lib,
+    );
+    assert_eq!(
+        met,
+        Selection::Narrowed {
+            seeds: paths(&["a", "b"]),
+            crates: paths(&["c@1.0.0", "d"]),
+            any_lib: false,
+            all_targets: paths(&["a", "b", "c@1.0.0", "d"]),
+            unlinted: Vec::new(),
+            direct_dependents: Vec::new(),
+            alone: paths(&["b"]),
+        }
+    );
+    assert_eq!(asked.into_inner(), [paths(&["c", "d"])]);
+    let never = |_: &[String]| panic!("a selection left whole keeps its own answer");
+    let widened = Selection::Widened("why".to_string());
+    assert_eq!(
+        meet(widened.clone(), &[narrowed(&["a"], &["a"], &[])], &never),
+        widened
+    );
+    assert_eq!(
+        meet(
+            whole.clone(),
+            &[narrowed(&["a"], &["a"], &[]), widened],
+            &never
+        ),
+        whole
+    );
+    assert_eq!(
+        meet(whole.clone(), &[narrowed(&["x"], &["x"], &[])], &never),
+        whole
+    );
+}
+
 /// End to end: a member that reads another's changed file only from its benches, examples or
 /// tests is judged alone with its own rows, and so is one whose test mounts a file of a nested
 /// package no member owns, with or without a `../`; one whose library or build script reads it
@@ -2071,6 +2376,63 @@ impl<'a> Committed<'a> {
         let selection = resolve(self.root, &self.tools, &self.path, "base");
         self.git(&["checkout", "-q", "--", "."]);
         selection
+    }
+
+    /// Leave the checkout at a merge of two commits made on `base`: the branch's, where each
+    /// of `ours` holds its text, and main's, where each of `theirs` does. The merge is the one
+    /// Git makes, or, with `by_hand`, one a person committed with each of those files holding
+    /// its text. The two commits, by the branches `<name>-ours` and `<name>-theirs`.
+    fn merged(
+        &self,
+        name: &str,
+        ours: &[(&str, &str)],
+        theirs: &[(&str, &str)],
+        by_hand: Option<&[(&str, &str)]>,
+    ) -> (String, String) {
+        let write = |files: &[(&str, &str)]| {
+            for (file, text) in files {
+                let at = self.root.join(file);
+                std::fs::create_dir_all(at.parent().expect("a file's folder")).expect("its folder");
+                std::fs::write(at, text).expect("the change");
+            }
+            self.git(&["add", "-A"]);
+        };
+        let (judged, tip) = (format!("{name}-ours"), format!("{name}-theirs"));
+        for (branch, files) in [(&tip, theirs), (&judged, ours)] {
+            self.git(&["checkout", "-q", "-b", branch, "base"]);
+            write(files);
+            self.git(&["commit", "-qm", branch]);
+        }
+        // The merge is made on a branch of its own: `judged` stays the branch's commit.
+        self.git(&["checkout", "-q", "-b", &format!("{name}-merge")]);
+        match by_hand {
+            None => self.git(&["merge", "-q", "--no-edit", &tip]),
+            Some(files) => {
+                // The merge may stop on a conflict: the person's files resolve it.
+                let _ = git(self.root, &self.path)
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(["merge", "-q", "--no-commit", "--no-ff", &tip])
+                    .output()
+                    .expect("git runs");
+                write(files);
+                self.git(&["commit", "-qm", "the merge, by hand"]);
+            }
+        }
+        (judged, tip)
+    }
+
+    /// What [`resolve_round`] selects for the merge the checkout stands at, of main's `tip`
+    /// into `judged`, sharing `shared`.
+    fn round(&self, tip: &str, judged: &str, shared: &[&str], mechanical: bool) -> Selection {
+        resolve_round(
+            self.root,
+            &self.tools,
+            &self.path,
+            tip,
+            judged,
+            paths(shared),
+            mechanical,
+        )
     }
 
     fn written(&self, files: &[(&str, &str)], select: impl FnOnce() -> Selection) -> Selection {

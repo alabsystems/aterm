@@ -23,7 +23,7 @@ use super::unicode::{
 use super::{Direction, arabic};
 use aterm_grapheme::GeneralCategory;
 
-pub(crate) fn shape_internal(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
+fn substitute_internal(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) -> Direction {
     let target_direction = buffer.direction;
     buffer.enter();
     buffer.reset_masks(plan.map.global_mask());
@@ -44,7 +44,26 @@ pub(crate) fn shape_internal(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Bu
         synthesize_glyph_classes(buffer);
     }
     layout::substitute(plan, face, buffer);
+    target_direction
+}
+
+pub(crate) fn shape_internal(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
+    let target_direction = substitute_internal(plan, face, buffer);
     position(plan, face, buffer);
+    hide_default_ignorables(face, buffer);
+    buffer.direction = target_direction;
+    buffer.leave();
+}
+
+pub(crate) fn shape_substitute_only_internal(
+    plan: &ShapePlan,
+    face: &ShapeFace,
+    buffer: &mut Buffer,
+) {
+    let target_direction = substitute_internal(plan, face, buffer);
+    if buffer.direction.is_backward() {
+        buffer.reverse();
+    }
     hide_default_ignorables(face, buffer);
     buffer.direction = target_direction;
     buffer.leave();

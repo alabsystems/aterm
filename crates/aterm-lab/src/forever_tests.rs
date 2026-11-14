@@ -5610,10 +5610,6 @@ fn seen_land_a(program: &str) -> Seen {
             j(131_000, "driven by aterm (land: waits only on you)"),
             j(137_000, "driven by aterm (land, landed)"),
         ],
-        menu: vec![j(
-            131_000,
-            &format!("needs-head|Needs you (1) rows=1\nneeds|◇ land-a — {NEED} · #"),
-        )],
         page: vec![
             j(1_000, "head=land-a: Window 2, tab 2"),
             j(
@@ -5683,9 +5679,6 @@ fn land_a_fails_a_wrong_window_read() {
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("an END"), "{why}");
     let mut s = seen_land_a("claude");
-    s.window.menu.push(j(380_000, "done|✓ land-a — landed #"));
-    assert_eq!(l(&s, "claude", Scenario::L5).0, "FAIL");
-    let mut s = seen_land_a("claude");
     s.window.page.pop();
     assert_eq!(l(&s, "claude", Scenario::L5).0, "FAIL");
     // The need beside the landing said to carry on (the second review, 2026-11-01).
@@ -5742,22 +5735,6 @@ fn land_a_fails_a_wrong_window_read() {
     let mut s = seen_land_a("claude");
     s.window.chip.pop();
     assert_eq!(l(&s, "claude", Scenario::L5).0, "FAIL");
-    let mut s = seen_land_a("claude");
-    s.window.menu.remove(0);
-    let (w, why) = l(&s, "claude", Scenario::L3);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("no Needs you row"), "{why}");
-    let mut s = seen_land_a("claude");
-    s.window.menu[0].1 =
-        format!("needs-head|Needs you (1) rows=1\nneeds|◇ land-a — claude needs you: {NEED} · #");
-    assert_eq!(l(&s, "claude", Scenario::L3).0, "FAIL");
-    for head in ["needs-head|Needs you (2) rows=1\n", ""] {
-        let mut s = seen_land_a("claude");
-        s.window.menu[0].1 = format!("{head}needs|◇ land-a — {NEED} · #");
-        let (w, why) = l(&s, "claude", Scenario::L3);
-        assert_eq!(w, "FAIL", "{head:?}: {why}");
-        assert!(why.contains("header"), "{why}");
-    }
     let mut s = seen_land_a("claude");
     s.window.strip[1].1 = "index=1 selected=0 states=busy".into();
     assert_eq!(l(&s, "claude", Scenario::L3).0, "FAIL");
@@ -5837,13 +5814,6 @@ fn seen_cruise_n() -> Seen {
             ),
         )
     };
-    let row = |t: i64, others: &[&str]| {
-        let under: String = others
-            .iter()
-            .map(|other| format!("\nneeds|{other} indent=1"))
-            .collect();
-        j(t, &format!("needs|◇ cruise-n — {NEED_A} · #{under}"))
-    };
     let page = |t: i64, state: &str| {
         j(
             t,
@@ -5920,12 +5890,6 @@ fn seen_cruise_n() -> Seen {
                 "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\"",
             )],
             strip: vec![j(1_000, "index=16 selected=1 states=selected")],
-            menu: vec![
-                row(6_000, &[NEED_B]),
-                j(131_000, ""),
-                row(376_000, &[]),
-                row(861_000, &[NEED_C]),
-            ],
             page: vec![
                 page(
                     6_000,
@@ -5942,39 +5906,10 @@ fn seen_cruise_n() -> Seen {
                 ),
             ],
             opening: opened("claude", "cruise"),
-            stopped: Some(j(868_000, &stopped_read(Some("Claude Code"), true))),
             ..window("cruise-n")
         },
         ..Seen::default()
     }
-}
-
-/// N4's stand-in ask beside its report as [`surfaces::stopped::ask_step`] keeps it (§14.7): on
-/// main (`first`) the ask's row above the report's, the report's row carrying `product`'s tip; on
-/// main before 7a the older report above with no tip.
-fn stopped_read(product: Option<&str>, first: bool) -> String {
-    let ask = format!(
-        "◇ {} — approve the stand-in request · 1s",
-        surfaces::stopped::ASK_TAB
-    );
-    let report = format!("◇ cruise-n — {NEED_A} · 3s");
-    let read = surfaces::stopped::Read {
-        rows: if first {
-            vec![ask, report]
-        } else {
-            vec![report, ask]
-        },
-        ask: Some(usize::from(!first)),
-        report: Some(usize::from(first)),
-        tip: product.map(|p| {
-            aterm_agent::supervise::mode_words::report_words(
-                p,
-                aterm_agent::harness::hold_said::NeedTail::CarryingOn,
-                false,
-            )
-        }),
-    };
-    format!("{} cleared=yes", read.line())
 }
 
 #[test]
@@ -6014,23 +5949,6 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
             ("N4", "FAIL")
         ]
     );
-    let mut s = seen_cruise_n();
-    s.window.stopped = Some(j(868_000, &stopped_read(None, false)));
-    assert_eq!(
-        verdicts(Chain::CruiseN, &s, "claude"),
-        [
-            ("N1", "PASS"),
-            ("N2", "PASS"),
-            ("N3", "PASS"),
-            ("N4", "FAIL")
-        ],
-        "main's read before 7a fails N4's stopped-first want alone"
-    );
-    s.window.stopped = None;
-    assert_eq!(
-        one(Chain::CruiseN, &s, "claude", Scenario::N4).0,
-        "UNOBSERVED"
-    );
     let n = |s: &Seen, k| surfaces::judge_needs_step(s, T0, k).word();
     let good = seen_cruise_n();
     assert_eq!((0..4).map(|k| n(&good, k)).collect::<Vec<_>>(), ["PASS"; 4]);
@@ -6054,11 +5972,6 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
     let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("never on the page's screen"), "{why}");
-    s.window.menu[0].1 = format!("needs|◇ cruise-n — {NEED_A} · #");
-    assert_eq!(one(Chain::CruiseN, &s, "claude", Scenario::N1).0, "FAIL");
-    let mut s = seen_cruise_n();
-    s.window.menu[1].1 = format!("needs|◇ cruise-n — {NEED_A} · #");
-    assert_eq!(one(Chain::CruiseN, &s, "claude", Scenario::N2).0, "FAIL");
     let page = |state: &str| format!("head=cruise-n: Window 2, tab 17\nstate={state}");
     let mut s = seen_cruise_n();
     s.window.page[0].1 = page(&format!("needs you: {NEED_A}; carrying on · pausing"));
@@ -6082,18 +5995,11 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no needs entry"), "{why}");
     let mut s = seen_cruise_n();
-    s.window.menu[0].1 = format!("needs|◇ cruise-n — {NEED_A} (+1 more) · #");
-    let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("no need row"), "{why}");
-    assert!(why.contains("wanted [\""), "{why}");
-    let mut s = seen_cruise_n();
     let before = |v: &mut Vec<(i64, String)>| v.retain(|(t, _)| *t < T0 + 370_000);
     for v in [
         &mut s.journal,
         &mut s.status,
         &mut s.meta,
-        &mut s.window.menu,
         &mut s.window.page,
     ] {
         before(v);
@@ -6133,7 +6039,6 @@ fn cruise_n_leaves_a_step_its_window_never_read_unobserved() {
         &mut s.meta,
         &mut s.window.chip,
         &mut s.window.strip,
-        &mut s.window.menu,
         &mut s.window.page,
     ] {
         watched(v);
@@ -6166,29 +6071,24 @@ fn cruise_n_leaves_a_step_its_window_never_read_unobserved() {
 }
 
 /// A GLANCE THAT CHANGED NOTHING IS A READ: one inside N1's span whose Harness page read failed,
-/// whose tooltip table was partial and whose chip and menu were as before its reply re-read the
-/// rows that stood then, here no need row, so N1 fails on them (`Window::glances`). Negative
-/// control: `n_unglanced` counting only page reads, tooltip reads and changes reads N1
+/// whose tooltip table was partial and whose chip was as before its reply re-read the chip
+/// that stood then, here one drawn as another face, so N1 fails on it (`Window::glances`).
+/// Negative control: `n_unglanced` counting only page reads, tooltip reads and changes reads N1
 /// UNOBSERVED.
 #[test]
-fn cruise_n_fails_a_step_on_rows_a_glance_read_again_unchanged() {
-    const CHIP: &str =
-        "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"Autopilot: cruise.\"";
-    // The window's chrome before N1's reply and inside its span: the chip, a strip whose second
-    // tab has no tooltip (a partial table), and a menu with no row naming cruise-n.
+fn cruise_n_fails_a_step_on_a_chip_a_glance_read_again_unchanged() {
+    const CHIP: &str = "window=2 program=claude face=cruise drawn=\"⤓ land\" spoken=\"x\"";
+    // The window's chrome before N1's reply and inside its span: the chip, and a strip whose
+    // second tab has no tooltip (a partial table).
     let chrome = format!(
         "autopilot sid=s-cn {CHIP}\n\
          toolbar-tabs count=2 selected=0 labels=[\"cruise-n\", \"other\"] states=[[], []] \
-         tooltips=[Some(\"cruise-n\\ndriven by aterm (cruise)\")]\n\
-         statusmenu \"Needs you (1)\" enabled=no at=0\n\
-         statusmenu \"◇ other — approve it · 4s\" enabled=yes checked=no at=1\n\
-         statusmenu --- at=2"
+         tooltips=[Some(\"cruise-n\\ndriven by aterm (cruise)\")]"
     );
     let mut s = seen_cruise_n();
     let mut w = surfaces::Window {
         front_tab: true,
         opening: s.window.opening.clone(),
-        stopped: s.window.stopped.clone(),
         ..window("cruise-n")
     };
     let before = surfaces::Glance::of(T0 + 1_000, &chrome, "");
@@ -6199,7 +6099,7 @@ fn cruise_n_fails_a_step_on_rows_a_glance_read_again_unchanged() {
     let said = w.note(&inside, "s-cn");
     assert!(
         said.iter()
-            .all(|(what, _)| !matches!(*what, "chip" | "menu" | "page")),
+            .all(|(what, _)| !matches!(*what, "chip" | "page")),
         "{said:?}"
     );
     assert_eq!(w.glances, [T0 + 1_000, T0 + 60_000]);
@@ -6209,60 +6109,12 @@ fn cruise_n_fails_a_step_on_rows_a_glance_read_again_unchanged() {
     s.window = w;
     let (v, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
     assert_eq!(v, "FAIL", "{why}");
-    assert!(why.contains("no need row"), "{why}");
-    // No glance in the span at all: the same rows say nothing of N1.
+    assert!(why.contains("drawn≠face"), "{why}");
+    // No glance in the span at all: the same chip says nothing of N1.
     s.window.glances.retain(|t| *t < T0 + 5_000);
     let (v, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
     assert_eq!(v, "UNOBSERVED", "{why}");
     assert!(why.contains("no window read in N1's span"), "{why}");
-}
-
-#[test]
-fn cruise_n_wants_each_other_need_on_a_row_one_level_in() {
-    let row = |others: &[&str]| {
-        let under: String = others
-            .iter()
-            .map(|other| format!("\nneeds|{other} indent=1"))
-            .collect();
-        format!("needs|◇ cruise-n — {NEED_A} · #{under}")
-    };
-    let mut s = seen_cruise_n();
-    s.window.menu[3].1 = row(&[NEED_B]);
-    let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N4);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains(&format!("wanted [{NEED_C:?}]")), "{why}");
-    let mut s = seen_cruise_n();
-    s.window.menu[0].1 = row(&[]);
-    let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains(&format!("wanted [{NEED_B:?}]")), "{why}");
-    let mut s = seen_cruise_n();
-    s.window.menu[2].1 = row(&[NEED_B]);
-    assert_eq!(one(Chain::CruiseN, &s, "claude", Scenario::N3).0, "FAIL");
-    let chrome = |b: &str| {
-        format!(
-            "statusmenu \"Needs you (1)\" enabled=no at=0\n\
-             statusmenu \"◇ cruise-n — {NEED_A} · 4s\" enabled=yes checked=no at=1\n\
-             {b}\n\
-             statusmenu --- at=3"
-        )
-    };
-    let read = |b: &str| surfaces::menu_of(&surfaces::menu_rows(&chrome(b)), "cruise-n");
-    let one_in = read(&format!(
-        "statusmenu {NEED_B:?} enabled=yes checked=no \
-         tip=\"Claude Code in cruise-n needs this too\" indent=1 at=2"
-    ));
-    assert_eq!(
-        one_in,
-        format!("needs-head|Needs you (1) rows=1\n{}", row(&[NEED_B]))
-    );
-    let lead = read(&format!(
-        "statusmenu   {NEED_B:?} enabled=yes checked=no at=1.0"
-    ));
-    assert_eq!(
-        lead,
-        format!("needs-head|Needs you (1) rows=1\n{}", row(&[]))
-    );
 }
 
 #[test]
@@ -6291,11 +6143,16 @@ fn a_tab_behind_passes_on_its_face_with_nothing_drawn() {
         "task=open needs=- needs_n=- autopilot=cruise supervisor=a agent=- end=1792578282 end_seen=0 end_cheered=0",
     ));
     assert_eq!(one(Chain::Cruise, &ended, "claude", Scenario::C1).0, "FAIL");
-    let mut row = s.clone();
-    row.window.menu.push(j(9_000, "done|✓ cruise — landed #"));
-    assert_eq!(one(Chain::Cruise, &row, "claude", Scenario::C1).0, "FAIL");
+    let mut dot = s.clone();
+    dot.window
+        .strip
+        .push(j(9_000, "index=10 selected=0 states=done"));
+    assert_eq!(one(Chain::Cruise, &dot, "claude", Scenario::C1).0, "FAIL");
     let mut need = s;
-    need.window.menu.push(j(9_000, "needs|◇ cruise — x · #"));
+    need.status.push(j(
+        9_000,
+        "task=open needs=ask needs_n=1 autopilot=cruise supervisor=a agent=- end=- end_seen=- end_cheered=-",
+    ));
     assert_eq!(one(Chain::Cruise, &need, "claude", Scenario::C1).0, "FAIL");
 }
 
@@ -6350,27 +6207,22 @@ fn seen_land_j(label: &str) -> Seen {
                 j(1_000, "index=14 selected=0 states=-"),
                 j(166_000, "index=14 selected=0 states=done"),
             ],
-            menu: vec![j(166_000, &format!("done|✓ {label} — landed #"))],
             looked: vec![
                 j(
                     900_000,
-                    "step=sweep end=1792578282 end_seen=0 selected=0 states=done done_row=yes",
+                    "step=sweep end=1792578282 end_seen=0 selected=0 states=done",
                 ),
                 j(
                     900_500,
-                    "step=look-on end=1792578282 end_seen=0 selected=0 states=busy,done done_row=yes",
+                    "step=look-on end=1792578282 end_seen=0 selected=0 states=busy,done",
                 ),
                 j(
                     901_000,
-                    "step=look end=1792578282 end_seen=1 selected=1 states=selected done_row=no",
+                    "step=look end=1792578282 end_seen=1 selected=1 states=selected",
                 ),
                 j(
                     901_500,
-                    "step=still end=1792578282 end_seen=0 selected=0 states=done done_row=yes",
-                ),
-                j(
-                    902_000,
-                    "step=press end=1792578282 end_seen=1 selected=1 states=selected done_row=no pressed=OK",
+                    "step=still end=1792578282 end_seen=0 selected=0 states=done",
                 ),
             ],
             opening: opened("claude", "land"),
@@ -6378,15 +6230,12 @@ fn seen_land_j(label: &str) -> Seen {
         },
         ..Seen::default()
     });
-    // The Done for you row's tip at the landing says what aterm checked (§14.9, 9c).
-    let tip = aterm_agent::supervise::mode_words::landed_tip(checked::receipt_of(&s, T0).as_ref());
-    s.window.done_tip = vec![j(166_000, &tip)];
     s.window.front = landed_front(&s, "claude", 903_000);
     s
 }
 
 #[test]
-fn land_j_and_land_k_pass_on_an_end_a_look_and_a_press_see() {
+fn land_j_and_land_k_pass_on_an_end_and_a_look_that_sees_it() {
     assert_eq!(
         verdicts(Chain::LandJ, &seen_land_j("land-j"), "claude"),
         [("L16", "PASS")]
@@ -6403,56 +6252,38 @@ fn land_j_and_land_k_fail_a_wrong_window_read() {
     let l17 = |s: &Seen| one(Chain::LandK, s, "claude", Scenario::L17);
     let mut s = seen_land_j("land-j");
     s.window.looked[2].1 =
-        "step=look end=1792578282 end_seen=1 selected=1 states=selected,done done_row=no".into();
+        "step=look end=1792578282 end_seen=1 selected=1 states=selected,done".into();
     assert_eq!(l16(&s).0, "FAIL");
     let mut s = seen_land_j("land-j");
-    s.window.looked[2].1 =
-        "step=look end=1792578282 end_seen=1 selected=1 states=selected done_row=yes".into();
-    assert_eq!(l16(&s).0, "FAIL");
-    let mut s = seen_land_j("land-j");
-    s.window.looked[2].1 =
-        "step=look end=1792578282 end_seen=1 selected=0 states=- done_row=no".into();
+    s.window.looked[2].1 = "step=look end=1792578282 end_seen=1 selected=0 states=-".into();
     assert_eq!(l16(&s).0, "FAIL");
     type Judge = fn(&Seen) -> (&'static str, String);
     let judges: [(&str, Judge); 2] = [("land-j", l16), ("land-k", l17)];
     for (label, judge) in judges {
         let mut s = seen_land_j(label);
         s.window.looked[1].1 =
-            "step=look-on end=1792578282 end_seen=1 selected=0 states=busy done_row=no".into();
+            "step=look-on end=1792578282 end_seen=1 selected=0 states=busy".into();
         let (w, why) = judge(&s);
         assert_eq!(w, "FAIL", "{label}: {why}");
         assert!(why.contains("behind the tab the look began on"), "{why}");
         let mut s = seen_land_j(label);
         s.window.looked[1].1 =
-            "step=look-on end=1792578282 end_seen=1 selected=0 states=busy,done done_row=yes"
-                .into();
+            "step=look-on end=1792578282 end_seen=1 selected=0 states=busy,done".into();
         assert_eq!(judge(&s).0, "FAIL", "{label}");
         let mut s = seen_land_j(label);
         s.window.looked.remove(1);
         assert_eq!(judge(&s).0, "UNOBSERVED", "{label}");
     }
     let mut s = seen_land_j("land-k");
-    s.window.looked[3].1 =
-        "step=still end=1792578282 end_seen=1 selected=0 states=- done_row=no".into();
+    s.window.looked[3].1 = "step=still end=1792578282 end_seen=1 selected=0 states=-".into();
     let (w, why) = l17(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("behind land-j"), "{why}");
     let mut s = seen_land_j("land-k");
     s.window.looked.remove(3);
     assert_eq!(l17(&s).0, "UNOBSERVED");
-    let mut s = seen_land_j("land-k");
-    s.window.looked[4].1 = s.window.looked[4].1.replace("pressed=OK", "pressed=ERR");
-    let (w, why) = l17(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("wanted pressed=OK"), "{why}");
     let mut s = seen_land_j("land-j");
-    s.window.menu.clear();
-    let (w, why) = l16(&s);
-    assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("yet no Done for you row once landed"), "{why}");
-    let mut s = seen_land_j("land-j");
-    s.window.looked[0].1 =
-        "step=sweep end=1792578282 end_seen=1 selected=0 states=- done_row=no".into();
+    s.window.looked[0].1 = "step=sweep end=1792578282 end_seen=1 selected=0 states=-".into();
     assert_eq!(l16(&s).0, "FAIL");
     let mut s = seen_land_j("land-j");
     s.status[2] = hold(
@@ -6490,19 +6321,10 @@ fn land_j_and_land_k_fail_a_wrong_window_read() {
     let mut s = seen_land_j("land-j");
     s.window.looked.truncate(2);
     assert_eq!(l16(&s).0, "UNOBSERVED");
-    let mut s = seen_land_j("land-k");
-    s.window.looked[4].1 =
-        "step=press end=1792578282 end_seen=1 selected=0 states=- done_row=no pressed=OK".into();
-    assert_eq!(l17(&s).0, "FAIL");
-    let mut s = seen_land_j("land-k");
-    s.window.looked[4].1 =
-        "step=press end=1792578282 end_seen=0 selected=0 states=done done_row=yes pressed=no-row"
-            .into();
-    assert_eq!(l17(&s).0, "FAIL");
 }
 
 #[test]
-fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
+fn land_e_passes_on_its_dot_and_a_page_counting_every_landed_tab() {
     let seen = |rest: Option<&str>| {
         let mut s = tasked();
         s.status = vec![
@@ -6512,10 +6334,6 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
         s.window = surfaces::Window {
             chip: vec![j(1_000, &behind("agy", "land"))],
             strip: vec![j(10_000, "index=5 selected=0 states=done")],
-            menu: vec![j(
-                10_000,
-                "done-head|Done for you (1) rows=1\ndone|✓ land-e — landed #",
-            )],
             rest: rest.map(str::to_string),
             opening: opened("agy", "land"),
             ..window("land-e")
@@ -6525,43 +6343,29 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
     };
     // The run's 2 done checks, and the Forced continues row and line that count them, as END
     // reads them on a live run (§14.17.6): with none read, that want is UNOBSERVED and so is L7.
-    let rest = |here: &str, landed: usize, today: &str, every: &str| {
+    let rest = |landed: usize, today: &str, every: &str| {
         use aterm_agent::harness::stats::{FORCED_CONTINUES, FORCED_CONTINUES_LINE};
         format!(
-            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 held_landing=6 held_needs=0 held_unread=0 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\" forced=2 forced_row=\"{FORCED_CONTINUES}: 2 today \u{b7} 2 in 7 days\" forced_line=\"{FORCED_CONTINUES_LINE}\" status_failed=\"-\""
+            "landed_tabs={landed} landing_tabs=6 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\" forced=2 forced_row=\"{FORCED_CONTINUES}: 2 today \u{b7} 2 in 7 days\" forced_line=\"{FORCED_CONTINUES_LINE}\" status_failed=\"-\""
         )
     };
     const TODAY: &str = "3 landed today · 2 kept going · 7 land prompts";
     const EVERY: &str = "Every session, 12 sessions: 2 cruising, 6 landing, 3 landed, 1 off";
     let l7 = |s: &Seen| one(Chain::LandE, s, "agy", Scenario::L7);
-    let good = seen(Some(&rest(
-        "This Mac — 6 landing · 3 landed · 2 shells",
-        3,
-        TODAY,
-        EVERY,
-    )));
+    let good = seen(Some(&rest(3, TODAY, EVERY)));
     let (w, why) = l7(&good);
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("today 3 landed today"), "{why}");
     assert_eq!(one(Chain::LandE, &good, "agy", Scenario::L7).0, "PASS");
-    for (here, landed) in [
-        ("This Mac — 2 shells", 3),
-        ("This Mac — 2 landed · 2 shells", 3),
-        ("This Mac — 0 landed", 0),
-    ] {
-        let (w, why) = l7(&seen(Some(&rest(here, landed, TODAY, EVERY))));
-        assert_eq!(w, "FAIL", "{here}: {why}");
-        assert!(why.contains("This Mac reads"), "{why}");
-    }
     let mut s = good.clone();
-    s.window.menu.clear();
+    s.window.strip[0].1 = "index=5 selected=0 states=-".into();
     assert_eq!(l7(&s).0, "FAIL");
     assert_eq!(l7(&seen(None)).0, "UNOBSERVED");
     let mut s = seen(None);
-    s.window.menu.clear();
+    s.window.strip[0].1 = "index=5 selected=0 states=-".into();
     let (w, why) = l7(&s);
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("no Done for you row"), "{why}");
+    assert!(why.contains("no • once landed"), "{why}");
     for (today, every) in [
         ("2 kept going today · 3 landed · 7 land prompts", EVERY),
         ("2 landed today · 2 kept going", EVERY),
@@ -6582,36 +6386,19 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
             "Every session, 12 sessions: 2 cruising, 6 landing, 2 landed, 1 off",
         ),
     ] {
-        let (w, why) = l7(&seen(Some(&rest(
-            "This Mac — 6 landing · 3 landed · 2 shells",
-            3,
-            today,
-            every,
-        ))));
+        let (w, why) = l7(&seen(Some(&rest(3, today, every))));
         assert_eq!(w, "FAIL", "{today} / {every}: {why}");
         assert!(why.contains("beside the landing: FAIL"), "{why}");
     }
     for (today, every) in [("-", EVERY), (TODAY, "-")] {
-        let (w, why) = l7(&seen(Some(&rest(
-            "This Mac — 6 landing · 3 landed · 2 shells",
-            3,
-            today,
-            every,
-        ))));
+        let (w, why) = l7(&seen(Some(&rest(3, today, every))));
         assert_eq!(w, "UNOBSERVED", "{today} / {every}: {why}");
     }
-    let none = rest(
-        "This Mac — 6 landing · 3 landed · 2 shells",
-        3,
-        TODAY,
-        EVERY,
-    )
-    .replace("landings=3", "landings=0");
+    let none = rest(3, TODAY, EVERY).replace("landings=3", "landings=0");
     assert_eq!(l7(&seen(Some(&none))).0, "FAIL");
     // CONTROL: a tab whose END status read failed is in no total, so rows short by that tab
     // match the totals, which pass where every read answered; the failed read fails L7.
     let counted = rest(
-        "This Mac — 6 landing · 2 landed · 2 shells",
         2,
         TODAY,
         "Every session, 12 sessions: 2 cruising, 6 landing, 2 landed, 1 off",
@@ -9765,10 +9552,6 @@ fn the_need_chains_answer_the_check_once_the_lab_read_the_need() {
         "attention_owners=1 attention_kinds=ask:needs attention=claude needs you".to_string(),
     ));
     assert!(need_read(&seen, false), "status and meta");
-    assert!(!need_read(&seen, true), "the window not read yet");
-    seen.window
-        .menu
-        .push((3, "needs|◇ land-a — rotate the deploy key · #".to_string()));
     assert!(!need_read(&seen, true), "no attention state read yet");
     seen.window
         .strip

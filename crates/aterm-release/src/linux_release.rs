@@ -1271,8 +1271,15 @@ impl Handoff {
     }
 }
 
-#[cfg(unix)]
 fn private_directory(path: &Path) -> Result<(), String> {
+    private_handoff_directory(path, "Linux handoff")
+}
+
+/// `path` is a handoff directory this user alone can write, as is every ancestor (root's
+/// sticky ones aside): the Linux handoff's rule, which the Windows handoff
+/// (windows_release.rs) shares. `what` names the handoff in a refusal.
+#[cfg(unix)]
+pub(super) fn private_handoff_directory(path: &Path, what: &str) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
     let uid = super::current_release_uid()?;
     for ancestor in path.ancestors() {
@@ -1282,32 +1289,43 @@ fn private_directory(path: &Path) -> Result<(), String> {
             || ![0, uid].contains(&metadata.uid())
             || metadata.mode() & 0o022 != 0 && !sticky_root
         {
-            return Err(format!(
-                "unsafe Linux handoff ancestry: {}",
-                ancestor.display()
-            ));
+            return Err(format!("unsafe {what} ancestry: {}", ancestor.display()));
         }
     }
     drop(super::open_release_directory(
         path,
         uid,
         false,
-        "Linux handoff directory",
+        &format!("{what} directory"),
     )?);
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn private_directory(_path: &Path) -> Result<(), String> {
-    Err("Linux handoff validation requires Unix ownership semantics".into())
+pub(super) fn private_handoff_directory(_path: &Path, what: &str) -> Result<(), String> {
+    Err(format!(
+        "{what} validation requires Unix ownership semantics"
+    ))
 }
 
-#[cfg(unix)]
 fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
+    stage_copy(source, destination, 0o755, "Linux artifact")
+}
+
+/// Copy the regular file `source` to `destination` through a durable stage beside it, with
+/// `mode`: the Linux handoff's staged copy, which the Windows handoff shares. `what` names the
+/// file in a refusal.
+#[cfg(unix)]
+pub(super) fn stage_copy(
+    source: &Path,
+    destination: &Path,
+    mode: u32,
+    what: &str,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
     let temp = destination.with_extension(format!("stage-{}", std::process::id()));
-    let mut output = crate::durable::open_create_new(&temp)
-        .map_err(|e| format!("create Linux artifact stage: {e}"))?;
+    let mut output =
+        crate::durable::open_create_new(&temp).map_err(|e| format!("create {what} stage: {e}"))?;
     let result = (|| {
         std::io::copy(
             &mut open_regular_nonblock(source).map_err(|e| e.to_string())?,
@@ -1315,12 +1333,16 @@ fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
         output
-            .set_permissions(fs::Permissions::from_mode(0o755))
+            .set_permissions(fs::Permissions::from_mode(mode))
             .map_err(|e| e.to_string())?;
         crate::durable::sync_all(&output).map_err(|e| e.to_string())?;
         fs::rename(&temp, destination).map_err(|e| e.to_string())?;
-        crate::durable::sync_dir(destination.parent().ok_or("Linux artifact has no parent")?)
-            .map_err(|e| e.to_string())
+        crate::durable::sync_dir(
+            destination
+                .parent()
+                .ok_or_else(|| format!("{what} has no parent"))?,
+        )
+        .map_err(|e| e.to_string())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -1329,8 +1351,13 @@ fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn atomic_copy(_source: &Path, _destination: &Path) -> Result<(), String> {
-    Err("Linux artifact staging requires Unix ownership semantics".into())
+pub(super) fn stage_copy(
+    _source: &Path,
+    _destination: &Path,
+    _mode: u32,
+    what: &str,
+) -> Result<(), String> {
+    Err(format!("{what} staging requires Unix ownership semantics"))
 }
 
 fn clean_head(repo: &Path, commit: &str) -> Result<(), String> {

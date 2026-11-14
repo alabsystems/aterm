@@ -5,6 +5,25 @@
 use super::*;
 
 #[test]
+fn only_the_contiguous_leading_parent_block_supplies_edges() {
+    let tree = "1".repeat(40);
+    let parent = "2".repeat(40);
+    let author = "author A <a@b> 1700000000 +0000\ncommitter C <c@d> 1700000000 +0000";
+    let canonical = format!(
+        "tree {tree}\nparent {parent}\n{author}\ngpgsig signed\n parent {}\nx-extra opaque\n\nmessage\nparent {}\n",
+        "3".repeat(40),
+        "4".repeat(40)
+    );
+    assert_eq!(
+        parents(canonical.as_bytes()).unwrap().as_slice(),
+        std::slice::from_ref(&parent)
+    );
+    let late = format!("tree {tree}\n{author}\nparent {parent}\n\nmessage\n");
+    assert!(parents(late.as_bytes()).is_err());
+    assert!(parents(b"not commit metadata\n").is_err());
+}
+
+#[test]
 fn original_git_digest_and_api_identity_are_exact_not_normalized_equivalents() {
     assert_eq!(
         aterm_codec::hex::encode_lower(&sha1(b"abc")),

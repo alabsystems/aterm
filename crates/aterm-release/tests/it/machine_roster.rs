@@ -241,7 +241,7 @@ fn a_finish_only_entry_proves_the_key_and_not_the_roster() {
 fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
     let dir = tempdir("unattributed");
     let inputs = inputs("0.99.0", 990);
-    let staged = publish::stage_manifest(&dir, &inputs, None, None).expect("stages");
+    let staged = publish::stage_manifest(&dir, &inputs, None, None, None).expect("stages");
     let bytes = std::fs::read(&staged).expect("staged bytes");
     let expected = manifest_out::emit(&manifest_out::build(&inputs)).expect("emits");
     assert_eq!(
@@ -406,7 +406,7 @@ fn attribution_is_inside_the_bytes_the_signature_covers() {
         pubkey_b64: pk(&M3),
         roster_seq: 4,
     };
-    let staged = publish::stage_manifest(&dir, &inputs, Some(&who), None).expect("stages");
+    let staged = publish::stage_manifest(&dir, &inputs, Some(&who), None, None).expect("stages");
     let signed_bytes = std::fs::read(&staged).expect("staged bytes");
     let text = String::from_utf8(signed_bytes.clone()).expect("utf8");
     assert!(text.contains("machine_id = \"m3\""), "{text}");
@@ -419,11 +419,11 @@ fn attribution_is_inside_the_bytes_the_signature_covers() {
     assert_eq!(parsed.machine_id.as_deref(), Some("m3"));
     assert_eq!(parsed.roster_seq, Some(4));
 
-    let unattributed = publish::stage_manifest(&dir, &inputs, None, None).expect("stages");
+    let unattributed = publish::stage_manifest(&dir, &inputs, None, None, None).expect("stages");
     let early_bytes = std::fs::read(&unattributed).expect("unattributed bytes");
     let early_signature = kp(&M3).sign(&early_bytes).as_ref().to_vec();
     let late =
-        publish::stage_manifest(&dir, &inputs, Some(&who), None).expect("re-stages, stamped");
+        publish::stage_manifest(&dir, &inputs, Some(&who), None, None).expect("re-stages, stamped");
     let late_bytes = std::fs::read(&late).expect("late bytes");
     assert_ne!(
         early_bytes, late_bytes,

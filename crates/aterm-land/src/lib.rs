@@ -7,9 +7,9 @@
 //! report, path, commit, successful status or serialized data. Composition policy belongs
 //! to that host: disjoint paths alone grant no check reuse or publication authority.
 //!
-//! A host may stop before a qualification or a source recheck and continue in another image
+//! A host may stop before a qualification or a recheck and continue in another image
 //! of itself ([`Judgment::Elsewhere`], [`Outcome::Elsewhere`], [`resume`]). The loop then
-//! yields a [`Checkpoint`]: DATA (the step, its revision and two counts) that names no
+//! yields a [`Checkpoint`]: DATA (the step, its revision and one count) that names no
 //! qualification. Only the host carries its own push session across; this crate never
 //! constructs a session or a qualification.
 
@@ -28,6 +28,10 @@ pub enum Judgment<Q> {
     /// The host cannot qualify or recheck this revision in this image: the loop yields the
     /// step's [`Checkpoint`] ([`Outcome::Elsewhere`]) for another image to [`resume`].
     Elsewhere,
+    /// A recheck's answer only: by the host's own rule no recheck answers for this revision, so
+    /// the loop qualifies it whole, as it does a merge whose tree is not the one the composition
+    /// tested. Nothing of the recheck ran.
+    Whole,
 }
 
 /// Which step a [`Checkpoint`] stopped before.
@@ -35,18 +39,19 @@ pub enum Judgment<Q> {
 pub enum Step {
     /// A whole qualification of the revision.
     Qualify,
-    /// A source recheck of the revision, a merge a composition made.
+    /// A recheck of the revision, a merge of a main tip into a revision the host qualified:
+    /// the host judges what that merge changed for the revision it qualified, by its own rule.
     Recheck,
 }
 
-/// Where the loop stopped for another image: the step it had not begun, its revision, the
-/// re-judges spent before it and, before a recheck, the compositions spent since the last
-/// whole qualification. DATA only: it names no qualification and grants no publication.
+/// Where the loop stopped for another image: the step it had not begun, its revision and,
+/// before a recheck, the compositions spent since the last qualification or recheck that passed
+/// (a recheck that passes renews them, so the count only has to be within the bound). DATA only:
+/// it names no qualification and grants no publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     pub step: Step,
     pub revision: Revision,
-    pub rejudges: usize,
     pub composes: usize,
 }
 
@@ -69,8 +74,18 @@ pub enum Merge {
 
 /// The host's composition decision, never a source or check owner.
 pub enum Composition {
-    Composes { tree: String, why: String },
-    Rechecks { tree: String, shared: Vec<String> },
+    Composes {
+        tree: String,
+        why: String,
+    },
+    Rechecks {
+        tree: String,
+        shared: Vec<String>,
+    },
+    /// The tip does not merge cleanly, and by the host's rule a qualification of the revision
+    /// still stands for the revision: a running one is not cut, and one that passed is kept by
+    /// the host through the merge, which stops on the conflict. The reason, as the host says it.
+    Held(String),
     Doomed(String),
 }
 
@@ -109,7 +124,9 @@ impl Watch {
                 return Ok(None);
             }
             match composition(&tip)? {
-                Composition::Composes { .. } | Composition::Rechecks { .. } => {
+                Composition::Composes { .. }
+                | Composition::Rechecks { .. }
+                | Composition::Held(_) => {
                     self.composed = tip;
                     Ok(None)
                 }
@@ -163,6 +180,12 @@ pub enum Event<'a> {
         tip: &'a str,
         why: &'a str,
     },
+    /// The tip conflicts with the revision, whose qualification the host keeps
+    /// ([`Composition::Held`]).
+    Conflicts {
+        tip: &'a str,
+        why: &'a str,
+    },
     MergeDiffers {
         tip: &'a str,
         made: &'a str,
@@ -172,20 +195,14 @@ pub enum Event<'a> {
         base: &'a str,
         limit: usize,
     },
-    StoppedRejudges {
-        base: &'a str,
-        limit: usize,
-        interrupted: bool,
-    },
-    StoppedUnjudged {
-        tip: &'a str,
-        limit: usize,
-    },
 }
 
 /// Finite orchestration bounds. Actual execution/network deadlines stay with their owners.
+/// No count of qualifications is one: each follows a merge of a new main tip, so the loop
+/// never judges one tip twice, and what ends it is a qualification's own exit, a merge's (a
+/// conflict's included, [`Composition::Held`]), a checkout that moved or the composition bound,
+/// which only a composition and a recheck spend.
 pub struct Limits {
-    pub rejudges: usize,
     pub composes: usize,
     pub stopped: i32,
     pub unjudged: i32,
@@ -202,9 +219,12 @@ pub struct PushRequest<'a, Q, S> {
     pub budget: &'a mut Budget,
 }
 
-/// A shared obstruction/composition budget, monotone within one qualification epoch.
-/// Only the engine resets it after a new whole qualification; a source-only recheck does
-/// not replenish it. Actual admission and absolute deadlines remain the host's owners.
+/// A shared obstruction/composition budget, monotone within one epoch. Only the engine resets
+/// it: after a whole qualification that passed, and after a recheck that passed, since each
+/// judged a merge of the main tip that sent the loop round, so the races before it are spent
+/// on a tip the loop no longer pushes onto. A recheck keeps its push session; a whole
+/// qualification begins a new one. Actual admission and absolute deadlines remain the host's
+/// owners.
 pub struct Budget {
     used: usize,
     limit: usize,
@@ -280,24 +300,18 @@ pub fn run<H: Host>(
     let mut budget = Budget::with_used(limits.composes, 0)?;
     let mut session = None;
     let judging = qualify(host, &revision, &mut budget, &mut session)?;
-    drive(host, revision, 0, budget, session, judging, &limits)
+    drive(host, revision, budget, session, judging, &limits)
 }
 
 /// Whether this image may resume `checkpoint` ([`resume`]), with a push session carried
-/// across (`session`) or without one: refused past this image's re-judge or composition bound,
-/// with a session a qualification never carries or without the one a recheck needs, or with a
+/// across (`session`) or without one: refused past this image's composition bound, with a
+/// session a qualification never carries or without the one a recheck needs, or with a
 /// composition count before a qualification. [`resume`] admits its checkpoint so itself; a
 /// host asks first only to tell such a refusal from what the resumed step then does.
 ///
 /// # Errors
 /// Why the checkpoint is refused.
 pub fn admit(checkpoint: &Checkpoint, session: bool, limits: &Limits) -> Result<(), String> {
-    if checkpoint.rejudges > limits.rejudges {
-        return Err(format!(
-            "the landing was handed over at re-judge {}, past this image's bound of {}",
-            checkpoint.rejudges, limits.rejudges
-        ));
-    }
     Budget::with_used(limits.composes, checkpoint.composes)?;
     match (checkpoint.step, session) {
         (Step::Qualify, false) if checkpoint.composes == 0 => Ok(()),
@@ -309,12 +323,17 @@ pub fn admit(checkpoint: &Checkpoint, session: bool, limits: &Limits) -> Result<
 }
 
 /// Continue the loop another image of this host yielded ([`Outcome::Elsewhere`]) at its
-/// `checkpoint`, with the push session the host carried across (a recheck's only). The
-/// checkpoint is refused as [`admit`] refuses it, and the checkout is read before its step
-/// runs: one that left the revision ends the landing as unjudged. As at [`run`]'s first
-/// qualification, the host may answer that step ([`Host::qualify`] or [`Host::recheck`]) from
-/// its own kept record of one it passed on that same revision, and is then bound by every rule
-/// here as for one it just ran.
+/// `checkpoint`, with the push session the host carried across (a recheck's only). A host also
+/// enters here itself, at a recheck with a new session and no compositions spent, for a
+/// revision that merges a main tip into one its own kept record says it qualified: a merge made
+/// outside this loop (by hand, after a conflict stopped it, or by an earlier run that ended
+/// before its recheck passed). The checkpoint is refused as [`admit`] refuses it, and the
+/// checkout is read before its step runs: one that left the revision ends the landing as
+/// unjudged. As at [`run`]'s first qualification, the host may answer that step
+/// ([`Host::qualify`] or [`Host::recheck`]) from its own kept record of one it passed on that
+/// same revision, and is then bound by every rule here as for one it just ran. A recheck the
+/// host's rule does not answer for ([`Judgment::Whole`]) is a whole qualification of the same
+/// revision.
 pub fn resume<H: Host>(
     host: &mut H,
     checkpoint: Checkpoint,
@@ -325,7 +344,6 @@ pub fn resume<H: Host>(
     let Checkpoint {
         step,
         revision,
-        rejudges,
         composes,
     } = checkpoint;
     let mut budget = Budget::with_used(limits.composes, composes)?;
@@ -336,30 +354,38 @@ pub fn resume<H: Host>(
         (Step::Qualify, _) => {
             let mut session = None;
             let judging = qualify(host, &revision, &mut budget, &mut session)?;
-            drive(host, revision, rejudges, budget, session, judging, &limits)
+            drive(host, revision, budget, session, judging, &limits)
         }
         (Step::Recheck, None) => Err("a recheck checkpoint carries no push session".into()),
         (Step::Recheck, Some(session)) => match host.recheck(&revision)? {
             Judgment::Exit(code) => Ok(Outcome::Exit(code)),
-            Judgment::Passed(q) => drive(
-                host,
-                revision,
-                rejudges,
-                budget,
-                Some(session),
-                Judgment::Passed(q),
-                &limits,
-            ),
+            Judgment::Passed(q) => {
+                budget.used = 0;
+                drive(
+                    host,
+                    revision,
+                    budget,
+                    Some(session),
+                    Judgment::Passed(q),
+                    &limits,
+                )
+            }
             Judgment::Interrupted(_) => Err(UNPOLLED_RECHECK.into()),
             Judgment::Elsewhere => Ok(Outcome::Elsewhere {
                 checkpoint: Checkpoint {
                     step: Step::Recheck,
                     revision,
-                    rejudges,
                     composes: budget.used(),
                 },
                 session: Some(session),
             }),
+            // No recheck answers for the revision: it is qualified whole, which begins its
+            // own push session.
+            Judgment::Whole => {
+                let mut session = None;
+                let judging = qualify(host, &revision, &mut budget, &mut session)?;
+                drive(host, revision, budget, session, judging, &limits)
+            }
         },
     }
 }
@@ -376,36 +402,39 @@ fn left<H: Host>(host: &mut H, at: &str) -> Result<bool, String> {
 }
 
 /// What a recheck that reports an interruption is: none of its runs is polled.
-const UNPOLLED_RECHECK: &str = "a source recheck was interrupted without a landing poll";
+const UNPOLLED_RECHECK: &str = "a recheck was interrupted without a landing poll";
 
-/// The loop from a qualification's outcome `judging` of `revision`, with `rejudges` spent
-/// and the epoch's `budget` and push `session`.
+/// What a qualification that answers [`Judgment::Whole`] is: only a recheck asks for one.
+const WHOLE_QUALIFICATION: &str = "a qualification asked for a whole qualification";
+
+/// The loop from a qualification's outcome `judging` of `revision`, with the epoch's `budget`
+/// and push `session`. Each turn merges the main tip that sent it round and qualifies the
+/// merge; no count of turns ends it ([`Limits`]).
 fn drive<H: Host>(
     host: &mut H,
     mut revision: Revision,
-    mut rejudges: usize,
     mut budget: Budget,
     mut session: Option<H::PushSession>,
     mut judging: Judgment<H::Qualification>,
     limits: &Limits,
 ) -> Result<Outcome<H::PushSession>, String> {
     loop {
-        let (tip, cut) = match judging {
+        let tip = match judging {
             Judgment::Exit(code) => return Ok(Outcome::Exit(code)),
-            // Every qualification reaches here with its revision and re-judge count set.
+            // Every qualification reaches here with its revision set.
             // A whole qualification starts a new epoch, so none carries a session.
             Judgment::Elsewhere => {
                 return Ok(Outcome::Elsewhere {
                     checkpoint: Checkpoint {
                         step: Step::Qualify,
                         revision,
-                        rejudges,
                         composes: 0,
                     },
                     session: None,
                 });
             }
-            Judgment::Interrupted(tip) => (tip, true),
+            Judgment::Interrupted(tip) => tip,
+            Judgment::Whole => return Err(WHOLE_QUALIFICATION.into()),
             Judgment::Passed(qualified) => {
                 match push(
                     host,
@@ -416,7 +445,7 @@ fn drive<H: Host>(
                     limits,
                 )? {
                     Pushing::Done(code) => return Ok(Outcome::Exit(code)),
-                    Pushing::Moved(tip) => (tip, false),
+                    Pushing::Moved(tip) => tip,
                     Pushing::Recheck { tip, tree } => {
                         if left(host, &revision.at)? {
                             return Ok(Outcome::Exit(limits.unjudged));
@@ -426,11 +455,14 @@ fn drive<H: Host>(
                         }
                         let at = host.head()?;
                         let made = host.tree(&at)?;
+                        let rechecked = Revision { at, base: tip };
                         if made == tree {
-                            let rechecked = Revision { at, base: tip };
                             match host.recheck(&rechecked)? {
                                 Judgment::Exit(code) => return Ok(Outcome::Exit(code)),
                                 Judgment::Passed(q) => {
+                                    // The recheck judged the merge of this tip: the races
+                                    // before it are spent, in the same push session.
+                                    budget.used = 0;
                                     revision = rechecked;
                                     judging = Judgment::Passed(q);
                                     continue;
@@ -443,28 +475,22 @@ fn drive<H: Host>(
                                         checkpoint: Checkpoint {
                                             step: Step::Recheck,
                                             revision: rechecked,
-                                            rejudges,
                                             composes: budget.used(),
                                         },
                                         session: session.take(),
                                     });
                                 }
+                                // No recheck answers for the merge: it is qualified whole.
+                                Judgment::Whole => {}
                             }
-                        }
-                        host.event(Event::MergeDiffers {
-                            tip: &tip,
-                            made: &made,
-                            expected: &tree,
-                        });
-                        if rejudges >= limits.rejudges {
-                            host.event(Event::StoppedUnjudged {
-                                tip: &tip,
-                                limit: limits.rejudges,
+                        } else {
+                            host.event(Event::MergeDiffers {
+                                tip: &rechecked.base,
+                                made: &made,
+                                expected: &tree,
                             });
-                            return Ok(Outcome::Exit(limits.stopped));
                         }
-                        revision = Revision { at, base: tip };
-                        rejudges += 1;
+                        revision = rechecked;
                         judging = qualify(host, &revision, &mut budget, &mut session)?;
                         continue;
                     }
@@ -474,14 +500,6 @@ fn drive<H: Host>(
         if left(host, &revision.at)? {
             return Ok(Outcome::Exit(limits.unjudged));
         }
-        if rejudges >= limits.rejudges {
-            host.event(Event::StoppedRejudges {
-                base: &revision.base,
-                limit: limits.rejudges,
-                interrupted: cut,
-            });
-            return Ok(Outcome::Exit(limits.stopped));
-        }
         if let Merge::Exit(code) = host.merge(&tip)? {
             return Ok(Outcome::Exit(code));
         }
@@ -489,7 +507,6 @@ fn drive<H: Host>(
             at: host.head()?,
             base: tip,
         };
-        rejudges += 1;
         judging = qualify(host, &revision, &mut budget, &mut session)?;
     }
 }
@@ -502,8 +519,8 @@ fn qualify<H: Host>(
 ) -> Result<Judgment<H::Qualification>, String> {
     let judged = host.qualify(revision)?;
     if matches!(judged, Judgment::Passed(_)) {
-        // A new whole qualification starts an epoch. Source-only rechecks
-        // never pass through here and retain the actual original push session.
+        // A new whole qualification starts an epoch and a push session. A recheck never
+        // passes through here: it renews the budget and retains the original push session.
         budget.used = 0;
         *session = None;
     }
@@ -540,7 +557,13 @@ fn push<H: Host>(
         };
         host.event(Event::MainMoved(&tip));
         let composition = host.composition(revision, &tip)?;
-        if !matches!(composition, Composition::Doomed(_)) && !budget.consume() {
+        // A tip that is merged and qualified, or whose merge stops on a conflict, is no race
+        // of this push: only a composition and a recheck spend the bound.
+        if matches!(
+            composition,
+            Composition::Composes { .. } | Composition::Rechecks { .. }
+        ) && !budget.consume()
+        {
             host.event(Event::StoppedComposes {
                 base: &revision.base,
                 limit: limits.composes,
@@ -562,6 +585,13 @@ fn push<H: Host>(
                     shared: &shared,
                 });
                 return Ok(Pushing::Recheck { tip, tree });
+            }
+            Composition::Held(why) => {
+                host.event(Event::Conflicts {
+                    tip: &tip,
+                    why: &why,
+                });
+                return Ok(Pushing::Moved(tip));
             }
             Composition::Doomed(why) => {
                 host.event(Event::DoesNotCompose {

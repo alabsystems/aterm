@@ -806,7 +806,7 @@ fn validate_reading(name: &str, reading: Reading) -> crate::Result<()> {
     } else if matches!(reading, Reading::SigningMaterial) {
         text::valid_entry_name(name) && crate::entry_class::signing_material(name)
     } else if matches!(reading, Reading::PublicationMaterial) {
-        name == "gh_access_token" || name == crate::entry_class::RELEASE_GH_TOKEN
+        name == crate::entry_class::DEV_GH_TOKEN || name == crate::entry_class::RELEASE_GH_TOKEN
     } else if materialized {
         text::valid_entry_name(name) && !crate::reserved_name(name)
     } else {

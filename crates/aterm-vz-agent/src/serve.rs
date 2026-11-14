@@ -304,6 +304,13 @@ fn start(exec: &Exec, identity: Identity) -> Result<Started, String> {
             Stdin::Pipe => Stdio::piped(),
         });
     let merged = if exec.merge {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "std-only for the musl guest build (aterm-uds needs aterm-libc, which has no \
+                      musl cell), and std's command hands the write end as the child's output, \
+                      which it could not copy close-on-fork; Linux's std pipe is close-on-exec at \
+                      creation"
+        )]
         let (read, write) = io::pipe().map_err(|e| format!("no pipe for the output: {e}"))?;
         let write2 = write
             .try_clone()

@@ -2529,6 +2529,8 @@ impl SettingsViewState {
         &mut self,
         families: Arc<aterm_render::font_catalog::MonospaceFamilies>,
     ) -> bool {
+        #[cfg(test)]
+        crate::app_settings::FONT_CATALOG_DELIVERIES.with(|n| n.set(n.get() + 1));
         if self.font_families.as_deref() == Some(&*families) {
             return false;
         }

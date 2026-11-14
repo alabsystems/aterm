@@ -530,6 +530,7 @@ fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
             Some(Met {
                 word: MetWord::BrowserControl,
                 host: Some("https://must-not-appear.invalid/token".into()),
+                why: Some("/synthetic/must-not-appear someone@must-not-appear.invalid".into()),
             }),
         )
     };

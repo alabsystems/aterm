@@ -2809,7 +2809,10 @@ fn denied_publication_read(receipt: bool, verification: bool, lapsed: bool) {
         at: None,
     };
     if receipt {
-        bridge.state.set_receipt_pin("s-host", 1, &pin).unwrap();
+        bridge
+            .state
+            .set_receipt_pin("s-host", 1, &pin, None)
+            .unwrap();
     } else {
         bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
     }
@@ -4846,7 +4849,7 @@ fn a_pinned_lost_ack_retries_its_original_face_after_restart() {
     };
     bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
     let (off, deduped, _) = bridge
-        .publish_reserved(&pin, &original, &body.encode())
+        .publish_reserved(&pin, &original, &body.encode(), false)
         .unwrap();
     assert!(!deduped);
     drop(bridge);
@@ -4856,7 +4859,7 @@ fn a_pinned_lost_ack_retries_its_original_face_after_restart() {
     body.t = 99;
     let pin = bridge.state.post_pin("s-host", 1).unwrap().unwrap();
     let (again, deduped, actual) = bridge
-        .publish_reserved(&pin, &moved, &body.encode())
+        .publish_reserved(&pin, &moved, &body.encode(), false)
         .unwrap();
     assert_eq!(again, off);
     assert!(deduped);
@@ -4872,7 +4875,7 @@ fn a_pinned_lost_ack_retries_its_original_face_after_restart() {
         "route movement does not append elsewhere"
     );
     body.text = "incompatible replay".into();
-    let refused = bridge.publish_reserved(&pin, &moved, &body.encode());
+    let refused = bridge.publish_reserved(&pin, &moved, &body.encode(), false);
     assert!(
         refused.is_err_and(|e| e.kind() == io::ErrorKind::InvalidData) && bridge.collided.is_none(),
         "a payload the pin cannot reconstruct stays queued, not a collision"
@@ -4915,7 +4918,7 @@ fn a_pinned_dedup_after_restart_requires_its_payload_and_legacy_ambiguity_stays_
         bridge.conn = Some(bridge.connect().unwrap().0.into());
         let pin = bridge.state.post_pin("s-host", 1).unwrap().unwrap();
         let error = bridge
-            .publish_reserved(&pin, &face, &intended.encode())
+            .publish_reserved(&pin, &face, &intended.encode(), false)
             .unwrap_err();
         assert!(!bridge.self_acked.contains(&off));
         if modern {
@@ -4962,7 +4965,7 @@ fn a_legacy_keys_fresh_append_recovers_ownership_after_reconciliation_and_restar
     };
     bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
     let (off, deduped, actual) = bridge
-        .publish_reserved(&pin, &face, &body.encode())
+        .publish_reserved(&pin, &face, &body.encode(), false)
         .unwrap();
     assert!(!deduped, "the legacy winner was already retained away");
     bridge
@@ -6152,7 +6155,9 @@ fn a_dedup_whose_record_a_cut_carried_below_its_oldest_since_the_answer_is_not_s
             owner: Some(1),
             at: None,
         };
-        let (off, deduped, _) = bridge.publish_reserved(&pin, &face, &encoded).unwrap();
+        let (off, deduped, _) = bridge
+            .publish_reserved(&pin, &face, &encoded, false)
+            .unwrap();
         assert!(!deduped, "the first attempt lands");
 
         let (cutter, at, of_face) = (Arc::clone(&broker), a.clone(), face.clone());
@@ -6177,7 +6182,7 @@ fn a_dedup_whose_record_a_cut_carried_below_its_oldest_since_the_answer_is_not_s
                 cutter.set_max_conns(1);
             }
         }));
-        let retried = bridge.publish_reserved(&pin, &face, &encoded);
+        let retried = bridge.publish_reserved(&pin, &face, &encoded, false);
         bridge.cut_after_the_answer = None;
         broker.set_max_conns(astream_broker::broker::MAX_CONNS);
         let (mut told, _) = transport::connect(&a, aterm_spec::wait::MUST_HAPPEN).unwrap();
@@ -6216,7 +6221,9 @@ fn a_dedup_whose_record_a_cut_carried_below_its_oldest_since_the_answer_is_not_s
             "CONTROL: nothing to verify, the post left queued: {refused}"
         );
         bridge.conn = Some(bridge.connect().unwrap().0.into());
-        let (again, deduped, _) = bridge.publish_reserved(&pin, &face, &encoded).unwrap();
+        let (again, deduped, _) = bridge
+            .publish_reserved(&pin, &face, &encoded, false)
+            .unwrap();
         assert!(!deduped, "CONTROL: the cut dropped the key");
         assert_eq!(
             copies(&mut told),
@@ -15660,7 +15667,10 @@ fn held_lane_read_back(fx: crate::fx::Fx, keyed: bool) -> HeldReadBack {
             at: None,
         };
         bridge.unsent = None;
-        bridge.state.set_receipt_pin("s-b", 1, &legacy).unwrap();
+        bridge
+            .state
+            .set_receipt_pin("s-b", 1, &legacy, None)
+            .unwrap();
         landed_earlier(
             &bridge,
             legacy.seq,
@@ -15671,7 +15681,7 @@ fn held_lane_read_back(fx: crate::fx::Fx, keyed: bool) -> HeldReadBack {
         journal_entry(&bridge, &legacy, &face, &r1, head);
         let r2 = receipt(&mut bridge, 4);
         let pin2 = fresh_pin(&mut bridge, &face, &r2, head);
-        bridge.state.set_receipt_pin("s-b", 2, &pin2).unwrap();
+        bridge.state.set_receipt_pin("s-b", 2, &pin2, None).unwrap();
         journal_entry(&bridge, &pin2, &face, &r2, head);
         let landed = landed_earlier(&bridge, pin2.seq, &face, &r2);
         *lane.outbox.lock().unwrap() = Some(
@@ -21343,4 +21353,466 @@ mod mesh {
     mod halts {
         include!("bridge_halt_tests.rs");
     }
+}
+
+/// What [`a_reworded_receipt`] left: the records on the receipt's face, by offset and words, the
+/// offsets aterm was told it landed at, and the send's answer.
+struct RewordedReceipt {
+    records: Vec<(u64, Vec<u8>)>,
+    delivered: Vec<u64>,
+    old: Vec<u8>,
+    new: Vec<u8>,
+    sent: io::Result<()>,
+}
+
+/// An owed receipt pinned (with its head) in words aterm no longer lists (`re=5`, aterm now
+/// listing `re=7`, as a mesh route's `wire_re` maps it otherwise since), its first attempt
+/// `landed` on the bus under the pin or not, then sent by this bridge, which claims nothing
+/// of it.
+fn a_reworded_receipt(fx: crate::fx::Fx, landed: bool) -> RewordedReceipt {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+    bridge.fx = fx;
+    let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+    let r = OwedReceipt {
+        sid: "s-host".to_string(),
+        rid: 1,
+        off: 7,
+        verdict: "handled".to_string(),
+        kind: "task".to_string(),
+        from: format!("s-sender@{}", bridge.node),
+        earlier_log: false,
+    };
+    let Ok(prefix) = bridge.receipt_lane(&r.from).unwrap() else {
+        unreachable!("an own session's lane")
+    };
+    let subject = format!("{prefix}/ack");
+    let old = receipt_body(1, &r.sid, 5, &r.verdict).encode();
+    let new = receipt_body(1, &r.sid, 7, &r.verdict).encode();
+    let pin = PublishPin {
+        seq: bridge.next_seq().unwrap(),
+        via_key: false,
+        identity: Some(publication_identity(&subject, &old)),
+        original: None,
+        original_off: None,
+        owner: None,
+        at: Some(head_of(&bridge)),
+    };
+    let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
+    bridge
+        .state
+        .set_receipt_pin(&r.sid, r.rid, &pin, log)
+        .unwrap();
+    if landed {
+        let (mut other, _) = bridge.connect().unwrap();
+        let (_, deduped) = other
+            .publish(bridge.producer_id, pin.seq, &subject, &old)
+            .unwrap();
+        assert!(!deduped, "PRECONDITION: the first attempt landed");
+    }
+    let sent = bridge.send_receipt(&r);
+    let (mut reader, _) = bridge.connect().unwrap();
+    let (rows, _) = reader.fetch(0, &subject, 16).unwrap();
+    RewordedReceipt {
+        records: rows
+            .into_iter()
+            .map(|(off, _, bytes)| (off, bytes))
+            .collect(),
+        delivered: lane.delivery_offsets(),
+        old,
+        new,
+        sent,
+    }
+}
+
+/// **A RECEIPT WHOSE WORDS LEFT ITS PIN IS READ BACK BY ITS PIN'S IDENTITY** (ATERM-KI-1111-7):
+/// its retry reads the pin's face from the pin's head, kept beside the pin
+/// (`StateDir::receipt_head`): a first attempt that landed is where aterm is told it landed,
+/// and nothing is sent; one that did not is published in the current words at the pin's own
+/// sequence and lands once.
+/// NEGATIVE CONTROL (`Mutant::HoldAReworded`): no read, and the receipt is refused and held, as
+/// before the fix, whether its attempt landed or not.
+#[test]
+fn a_receipt_whose_words_left_its_pin_is_read_back_by_its_identity() {
+    let landed = a_reworded_receipt(crate::fx::Fx::os(), true);
+    assert!(landed.sent.is_ok(), "{:?}", landed.sent);
+    assert_eq!(landed.records.len(), 1, "nothing sent again");
+    assert_eq!(landed.records[0].1, landed.old);
+    assert_eq!(landed.delivered, vec![landed.records[0].0]);
+    let unlanded = a_reworded_receipt(crate::fx::Fx::os(), false);
+    assert!(unlanded.sent.is_ok(), "{:?}", unlanded.sent);
+    assert_eq!(unlanded.records.len(), 1, "one copy, of the current words");
+    assert_eq!(
+        crate::body::Body::decode(&unlanded.records[0].1).0.re,
+        crate::body::Body::decode(&unlanded.new).0.re
+    );
+    assert_eq!(unlanded.delivered, vec![unlanded.records[0].0]);
+    for landed in [true, false] {
+        let held = a_reworded_receipt(
+            crate::fx::Fx::os_without(crate::sim::world::Mutant::HoldAReworded),
+            landed,
+        );
+        assert!(
+            held.sent.as_ref().is_err_and(unverifiable) && held.delivered.is_empty(),
+            "CONTROL landed={landed}: {:?}, delivered {:?}",
+            held.sent,
+            held.delivered
+        );
+    }
+}
+
+/// **A REWORDED RETRY KEEPS ITS PIN'S SEQUENCE, SO A FIRST ATTEMPT THAT COMMITS LATE IS ITS
+/// ONE COPY** (ATERM-KI-1111-7's review): an owed receipt pinned in words aterm no longer
+/// lists, its first attempt not on the bus when the retry reads it back by its pin's
+/// identity, and then committed (a frame an earlier connection left the broker committing,
+/// [`Bridge::after_a_reworded_read`]) before the retry is published. Published in its current
+/// words at the pin's own sequence, the retry is answered by astream's dedup with that late
+/// copy, which the pin's identity vouches for: one record, and aterm is told it landed there.
+/// At a fresh sequence nothing deduped the late copy, and the receipt was on the bus twice.
+#[cfg(unix)]
+#[test]
+fn a_reworded_retry_is_deduped_against_a_first_attempt_that_commits_late() {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+    let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+    let r = OwedReceipt {
+        sid: "s-host".to_string(),
+        rid: 1,
+        off: 7,
+        verdict: "handled".to_string(),
+        kind: "task".to_string(),
+        from: format!("s-sender@{}", bridge.node),
+        earlier_log: false,
+    };
+    let Ok(prefix) = bridge.receipt_lane(&r.from).unwrap() else {
+        unreachable!("an own session's lane")
+    };
+    let subject = format!("{prefix}/ack");
+    let old = receipt_body(1, &r.sid, 5, &r.verdict).encode();
+    let pin = PublishPin {
+        seq: bridge.next_seq().unwrap(),
+        via_key: false,
+        identity: Some(publication_identity(&subject, &old)),
+        original: None,
+        original_off: None,
+        owner: None,
+        at: Some(head_of(&bridge)),
+    };
+    bridge.unsent = None;
+    let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
+    bridge
+        .state
+        .set_receipt_pin(&r.sid, r.rid, &pin, log)
+        .unwrap();
+    let (mut late, _) = bridge.connect().unwrap();
+    let (producer, seq, face, words) = (bridge.producer_id, pin.seq, subject.clone(), old.clone());
+    bridge.after_a_reworded_read = Some(Box::new(move || {
+        let (_, deduped) = late.publish(producer, seq, &face, &words).unwrap();
+        assert!(!deduped, "PRECONDITION: the late commit is the first copy");
+    }));
+    let sent = bridge.send_receipt(&r);
+    assert!(sent.is_ok(), "{sent:?}");
+    let (mut reader, _) = bridge.connect().unwrap();
+    let (rows, _) = reader.fetch(0, &subject, 16).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one copy of the receipt: {:?}",
+        rows.iter().map(|(off, _, _)| off).collect::<Vec<_>>()
+    );
+    assert_eq!(rows[0].2, old, "the late first attempt is the copy");
+    assert_eq!(lane.delivery_offsets(), vec![rows[0].0]);
+}
+
+/// **A REWORDED KEYED POST'S KEY NEVER LOSES ITS PIN** (ATERM-KI-1111-7's review): `s-a`'s
+/// post 1 owns its key `k`, pinned in words aterm no longer lists and not on the bus, and the
+/// disk refuses its pin's rewrite at the retry. The retry keeps the pin's sequence, so the
+/// key's pin is never rewritten before the post lands, and is reconciled to its record once it
+/// does. Post 2, a re-post under `k`, then retires at post 1's record, `dup=1`, and the key has
+/// one record on the bus. Repinned at a fresh sequence, the key's pin was moved first and the
+/// post's then refused, and the next retry, finding the key no longer at its stale pin, left
+/// the key at a sequence nothing landed at: post 2 was published there, a second record of
+/// the key.
+#[cfg(unix)]
+#[test]
+fn a_reworded_keyed_posts_key_keeps_its_pin_through_a_refused_write() {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (3, "s-r")]);
+    assert!(bridge.refresh_sessions().is_ok());
+    lane.retire_from_outbox();
+    let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+    let face = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    bridge.indexed_subjects.insert(face.clone());
+    let head = head_of(&bridge);
+    let mut stale = Body::new(1);
+    stale.from = Some("s-a".to_string());
+    stale.text = "a0".to_string();
+    let pin = PublishPin {
+        owner: Some(1),
+        ..fresh_pin(&mut bridge, &face, &stale.encode(), head)
+    };
+    bridge.state.set_key_pin("s-a", "k", &pin).unwrap();
+    bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+    let keyed = |id: u64, text: &str| {
+        queued_note("s-a", id, "@s-r", text).replacen(" kind=", " key=k kind=", 1)
+    };
+    *lane.outbox.lock().unwrap() = Some(keyed(1, "a1"));
+    let _ = bridge.state.refuse_writes_of(Some("sent/s-a.1"));
+    bridge.drain_outbox();
+    let _ = bridge.state.refuse_writes_of(None);
+    bridge.held_senders.clear();
+    if retired_at(&retirements(&lane), "s-a", 1).is_none() {
+        bridge.drain_outbox();
+    }
+    let first = retired_at(&retirements(&lane), "s-a", 1);
+    assert!(first.is_some(), "post 1 landed: {:?}", retirements(&lane));
+    *lane.outbox.lock().unwrap() = Some(keyed(2, "a2"));
+    bridge.held_senders.clear();
+    bridge.drain_outbox();
+    assert_eq!(
+        retired_at(&retirements(&lane), "s-a", 2),
+        first,
+        "post 2 retires at its key's record: {:?}",
+        retirements(&lane)
+    );
+    let (mut reader, _) = bridge.connect().unwrap();
+    assert_eq!(
+        notes_on(&mut reader, &face)
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a1"],
+        "one record of the key"
+    );
+}
+
+/// **A KEY'S OWN POST REBUILT FROM ITS KEY'S PIN IS PINNED IN THE WORDS IT SENDS** (the
+/// review of seed 590's fix): `s-a`'s post 1 owns its key `k`, whose pin a drain wrote in words
+/// it then sent nothing in (its own post pin refused), and aterm now lists the post in other
+/// words. The rebuilt pin names the words this drain publishes, so its retry reads its attempt
+/// back by them ([`Bridge::landed_at_its_pin`]), not as a reworded attempt
+/// ([`Bridge::reworded_landing`]) by the key's words, which no attempt published and which
+/// would leave an attempt in a later drain's words unfound. One record of the key lands, and
+/// the key is reconciled to it. A wall clock that moved between drains rewords nothing: a
+/// publication identity is read with its `t=` aside.
+#[cfg(unix)]
+#[test]
+fn a_keys_own_post_rebuilt_from_its_keys_pin_is_pinned_in_the_words_it_sends() {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (3, "s-r")]);
+    assert!(bridge.refresh_sessions().is_ok());
+    lane.retire_from_outbox();
+    let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+    let face = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    bridge.indexed_subjects.insert(face.clone());
+    let words = |t: u64, text: &str| {
+        let mut body = Body::new(t);
+        body.from = Some("s-a".to_string());
+        body.text = text.to_string();
+        body.encode()
+    };
+    assert_eq!(
+        publication_identity(&face, &words(1, "a1")),
+        publication_identity(&face, &words(2, "a1")),
+        "PRECONDITION: a drain's wall clock is no rewording"
+    );
+    let head = head_of(&bridge);
+    let key = PublishPin {
+        owner: Some(1),
+        at: None,
+        ..fresh_pin(&mut bridge, &face, &words(1, "a0"), head)
+    };
+    bridge.state.set_key_pin("s-a", "k", &key).unwrap();
+    bridge.after_a_reworded_read = Some(Box::new(|| {
+        panic!("the rebuilt pin read its attempt back as a reworded one")
+    }));
+    *lane.outbox.lock().unwrap() =
+        Some(queued_note("s-a", 1, "@s-r", "a1").replacen(" kind=", " key=k kind=", 1));
+    bridge.drain_outbox();
+    let landed = retired_at(&retirements(&lane), "s-a", 1);
+    assert!(landed.is_some(), "post 1 landed: {:?}", retirements(&lane));
+    let (mut reader, _) = bridge.connect().unwrap();
+    assert_eq!(
+        notes_on(&mut reader, &face)
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a1"],
+        "one record of the key"
+    );
+    let reconciled = bridge.state.key_pin("s-a", "k").unwrap().expect("k's pin");
+    assert_eq!(
+        (reconciled.seq, reconciled.identity, reconciled.original_off),
+        (
+            key.seq,
+            Some(publication_identity(&face, &words(1, "a1"))),
+            landed
+        ),
+        "the key is at its post's record"
+    );
+}
+
+/// **A RECEIPT'S HEAD IS TRUSTED ONLY FOR ITS OWN PIN, ON ITS OWN LOG** (ATERM-KI-1111-7's
+/// review, `state::ACK_HEADS`): a build before the heads neither moves nor clears the head
+/// file, so after a downgrade and an upgrade the file can name another pin's head, or an
+/// offset of a log since replaced. The head kept beside receipt 1's pin is read back for that
+/// pin on the log it was written on, and on another log from that log's start at most (a move
+/// an older build made past it, [`Bridge::read_back_from`]); once an older build pinned the
+/// receipt again at another sequence (its `acks/` file rewritten, the head left), the head
+/// names none.
+#[cfg(unix)]
+#[test]
+fn a_receipts_head_is_read_only_for_its_own_pin() {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+    let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+    let headed = PublishPin {
+        seq: 5,
+        via_key: false,
+        identity: None,
+        original: None,
+        original_off: None,
+        owner: None,
+        at: Some(40),
+    };
+    let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
+    bridge
+        .state
+        .set_receipt_pin("s-host", 1, &headed, log)
+        .unwrap();
+    assert_eq!(
+        bridge
+            .receipt_pin_now("s-host", 1)
+            .unwrap()
+            .map(|pin| pin.at),
+        Some(Some(40)),
+        "its own pin, on its own log"
+    );
+    let another = astream_broker::LogIdentity {
+        id: [7; 16],
+        generation: 0,
+    };
+    assert_ne!(log, Some(another), "PRECONDITION: another log");
+    bridge
+        .state
+        .set_receipt_pin("s-host", 1, &headed, Some(another))
+        .unwrap();
+    let elsewhere = bridge
+        .receipt_pin_now("s-host", 1)
+        .unwrap()
+        .map(|pin| pin.at);
+    assert!(
+        matches!(elsewhere, Some(None | Some(0))),
+        "a head of another log is not an offset of this one: {elsewhere:?}"
+    );
+    std::fs::write(
+        std::path::Path::new(&bridge.cfg.state_dir).join("acks/s-host.1"),
+        "9",
+    )
+    .unwrap();
+    let repinned = bridge.receipt_pin_now("s-host", 1).unwrap();
+    assert_eq!(repinned.as_ref().map(|pin| pin.seq), Some(9));
+    assert_eq!(
+        repinned.map(|pin| pin.at),
+        Some(None),
+        "an older build's pin at another sequence names no head"
+    );
+}
+
+/// What [`reworded_past_a_cut`] left: the records on the receipt's face, by words, and the
+/// offsets aterm was told it landed at.
+#[cfg(unix)]
+struct PastACut {
+    records: Vec<Vec<u8>>,
+    delivered: Vec<u64>,
+    old: Vec<u8>,
+}
+
+/// An owed receipt pinned in words aterm no longer lists, its first attempt landed under the
+/// pin, and retention then cut below the head, carrying that record and dropping its dedup key;
+/// then sent by this bridge.
+#[cfg(unix)]
+fn reworded_past_a_cut(fx: crate::fx::Fx) -> PastACut {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+    bridge.fx = fx;
+    let (broker, _server) = on_a_broker(&lane, &mut bridge, true);
+    let r = OwedReceipt {
+        sid: "s-host".to_string(),
+        rid: 1,
+        off: 7,
+        verdict: "handled".to_string(),
+        kind: "task".to_string(),
+        from: format!("s-sender@{}", bridge.node),
+        earlier_log: false,
+    };
+    let Ok(prefix) = bridge.receipt_lane(&r.from).unwrap() else {
+        unreachable!("an own session's lane")
+    };
+    let subject = format!("{prefix}/ack");
+    let old = receipt_body(1, &r.sid, 5, &r.verdict).encode();
+    let pin = PublishPin {
+        seq: bridge.next_seq().unwrap(),
+        via_key: false,
+        identity: Some(publication_identity(&subject, &old)),
+        original: None,
+        original_off: None,
+        owner: None,
+        at: Some(head_of(&bridge)),
+    };
+    bridge.unsent = None;
+    let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
+    bridge
+        .state
+        .set_receipt_pin(&r.sid, r.rid, &pin, log)
+        .unwrap();
+    landed_earlier(&bridge, pin.seq, &subject, &old);
+    // A class that holds the lanes carries the record past the cut; the cut drops its key.
+    broker
+        .set_retention(
+            astream_broker::Retention::new(
+                vec![
+                    astream_broker::Rule::prefix(crate::broker_rules::EV_FILTER).unwrap(),
+                    astream_broker::Rule::hold(crate::broker_rules::MAIL_FILTER).unwrap(),
+                ],
+                astream_broker::Rule::default_keeping_all(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    broker
+        .retain_before_carrying_state(head_of(&bridge))
+        .unwrap();
+    let sent = bridge.send_receipt(&r);
+    assert!(sent.is_ok(), "{sent:?}");
+    let (mut reader, _) = bridge.connect().unwrap();
+    let rows = match crate::transport::fetch_told_kept(&mut reader, 0, &subject, 16) {
+        Ok(((rows, _), _)) => rows,
+        Err(e) => panic!("the told read: {e}"),
+    };
+    PastACut {
+        records: rows.into_iter().map(|(_, _, bytes)| bytes).collect(),
+        delivered: lane.delivery_offsets(),
+        old,
+    }
+}
+
+/// **A REWORDED RETRY PAST A CUT READS ITS LANDED ATTEMPT BACK** (ATERM-KI-1111-7): published
+/// at its pin's own sequence, a reworded retry is deduped onto a first attempt only while that
+/// attempt's dedup key lives; past a cut that dropped the key, retention still holding the
+/// record, only the read back by the pin's identity finds it, and the receipt settles there,
+/// nothing sent. NEGATIVE CONTROL (`Mutant::RewordedWithoutReadingBack`): no read, and the
+/// current words land a second record beside the first.
+#[cfg(unix)]
+#[test]
+fn a_reworded_retry_past_a_cut_reads_its_landed_attempt_back() {
+    let read = reworded_past_a_cut(crate::fx::Fx::os());
+    assert_eq!(
+        read.records,
+        vec![read.old.clone()],
+        "one record, the first attempt's"
+    );
+    assert_eq!(read.delivered.len(), 1, "{:?}", read.delivered);
+    let control = reworded_past_a_cut(crate::fx::Fx::os_without(
+        crate::sim::world::Mutant::RewordedWithoutReadingBack,
+    ));
+    assert_eq!(
+        control.records.len(),
+        2,
+        "CONTROL: a second record beside the first"
+    );
 }

@@ -214,6 +214,32 @@ fn encode(nonce: &str, state: State) -> String {
     format!("OK 1\n{value}\n")
 }
 
+/// Set to `1` on what another Mac starts here: the renewal its request starts
+/// ([`renewal_command`]), and every tab its fleet drive starts (aterm's window sets it in the
+/// tab's environment). What carries it, and every sign-in that starts, opens no window and no
+/// browser on this Mac's desk (`cli::opens_sign_in_window_by`), and nobody at this Mac's
+/// terminal is taken to have started it (`cli::person_at_terminal`). A tab this Mac started
+/// that another Mac's drive then typed into carries none: the instance that holds the tab
+/// says so (`fleet_session`).
+pub const FOR_PEER_ENV: &str = "ATERM_ACCOUNTS_RENEW_FOR_PEER";
+
+/// The fixed unattended renewal another Mac's request starts here: this Mac's own due
+/// accounts, with no terminal, so nobody at this Mac started it. It is marked as a peer's
+/// ([`FOR_PEER_ENV`]) and carries no grant of the sign-in window
+/// ([`super::open_url::WINDOW_ENV`]), whatever this process inherited: a sign-in that needs
+/// the window ends as an error on record for this Mac's own upkeep or a person at it, and
+/// nothing opens on its desk.
+fn renewal_command(program: &Path) -> aterm_uds::spawnfd::Command {
+    use aterm_uds::spawnfd::Tether as _;
+    let mut command = aterm_uds::spawnfd::command(program);
+    command.tether();
+    command
+        .args(["harness", "accounts", "renew", "--due", "--here"])
+        .env(FOR_PEER_ENV, "1")
+        .env_remove(super::open_url::WINDOW_ENV);
+    command
+}
+
 /// Execute a fixed unattended renewal in this process's own home and configuration.
 fn run(
     program: &Path,
@@ -225,10 +251,7 @@ fn run(
     if scope.is_some() {
         return Ok(None);
     }
-    use aterm_uds::spawnfd::Tether as _;
-    let mut command = aterm_uds::spawnfd::command(program);
-    command.tether();
-    command.args(["harness", "accounts", "renew", "--due", "--here"]);
+    let mut command = renewal_command(program);
     #[cfg(unix)]
     let output = aterm_uds::deadline::output_with_input_until_watching(
         &mut command,

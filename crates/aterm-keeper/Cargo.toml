@@ -13,6 +13,8 @@ description = "aterm — the PTY keeper: a per-login holder of a custody copy of
 # The cordoned unsafe crate the keeper's OS half is built on (descriptors, peers, process
 # birth, exit watch, spawn, holder scan).
 aterm-uds = { workspace = true }
+# Shared native code-requirement checks; Keeper retains its original async owner.
+trust-resource-provenance = { workspace = true }
 # The workspace's one FNV-1a/64, for a dev keeper's per-path label. Its one
 # dependency is astream-wire (dependency-free, vendor/astream), whose byte loop it runs.
 aterm-hash = { workspace = true }

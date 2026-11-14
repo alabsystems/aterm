@@ -148,12 +148,12 @@ pub struct Credential {
 /// `[everyone]` holds them (the names `tests/flows.rs`'s install-lane test hands over).
 pub const CREDENTIALS: [Credential; 3] = [
     Credential {
-        file: "gh_access_token",
+        file: aterm_types::vault_entry::DEV_GH_TOKEN,
         what: "GitHub",
         synthetic: "nux-synthetic-github-%s",
     },
     Credential {
-        file: "gh_access_token_alabsystems",
+        file: aterm_types::vault_entry::RELEASE_GH_TOKEN,
         what: "publishing",
         synthetic: "nux-synthetic-publish-%s",
     },

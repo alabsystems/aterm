@@ -104,7 +104,6 @@ mod exec_plain;
 /// from it (design §6.8).
 pub mod first_launch;
 /// Who raised an update floor, so a revocation can take it back.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod floor_sources;
 #[cfg(target_os = "macos")]
 mod github;
@@ -167,6 +166,9 @@ pub mod restore_soak;
 /// Durable authenticated images for independent service activation.
 #[cfg(unix)]
 pub mod service_artifact;
+/// Where the updater stands: the one decision `aterm update status` and a fleet survey share.
+mod standing;
+pub use standing::{StatusArm, fleet_fact, staged_tries};
 #[cfg(target_os = "macos")]
 mod status;
 #[cfg(target_os = "macos")]
@@ -179,9 +181,11 @@ pub mod which_copy;
 /// The one artifact a window here saw fail to start, which no windowless lane installs.
 mod window_start_failure;
 pub use window_start_failure::{FailedStartBytes, WindowStartFailure};
-/// Windows: the locally staged build's pointer, its standing against the running copy, and the
-/// staged install.
+/// Windows: the staged build (the local build loop's or the release channel's), its standing
+/// against the running copy, and the staged install.
 pub mod windows;
+/// Windows: the signed release channel's portable zip, verified, unpacked and staged.
+pub mod windows_channel;
 
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
@@ -444,15 +448,18 @@ pub const TRIAL_SETTLE_AFTER_REFUSALS: u32 = PERSISTENT_AFTER;
 /// clock step, and an ask that ran no proof add nothing.
 pub const TRIAL_SETTLE_REFUSAL_SPAN: std::time::Duration = PERSISTENT_SPAN;
 
-/// Whether the updater runs on this platform at all.
+/// Whether the in-process updater (the background checker, the Software Update page, the
+/// staged bundle or executable swap) runs on this platform at all. Windows has none of it: its
+/// release channel is checked and staged by [`windows_channel`] through the staged-build watch
+/// ([`staged_notice_enabled`]) and installed by the staged dist's own `install.ps1`.
 #[must_use]
 pub const fn enabled() -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
 /// Whether a window announces a build staged on this machine (`windows::Standing::offered`):
-/// Windows, where [`enabled`] is false and no checker runs. It reads one local file and never
-/// the network.
+/// Windows, where [`enabled`] is false. Its watch reads the local pointers, and checks the
+/// signed release channel when that is due ([`windows_channel::CHECK_EVERY`]).
 #[must_use]
 pub const fn staged_notice_enabled() -> bool {
     cfg!(windows)
@@ -705,6 +712,24 @@ fn older_than(current_build: u64, installed: Option<u64>) -> Option<u64> {
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub const fn older_build_installed(_current_build: u64) -> Option<u64> {
+    None
+}
+
+/// The build of the bundle installed in this copy's place, the one `aterm update status` on this
+/// Mac runs (`~/.local/bin/aterm` is that bundle's): an update may have moved it past the build
+/// this process runs, and a revert put it behind. `None` for a copy outside an installed bundle
+/// and where its build does not read. It reads the installed bundle's `Info.plist` alone.
+#[cfg(target_os = "macos")]
+pub(crate) fn installed_bundle_build() -> Option<u64> {
+    let installed = bundle::resolve()?;
+    installed_build_observed(&installed.app_root).ok()
+}
+
+/// Off macOS no bundle is installed in this copy's place; Linux's status reads the build of the
+/// executable installed at its path itself. Windows asks for none: its standing is the staged
+/// build's ([`windows::Here::fleet_fact`]).
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) const fn installed_bundle_build() -> Option<u64> {
     None
 }
 
@@ -1501,14 +1526,6 @@ pub fn defer_linux_session_verdict(
     {
         false
     }
-}
-
-/// Reads now the path of the executable this process runs, which the Linux lane keeps for the
-/// process's life: read first after a sibling replaced the executable, it would name the
-/// unlinked file and the process would run no background check. A no-op off Linux.
-pub fn linux_capture_executable() {
-    #[cfg(target_os = "linux")]
-    linux::capture_context();
 }
 
 /// A windowed Linux launch has opened its display (its event loop is built): on Linux, counts it
@@ -4248,6 +4265,10 @@ pub struct UpdateStatus {
     /// The update record's hold on a build newer than the running one: live, or lapsed and kept
     /// as history until a start, a newer build or a person ends it.
     pub hold: Option<HoldView>,
+    /// The update record's window-start failure where it names the exact bytes of the staged
+    /// build, newer than the running one ([`HoldView::start_failure_of`]), live or lapsed: while
+    /// it holds, no start without a window (a headless boot, the node job) installs that stage.
+    pub start_failure: Option<HoldView>,
     /// How the last hold ended.
     pub last: Option<update_record::Ended>,
     /// The newest build the check lane saw.
@@ -4288,8 +4309,43 @@ impl HoldView {
     /// `record`'s hold on a build newer than `running`, as of `now`.
     #[must_use]
     pub fn of(record: &update_record::UpdateRecord, running: u64, now: u64) -> Option<Self> {
-        let hold = record.hold.as_ref().filter(|hold| hold.build > running)?;
-        Some(Self {
+        record
+            .hold
+            .as_ref()
+            .filter(|hold| hold.build > running)
+            .map(|hold| Self::view(hold, now))
+    }
+
+    /// `record`'s window-start failure ([`update_record::UpdateRecord::start_failure`]) where it
+    /// names the exact bytes of the stage of build `staged` (`staged_sha256`, its DMG's digest in
+    /// hex of either case) and that build is newer than `running`, as of `now`: what keeps every
+    /// start with no window from installing that stage while it holds
+    /// ([`update_record::UpdateRecord::holds_windowless`]). It is named by the stage's `version`
+    /// where the failure recorded none, as a window books none.
+    #[must_use]
+    pub fn start_failure_of(
+        record: &update_record::UpdateRecord,
+        running: u64,
+        staged: u64,
+        version: &str,
+        staged_sha256: &str,
+        now: u64,
+    ) -> Option<Self> {
+        let failed = record.start_failure.as_ref().filter(|failed| {
+            failed.build == staged
+                && staged > running
+                && update_record::Sha::parse(staged_sha256.trim()) == Some(failed.sha)
+        })?;
+        let mut view = Self::view(failed, now);
+        if view.version.is_empty() {
+            version.clone_into(&mut view.version);
+        }
+        Some(view)
+    }
+
+    /// `hold` as status reports it at `now`.
+    fn view(hold: &update_record::Hold, now: u64) -> Self {
+        Self {
             build: hold.build,
             version: hold.version.clone(),
             cause: hold.cause,
@@ -4299,7 +4355,7 @@ impl HoldView {
             until: hold.until,
             live: hold.live(now),
             peer_lifted: hold.peer_lifted,
-        })
+        }
     }
 }
 
@@ -4494,6 +4550,7 @@ impl UpdateStatus {
             failing_checks_kind: String::new(),
             channel_unreadable: false,
             hold: None,
+            start_failure: None,
             last: None,
             offered: None,
             behind: false,
@@ -4887,8 +4944,22 @@ pub fn ledger_unreadable_cause() -> String {
 #[must_use]
 pub fn status(current_build: u64) -> Option<UpdateStatus> {
     let staging = paths::Staging::resolve()?;
+    Some(status_at(
+        &staging,
+        current_build,
+        bundle::resolve().is_some(),
+    ))
+}
+
+/// [`status`] of the update root `staging`, for a copy that is `installable` or not. Every field
+/// is read from the machine's ledgers, which each process reads alike: whether the channel is
+/// unreadable is the status ledger's mark of the last check, made by whichever process made
+/// that check ([`unreadable::NOTE`]), for this build.
+#[cfg(target_os = "macos")]
+fn status_at(staging: &paths::Staging, current_build: u64, installable: bool) -> UpdateStatus {
     let (mut checked_from_build, mut outcome) = (current_build, String::new());
-    let updated_at = check_receipt::completed_at(&staging).unwrap_or_default();
+    let mut stranded = false;
+    let updated_at = check_receipt::completed_at(staging).unwrap_or_default();
     if let Some(text) = read_ledger_text(&staging.status)
         && let Ok(v) = text.parse::<aterm_toml::Value>()
     {
@@ -4902,8 +4973,10 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
             .and_then(aterm_toml::Value::as_str)
             .unwrap_or("")
             .to_string();
+        stranded = v.get("delivery").and_then(aterm_toml::Value::as_str) == Some(unreadable::NOTE);
     }
-    let mut ready = manifest::Ready::read_publishable(&staging);
+    let channel_unreadable = stranded && checked_from_build == current_build;
+    let mut ready = manifest::Ready::read_publishable(staging);
     let reconciliation = reconcile_status_outcome(
         current_build,
         checked_from_build,
@@ -4914,19 +4987,30 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         ready = None;
     }
     let current_build = reconciliation.current_build;
-    let record = hold::load(&staging);
+    let record = hold::load(staging);
+    let now = install::unix_now_secs();
     let (hold, behind, held) = hold_report(
         &record,
         current_build,
         reconciliation.outcome.into_string(),
-        install::unix_now_secs(),
+        now,
     );
     outcome = held;
+    let start_failure = ready.as_ref().and_then(|ready| {
+        HoldView::start_failure_of(
+            &record,
+            current_build,
+            ready.build_number,
+            &ready.version,
+            &ready.dmg_sha256,
+            now,
+        )
+    });
     let h = health::Health::read(&staging.health());
-    Some(UpdateStatus {
+    UpdateStatus {
         linux: None,
         enabled: enabled(),
-        installable: bundle::resolve().is_some(),
+        installable,
         current_build,
         staged_build: ready.as_ref().map(|r| r.build_number),
         staged_version: ready.as_ref().map(|r| r.version.clone()),
@@ -4944,12 +5028,13 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         failing_kind: h.kind,
         failing_applies: h.apply_failures,
         failing_since: h.failing_since,
-        channel_unreadable: unreadable::is_stranded(),
+        channel_unreadable,
         hold,
+        start_failure,
         last: record.last,
         offered: record.offered,
         behind,
-    })
+    }
 }
 
 /// Timestamp of the last completed check for this source and running build.

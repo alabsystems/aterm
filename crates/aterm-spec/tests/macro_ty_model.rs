@@ -412,3 +412,51 @@ fn writing_a_model_registers_it() {
     assert_eq!(model.name, "RegisteredByAttribute");
     assert_eq!(live.goal.to_tla(), registered_obligation().goal.to_tla());
 }
+
+// Hand-built models must obey the same namespace as macro-authored models.
+#[test]
+fn emission_rejects_reserved_and_cross_role_names() {
+    for name in [
+        "Next",
+        "Init",
+        "Spec",
+        "vars",
+        "seq",
+        "MaxSeq",
+        "CursorBounded",
+    ] {
+        let mut model = cursor_unguarded_hand();
+        model.actions[0].name = name;
+        assert!(
+            std::panic::catch_unwind(|| model.to_tla()).is_err(),
+            "{name}"
+        );
+        assert!(
+            std::panic::catch_unwind(|| model.transition_spec()).is_err(),
+            "{name}"
+        );
+        assert!(
+            std::panic::catch_unwind(|| model.to_cfg()).is_err(),
+            "{name}"
+        );
+        assert!(
+            std::panic::catch_unwind(|| model.transition_cfg(&[])).is_err(),
+            "{name}: transition config"
+        );
+    }
+}
+
+#[test]
+fn emission_rejects_function_variable_collisions() {
+    for name in ["Next", "seq", "Grow"] {
+        let mut model = cursor_unguarded_hand();
+        model.fn_vars.push(aterm_spec::derive::FnVar {
+            name,
+            range: "MaxSeq",
+        });
+        assert!(
+            std::panic::catch_unwind(|| model.to_tla()).is_err(),
+            "{name}"
+        );
+    }
+}

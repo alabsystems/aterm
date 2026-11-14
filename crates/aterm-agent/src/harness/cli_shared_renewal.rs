@@ -486,6 +486,7 @@ impl Guard<'_> {
                             if !required.trim().is_empty() && profile == required => {}
                         RenewBrowser::Default => return Err("shared renewal requires a local browser profile, but its opener is unavailable".into()),
                         RenewBrowser::Remote { .. } => return Err("shared renewal cannot enforce the required browser profile over a remote route".into()),
+                        RenewBrowser::Window { .. } => return Err("shared renewal cannot enforce the required browser profile in aterm's sign-in window".into()),
                         RenewBrowser::Profile { .. } | RenewBrowser::OwnProfile { .. } => return Err("shared renewal selected a different browser profile than the approved requirement".into()),
                     }
                 }
@@ -1028,7 +1029,7 @@ pub(in crate::harness) fn background(
         && !host.work_cancelled()
         && !observation
             .as_ref()
-            .is_some_and(super::RenewalObservation::service_deferred)
+            .is_some_and(super::RenewalObservation::deferred)
         && let Some(lock) = signin.lock()
     {
         guard.failed(

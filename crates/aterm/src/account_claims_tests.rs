@@ -7,12 +7,33 @@ use aterm_types::network_state::{HistoryState, MachineIdentity, PeerObservation,
 use std::time::{Duration, Instant};
 
 fn publication(sampled: Instant, wall_ms: u64) -> Publication {
+    publication_of(sampled, wall_ms, Some(observer()), HistoryState::Ready)
+}
+
+/// This Mac's own identity as its observer confirmed it.
+fn observer() -> MachineIdentity {
+    MachineIdentity {
+        machine_id: [1; 16],
+        incarnation: [1; 16],
+        label: None,
+    }
+}
+
+/// A current Active publication whose one peer was last heard past the presence window, naming
+/// `observer` as its observer, with its history in `history`.
+fn publication_of(
+    sampled: Instant,
+    wall_ms: u64,
+    observer: Option<MachineIdentity>,
+    history: HistoryState,
+) -> Publication {
     let heard = wall_ms - (claims::PRESENCE_TTL_S.unsigned_abs() + 60) * 1000;
     Publication::new(
         NetworkObservation {
             observed_at_ms: wall_ms,
             visibility: Visibility::Active,
-            history: HistoryState::Ready,
+            history,
+            observer,
             peers: vec![PeerObservation {
                 slot: 1,
                 identity: MachineIdentity {
@@ -68,6 +89,106 @@ fn current_local_observation_still_lapses_genuinely_absent_peer_claims() {
     let observation = observation_at(publication(now, wall), now, Some(wall));
     assert_eq!(observation.visibility, Visibility::Active);
     assert!(unheard(&observation, wall));
+}
+
+/// An observer that takes no contacts publishes Active over a peer list it does not keep
+/// current, and names no observer: one that refused its retained history (another observer's or
+/// trust context's, as a writer successor's did before it took up its own), could not open it,
+/// or has not confirmed this Mac yet contacts none of those peers into it, so their last contacts
+/// stand still. Its peers' leases do not lapse by it: it gives no presence, as a Mac that cannot
+/// look gives none. An observer whose checkpoint failed still names itself and takes every
+/// contact (`aterm_db`'s `a_failed_checkpoint_keeps_hearing_peers_and_naming_its_observer`), so
+/// its peers' last contacts are current: an absent peer's lease still lapses by it, as by a
+/// ready one (`current_local_observation_still_lapses_genuinely_absent_peer_claims`).
+///
+/// Negative controls: with presence read off visibility alone, an observer that named none lapsed
+/// the peer's lease (`an observer that takes no contacts lapsed a peer's lease (Unavailable)`);
+/// with it gated on a ready history (2026-11-13), the failed checkpoint's observer gave no
+/// presence and the absent peer's lease stood until its row's `until` (`an observer whose
+/// checkpoint failed kept an absent peer's lease`).
+#[test]
+fn an_observer_that_takes_no_contacts_lapses_no_claim() {
+    let wall = 2_000_000;
+    let now = Instant::now();
+    let failed = observation_at(
+        publication_of(now, wall, Some(observer()), HistoryState::Unavailable),
+        now,
+        Some(wall),
+    );
+    assert!(
+        unheard(&failed, wall),
+        "an observer whose checkpoint failed kept an absent peer's lease"
+    );
+    for history in [
+        HistoryState::Unavailable,
+        HistoryState::Restoring,
+        HistoryState::Ready,
+    ] {
+        let observation = observation_at(publication_of(now, wall, None, history), now, Some(wall));
+        assert_eq!(
+            observation.visibility,
+            Visibility::Active,
+            "PRECONDITION: a current publication"
+        );
+        assert!(
+            !unheard(&observation, wall),
+            "an observer that takes no contacts lapsed a peer's lease ({history:?})"
+        );
+        assert_eq!(presence(&observation), None, "{history:?}");
+    }
+}
+
+/// The newest row this Mac's earlier writer seat signed (the db read's `former`) goes into the
+/// book as the current seat's own row at counter 0, while that seat has none: its claims keep
+/// their `since`, so a peer's claim made after them is junior here (the harness's
+/// `a_writer_successor_keeps_the_seniority_of_the_claims_it_still_uses`). It never replaces a row
+/// the current seat wrote, and a lapsed row or one that claims nothing carries nothing.
+///
+/// Negative control: with `carry` putting nothing in, the book held no row of the current seat's
+/// (`carried as the current seat's own row`), so the peer's junior claim held the account.
+#[test]
+fn the_earlier_seats_row_carries_its_seniority_into_the_current_seats_book() {
+    use aterm_json::json;
+    let now = 1_790_000_000;
+    let body = |counter: u64, since: i64, until: i64| {
+        json!({"v": 1, "label": "m1", "counter": counter, "until": until, "claims": [
+            {"pool": "claude", "email": "a@example.test", "kind": "lease", "since": since}
+        ]})
+    };
+    let key = claims::LeaseKey::new("claude", "a@example.test").unwrap();
+    let peer = Row::from_value("dd04", &body(1, now - 600, now + 3600)).unwrap();
+    let former = body(7, now - 1200, now + 3600);
+    let mut book = Book::of([peer.clone()]);
+    carry(&mut book, "ee01", Some(&former), now);
+    let carried = book
+        .row("ee01")
+        .expect("carried as the current seat's own row");
+    assert_eq!(carried.counter, 0);
+    assert_eq!(
+        carried.claim(&key).map(|claim| claim.since),
+        Some(now - 1200)
+    );
+    let view = claims::View {
+        me: "ee01".to_owned(),
+        ..claims::View::default()
+    };
+    assert_eq!(
+        book.senior(&key, &view, now).map(|holder| holder.machine),
+        Some("ee01".to_owned()),
+        "the peer's later claim is junior"
+    );
+    // A row the current seat wrote stands.
+    let written = Row::from_value("ee01", &body(1, now, now + 3600)).unwrap();
+    let mut book = Book::of([peer.clone(), written.clone()]);
+    carry(&mut book, "ee01", Some(&former), now);
+    assert_eq!(book.row("ee01"), Some(&written));
+    // A lapsed row, one that claims nothing, and none at all carry nothing.
+    let empty = json!({"v": 1, "label": "m1", "counter": 7, "until": now + 3600, "claims": []});
+    for former in [Some(body(7, now - 1200, now)), Some(empty), None] {
+        let mut book = Book::of([peer.clone()]);
+        carry(&mut book, "ee01", former.as_ref(), now);
+        assert_eq!(book.row("ee01"), None, "{former:?}");
+    }
 }
 
 #[test]

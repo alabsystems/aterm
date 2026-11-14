@@ -145,7 +145,10 @@ pub(crate) struct TerminalLeafRestore {
     pub claim_ended: bool,
     /// The task record of a parked worker in this leaf, as a seamless update carries one without
     /// its ages ([`crate::task_record::restore_row`]), so a restore other than a seamless update
-    /// keeps the row a worker's tab is listed by ([`crate::task_record::seed_restored`]).
+    /// keeps the row a worker's tab is listed by ([`crate::task_record::seed_restored`]). The
+    /// result file the row names outlives the quit that wrote it
+    /// (`crate::task_launch::retire_task_files_at_quit`). A worker kept as a tab is the person's
+    /// and carries none: its record, and the result it named, end with the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
     /// The agent this leaf carries runs in a claim folder but is no claim worker (the leaf names
@@ -2908,7 +2911,7 @@ pub(crate) fn manifest_path() -> Option<PathBuf> {
 /// Durably write `manifest` under the process-shared restore lock.
 #[cfg(test)]
 pub(crate) fn write_to(path: &Path, manifest: &RestoreManifest) -> Result<(), String> {
-    write_quit_to(path, manifest, None)
+    write_quit_to(path, manifest, None).map_err(String::from)
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -3064,6 +3067,9 @@ fn other_desks(path: &Path, run: &str) -> Vec<Desk> {
         .collect()
 }
 
+/// The quit's write of its layout `manifest` of run `run` to `path`, durably, under the restore
+/// lock, its fault kept whole: it says whether the layout was published before the write failed
+/// ([`RestoreFault::published`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -3076,9 +3082,8 @@ pub(crate) fn write_quit_to(
     path: &Path,
     manifest: &RestoreManifest,
     run: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), RestoreFault> {
     write_quit_to_waiting(path, manifest, run, LockWait::Unbounded, Flush::Durable)
-        .map_err(String::from)
 }
 
 /// [`write_quit_to`] for the cold update lane, which runs on the GUI main thread.
@@ -3409,13 +3414,6 @@ impl RestoreFault {
         self.passing
     }
 
-    #[cfg_attr(
-        not(unix),
-        allow(
-            dead_code,
-            reason = "the cold update lane, which reads it, is unix-only"
-        )
-    )]
     pub(crate) const fn published(&self) -> bool {
         self.published
     }
@@ -3761,12 +3759,16 @@ fn sync_restore_directory(_path: &Path, _flush: Flush) -> std::io::Result<()> {
 /// Write the manifest to the standard [`manifest_path`] (graceful-quit hook).
 #[cfg(any(windows, test))]
 pub(crate) fn write(manifest: &RestoreManifest) -> Result<(), String> {
-    write_quit(manifest, None)
+    write_quit(manifest, None).map_err(String::from)
 }
 
-/// [`write`] for the quit.
-pub(crate) fn write_quit(manifest: &RestoreManifest, run: Option<&str>) -> Result<(), String> {
-    let path = manifest_path().ok_or_else(no_manifest_path)?;
+/// [`write`] for the quit: [`write_quit_to`] at the standard [`manifest_path`], its fault kept
+/// whole, so the quit knows a layout that was published though the write failed after.
+pub(crate) fn write_quit(
+    manifest: &RestoreManifest,
+    run: Option<&str>,
+) -> Result<(), RestoreFault> {
+    let path = manifest_path().ok_or_else(|| RestoreFault::settled(no_manifest_path()))?;
     write_quit_to(&path, manifest, run)
 }
 

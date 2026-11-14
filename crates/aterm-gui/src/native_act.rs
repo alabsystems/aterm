@@ -1130,11 +1130,13 @@ impl Operation {
         self.seal_completion(Decision::Retired(reason))
     }
 
+    /// An uncertain append was never delivered (delivery needs it recorded), so it ends only in
+    /// a decision that claims nothing about execution: Unknown, or Closed at its close.
     fn seal_completion(&mut self, decision: Decision) -> Option<Completion> {
         if !self.preparation.can_publish()
             || matches!(self.grant_record, GrantRecord::Writing(_))
             || (matches!(self.grant_record, GrantRecord::Uncertain(_))
-                && decision != Decision::Unknown)
+                && !matches!(decision, Decision::Unknown | Decision::Closed))
         {
             return None;
         }
@@ -3095,9 +3097,18 @@ fn finish(
         project = "aterm_gui::native_act::tests::publication::transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Hear",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
 fn completed_reply(operation: &Arc<Mutex<Operation>>) -> String {
     let op = operation.lock().unwrap_or_else(|p| p.into_inner());
     let phase = op.phase;
+    let id = op.request.id.clone();
     let claim = op.claim_outcome;
     let drain = op.completion_drain.clone();
     let observation = op.completed_observation.clone();
@@ -3151,6 +3162,9 @@ fn completed_reply(operation: &Arc<Mutex<Operation>>) -> String {
         Phase::Completed(Decision::ProvenNotCommittedRollbackSafe) => ROLLBACK_SAFE.into(),
         Phase::Completed(Decision::Retired(reason)) => {
             format!("OK native-act state=retired reason={}\n", reason.word())
+        }
+        Phase::Completed(Decision::Closed) => {
+            aterm_agent::harness::native_act::closed_reply(&id).unwrap_or_else(|| UNKNOWN.into())
         }
         _ => UNKNOWN.into(),
     }
@@ -3292,6 +3306,14 @@ fn resolved_reply(command: &RestartCommand, deadline_us: u64) -> String {
     )
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "GrantAck",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
 fn serve_launcher(
     ctx: &Arc<crate::SessionCtx>,
     master: i32,
@@ -3409,6 +3431,30 @@ impl Drop for GrantWriting {
         machine = "IssuerGrant",
         action = "Invalidate",
         reason = "The injected conversation authority becomes stale"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Reserve",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Deliver",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHandoffHold",
+        action = "ChildExits",
+        reason = "The grantee the launcher exec'd exits, which the retained kernel death watch observes"
     )
 )]
 #[cfg_attr(
@@ -4023,6 +4069,7 @@ pub(crate) fn fixture_operation_state(
         Phase::Completed(Decision::ProvenNotCommittedRollbackSafe) => {
             ("completed", "rollback-safe")
         }
+        Phase::Completed(Decision::Closed) => ("completed", "closed"),
         Phase::Completed(_) => ("completed", "other"),
         _ => ("active", "none"),
     };
@@ -4053,6 +4100,42 @@ pub(crate) fn fixture_operation_state(
     )
 }
 
+/// An own-image deadline revokes completion authority without claiming what the external
+/// supervisor did. Terminal operations retain their original result, including a commit
+/// sealed before expiry. An unread clock proves no expiry.
+fn own_image_expired(op: &Operation) -> bool {
+    matches!(op.request.plan, NativePlan::OwnImage { .. })
+        && !matches!(op.phase, Phase::Queued | Phase::Completed(_))
+        && op
+            .clock
+            .now_us()
+            .is_some_and(|now| now >= op.request.deadline_us)
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Sweep",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "ReleaseUngranted",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Retire",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
 fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
     let operations = {
         let table = match ctx.fenced_writes.native.try_lock() {
@@ -4083,6 +4166,13 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
         if matches!(op.phase, Phase::Queued | Phase::Completed(_)) {
             continue;
         }
+        if own_image_expired(&op) {
+            let completion = op.seal_completion(Decision::Unknown);
+            drop(op);
+            let _ = finish(ctx, &operation, completion);
+            ctx.watchers.ring_watchers();
+            continue;
+        }
         let abandoned = match &op.request.plan {
             NativePlan::OwnImage { .. } => true,
             NativePlan::Restart { shell, .. } => {
@@ -4107,12 +4197,11 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
             ctx.watchers.ring_watchers();
             continue;
         }
-        if op.authority.builtin
-            && (!op.signal_sent || op.signal_accepted == Some(false))
-            && !op.resume_sent
-            && op.resume_attempt.is_none()
-        {
-            let Some(completion) = op.seal_without_effect(kernel) else {
+        if took_no_effect(&op) {
+            let Some(completion) = op
+                .seal_without_effect(kernel)
+                .or_else(|| close_at_close(&mut op, kernel))
+            else {
                 continue;
             };
             drop(op);
@@ -4121,6 +4210,12 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
             continue;
         }
         let Some(reason) = retirement(&op, kernel) else {
+            if let Some(completion) = close_at_close(&mut op, kernel) {
+                drop(op);
+                let _receipt = finish(ctx, &operation, Some(completion));
+                ctx.watchers.ring_watchers();
+                continue;
+            }
             if starts_nothing_more(&op, kernel)
                 && let Some(custody) = &op.custody
             {
@@ -4135,32 +4230,132 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
     }
 }
 
+/// A builtin restart that took no effect, which [`Operation::seal_without_effect`] proves
+/// rollback-safe: its signal never went or was refused, and no Resume, input attempt or grant
+/// followed. A refused rollback Resume resets `resume_sent` and the attempt before its guards
+/// answer, over a grant that may have run; that restart took effect, and the grant record says so.
+fn took_no_effect(op: &Operation) -> bool {
+    op.authority.builtin
+        && (!op.signal_sent || op.signal_accepted == Some(false))
+        && !op.resume_sent
+        && op.resume_attempt.is_none()
+        && op.grant_record == GrantRecord::None
+}
+
+/// Whether `op`, a restart, has passed its close ([`Prepare::close_us`]) on its monotonic clock,
+/// the one clock every process of the boot reads. A clock that does not read counts as past it:
+/// what the close seals ([`Decision::Closed`]) claims nothing. An own-image move has no close: it
+/// ends Unknown at its deadline, which an unread clock does not pass ([`own_image_expired`]).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHandoffHold",
+        action = "Expire",
+        reason = "The injected monotonic clock passes the operation's deadline, which fences every effect"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHandoffHold",
+        action = "PassClose",
+        reason = "The injected monotonic clock passes the close, the deadline plus COMPLETION_US"
+    )
+)]
+fn past_close(op: &Operation) -> bool {
+    matches!(op.request.plan, NativePlan::Restart { .. })
+        && op.clock.remaining(op.request.close_us()).is_none()
+}
+
+/// The operation's end at its close ([`Prepare::close_us`]), where nothing else ends it: past the
+/// close no host epoch commits, precommits, recovers or reconciles it, so the sweep and each of
+/// those requests seal it here, once. The sweep's own verdicts come first, each more precise than
+/// a close: a quiet uncertain grant is Unknown, an operation that took no effect is rollback-safe,
+/// one whose every process exited retires, and one that can start nothing more keeps its early
+/// release ([`starts_nothing_more`]) and its later positive retirement. Anything else is sealed
+/// [`Decision::Closed`], which claims nothing about execution, and dropping its custody lets the
+/// update's handoff go on. `None` while the close is ahead; while a grant's append is in flight,
+/// whose outcome is not yet a fact; while an input attempt may still write a byte, half a line a
+/// successor's input could finish. An account continuation uses the existing opaque terminal
+/// seal: relation recovery retains its possible-execution evidence, without a NoExec witness or
+/// another successor. Unlike an ordinary restart's early release, its close also ends retained
+/// account custody. An own-image move never reaches it: it closes Unknown at its deadline
+/// ([`own_image_expired`]).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Sweep",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
+fn close_at_close(op: &mut Operation, kernel: &dyn Kernel) -> Option<Completion> {
+    if !past_close(op)
+        || matches!(op.grant_record, GrantRecord::Writing(_))
+        || op
+            .resume_attempt
+            .as_ref()
+            .is_some_and(|attempt| !attempt.idle())
+    {
+        return None;
+    }
+    if uncertain_quiescent(op, kernel) {
+        return op.seal_completion(Decision::Unknown);
+    }
+    if took_no_effect(op)
+        && let Some(completion) = op.seal_without_effect(kernel)
+    {
+        return Some(completion);
+    }
+    if let Some(reason) = retirement(op, kernel) {
+        return op.seal_retirement(reason, kernel);
+    }
+    if op.authority.account.is_none() && starts_nothing_more(op, kernel) {
+        return None;
+    }
+    op.seal_completion(Decision::Closed)
+}
+
 /// An abandoned operation that can start nothing more, though its processes may outlive it by
 /// days. A restart signalled before its deadline and past it now, with no Resume, grant or
 /// child: Signal and Resume refuse past the deadline and no child exists without a Resume, so
 /// all it can still do is wait for the source's own exit, which a source that outlives its
 /// SIGTERM, or a group that keeps a member, may never make. An own-image move whose actor is
-/// gone: every request on it must come from that actor's exact process ([`same_actor`]), so
-/// nothing is left to move or record the child it moved, which may run on. The update's handoff
-/// stops waiting on either ([`NativeCustody::release_handoff_guard`]); the input position stays
-/// until it retires. A restart that granted a child Execute is not one: past its deadline its
-/// Precommit and Commit still seal and record its outcome, which no successor could answer.
+/// gone before its deadline: every request on it must come from that actor's exact process
+/// ([`same_actor`]), so nothing is left to move or record the child it moved, which may run on.
+/// The update's handoff stops waiting on either ([`NativeCustody::release_handoff_guard`]); the
+/// input position stays until it retires. A restart that granted a child Execute is not one:
+/// past the deadline it may still commit until its close, where [`close_at_close`] seals it. An
+/// own-image move whose actor lives closes Unknown at its deadline ([`own_image_expired`]).
 fn starts_nothing_more(op: &Operation, kernel: &dyn Kernel) -> bool {
     match &op.request.plan {
-        NativePlan::Restart { .. } => {
-            op.clock.remaining(op.request.deadline_us).is_none()
-                && op.signal_accepted == Some(true)
-                && !op.resume_sent
-                && op.resume_attempt.is_none()
-                && op.grant_record == GrantRecord::None
-                && op.children.iter().all(Option::is_none)
-        }
+        NativePlan::Restart { .. } => signalled_and_never_resumed(op),
         NativePlan::OwnImage { .. } => op
             .authority
             .actor
             .as_ref()
             .is_some_and(|actor| kernel.birth_alive(actor) == Some(false)),
     }
+}
+
+/// The restart arm of [`starts_nothing_more`]: past its deadline, its signal accepted, and no
+/// Resume, input attempt, grant or child. The own-image arm is outside `NativeHandoffHold`, a
+/// model of one restart, and releases on its actor's death whatever the clock says.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "ReleaseUngranted",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
+fn signalled_and_never_resumed(op: &Operation) -> bool {
+    op.clock.remaining(op.request.deadline_us).is_none()
+        && op.signal_accepted == Some(true)
+        && !op.resume_sent
+        && op.resume_attempt.is_none()
+        && op.grant_record == GrantRecord::None
+        && op.children.iter().all(Option::is_none)
 }
 
 pub(crate) fn serve(
@@ -4289,7 +4484,7 @@ enum TerminalRecord {
     aterm_spec_anchor::spec_unmodeled(
         machine = "TerminalPublication",
         action = "CloseUnknown",
-        reason = "An opaque terminal fact is supplied by the separately checked completion protocol"
+        reason = "An opaque terminal fact (Unknown, or Closed at the operation's close) is supplied by the separately checked completion protocol"
     )
 )]
 #[cfg_attr(
@@ -4456,6 +4651,7 @@ fn serve_with_publication(
         || reply == ROLLBACK_SAFE
         || reply.starts_with("OK native-act state=committed ")
         || reply.starts_with("OK native-act state=retired ")
+        || reply.starts_with("OK native-act state=closed ")
     {
         let operation = operation.or_else(|| request_operation(ctx, &saved));
         let evidence = operation.as_ref().and_then(|operation| {
@@ -4559,9 +4755,10 @@ fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> 
     }
 }
 
-/// `lapsed` for a refused restart prepare when no grant under it can leave an agent running,
-/// from facts this host reads now; `None` keeps the refusal. It writes, reserves and admits
-/// nothing, and claims nothing about the old operation's other resources.
+/// `lapsed` for a refused restart prepare when no grant under it can leave an agent running, and
+/// `closed` when one may have but the operation's close has passed, from facts this host reads
+/// now; `None` keeps the refusal. It writes, reserves and admits nothing, and claims nothing
+/// about the old operation's other resources.
 ///
 /// Only a cold or supported typed asked restart from the built-in harness qualifies (the
 /// caller's `historical_reader`), with no reservation, cancellation, account fence, renewal
@@ -4586,11 +4783,16 @@ fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> 
 ///    possible execution or a seal), or an absence from the journal its `custody=` stamp
 ///    names, `lapsed` at any clock:
 ///    every process of that boot has ended, and no host of this boot admits the stamp;
-/// 6. a complete recipient history can lapse on this boot after the deadline when every
+/// 6. its possible execution (the record, or a seal after it) read on this boot at or past the
+///    operation's close ([`Prepare::close_us`]) is `closed`: past the close no host epoch of this
+///    boot commits, precommits, recovers or reconciles the operation, so its old host answers
+///    `closed` as well, and `closed` claims nothing about whether the grant ran;
+/// 7. a complete recipient history can lapse on this boot after the deadline when every
 ///    recorded birth and process group has positively retired; its own reader keeps unknown
 ///    probes, foreign clocks and inconsistent histories held;
-/// 7. anything else keeps the refusal: legacy possible execution on this boot, another record
-///    of the id, an unreadable journal, a deadline still ahead, or an unstamped absence.
+/// 8. anything else keeps the refusal: legacy possible execution on this boot, possible
+///    execution recorded on this boot before its close, another record of the id, an unreadable
+///    journal, a deadline still ahead, or an unstamped absence.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -4762,6 +4964,30 @@ fn historical(ctx: &crate::SessionCtx, saved: &Request, kernel: &dyn Kernel) -> 
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
+        machine = "NativeHistoricalClosure",
+        action = "AnswerClosed",
+        project = "aterm_gui::native_act::tests::historical_closure::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHistoricalClosure",
+        action = "PassClose",
+        reason = "The boot's monotonic clock, which every process of the boot reads, passes the close: the deadline plus COMPLETION_US"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Answer",
+        project = "aterm_gui::native_act::tests::handoff_hold::Successor::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "RecipientClosure",
         action = "ReadClock",
         project = "aterm_gui::native_act::tests::recipient_recovery::World::probe"
@@ -4817,7 +5043,12 @@ fn historical_prepare(
         Closure::Exact(Recorded::NoExec) => return Some(NOEXEC.into()),
         Closure::Exact(Recorded::Sealed { may_execute: false }) => true,
         Closure::Exact(Recorded::Prepared) => expired || other_boot,
-        Closure::Exact(Recorded::MayExecute | Recorded::Sealed { may_execute: true }) => other_boot,
+        Closure::Exact(Recorded::MayExecute | Recorded::Sealed { may_execute: true }) => {
+            if !other_boot && clock_us >= prepare.close_us() {
+                return aterm_agent::harness::native_act::closed_reply(&prepare.id);
+            }
+            other_boot
+        }
         Closure::Absent(custody) => {
             prepare.custody.is_some() && custody == prepare.custody && (expired || other_boot)
         }
@@ -4840,6 +5071,36 @@ fn historical_prepare(
     }
 }
 
+/// Finish what [`close_at_close`] sealed and answer it; Unknown where it sealed nothing.
+fn seal_at_close(
+    ctx: &crate::SessionCtx,
+    operation: &Arc<Mutex<Operation>>,
+    completion: Option<Completion>,
+) -> String {
+    let Some(completion) = completion else {
+        return UNKNOWN.into();
+    };
+    let reply = finish(ctx, operation, Some(completion));
+    ctx.watchers.ring_watchers();
+    reply
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Commit",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeHandoffHold",
+        action = "Sweep",
+        project = "aterm_gui::native_act::tests::handoff_hold::Host::probe"
+    )
+)]
 fn serve_request(
     ctx: &Arc<crate::SessionCtx>,
     master: i32,
@@ -4854,7 +5115,7 @@ fn serve_request(
             return format!("OK native-act state=constructors plans={}\n", if enabled.is_empty() { "-".into() } else { enabled.join(",") });
         }
         Request::Info => return host_epoch().map_or_else(|| "ERR native entropy unavailable\n".into(), |epoch|
-            format!("OK native-act state=info epoch={epoch} native-act=1 handoff=blocked clock=monotonic-us own-image={}\n", own_image_rows(&ctx.native_policy))),
+            format!("OK native-act state=info epoch={epoch} native-act=1 handoff=close clock=monotonic-us own-image={}\n", own_image_rows(&ctx.native_policy))),
         Request::RejectionDomain => return if caller.principal == crate::control::Principal::Harness {
             match kernel.rejection_domain() {
                 Ok(Some(domain)) => format!("OK native-act state=rejection-domain domain={domain}\n"),
@@ -4993,6 +5254,29 @@ fn serve_request(
         }
         return DENIED.into();
     }
+    if own_image_expired(&op) {
+        let completion = op.seal_completion(Decision::Unknown);
+        drop(op);
+        drop(mutation_meta);
+        drop(_asked_account_guard);
+        let reply = finish(ctx, &operation, completion);
+        ctx.watchers.ring_watchers();
+        return reply;
+    }
+    // Past its close nothing changes an operation's outcome in any host epoch: each request that
+    // could seals it as the sweep does ([`close_at_close`]) and answers what it sealed. Abort and
+    // Query read the outcome without changing it.
+    if matches!(
+        request,
+        Request::Recover(_) | Request::Precommit(..) | Request::Commit(..) | Request::Reconcile(_)
+    ) && !matches!(op.phase, Phase::Queued | Phase::Completed(_))
+        && past_close(&op)
+    {
+        let completion = close_at_close(&mut op, kernel);
+        drop(op);
+        drop(mutation_meta);
+        return seal_at_close(ctx, &operation, completion);
+    }
     match request {
         Request::Recover(_) => {
             if matches!(op.phase, Phase::Completed(_)) {
@@ -5105,6 +5389,12 @@ fn serve_request(
             }
         },
         Request::Precommit(_, phase) => {
+            // A poll that meets the close answers it, as Commit would; every other terminal
+            // outcome keeps its Unknown here and is read by Query.
+            if op.phase == Phase::Completed(Decision::Closed) {
+                drop(op);
+                return completed_reply(&operation);
+            }
             let outcome = if matches!(op.phase, Phase::Started | Phase::Precommitted(_)) {
                 observe_image_outcome(&op, master, phase, kernel)
             } else {
@@ -5222,6 +5512,15 @@ fn serve_request(
                         }
                     }
                 }
+                // The last read before the seal, under the Meta and operation locks the sweep
+                // only tries: Committed is never sealed at or past the close.
+                if past_close(&op) {
+                    let completion = close_at_close(&mut op, kernel);
+                    drop(op);
+                    drop(mutation_meta);
+                    drop(capture);
+                    return seal_at_close(ctx, &operation, completion);
+                }
                 op.commit_version = Some(version);
                 let mut completion = op.seal_completion(Decision::Committed);
                 if completion.is_some()
@@ -5270,11 +5569,39 @@ fn serve_request(
             drop(mutation_meta);
             let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
+            // Between the locks the sweep may have closed it: answer that, never rebind.
+            if matches!(op.phase, Phase::Completed(_)) {
+                drop(op);
+                drop(meta);
+                return completed_reply(&operation);
+            }
+            // Waiting for Meta cannot extend an own-image move's completion authority.
+            if own_image_expired(&op) {
+                let completion = op.seal_completion(Decision::Unknown);
+                drop(op);
+                drop(meta);
+                let reply = finish(ctx, &operation, completion);
+                ctx.watchers.ring_watchers();
+                return reply;
+            }
             if op.phase != Phase::Committing(phase)
                 || (!op.authority.builtin && (caller.connection != op.channel || op.channel_closed))
                 || !image_outcome(&op, master, phase, kernel)
             {
                 return UNKNOWN.into();
+            }
+            // Kernel outcome observations may themselves consume the remaining time. This is the
+            // last clock read before the claim is rebound, under the Meta and operation locks the
+            // sweep only tries. Only an own-image move reaches here (a builtin Commit returned
+            // above), and one at or past its deadline binds nothing; an unread clock proves no
+            // expiry, so it still binds.
+            if own_image_expired(&op) {
+                let completion = op.seal_completion(Decision::Unknown);
+                drop(op);
+                drop(meta);
+                let reply = finish(ctx, &operation, completion);
+                ctx.watchers.ring_watchers();
+                return reply;
             }
             if !op.authority.builtin
                 && meta.supervisor_authority(crate::metrics::now_us()) == op.authority.snapshot
@@ -5730,6 +6057,14 @@ impl NativeInput {
     fn settled(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.sealed && state.pending == 0 && !state.uncertain
+    }
+
+    /// No byte of this attempt can follow: its producer sealed it and no work is pending. Unlike
+    /// [`Self::settled`] it reads no `uncertain`, which an attempt that may have written keeps
+    /// for good.
+    fn idle(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.sealed && state.pending == 0
     }
 
     pub(crate) fn start(&self, nonparking: bool) -> bool {

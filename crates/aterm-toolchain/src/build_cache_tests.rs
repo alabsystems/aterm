@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+impl FinalTarget {
+    fn explicit_path(self) -> PathBuf {
+        match self {
+            Self::Explicit(path) => path,
+            Self::WorkspaceDefault => panic!("expected an explicitly selected final target"),
+        }
+    }
+}
+
 #[test]
 fn only_an_external_frontend_loses_the_config_words() {
     let words = |line: &str| {
@@ -133,7 +142,7 @@ fn native_manifest_discovery_keeps_directory_priority_and_explicit_overrides() {
                 member.join("Cargo.toml").display().to_string(),
             ]);
         }
-        let selected = explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None);
+        let selected = selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None);
         let expected = match shape {
             "preferred-unreadable" => None,
             "nearest-cargo" | "explicit-cargo" => Some(member.join("Cargo.toml")),
@@ -172,7 +181,7 @@ fn native_manifest_discovery_reaches_a_distant_compatibility_manifest() {
         "--target-dir".into(),
         home.join("output").display().to_string(),
     ];
-    let selected = explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None).unwrap();
+    let selected = selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).unwrap();
     assert_eq!(selected.manifests, vec![owner.join("Cargo.toml")]);
 }
 
@@ -209,7 +218,7 @@ fn implicit_manifest_selection_distinguishes_absence_from_read_errors() {
                 "--target-dir".into(),
                 home.join("output").display().to_string(),
             ];
-            let selected = explicit_cache(&args, tool, &machine, &|_| UserAlias::None);
+            let selected = selected_outputs(&args, tool, &machine, &|_| UserAlias::None);
             let expected = match shape {
                 "readable" => Some(cwd.join("Cargo.toml")),
                 "absent" => Some(parent.join("Cargo.toml")),
@@ -276,8 +285,8 @@ fn explicit_outputs_keep_independent_winners_and_definition_bases() {
                 "settings/root.toml".into(),
             ];
             args.extend(extra.into_iter().map(str::to_owned));
-            let selected = explicit_cache(&args, tool, &machine, &|_| UserAlias::None).unwrap();
-            assert_eq!(selected.target, target);
+            let selected = selected_outputs(&args, tool, &machine, &|_| UserAlias::None).unwrap();
+            assert_eq!(selected.target.explicit_path(), target);
             assert_eq!(selected.intermediates, Some(intermediate));
             assert_eq!(selected.manifests, vec![cwd.join("Cargo.toml")]);
         }
@@ -314,7 +323,7 @@ fn explicit_intermediates_require_a_known_path_and_frontend() {
                 "--target-dir".into(),
                 "final".into(),
             ];
-            let selected = explicit_cache(&args, tool, &machine, &|_| UserAlias::None);
+            let selected = selected_outputs(&args, tool, &machine, &|_| UserAlias::None);
             if raw == "intermediate" && tool != Tool::Cargo {
                 assert_eq!(selected.unwrap().intermediates, Some(cwd.join(raw)));
             } else {
@@ -363,7 +372,7 @@ fn proof_frontend_output_selection_requires_its_own_provenance() {
                 args.extend(["--target-dir".into(), "final".into()]);
             }
             assert!(
-                explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None).is_none(),
+                selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).is_none(),
                 "global={global} {config}"
             );
         }
@@ -376,7 +385,7 @@ fn proof_frontend_output_selection_requires_its_own_provenance() {
     ];
     let env = |name: &str| (name == BUILD_DIR_ENV).then(|| OsString::from("separate"));
     assert!(
-        explicit_cache(
+        selected_outputs(
             &args,
             Tool::Targo,
             &Machine {
@@ -387,8 +396,8 @@ fn proof_frontend_output_selection_requires_its_own_provenance() {
         )
         .is_none()
     );
-    let selected = explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None).unwrap();
-    assert_eq!(selected.target, cwd.join("final"));
+    let selected = selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).unwrap();
+    assert_eq!(selected.target.explicit_path(), cwd.join("final"));
     assert!(
         selected.intermediates.is_none(),
         "the known explicit proof target keeps its existing custody path"
@@ -441,7 +450,8 @@ fn a_configured_target_is_the_one_every_targo_reads() {
             writable: &|_| Some(true),
         };
         assert_eq!(
-            explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None).map(|c| c.target),
+            selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None)
+                .map(|c| c.target.explicit_path()),
             expected,
             "{in_outer:?} {in_twin:?}"
         );
@@ -525,7 +535,8 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
             expected.clone()
         };
         assert_eq!(
-            explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None).map(|c| c.target),
+            selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None)
+                .map(|c| c.target.explicit_path()),
             trust_expected,
             "{text}"
         );
@@ -540,7 +551,7 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
         let env =
             |key: &str| (key == "CARGO_TARGET_DIR").then(|| overridden.clone().into_os_string());
         assert_eq!(
-            explicit_cache(
+            selected_outputs(
                 &args,
                 Tool::Targo,
                 &Machine {
@@ -550,7 +561,8 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
                 &|_| UserAlias::None,
             )
             .unwrap()
-            .target,
+            .target
+            .explicit_path(),
             overridden
         );
     }
@@ -1927,10 +1939,10 @@ fn cli_include_graphs_preserve_target_custody_only_when_every_layer_does() {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-            let selected = explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None);
+            let selected = selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None);
             assert_eq!(selected.is_some(), accepted, "{config}: {leaf:?}");
             if let Some(selected) = selected {
-                assert_eq!(selected.target, cwd.join("fresh"));
+                assert_eq!(selected.target.explicit_path(), cwd.join("fresh"));
                 if leaf.is_some_and(|text| text.contains("separate")) {
                     assert_eq!(selected.intermediates, Some(cwd.join("separate")));
                 }
@@ -1975,9 +1987,10 @@ fn included_targets_keep_definition_bases_and_cargo_merge_order() {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let selected = explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None).unwrap();
+        let selected =
+            selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).unwrap();
         assert_eq!(
-            selected.target,
+            selected.target.explicit_path(),
             cwd.join(if own { "own" } else { "cfg/two" })
         );
         let inline = [
@@ -1990,9 +2003,10 @@ fn included_targets_keep_definition_bases_and_cargo_merge_order() {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         assert_eq!(
-            explicit_cache(&inline, Tool::Targo, &machine, &|_| UserAlias::None)
+            selected_outputs(&inline, Tool::Targo, &machine, &|_| UserAlias::None)
                 .unwrap()
-                .target,
+                .target
+                .explicit_path(),
             cwd.join("cfg/two")
         );
     }
@@ -2043,9 +2057,9 @@ fn explicit_targets_accept_only_proven_directory_neutral_config_files() {
                     ],
                 ]
                 .concat();
-                let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
+                let selected = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None)
                     .expect("readable directory-neutral file preserves explicit target custody");
-                assert_eq!(selected.target, cwd.join("fresh.noindex"));
+                assert_eq!(selected.target.explicit_path(), cwd.join("fresh.noindex"));
                 assert_eq!(selected.manifests, vec![manifest.clone()]);
                 // Observation grants no new placement behavior and never rewrites argv.
                 assert!(super::decide(&args, Tool::Targo, &m).is_none());
@@ -2096,7 +2110,7 @@ fn config_files_with_unresolved_output_choices_grant_no_explicit_target() {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         assert!(
-            explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
+            selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
             "{text:?}"
         );
     }
@@ -2146,13 +2160,13 @@ fn explicit_target_custody_parses_neutral_inline_config_values() {
                     ],
                 ]
                 .concat();
-                let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None);
+                let selected = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None);
                 if file_exists {
                     assert!(selected.is_none(), "file takes precedence: {value}");
                 } else {
                     let selected =
                         selected.expect("neutral parsed inline data preserves target custody");
-                    assert_eq!(selected.target, cwd.join("fresh.noindex"));
+                    assert_eq!(selected.target.explicit_path(), cwd.join("fresh.noindex"));
                     assert_eq!(selected.manifests, vec![cwd.join("Cargo.toml")]);
                 }
             }
@@ -2196,7 +2210,7 @@ fn inline_configs_with_unknown_or_escaped_output_selection_grant_no_target() {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         assert!(
-            explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
+            selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
             "{value}"
         );
     }
@@ -2251,9 +2265,9 @@ fn explicit_target_selection_outranks_config_target_keys() {
             if source == "argv" {
                 args.extend(["--target-dir".into(), "chosen.noindex".into()]);
             }
-            let chosen = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
+            let chosen = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None)
                 .expect("explicit target overrides config target-dir");
-            assert_eq!(chosen.target, cwd.join("chosen.noindex"));
+            assert_eq!(chosen.target.explicit_path(), cwd.join("chosen.noindex"));
             assert_eq!(chosen.manifests, vec![manifest.clone()]);
         }
     }
@@ -2293,9 +2307,10 @@ fn neutral_or_overridden_cli_files_need_no_target_path_base() {
         ]
         .map(str::to_owned);
         assert_eq!(
-            explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
+            selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None)
                 .unwrap()
-                .target,
+                .target
+                .explicit_path(),
             cwd.join("chosen")
         );
     }
@@ -2350,7 +2365,7 @@ fn unresolved_cli_include_graphs_never_grant_custody() {
                 args.extend(["--target-dir".into(), "chosen".into()]);
             }
             assert!(
-                explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
+                selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
                 "{include} direct={direct}"
             );
         }
@@ -2392,11 +2407,14 @@ fn cli_include_seen_sets_match_file_and_inline_argument_scopes() {
             value,
         ]
         .map(str::to_owned);
-        let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None);
+        let selected = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None);
         if value == "settings.toml" {
             assert!(selected.is_none());
         } else {
-            assert_eq!(selected.unwrap().target, home.join("chosen"));
+            assert_eq!(
+                selected.unwrap().target.explicit_path(),
+                home.join("chosen")
+            );
         }
     }
 }
@@ -2439,7 +2457,7 @@ fn cli_include_observation_bounds_aggregate_text_before_retaining_layers() {
         "include=['0.toml']",
     ]
     .map(str::to_owned);
-    assert!(explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none());
+    assert!(selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none());
     assert!(
         reads.get() <= 16,
         "stop before retaining an unbounded large-file chain"
@@ -2494,7 +2512,7 @@ fn cli_include_observation_bounds_depth_and_optional_missing_reads() {
             &text,
         ]
         .map(str::to_owned);
-        assert!(explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none());
+        assert!(selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none());
         assert!(
             reads.get() <= 1024,
             "bounded include reads, got {}",
@@ -2550,7 +2568,7 @@ fn discovered_include_observation_bounds_optional_missing_reads() {
         "an incomplete graph names both outputs"
     );
     let args = ["--unverified", "build", "--target-dir", "chosen"].map(str::to_owned);
-    assert!(explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none());
+    assert!(selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none());
 }
 
 #[test]
@@ -2785,10 +2803,10 @@ fn discovered_outputs_keep_independent_winners_and_definition_bases() {
             if explicit {
                 args.extend(["--target-dir".into(), "explicit-final".into()]);
             }
-            let chosen = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
+            let chosen = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None)
                 .expect("complete discovered outputs retain independent winners");
             assert_eq!(
-                chosen.target,
+                chosen.target.explicit_path(),
                 cwd.join(if explicit {
                     "explicit-final"
                 } else {
@@ -2850,7 +2868,7 @@ fn discovered_output_precedence_is_independent_for_each_selected_path() {
             if level >= 4 {
                 args.extend(["--target-dir".into(), "argv-final".into()]);
             }
-            let chosen = explicit_cache(&args, tool, &m, &|_| UserAlias::None).unwrap();
+            let chosen = selected_outputs(&args, tool, &m, &|_| UserAlias::None).unwrap();
             let (target, build) = match level {
                 0 => (
                     project.join("discovered-final"),
@@ -2862,7 +2880,7 @@ fn discovered_output_precedence_is_independent_for_each_selected_path() {
                 _ => (cwd.join("argv-final"), cwd.join("cli-build")),
             };
             assert_eq!(
-                (chosen.target, chosen.intermediates),
+                (chosen.target.explicit_path(), chosen.intermediates),
                 (target, Some(build)),
                 "{tool:?} level={level}"
             );
@@ -2908,13 +2926,13 @@ fn discovered_package_home_variants_must_agree_after_higher_choices() {
             writable: &|_| Some(true),
         };
         let args = ["--unverified", "build", "--target-dir", "chosen"].map(str::to_owned);
-        let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None);
+        let selected = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None);
         if mode == "ambiguous" {
             assert!(selected.is_none());
             continue;
         }
         let chosen = selected.unwrap();
-        assert_eq!(chosen.target, cwd.join("chosen"));
+        assert_eq!(chosen.target.explicit_path(), cwd.join("chosen"));
         assert_eq!(
             chosen.intermediates,
             match mode {
@@ -2923,6 +2941,54 @@ fn discovered_package_home_variants_must_agree_after_higher_choices() {
                 _ => None,
             }
         );
+    }
+}
+
+#[test]
+fn a_default_final_target_requires_a_complete_native_output_graph() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("project");
+    for (text, complete) in [
+        ("build.jobs=2", true),
+        ("include=[{path='missing.toml',optional=true}]", true),
+        ("include=['missing.toml']", false),
+        ("include=['config.toml']", false),
+        ("include=[3]", false),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == cwd.join(".cargo/config.toml") {
+                Some(text.into())
+            } else if path == cwd.join("Cargo.toml") {
+                Some("[workspace]".into())
+            } else {
+                None
+            })
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = [
+            "--unverified",
+            "build",
+            "--config",
+            "build.build-dir='intermediate'",
+        ]
+        .map(str::to_owned);
+        let choice = selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None);
+        if complete {
+            let choice = choice.expect(text);
+            assert_eq!(choice.target, FinalTarget::WorkspaceDefault);
+            assert_eq!(choice.intermediates, Some(cwd.join("intermediate")));
+            assert_eq!(choice.manifests, vec![cwd.join("Cargo.toml")]);
+        } else {
+            assert!(choice.is_none(), "{text}");
+        }
     }
 }
 
@@ -2962,7 +3028,7 @@ fn discovered_output_grants_keep_unknown_graphs_frontends_and_templates_refused(
         };
         let args = ["--unverified", "build", "--target-dir", "known"].map(str::to_owned);
         assert!(
-            explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
+            selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
             "{text}"
         );
     }
@@ -2987,11 +3053,10 @@ fn discovered_output_grants_keep_unknown_graphs_frontends_and_templates_refused(
     for (tool, words) in [
         (Tool::Cargo, vec!["build", "--target-dir", "known"]),
         (Tool::Targo, vec!["trust", "check", "--target-dir", "known"]),
-        (Tool::Targo, vec!["--unverified", "build"]),
     ] {
         let args: Vec<_> = words.into_iter().map(str::to_owned).collect();
         assert!(
-            explicit_cache(&args, tool, &m, &|_| UserAlias::None).is_none(),
+            selected_outputs(&args, tool, &m, &|_| UserAlias::None).is_none(),
             "{tool:?}"
         );
     }
@@ -3013,7 +3078,7 @@ fn discovered_output_grants_keep_unknown_graphs_frontends_and_templates_refused(
     };
     let args = ["--unverified", "build", "--target-dir", "known"].map(str::to_owned);
     assert_eq!(
-        explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
+        selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None)
             .unwrap()
             .intermediates,
         Some(cwd.join("higher-build"))
@@ -3063,7 +3128,7 @@ fn discovered_package_home_alias_of_an_ancestor_is_not_loaded_again() {
         "known",
     ]
     .map(str::to_owned);
-    let chosen = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).unwrap();
+    let chosen = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).unwrap();
     assert_eq!(chosen.intermediates, Some(project.join("chosen-build")));
 }
 
@@ -3102,12 +3167,12 @@ fn cli_include_support_requires_a_known_frontend_capability() {
             if direct {
                 args.extend(["--target-dir".into(), "chosen".into()]);
             }
-            let selected = explicit_cache(&args, tool, &m, &|_| UserAlias::None);
+            let selected = selected_outputs(&args, tool, &m, &|_| UserAlias::None);
             if tool == Tool::Cargo {
                 assert!(selected.is_none());
             } else {
                 assert_eq!(
-                    selected.unwrap().target,
+                    selected.unwrap().target.explicit_path(),
                     cwd.join(if direct { "chosen" } else { "included" })
                 );
             }
@@ -3115,9 +3180,10 @@ fn cli_include_support_requires_a_known_frontend_capability() {
     }
     let args = ["build", "--config", "include=[]", "--target-dir", "chosen"].map(str::to_owned);
     assert_eq!(
-        explicit_cache(&args, Tool::Cargo, &m, &|_| UserAlias::None)
+        selected_outputs(&args, Tool::Cargo, &m, &|_| UserAlias::None)
             .unwrap()
-            .target,
+            .target
+            .explicit_path(),
         cwd.join("chosen")
     );
 }
@@ -3173,9 +3239,9 @@ fn cli_config_targets_keep_the_winning_values_path_base() {
         for config in configs {
             args.extend(["--config".into(), config.into()]);
         }
-        let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
+        let selected = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None)
             .expect("parsed CLI config selects its target before config-level environment");
-        assert_eq!(selected.target, expected);
+        assert_eq!(selected.target.explicit_path(), expected);
         assert_eq!(selected.manifests, vec![manifest.clone()]);
     }
 }
@@ -3230,12 +3296,12 @@ fn config_targets_preserve_higher_override_and_program_boundaries() {
         if source == "program-word" {
             args.extend(["serve".into(), "--target-dir".into(), "program-only".into()]);
         }
-        let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None);
+        let selected = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None);
         if source.starts_with("empty-") {
             assert!(selected.is_none(), "{source}");
         } else {
             assert_eq!(
-                selected.expect(source).target,
+                selected.expect(source).target.explicit_path(),
                 cwd.join("configured"),
                 "{source}"
             );
@@ -3275,7 +3341,7 @@ fn initial_manifest_readings_preserve_frontend_grammar() {
                 _ => vec!["build".into()],
             };
             args.push("--target-dir=output".into());
-            let selected = explicit_cache(&args, tool, &machine, &|_| UserAlias::None);
+            let selected = selected_outputs(&args, tool, &machine, &|_| UserAlias::None);
             let expected = if tool == Tool::Cargo {
                 Some(vec![cwd.join("Cargo.toml")])
             } else if unreadable_native {
@@ -3295,7 +3361,7 @@ fn initial_manifest_readings_preserve_frontend_grammar() {
         let expected =
             (!unreadable_native).then(|| vec![cwd.join("Targo.toml"), cwd.join("Cargo.toml")]);
         assert_eq!(
-            explicit_cache(&proof, Tool::Targo, &machine, &|_| UserAlias::None)
+            selected_outputs(&proof, Tool::Targo, &machine, &|_| UserAlias::None)
                 .map(|cache| cache.manifests),
             expected,
             "proof frontend, unreadable={unreadable_native}"

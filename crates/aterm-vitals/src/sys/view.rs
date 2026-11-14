@@ -8,7 +8,7 @@ use super::jobs_view;
 use super::json::Jv;
 use super::query::{ScopeArg, SysQuery, View};
 use super::why;
-use super::{Ctx, Freshness, clock_ms, exe_word, pct};
+use super::{BudgetFacts, BudgetRead, Ctx, Freshness, clock_ms, exe_word, pct};
 use crate::events::{EventKind, LoadScope, millicores};
 use crate::model::{ProcScope, ProcView, ProgramGroup, RowScope, ScopeView, Snapshot};
 use crate::words;
@@ -818,6 +818,9 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
     if let Some(g) = ctx.gap {
         lines.push(note("gap", format!("gap why={}", g.word())));
     }
+    if let Some(line) = stale_line(q.view, ctx) {
+        lines.push(line);
+    }
     let events: Vec<Line> = ctx.snap.map_or_else(Vec::new, |s| {
         ctx.events
             .iter()
@@ -875,6 +878,27 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
         lines,
         json: None,
     }
+}
+
+/// The first line of a view whose figures come from a snapshot the reader has not refreshed
+/// ([`Freshness::Stale`]): when they were read and how long ago, in words, so a reader of the
+/// lines alone never takes an old `cores busy` or `easing` for the present (the header's
+/// `state=stale` is the only other mark). `None` for a fresh or warming view, and for one with
+/// no snapshot, which says it has none.
+fn stale_line(view: View, ctx: &Ctx<'_>) -> Option<Line> {
+    if ctx.state != Freshness::Stale || ctx.snap.is_none() {
+        return None;
+    }
+    let (unix_ms, age_ms, _) = as_of(view, ctx)?;
+    Some(note(
+        "state",
+        format!(
+            "state  stale: these figures were read {} ago, at {} UTC, and have not been read \
+             since",
+            words::duration(age_ms),
+            clock_ms(unix_ms)
+        ),
+    ))
 }
 
 fn overview_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
@@ -2297,7 +2321,85 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             format!("volume {}", unavailable("not_sampled")),
         )),
     }
+    lines.push(line(
+        "budget",
+        format!("budget {}", budget_words(ctx.volume.map(|v| v.budget))),
+    ));
     lines.push(note("summary", disk_summary(ctx)));
+}
+
+/// How far a sized budget's rebuildable bytes are from its target, as the one field that says
+/// so: `over_bytes` where they are over it, else `under_bytes` (`0` at the target).
+fn budget_gap(b: &BudgetFacts) -> (&'static str, u64) {
+    let over = b.rebuildable.saturating_sub(b.target);
+    if over > 0 {
+        ("over_bytes", over)
+    } else {
+        ("under_bytes", b.target.saturating_sub(b.rebuildable))
+    }
+}
+
+/// `complete`, or `partial` where the sizing was cut short: the rebuildable bytes, the target and
+/// `over_bytes` are then floors and the kept bytes a ceiling ([`BudgetFacts`]).
+fn budget_walk(b: &BudgetFacts) -> &'static str {
+    if b.partial { "partial" } else { "complete" }
+}
+
+/// `aterm.toml` where the cap is the figure `disk.cap_used_gib` wrote, `share` where it is the
+/// volume's share.
+fn budget_cap_from(b: &BudgetFacts) -> &'static str {
+    if b.cap_written { "aterm.toml" } else { "share" }
+}
+
+/// Why a disk view prints no budget figures (`read` is `None` where the view has no volume).
+fn budget_why(read: Option<BudgetRead>) -> &'static str {
+    match read {
+        Some(BudgetRead::Warming) => "warming",
+        Some(BudgetRead::Off) => "not_enabled:disk.cap_used_gib",
+        Some(BudgetRead::NotSampled | BudgetRead::Sized(_)) | None => "not_sampled",
+    }
+}
+
+/// A disk view's `budget` record after its key: the figures of a sized budget, or why there
+/// are none (`read` is `None` where the view has no volume).
+fn budget_words(read: Option<BudgetRead>) -> String {
+    match read {
+        Some(BudgetRead::Sized(b)) => {
+            let (gap, by) = budget_gap(&b);
+            format!(
+                "cap_bytes={} cap_from={} kept_bytes={} target_bytes={} rebuildable_bytes={} {gap}={by} walk={} sized_s={}",
+                b.cap,
+                budget_cap_from(&b),
+                b.kept,
+                b.target,
+                b.rebuildable,
+                budget_walk(&b),
+                b.sized_s
+            )
+        }
+        other => unavailable(budget_why(other)),
+    }
+}
+
+/// [`budget_words`] as the JSON `budget` value: the same figures (`sized_age_s` for the age),
+/// or `{"why": <word>}`.
+fn budget_json(read: Option<BudgetRead>) -> Jv {
+    match read {
+        Some(BudgetRead::Sized(b)) => {
+            let (gap, by) = budget_gap(&b);
+            Jv::obj([
+                ("cap_bytes", Jv::u(b.cap)),
+                ("cap_from", Jv::s(budget_cap_from(&b))),
+                ("kept_bytes", Jv::u(b.kept)),
+                ("target_bytes", Jv::u(b.target)),
+                ("rebuildable_bytes", Jv::u(b.rebuildable)),
+                (gap, Jv::u(by)),
+                ("walk", Jv::s(budget_walk(&b))),
+                ("sized_age_s", Jv::u(b.sized_s)),
+            ])
+        }
+        other => Jv::why(budget_why(other)),
+    }
 }
 
 fn net_summary_words(s: &Snapshot, net: &crate::model::NetView) -> String {
@@ -3989,6 +4091,7 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         o.set("programs_withheld", Jv::u(withheld as u64));
     }
     o.set("volume", volume);
+    o.set("budget", budget_json(ctx.volume.map(|v| v.budget)));
     o
 }
 

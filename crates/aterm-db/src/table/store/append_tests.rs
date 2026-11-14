@@ -160,64 +160,62 @@ fn ingest_refusals_preserve_the_journal_index_and_writer_usage() {
 /// is not a removal cutoff. A real cutoff still opens, under the ordinary fresh key admission.
 #[test]
 fn retained_non_cut_payloads_avoid_decryption_but_cutoffs_still_open() {
-    journals::with_own(
-        std::sync::Arc::new(journals::Journals::new(1, 64 * 1024, 64 * 1024)),
-        || {
-            let lab = crate::table::tests::Lab::new(&[Role::Writer]);
-            let bootstrap = lab.bootstrap(0);
-            let session = Session::open(&bootstrap).unwrap();
-            let directory = lab._home.path().join("retained-payload");
-            let mut store = Store::create(&session, &directory).unwrap();
-            let scope = store.scope();
-            store
-                .commit_catalog(&session, b"first application record")
-                .unwrap();
-            let cut = cutoff::Cut {
-                actor: session.actor(),
-                through: None,
-            };
-            store
-                .commit_catalog(&session, &cutoff::encode(&cut))
-                .unwrap();
-            store
-                .commit_catalog(&session, b"second application record")
-                .unwrap();
-            drop((store, session));
-            let session = Session::observe(&bootstrap).unwrap();
-            let warm = Store::observe(&session, &directory, scope).unwrap();
-            assert_eq!(
-                warm.records
-                    .values()
-                    .filter(|record| record.cut.is_some())
-                    .count(),
-                1
-            );
-            let before = crate::crypto::test_cipher_constructions();
-            let observed = Store::observe(&session, &directory, scope).unwrap();
-            for (id, retained) in &warm.records {
+    for body_budget in [64 * 1024, 2048] {
+        journals::with_own(
+            std::sync::Arc::new(journals::Journals::new(1, 64 * 1024, body_budget)),
+            || {
+                let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+                let bootstrap = lab.bootstrap(0);
+                let session = Session::open(&bootstrap).unwrap();
+                let directory = lab._home.path().join("retained-payload");
+                let mut store = Store::create(&session, &directory).unwrap();
+                let scope = store.scope();
+                store.commit_catalog(&session, &[b'a'; 4096]).unwrap();
+                let cut = cutoff::Cut {
+                    actor: session.actor(),
+                    through: None,
+                };
+                store
+                    .commit_catalog(&session, &cutoff::encode(&cut))
+                    .unwrap();
+                store.commit_catalog(&session, &[b'b'; 4096]).unwrap();
+                drop((store, session));
+                let session = Session::observe(&bootstrap).unwrap();
+                let warm = Store::observe(&session, &directory, scope).unwrap();
                 assert_eq!(
-                    observed.records[id].wire.as_ptr(),
-                    retained.wire.as_ptr(),
-                    "replays share immutable ciphertext instead of copying it"
+                    warm.records
+                        .values()
+                        .filter(|record| record.cut.is_some())
+                        .count(),
+                    1
                 );
-            }
-            drop(warm);
-            assert_eq!(observed.inventory_unchecked().len(), 3);
-            assert_eq!(
-                observed
-                    .records
-                    .values()
-                    .filter(|record| record.cut.is_some())
-                    .count(),
-                1
-            );
-            assert_eq!(
-                crate::crypto::test_cipher_constructions() - before,
-                1,
-                "only the cutoff needs a fresh payload opening"
-            );
-        },
-    );
+                let before = crate::crypto::test_cipher_constructions();
+                let observed = Store::observe(&session, &directory, scope).unwrap();
+                for (id, retained) in &warm.records {
+                    assert_eq!(
+                        observed.records[id].wire.as_ptr() == retained.wire.as_ptr(),
+                        body_budget > 2048,
+                        "only the full journal cache retains ciphertext bodies"
+                    );
+                }
+                drop(warm);
+                assert_eq!(observed.inventory_unchecked().len(), 3);
+                assert_eq!(
+                    observed
+                        .records
+                        .values()
+                        .filter(|record| record.cut.is_some())
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    crate::crypto::test_cipher_constructions() - before,
+                    1,
+                    "only the cutoff needs a fresh payload opening"
+                );
+            },
+        );
+    }
 }
 
 /// A fact under another key must not hide a real cutoff. This supplies a wrong comparison

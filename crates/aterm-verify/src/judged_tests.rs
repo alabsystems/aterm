@@ -3,6 +3,49 @@
 
 use super::*;
 
+/// A fixture's git child: it must finish, so it runs while it makes progress under the
+/// one-minute hang detector (AGENTS.md), never under the production journal's 60 s wall clock
+/// (`judged::deadline`). Building a fixture journal writes one loose object per tree, and on a
+/// loaded machine that file creation alone outlasts a minute while git keeps working. The
+/// journal's own operations under test keep their production deadline.
+fn fixture(cmd: &mut Command, input: Option<&[u8]>) -> Result<String, String> {
+    let dir = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+    let stdin = match input {
+        Some(bytes) => {
+            let path = dir.path().join("stdin");
+            std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+            std::fs::File::open(&path)
+                .map_err(|e| e.to_string())?
+                .into()
+        }
+        None => aterm_uds::spawnfd::Stdio::null(),
+    };
+    let out = aterm_uds::deadline::output_from_while_process_progressing(
+        cmd,
+        stdin,
+        aterm_uds::deadline::ECHO_HANG,
+        "a judged fixture's git",
+    )
+    .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    // The progress wait keeps only the last `OUTPUT_KEEP` bytes of each stream: refuse output
+    // that reaches it rather than answer with its tail.
+    if out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
+        return Err(format!(
+            "a fixture's git wrote {} bytes or more, all the progress wait keeps; read less",
+            aterm_uds::deadline::OUTPUT_KEEP
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| e.to_string())
+}
+
+/// Fixture git, shadowing the journal's own `git` for every set-up and inspection call here.
+fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+    fixture(&mut command(root, args), None).map(|s| s.trim().to_owned())
+}
+
 #[test]
 fn history_keeps_cancelled_attempts_replaced_by_a_verdict() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -229,11 +272,14 @@ fn scratch(remotes: &[&str]) -> (aterm_tempfile::TempDir, std::path::PathBuf) {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let root = tmp.path().join("one");
     git(tmp.path(), &["init", "--quiet", "one"]).unwrap();
+    // These disposable repositories have no owner for detached object maintenance.
+    git(&root, &["config", "maintenance.auto", "false"]).unwrap();
     git(&root, &["config", "user.name", "Andrew Yates"]).unwrap();
     git(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
     for remote in remotes {
         git(tmp.path(), &["init", "--bare", "--quiet", remote]).unwrap();
         let url = tmp.path().join(remote);
+        git(&url, &["config", "maintenance.auto", "false"]).unwrap();
         git(&root, &["remote", "add", remote, url.to_str().unwrap()]).unwrap();
     }
     (tmp, root)
@@ -244,7 +290,7 @@ fn rev(root: &Path, spec: &str) -> String {
 }
 
 fn blob_of(root: &Path, text: &str) -> String {
-    output(
+    fixture(
         &mut command(root, &["hash-object", "-w", "--stdin"]),
         Some(text.as_bytes()),
     )
@@ -270,7 +316,7 @@ fn by_index(root: &Path, base: Option<&str>, edits: &[Edit]) -> String {
     let run = |args: &[&str], input: Option<&[u8]>| {
         let mut cmd = command(root, args);
         cmd.env("GIT_INDEX_FILE", &index);
-        output(&mut cmd, input).unwrap()
+        fixture(&mut cmd, input).unwrap()
     };
     run(&["read-tree", base.unwrap_or("--empty")], None);
     for edit in edits {
@@ -306,7 +352,7 @@ fn with_files(root: &Path, parent: &str, paths: &[String], body: &str) -> String
     let run = |args: &[&str], input: Option<&[u8]>| {
         let mut cmd = command(root, args);
         cmd.env("GIT_INDEX_FILE", &index);
-        output(&mut cmd, input).unwrap()
+        fixture(&mut cmd, input).unwrap()
     };
     run(&["read-tree", parent], None);
     let lines: String = paths
@@ -416,7 +462,7 @@ fn an_append_writes_only_the_trees_it_touches() {
     assert_eq!(
         git(
             &one,
-            &["ls-tree", "-r", "--name-only", &after_large, "land/"]
+            &["ls-tree", "-r", "--object-only", &after_large, "land/"]
         )
         .unwrap()
         .lines()

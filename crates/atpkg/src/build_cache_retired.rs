@@ -27,9 +27,30 @@
 //! missing tree authorizes metadata cleanup only after the remover recorded its whole removal;
 //! a merely prepared tree might have been moved. New source or Git metadata writes keep either
 //! phase, and a changed clock cannot turn a future receipt into authority for cleanup.
+//!
+//! The same judge and remover are open to a linked worktree aterm's agents make
+//! ([`judge_worktree`], [`remove_worktree`]): the disk watch's worktree step finds them. Only
+//! one of the two shapes an agent's worktree has is a candidate ([`agent_made`]): a folder named
+//! `*.noindex` with a `.ubd` folder above it (AGENTS.md's shape), or a folder in its checkout's
+//! `.claude/worktrees/` (Claude Code's own isolation worktrees); a person's worktree in any other
+//! place, and every worktree of a bare repository, stays. Such a worktree may be on a branch;
+//! beyond the snapshot's rule it goes only while git has no operation in progress in it, it
+//! holds no per-worktree ref, no other worktree lies inside it, neither its HEAD's reflog nor
+//! its branch's names a commit `origin/main` lacks, no tracked file is one git is told not to
+//! look at, git status read it without a warning, every entry git ignores in it or in any
+//! submodule checked out in it is a tagged cache folder, no submodule folder that is not checked
+//! out holds anything, and git wrote none of its HEAD, its HEAD's reflog or its branch's reflog
+//! for [`UNWRITTEN`]. Its receipt lies in the checkout's git directory (`.git/aterm-retiring/`),
+//! one per worktree, with what it ignored; a receipt is withdrawn when its removal stops before
+//! its first entry goes, and a tree that did not go whole keeps git's entry for it, so the next
+//! look finds it again and holds it to every rule that does not need its tree whole, and to git
+//! seeing nothing in it or in its submodules, ignored entries included, but what the removal did
+//! (a tracked file gone, an entry it ignored). A tree that stands once git's entry for it went
+//! (a `git worktree prune` or `git gc` dropped it) stays: nothing can then say what was put in
+//! it since.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[path = "build_cache_retired_pending.rs"]
 mod pending;
@@ -54,6 +75,31 @@ const CELLS: &str = "-verify-cells.noindex";
 
 /// The machine lock's directory in the user's cache.
 const LOCK_DIR: &str = "aterm-verify";
+
+/// The most reflog entries one worktree's judgment reads, its HEAD's and its branch's each.
+const MAX_REFLOG: usize = 4096;
+
+/// Which rule a worktree is judged by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// The retired gate's own snapshot: detached, as the gate left it, and judged half removed
+    /// when a removal that stopped part way took git's entry for it.
+    Snapshot,
+    /// Any linked worktree of the checkout, on a branch or detached, which git lists.
+    Linked,
+}
+
+/// A linked worktree the judge admits ([`judge_worktree`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    /// Why it goes.
+    pub why: String,
+    /// The commit its HEAD names.
+    pub head: String,
+    /// The branch it is on (the full `refs/heads/…`), `None` when detached or when its removal
+    /// resumes from a receipt.
+    pub branch: Option<String>,
+}
 
 /// What one leftover was to the gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +194,13 @@ pub trait Git {
             err: "bounded original Git history reads are unavailable".to_owned(),
         }
     }
+
+    /// When this git's runs end: a run still going then is killed and answers no code, and the
+    /// walks a judgment makes beside them ([`written`]) stop there too, keeping what they judge.
+    /// `None`: they run to their end.
+    fn until(&self) -> Option<Instant> {
+        None
+    }
 }
 
 /// The first `git` on `PATH`, run as [`GitProgram`].
@@ -205,12 +258,50 @@ impl Git for GitCli {
     }
 }
 
-impl Git for GitProgram<'_> {
+/// [`GitCli`] whose every run ends by the instant it holds: a run still going then is killed
+/// and answers no code, so the judgment it serves keeps what it judges, and the judgment's own
+/// walks stop there too ([`Git::until`]). An unattended caller that must not block (the disk
+/// look's worktree step) asks git through it.
+#[derive(Clone, Copy, Debug)]
+pub struct GitUntil(pub Instant);
+
+impl Git for GitUntil {
     fn run(&self, dir: &Path, args: &[&str]) -> Answer {
         self.run_with_alt(dir, args, None)
     }
 
     fn run_with_alt(&self, dir: &Path, args: &[&str], alt: Option<&Path>) -> Answer {
+        match GitCli::program() {
+            Ok(program) => GitProgram(&program).run_until(dir, args, alt, Some(self.0)),
+            Err(unrun) => unrun,
+        }
+    }
+
+    fn read_history(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        input: &[u8],
+        objects: Option<&Path>,
+        deadline: std::time::Instant,
+    ) -> Answer {
+        GitCli.read_history(dir, args, input, objects, deadline.min(self.0))
+    }
+
+    fn until(&self) -> Option<Instant> {
+        Some(self.0)
+    }
+}
+
+impl GitProgram<'_> {
+    /// [`Git::run_with_alt`], killed at `until` when one is given.
+    fn run_until(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        alt: Option<&Path>,
+        until: Option<Instant>,
+    ) -> Answer {
         let guard = match lazy_fetch::guard(self.0) {
             Ok(guard) => guard,
             Err(why) => return Answer::unrun(why),
@@ -228,15 +319,33 @@ impl Git for GitProgram<'_> {
         if let Some(alt) = alt {
             cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", git_path(alt));
         }
-        let out = cmd.output();
+        let out = match until {
+            None => cmd.output(),
+            Some(deadline) => aterm_uds::deadline::output_with_input_until(
+                &mut cmd,
+                aterm_uds::secret::Secret::new(&[]),
+                deadline,
+                aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+            ),
+        };
         match out {
             Ok(o) => Answer {
                 code: o.status.code(),
                 out: String::from_utf8_lossy(&o.stdout).into_owned(),
                 err: String::from_utf8_lossy(&o.stderr).trim().to_owned(),
             },
-            Err(e) => Answer::unrun(format!("git did not start: {e}")),
+            Err(e) => Answer::unrun(format!("git did not start or did not finish: {e}")),
         }
+    }
+}
+
+impl Git for GitProgram<'_> {
+    fn run(&self, dir: &Path, args: &[&str]) -> Answer {
+        self.run_with_alt(dir, args, None)
+    }
+
+    fn run_with_alt(&self, dir: &Path, args: &[&str], alt: Option<&Path>) -> Answer {
+        self.run_until(dir, args, alt, None)
     }
 
     fn read_history(
@@ -389,10 +498,17 @@ fn checkouts(home: &Path, workspaces: &[PathBuf]) -> Vec<PathBuf> {
 
 /// The first file or directory under `dir` (itself included) written at or after `since`, with
 /// git's own directories inside it passed over (a `.git` and any directory laid out as one, as a
-/// submodule's is): git writes its bookkeeping on a read. `None` when nothing was.
-#[must_use]
-pub fn written_since(dir: &Path, since: SystemTime) -> Option<PathBuf> {
-    written(dir, since, Times::All)
+/// submodule's is): git writes its bookkeeping on a read. `Ok(None)` when nothing was.
+///
+/// # Errors
+/// An entry that could not be read or listed, or `until` passed during the walk: whether it was
+/// written is then unknown, and what the caller judges stays.
+pub fn written_since(
+    dir: &Path,
+    since: SystemTime,
+    until: Option<Instant>,
+) -> Result<Option<PathBuf>, String> {
+    written(dir, since, Times::All, until)
 }
 
 /// Whose own modification times say a tree was written.
@@ -407,17 +523,41 @@ enum Times {
     NotFolders,
 }
 
-/// [`written_since`], the entries whose times count as `times` says.
-fn written(dir: &Path, since: SystemTime, times: Times) -> Option<PathBuf> {
+/// [`written_since`], the entries whose times count as `times` says. An entry gone during the
+/// walk is passed over; one that cannot be read or listed, or `until` passing, is an `Err`: an
+/// unreadable folder may hold anything, and the remover would take it whole.
+fn written(
+    dir: &Path,
+    since: SystemTime,
+    times: Times,
+    until: Option<Instant>,
+) -> Result<Option<PathBuf>, String> {
+    let unreadable = |at: &Path, e: &std::io::Error| {
+        format!(
+            "{} could not be read ({e}), so whether it was written is unknown",
+            at.display()
+        )
+    };
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(at) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&at) else {
-            continue;
+        if until.is_some_and(|until| Instant::now() >= until) {
+            return Err(format!(
+                "the walk of {} ran out of time, so whether it was written is unknown",
+                dir.display()
+            ));
+        }
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(meta) => meta,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(unreadable(at.as_path(), &e)),
         };
         let children: Vec<std::fs::DirEntry> = if meta.is_dir() {
-            std::fs::read_dir(&at)
-                .map(|entries| entries.flatten().collect())
-                .unwrap_or_default()
+            match entries(&at) {
+                Ok(children) => children,
+                Err(e) if gone(&e) => continue,
+                Err(e) => return Err(unreadable(at.as_path(), &e)),
+            }
         } else {
             Vec::new()
         };
@@ -427,17 +567,27 @@ fn written(dir: &Path, since: SystemTime, times: Times) -> Option<PathBuf> {
         }
         let fresh = |m: &std::fs::Metadata| m.modified().is_ok_and(|t| t >= since);
         if (times == Times::All || !meta.is_dir()) && fresh(&meta) {
-            return Some(at);
+            return Ok(Some(at));
         }
         for e in children.into_iter().filter(|e| e.file_name() != ".git") {
             if e.file_type().is_ok_and(|ft| ft.is_dir()) {
                 stack.push(e.path());
-            } else if e.metadata().as_ref().is_ok_and(fresh) {
-                return Some(e.path());
+                continue;
+            }
+            match e.metadata() {
+                Ok(m) if fresh(&m) => return Ok(Some(e.path())),
+                Ok(_) => {}
+                Err(err) if gone(&err) => {}
+                Err(err) => return Err(unreadable(e.path().as_path(), &err)),
             }
         }
     }
-    None
+    Ok(None)
+}
+
+/// Every entry of the folder `dir`.
+fn entries(dir: &Path) -> std::io::Result<Vec<std::fs::DirEntry>> {
+    std::fs::read_dir(dir)?.collect()
 }
 
 /// `d` as a person reads an age: `5h`, `13d`.
@@ -451,9 +601,19 @@ fn age(d: Duration) -> String {
 }
 
 /// Why `path` stays for a write since `since` (`None`: nothing written, it may go), at `now`,
-/// the entries whose times count as `times` says.
-fn written_words(path: &Path, since: SystemTime, now: SystemTime, times: Times) -> Option<String> {
-    let hit = written(path, since, times)?;
+/// the entries whose times count as `times` says, the walk ending at `until`: an entry it could
+/// not read, or time running out, keeps it too.
+fn written_words(
+    path: &Path,
+    since: SystemTime,
+    now: SystemTime,
+    times: Times,
+    until: Option<Instant>,
+) -> Option<String> {
+    let hit = match written(path, since, times, until) {
+        Ok(hit) => hit?,
+        Err(why) => return Some(why),
+    };
     let when = std::fs::symlink_metadata(&hit)
         .and_then(|m| m.modified())
         .ok()
@@ -475,22 +635,19 @@ struct Listed {
     branch: Option<String>,
 }
 
-/// The entry `git worktree list --porcelain` in `checkout` gives `wt`.
-fn listed(git: &dyn Git, checkout: &Path, wt: &Path) -> Result<Option<Listed>, String> {
+/// Every worktree `git worktree list --porcelain` in `checkout` gives (the main checkout's
+/// first), each with its path as git lists it.
+fn listing(git: &dyn Git, checkout: &Path) -> Result<Vec<(PathBuf, Listed)>, String> {
     let a = git.run(checkout, &["worktree", "list", "--porcelain"]);
     if a.code != Some(0) {
         return Err(format!("git worktree list failed: {}", a.err));
     }
-    let want = std::fs::canonicalize(wt).unwrap_or_else(|_| wt.to_path_buf());
+    let mut out = Vec::new();
     for block in a.out.split("\n\n") {
         let mut lines = block.lines();
         let Some(path) = lines.next().and_then(|l| l.strip_prefix("worktree ")) else {
             continue;
         };
-        let at = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-        if at != want {
-            continue;
-        }
         let mut entry = Listed::default();
         for line in lines {
             if let Some(h) = line.strip_prefix("HEAD ") {
@@ -503,9 +660,32 @@ fn listed(git: &dyn Git, checkout: &Path, wt: &Path) -> Result<Option<Listed>, S
                 entry.branch = Some(b.to_owned());
             }
         }
-        return Ok(Some(entry));
+        out.push((PathBuf::from(path), entry));
     }
-    Ok(None)
+    Ok(out)
+}
+
+/// `path` resolved where it can be, as written where it cannot.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The entry `git worktree list --porcelain` in `checkout` gives `wt`.
+fn listed(git: &dyn Git, checkout: &Path, wt: &Path) -> Result<Option<Listed>, String> {
+    let want = resolved(wt);
+    Ok(listing(git, checkout)?
+        .into_iter()
+        .find(|(at, _)| resolved(at) == want)
+        .map(|(_, entry)| entry))
+}
+
+/// The path of every worktree `git worktree list --porcelain` in `checkout` gives, the main
+/// checkout's included, each resolved where it can be.
+fn listed_paths(git: &dyn Git, checkout: &Path) -> Result<Vec<PathBuf>, String> {
+    Ok(listing(git, checkout)?
+        .into_iter()
+        .map(|(at, _)| resolved(&at))
+        .collect())
 }
 
 /// The bytes of `gitfile`, a worktree's `.git`, while it is a file as git writes one (a line
@@ -661,55 +841,115 @@ fn judge_snapshot(
     wt: &Path,
     now: SystemTime,
 ) -> Result<String, String> {
+    judge_tree(git, checkout, wt, now, Shape::Snapshot).map(|admitted| admitted.why)
+}
+
+/// The verdict on the worktree `wt` of `checkout` at `now`, by the rule `shape` names.
+fn judge_tree(
+    git: &dyn Git,
+    checkout: &Path,
+    wt: &Path,
+    now: SystemTime,
+    shape: Shape,
+) -> Result<Admitted, String> {
+    let until = git.until();
     if let Some(removal) = pending::read_at(checkout, wt, now)? {
         if removal.entry.join("locked").symlink_metadata().is_ok() {
             return Err(LOCKED.to_owned());
         }
-        if let Some(entry) = listed(git, checkout, wt)? {
+        let now_listed = listed(git, checkout, wt)?;
+        if let Some(entry) = &now_listed {
             if entry.locked {
                 return Err(LOCKED.to_owned());
             }
-            if !entry.detached || entry.head != removal.head {
+            if (shape == Shape::Snapshot && !entry.detached) || entry.head != removal.head {
                 return Err("snapshot HEAD changed after removal began".to_owned());
             }
         }
         in_main(git, checkout, &removal.head)?;
+        // A receipt binds what was admitted, not what a person did in the tree since: a linked
+        // worktree whose removal stopped part way is held again to every rule that does not
+        // need its tree whole, and what git sees in what is left of it must be the removal's.
+        // Its removal keeps git's entry while any of its tree stays, so a tree that stands
+        // without it lost it to someone else (a `git worktree prune`, a `git gc`): with no entry
+        // nothing can say what was put in it since, and what is left stays.
+        if shape == Shape::Linked {
+            if removal.entry.symlink_metadata().is_ok() {
+                let branch = now_listed.as_ref().and_then(|e| e.branch.as_deref());
+                linked_clear(git, checkout, wt, &removal.entry, branch)?;
+                if wt.symlink_metadata().is_ok() {
+                    removal_only(git, wt, &removal.entry, &removal.ignored)?;
+                }
+            } else if wt.symlink_metadata().is_ok() {
+                return Err(format!(
+                    "git's entry for it ({}) went while its tree stands (a git worktree prune or \
+                     git gc dropped it), so nothing can say what was put in it since: what is \
+                     left stays",
+                    removal.entry.display()
+                ));
+            }
+        }
         history::clear(git, checkout, wt, Some(&removal.entry))?;
-        return Ok(
-            "the exact snapshot's interrupted removal, bound by its durable receipt".to_owned(),
-        );
+        let why = match shape {
+            Shape::Snapshot => {
+                "the exact snapshot's interrupted removal, bound by its durable receipt"
+            }
+            Shape::Linked => {
+                "the exact worktree's interrupted removal, bound by its durable receipt"
+            }
+        };
+        return Ok(Admitted {
+            why: why.to_owned(),
+            head: removal.head,
+            branch: None,
+        });
     }
     let Some(entry) = listed(git, checkout, wt)? else {
+        if shape == Shape::Linked {
+            return Err(unlisted(checkout));
+        }
         let Some(gone) = half_removed(checkout, wt) else {
             return Err(unlisted(checkout));
         };
         history::clear(git, checkout, wt, None)?;
         if let Some(why) = now
             .checked_sub(UNWRITTEN)
-            .and_then(|since| written_words(wt, since, now, Times::NotFolders))
+            .and_then(|since| written_words(wt, since, now, Times::NotFolders, until))
         {
             return Err(why);
         }
-        return Ok(format!(
-            "the retired verify gate's snapshot of {} (its code went in 42e8a9a273), half \
-             removed: a removal that stopped part way took git's entry for it ({}), which its \
-             .git still names, no file in it written in the last {}",
-            checkout.display(),
-            gone.display(),
-            age(UNWRITTEN)
-        ));
+        return Ok(Admitted {
+            why: format!(
+                "the retired verify gate's snapshot of {} (its code went in 42e8a9a273), half \
+                 removed: a removal that stopped part way took git's entry for it ({}), which \
+                 its .git still names, no file in it written in the last {}",
+                checkout.display(),
+                gone.display(),
+                age(UNWRITTEN)
+            ),
+            head: String::new(),
+            branch: None,
+        });
     };
     if entry.locked {
         return Err(LOCKED.to_owned());
     }
-    if !entry.detached {
+    if shape == Shape::Snapshot && !entry.detached {
         return Err(format!(
             "it is on {}, not detached as the gate left it",
             entry.branch.as_deref().unwrap_or("a branch")
         ));
     }
+    let own = gitfile_text(&wt.join(".git")).and_then(|text| own_entry(checkout, wt, &text));
+    if shape == Shape::Linked && own.is_none() {
+        return Err(format!(
+            "its .git is not a file naming git's entry for it in {}: a main checkout or another \
+             repository's",
+            checkout.display()
+        ));
+    }
     let short = in_main(git, checkout, &entry.head)?;
-    let changed = snapshot_changes(git, checkout, wt)?;
+    let changed = snapshot_changes(git, checkout, wt, shape == Shape::Linked)?;
     if let Some(first) = changed.first() {
         return Err(format!(
             "it has {} uncommitted change(s) ({}{})",
@@ -718,25 +958,607 @@ fn judge_snapshot(
             if changed.len() > 1 { ", …" } else { "" }
         ));
     }
-    let own = gitfile_text(&wt.join(".git")).and_then(|text| own_entry(checkout, wt, &text));
+    if shape == Shape::Linked
+        && let Some(admin) = own.as_deref()
+    {
+        let since = now
+            .checked_sub(UNWRITTEN)
+            .ok_or("the clock reads too early to date the last seven days")?;
+        hidden_edits(git, wt, wt, &[])?;
+        linked_clear(git, checkout, wt, admin, entry.branch.as_deref())?;
+        ignored_entries(git, wt)?;
+        git_files_quiet(checkout, admin, entry.branch.as_deref(), since, now, until)?;
+    }
     history::clear(git, checkout, wt, own.as_deref())?;
     if let Some(why) = now
         .checked_sub(UNWRITTEN)
-        .and_then(|since| written_words(wt, since, now, Times::All))
+        .and_then(|since| written_words(wt, since, now, Times::All, until))
     {
         return Err(why);
     }
-    Ok(format!(
-        "the retired verify gate's snapshot of {} (its code went in 42e8a9a273): a clean worktree \
-         detached at {short}, which origin/main contains, nothing in it written in the last {}",
-        checkout.display(),
-        age(UNWRITTEN)
-    ))
+    let why = match shape {
+        Shape::Snapshot => format!(
+            "the retired verify gate's snapshot of {} (its code went in 42e8a9a273): a clean \
+             worktree detached at {short}, which origin/main contains, nothing in it written in \
+             the last {}",
+            checkout.display(),
+            age(UNWRITTEN)
+        ),
+        Shape::Linked => format!(
+            "a clean linked worktree of {} at {short}{}, which origin/main contains, nothing in \
+             it written in the last {}",
+            checkout.display(),
+            entry
+                .branch
+                .as_deref()
+                .map_or_else(String::new, |b| format!(" on {b}")),
+            age(UNWRITTEN)
+        ),
+    };
+    Ok(Admitted {
+        why,
+        head: entry.head,
+        branch: entry.branch,
+    })
+}
+
+/// The names git gives an operation in progress in a worktree's entry: a rebase, a merge, a
+/// cherry-pick, a revert, a bisect, a sequence of picks.
+const IN_PROGRESS: &[&str] = &[
+    "rebase-merge",
+    "rebase-apply",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "sequencer",
+];
+
+/// What a linked worktree must hold beyond the snapshot's rule before it goes, its entry
+/// `admin` and `branch` the one git lists it on, whether or not its tree stands: git has no
+/// operation in progress in it; it holds no per-worktree ref; no other worktree of `checkout`
+/// lies inside it; and no commit its HEAD's or its branch's reflog names is missing from
+/// `origin/main` (removing the entry and the branch drops those reflogs, which may be such a
+/// commit's only root).
+fn linked_clear(
+    git: &dyn Git,
+    checkout: &Path,
+    wt: &Path,
+    admin: &Path,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    for name in IN_PROGRESS {
+        match std::fs::symlink_metadata(admin.join(name)) {
+            Ok(_) => {
+                return Err(format!("git has an operation in progress in it ({name})"));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "whether git has an operation in progress in it ({name}) could not be read: \
+                     {e}"
+                ));
+            }
+        }
+    }
+    if let Some(held) = first_file(&admin.join("refs"))? {
+        return Err(format!(
+            "it holds a per-worktree ref ({}), which goes with git's entry for it",
+            held.display()
+        ));
+    }
+    let inside = resolved(wt);
+    if let Some(nested) = listed_paths(git, checkout)?
+        .into_iter()
+        .find(|p| *p != inside && p.starts_with(&inside))
+    {
+        return Err(format!(
+            "another worktree of {}, {}, lies inside it",
+            checkout.display(),
+            nested.display()
+        ));
+    }
+    let mut oids = reflog(git, checkout, Some(admin), "HEAD")?;
+    if let Some(branch) = branch {
+        oids.extend(reflog(git, checkout, None, branch)?);
+    }
+    oids.sort();
+    oids.dedup();
+    if !oids.is_empty() {
+        let mut args = vec!["rev-list", "-n1"];
+        args.extend(oids.iter().map(String::as_str));
+        args.extend(["--not", "refs/remotes/origin/main"]);
+        let lacking = git.run(checkout, &args);
+        if lacking.code != Some(0) {
+            return Err(format!(
+                "git could not say whether its reflog names a commit origin/main lacks: {}",
+                lacking.err
+            ));
+        }
+        if let Some(first) = lacking.out.lines().map(str::trim).find(|l| !l.is_empty()) {
+            return Err(format!(
+                "its reflog names a commit origin/main lacks (first {}), whose only root that \
+                 reflog may be",
+                first.get(..10).unwrap_or(first)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether git wrote none of a linked worktree's own files at or after `since`, at `now`, the
+/// walk ending at `until`: its HEAD, its HEAD's reflog, its branch's reflog (`branch`, the one
+/// git lists it on) and a per-worktree reftable in its entry `admin` of `checkout`. A reset or a
+/// checkout writes those, not always a file in the tree.
+fn git_files_quiet(
+    checkout: &Path,
+    admin: &Path,
+    branch: Option<&str>,
+    since: SystemTime,
+    now: SystemTime,
+    until: Option<Instant>,
+) -> Result<(), String> {
+    let mut written = vec![admin.join("HEAD"), admin.join("logs").join("HEAD")];
+    if let Some(branch) = branch {
+        let rel = Path::new(branch);
+        if !rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!("its branch {branch} is no name git writes"));
+        }
+        written.push(checkout.join(".git").join("logs").join(rel));
+    }
+    if let Some(table) = std::fs::symlink_metadata(admin.join("reftable"))
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .map(|_| admin.join("reftable"))
+    {
+        written.push(table);
+    }
+    for file in &written {
+        match std::fs::symlink_metadata(file) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{} could not be read: {e}", file.display())),
+        }
+        if let Some(why) = written_words(file, since, now, Times::All, until) {
+            return Err(why);
+        }
+    }
+    Ok(())
+}
+
+/// `--git-dir=<admin>`: git's own entry of a linked worktree, through which git reads the
+/// worktree whether or not its tree and its `.git` stand.
+fn git_dir_arg(admin: &Path) -> Result<String, String> {
+    git_path(admin)
+        .to_str()
+        .map(|admin| format!("--git-dir={admin}"))
+        .ok_or_else(|| format!("{} is no path git takes as an argument", admin.display()))
+}
+
+/// The tracked files of the linked worktree `wt` that git is told not to look at, and that
+/// stand in its tree: one marked assume-unchanged (`git ls-files -v` tags it in lower case) or
+/// skip-worktree (`S`) hides its edits from `git status`, so it keeps the worktree. A sparse
+/// checkout's skip-worktree files are not in the tree, and do not. Git runs in `dir` with
+/// `prefix` before its command (a `--git-dir` and `--work-tree` when the tree's `.git` may be
+/// gone).
+fn hidden_edits(git: &dyn Git, dir: &Path, wt: &Path, prefix: &[&str]) -> Result<(), String> {
+    let mut args = prefix.to_vec();
+    args.extend(["ls-files", "-v", "-z"]);
+    let ls = git.run(dir, &args);
+    if ls.code != Some(0) {
+        return Err(format!(
+            "git could not list which of its files it is told not to look at: {}",
+            ls.err
+        ));
+    }
+    for row in ls.out.split('\0').filter(|r| !r.is_empty()) {
+        let Some((tag, rel)) = row.split_once(' ') else {
+            return Err(format!("git ls-files gave a row it does not write ({row})"));
+        };
+        let hidden = tag == "S" || tag.chars().all(|c| c.is_ascii_lowercase());
+        if hidden && std::fs::symlink_metadata(wt.join(rel)).is_ok() {
+            return Err(format!(
+                "git is told not to look at its file {rel} (`{tag}`: assume-unchanged or \
+                 skip-worktree), so an edit to it would not show"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One level of a linked worktree git reads on its own: the worktree, or a submodule checked out
+/// in it (nested ones included).
+#[derive(Clone, Debug)]
+struct Level {
+    /// Its folder.
+    dir: PathBuf,
+    /// Its path in the worktree with a trailing `/` (`vendor/astream/`), empty for the worktree.
+    prefix: String,
+    /// The commit its parent's index records for it, `None` for the worktree.
+    recorded: Option<String>,
+}
+
+impl Level {
+    /// Its path in the worktree, or `the worktree` for the worktree itself.
+    fn prefix_or_root(&self) -> &str {
+        if self.prefix.is_empty() {
+            "the worktree"
+        } else {
+            &self.prefix
+        }
+    }
+}
+
+/// The most levels of nested submodules [`levels`] descends.
+const MAX_DEPTH: usize = 8;
+
+/// The most submodules checked out in one worktree that [`levels`] reads.
+const MAX_LEVELS: usize = 64;
+
+/// The linked worktree `wt` and every submodule checked out in it, nested ones included, each
+/// read through its own index (`git ls-files --stage`); git runs at the worktree with `args`
+/// before its command (a `--git-dir` and `--work-tree` when the tree's `.git` may be gone). A
+/// gitlink whose folder holds a `.git` is checked out, and git reads it as a level of its own:
+/// the superproject's `git status`, under any `--ignore-submodules`, reports no file git ignores
+/// in it. A gitlink folder with no `.git` that holds anything is an `Err`: git status sees
+/// nothing in it at all, and the remover would take it whole. So is an unmerged gitlink, a path
+/// git does not write, a gitlink that is no folder, and more than [`MAX_LEVELS`] levels or
+/// [`MAX_DEPTH`] deep.
+fn levels(git: &dyn Git, wt: &Path, args: &[&str]) -> Result<Vec<Level>, String> {
+    let mut out = vec![Level {
+        dir: wt.to_path_buf(),
+        prefix: String::new(),
+        recorded: None,
+    }];
+    let mut depth = vec![0usize];
+    let mut next = 0;
+    while let Some(level) = out.get(next).cloned() {
+        let at = depth[next];
+        next += 1;
+        let mut ls_args: Vec<&str> = if level.prefix.is_empty() {
+            args.to_vec()
+        } else {
+            Vec::new()
+        };
+        ls_args.extend(["ls-files", "-z", "--stage"]);
+        let ls = git.run(&level.dir, &ls_args);
+        if ls.code != Some(0) || !ls.err.is_empty() {
+            return Err(format!(
+                "git could not list the submodules of {}: {}",
+                level.dir.display(),
+                ls.err
+            ));
+        }
+        for row in ls.out.split('\0').filter(|r| !r.is_empty()) {
+            let Some((meta, rel)) = row.split_once('\t') else {
+                return Err(format!("git ls-files gave a row it does not write ({row})"));
+            };
+            let mut parts = meta.split_whitespace();
+            let (Some(mode), Some(sha), Some(stage), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Err(format!("git ls-files gave a row it does not write ({row})"));
+            };
+            if mode != "160000" {
+                continue;
+            }
+            let path = format!("{}{rel}", level.prefix);
+            if stage != "0" {
+                return Err(format!("its submodule {path} is unmerged"));
+            }
+            if !Path::new(rel)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(format!("its submodule path {path} is no path git writes"));
+            }
+            let dir = level.dir.join(rel);
+            match std::fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => return Err(format!("its submodule {path} is no folder")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("its submodule {path} could not be read: {e}")),
+            }
+            match std::fs::symlink_metadata(dir.join(".git")) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let held = entries(&dir)
+                        .map_err(|e| format!("its submodule {path} could not be listed: {e}"))?;
+                    if !held.is_empty() {
+                        return Err(format!(
+                            "its submodule folder {path}/ holds files but no .git, so git sees \
+                             nothing in it: it stays"
+                        ));
+                    }
+                    continue;
+                }
+                Err(e) => return Err(format!("its submodule {path} could not be read: {e}")),
+            }
+            if at + 1 > MAX_DEPTH || out.len() == MAX_LEVELS {
+                return Err(format!(
+                    "it holds more submodules than a judgment reads (at most {MAX_LEVELS}, \
+                     {MAX_DEPTH} deep)"
+                ));
+            }
+            out.push(Level {
+                dir,
+                prefix: format!("{path}/"),
+                recorded: Some(sha.to_owned()),
+            });
+            depth.push(at + 1);
+        }
+    }
+    Ok(out)
+}
+
+/// The ignored entries of the linked worktree `wt` and of every submodule checked out in it
+/// ([`levels`]; `git status --ignored`'s `!!` rows, a folder as one, each named by its path in
+/// `wt`), recorded in its removal's receipt: once the removal takes a `.gitignore`, what it
+/// ignored reads as untracked, and only these may ([`removal_only`]). Any other row means the
+/// tree changed since it was judged, and it stays. At most [`MAX_IGNORED`] in all.
+///
+/// Each must be a folder that says it is a cache ([`cache_tagged`], read in its own level): an
+/// ignored file or other folder (a `.env`, local notes, `node_modules`, a submodule's `.claude/`)
+/// may be what nobody can regenerate, and git holds no copy of it, so the worktree stays.
+fn ignored_entries(git: &dyn Git, wt: &Path) -> Result<Vec<String>, String> {
+    let mut ignored = Vec::new();
+    for level in levels(git, wt, &[])? {
+        // A submodule's own index can hide an edit too: its superproject's status and ls-files
+        // show it as one clean gitlink.
+        hidden_edits(git, &level.dir, &level.dir, &[])
+            .map_err(|why| format!("in {}: {why}", level.prefix_or_root()))?;
+        let status = git.run(
+            &level.dir,
+            &[
+                "status",
+                "--porcelain",
+                "-z",
+                "--ignored",
+                "--untracked-files=normal",
+                "--ignore-submodules=all",
+            ],
+        );
+        if status.code != Some(0) || !status.err.is_empty() {
+            return Err(format!(
+                "git status could not list what it ignores in {}: {}",
+                level.dir.display(),
+                status.err
+            ));
+        }
+        for row in status.out.split('\0').filter(|r| !r.is_empty()) {
+            let Some(rel) = row.strip_prefix("!! ") else {
+                return Err(format!(
+                    "it changed since it was judged ({}{row})",
+                    level.prefix
+                ));
+            };
+            let path = format!("{}{rel}", level.prefix);
+            if !cache_tagged(&level.dir, rel) {
+                return Err(format!(
+                    "it holds {path}, which git ignores and which is no tagged cache folder; \
+                     git keeps no copy of it"
+                ));
+            }
+            if ignored.len() == MAX_IGNORED {
+                return Err(format!(
+                    "it holds more than {MAX_IGNORED} ignored entries, too many to record"
+                ));
+            }
+            ignored.push(path);
+        }
+    }
+    Ok(ignored)
+}
+
+/// Whether `rel`, an ignored row of `wt`'s `git status`, is a folder (git ends a folder's row
+/// with `/`), not a link, that holds a `CACHEDIR.TAG` file whose first line is the cache
+/// directory tag's signature, as Cargo writes in every target folder it makes.
+fn cache_tagged(wt: &Path, rel: &str) -> bool {
+    use std::io::Read as _;
+    const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let Some(folder) = rel.strip_suffix('/') else {
+        return false;
+    };
+    let folder = wt.join(folder);
+    let is_folder = std::fs::symlink_metadata(&folder).is_ok_and(|m| m.file_type().is_dir());
+    let tag = folder.join("CACHEDIR.TAG");
+    let Ok((file, meta)) = crate::metadata_io::open_regular_with_meta(&tag) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(SIGNATURE.len());
+    is_folder
+        && meta.len() >= SIGNATURE.len() as u64
+        && file
+            .take(SIGNATURE.len() as u64)
+            .read_to_end(&mut head)
+            .is_ok()
+        && head == SIGNATURE
+}
+
+/// The most ignored entries a linked worktree's receipt records ([`ignored_entries`]).
+const MAX_IGNORED: usize = 256;
+
+/// Whether all git sees changed in `wt`, a linked worktree whose removal stopped part way, and
+/// in every submodule still checked out in it ([`levels`]), read through its entry `admin` (its
+/// `.git` may be gone), is the removal's: a tracked file deleted, an entry untracked or ignored
+/// under one of `ignored`, what it and its submodules ignored when its removal began (a
+/// `.gitignore` may be among what went), or a submodule still at the commit its parent records
+/// (what is in it is read as a level of its own). Anything else (a file put in it since, ignored
+/// or not, an edit, a staged change, a submodule moved, a file git is told not to look at, a
+/// submodule folder that holds files but no `.git`) keeps it, whatever its modification time
+/// says: a move or a copy keeps an old one. A removal that stopped among a submodule's files,
+/// having taken its `.git` and not the rest, so leaves what stays for a person to look at.
+fn removal_only(git: &dyn Git, wt: &Path, admin: &Path, ignored: &[String]) -> Result<(), String> {
+    let git_dir = git_dir_arg(admin)?;
+    let work_tree = git_path(wt)
+        .to_str()
+        .map(|wt| format!("--work-tree={wt}"))
+        .ok_or_else(|| format!("{} is no path git takes as an argument", wt.display()))?;
+    let top = [git_dir.as_str(), work_tree.as_str()];
+    let under = |rel: &str| {
+        ignored
+            .iter()
+            .any(|i| rel == i.as_str() || (i.ends_with('/') && rel.starts_with(i.as_str())))
+    };
+    let levels = levels(git, wt, &top)?;
+    // A submodule git reads as a level of its own stays where its removal began while its HEAD
+    // is the commit its parent's index records: `M` in its parent's status then says only that
+    // something in it changed, which its own level's read judges.
+    let unmoved = |path: &str| -> Result<bool, String> {
+        let Some(level) = levels.iter().find(|l| l.prefix == path) else {
+            return Ok(false);
+        };
+        let head = git.run(&level.dir, &["rev-parse", "--verify", "HEAD^{commit}"]);
+        if head.code != Some(0) {
+            return Err(format!(
+                "git cannot read the HEAD of its submodule {path} ({}), so it stays",
+                head.err
+            ));
+        }
+        Ok(level.recorded.as_deref() == Some(head.out.trim()))
+    };
+    for level in &levels {
+        let mut args: Vec<&str> = if level.prefix.is_empty() {
+            top.to_vec()
+        } else {
+            Vec::new()
+        };
+        args.extend([
+            "status",
+            "--porcelain",
+            "-z",
+            "--ignored",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ]);
+        let status = git.run(&level.dir, &args);
+        if status.code != Some(0) || !status.err.is_empty() {
+            return Err(format!(
+                "git status cannot read what its stopped removal left in {} ({}), so it stays",
+                level.dir.display(),
+                status.err
+            ));
+        }
+        for row in status.out.split('\0').filter(|r| !r.is_empty()) {
+            let theirs = match row.split_at_checked(3) {
+                Some((" D ", _)) => false,
+                Some(("?? " | "!! ", rel)) => !under(&format!("{}{rel}", level.prefix)),
+                Some((" M ", rel)) => !unmoved(&format!("{}{rel}/", level.prefix))?,
+                _ => true,
+            };
+            if theirs {
+                let at = if level.prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in {}", level.prefix)
+                };
+                return Err(format!(
+                    "its removal stopped part way and it now holds what no removal makes \
+                     ({row}{at}), so it stays"
+                ));
+            }
+        }
+        let prefix: &[&str] = if level.prefix.is_empty() { &top } else { &[] };
+        hidden_edits(git, &level.dir, &level.dir, prefix)?;
+    }
+    Ok(())
+}
+
+/// The first file (anything but a folder) under `dir`, `None` when it holds none or is not
+/// there. A folder that cannot be listed is an `Err`.
+fn first_file(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(at) = stack.pop() {
+        let entries = match std::fs::read_dir(&at) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && at == dir => return Ok(None),
+            Err(e) => return Err(format!("{} could not be listed: {e}", at.display())),
+        };
+        for e in entries {
+            let e = e.map_err(|e| format!("{} could not be listed: {e}", at.display()))?;
+            seen += 1;
+            if seen > MAX_REFLOG {
+                return Err(format!("{} holds too many entries to read", dir.display()));
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(e.path());
+            } else {
+                return Ok(Some(e.path()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The commits the reflog of `name` (`HEAD`, or a full branch ref) names, read in `checkout`,
+/// through the linked worktree entry `admin` when one is given (a worktree's own HEAD, whose
+/// tree may be gone): at most [`MAX_REFLOG`], each a whole object name. A read that fails, or
+/// any line that is not an object name, is an `Err`.
+fn reflog(
+    git: &dyn Git,
+    checkout: &Path,
+    admin: Option<&Path>,
+    name: &str,
+) -> Result<Vec<String>, String> {
+    let limit = format!("-n{}", MAX_REFLOG + 1);
+    let git_dir = admin.map(git_dir_arg).transpose()?;
+    let mut args: Vec<&str> = git_dir.as_deref().into_iter().collect();
+    args.extend([
+        "log",
+        "-g",
+        "--no-show-signature",
+        "--format=%H",
+        limit.as_str(),
+        name,
+        "--",
+    ]);
+    let read = git.run(checkout, &args);
+    if read.code != Some(0) {
+        return Err(format!(
+            "the reflog of {name} could not be read: {}",
+            read.err
+        ));
+    }
+    let oids: Vec<String> = read
+        .out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if oids.len() > MAX_REFLOG {
+        return Err(format!(
+            "the reflog of {name} names more than {MAX_REFLOG} commits, too many to hold to \
+             origin/main"
+        ));
+    }
+    if let Some(bad) = oids
+        .iter()
+        .find(|o| !matches!(o.len(), 40 | 64) || !o.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(format!(
+            "the reflog of {name} read as something other than commit names ({bad})"
+        ));
+    }
+    Ok(oids)
 }
 
 /// Dirty or untracked entries in `wt` and its submodules, reading `checkout`'s own `.git/modules`
 /// object store when a submodule's `objects/info/alternates` points at a since-removed worktree.
-fn snapshot_changes(git: &dyn Git, checkout: &Path, wt: &Path) -> Result<Vec<String>, String> {
+///
+/// `strict` (a linked worktree's judgment) also holds a warning git wrote while it exited 0 to
+/// mean it may not have seen every file: git status warns and goes on past a folder it cannot
+/// read, which the remover would take whole.
+fn snapshot_changes(
+    git: &dyn Git,
+    checkout: &Path,
+    wt: &Path,
+    strict: bool,
+) -> Result<Vec<String>, String> {
     let status = git.run(
         wt,
         &[
@@ -746,6 +1568,12 @@ fn snapshot_changes(git: &dyn Git, checkout: &Path, wt: &Path) -> Result<Vec<Str
             "--untracked-files=normal",
         ],
     );
+    if status.code == Some(0) && strict && !status.err.is_empty() {
+        return Err(format!(
+            "git status warned ({}), so it may not have seen every file in it",
+            status.err.lines().next().unwrap_or_default()
+        ));
+    }
     if status.code == Some(0) {
         return Ok(status
             .out
@@ -944,7 +1772,7 @@ pub fn plan(roots: &Roots, now: SystemTime, git: &dyn Git) -> Vec<Leftover> {
         if let Some(cells) = beside(&checkout, CELLS).filter(|p| p.is_dir()) {
             let verdict = if !snapshot_gone {
                 Err("its snapshot stays, and it goes with it".to_owned())
-            } else if let Some(why) = written_words(&cells, since, now, Times::All) {
+            } else if let Some(why) = written_words(&cells, since, now, Times::All, git.until()) {
                 Err(why)
             } else {
                 Ok(format!(
@@ -966,7 +1794,7 @@ pub fn plan(roots: &Roots, now: SystemTime, git: &dyn Git) -> Vec<Leftover> {
         let verdict = match lock_held(&lock) {
             Some(true) => Err("a process holds its lock".to_owned()),
             None => Err("its lock could not be tried".to_owned()),
-            Some(false) => match written_words(&lock, since, now, Times::All) {
+            Some(false) => match written_words(&lock, since, now, Times::All, git.until()) {
                 Some(why) => Err(why),
                 None => Ok(format!(
                     "the retired verify gate's machine lock, which nothing holds, nothing in it \
@@ -1010,8 +1838,27 @@ fn remove_snapshot(
     now: SystemTime,
     fence: &super::fence::Fence<'_>,
 ) -> Result<(), String> {
+    remove_tree(git, checkout, wt, now, Shape::Snapshot, fence)
+}
+
+/// [`remove_snapshot`] for the worktree `wt` of `checkout` judged by the rule `shape` names. A
+/// linked worktree ([`Shape::Linked`]) is never taken for one half removed, and when an entry
+/// of its tree stays git's entry for it stays too, its `.git` written back: discovery finds a
+/// linked worktree only through git's entry, so the next look judges what is left again.
+fn remove_tree(
+    git: &dyn Git,
+    checkout: &Path,
+    wt: &Path,
+    now: SystemTime,
+    shape: Shape,
+    fence: &super::fence::Fence<'_>,
+) -> Result<(), String> {
     let mut recovery = pending::read(checkout, wt)?;
-    judge_snapshot(git, checkout, wt, now)?;
+    // The receipt's start, taken before the judgment's first git read: a write git's last read
+    // missed (it had read that folder already) is dated at or after it, and custody below keeps
+    // the tree for it.
+    let cutoff = pending::file_clock_now();
+    judge_tree(git, checkout, wt, now, shape)?;
     let now_listed = listed(git, checkout, wt)?;
     if now_listed.as_ref().is_some_and(|entry| entry.locked) {
         return Err(LOCKED.to_owned());
@@ -1039,50 +1886,87 @@ fn remove_snapshot(
                 checkout.display()
             )
         })?),
-        (None, None) if half_removed(checkout, wt).is_some() => None,
+        (None, None) if shape == Shape::Snapshot && half_removed(checkout, wt).is_some() => None,
         (None, None) => return Err(unlisted(checkout)),
     };
-    let cutoff = pending::file_clock_now();
+    // What a linked worktree ignores now, before its removal can take a `.gitignore`: the one
+    // kind of untracked entry a stopped removal may leave ([`removal_only`]).
+    let ignored = if shape == Shape::Linked && recovery.is_none() {
+        ignored_entries(git, wt)?
+    } else {
+        Vec::new()
+    };
     let prepared = if recovery.is_none()
         && let (Some(entry), Some(listed)) = (&own, &now_listed)
     {
-        Some(pending::prepare(wt, entry, &listed.head, &text, cutoff)?)
+        Some(pending::prepare(
+            wt,
+            entry,
+            &listed.head,
+            &text,
+            cutoff,
+            ignored,
+        )?)
     } else {
         None
     };
     if !fence.clear(wt, own.as_deref().unwrap_or(wt)) {
         return Err(USED.to_owned());
     }
+    // A receipt this call commits binds a removal that has not begun: whatever keeps the tree
+    // before its first entry goes withdraws it, so no later look resumes on its authority
+    // (the receipt branch admits less than a whole judgment does).
+    let fresh = prepared.is_some();
     if let Some(prepared) = prepared {
         pending::commit(checkout, &prepared)?;
         recovery = Some(prepared);
-        if !fence.clear(wt, own.as_deref().unwrap_or(wt)) {
-            return Err(USED.to_owned());
-        }
     }
-    if let Some(removal) = &recovery {
-        pending::revalidate(checkout, wt, removal)?;
-    } else {
-        pending::unchanged_since(wt, cutoff, true)?;
-        if gitfile_text(&gitfile).as_ref() != Some(&text) {
-            return Err("snapshot Git binding changed during admission".to_owned());
+    let custody: Result<(), String> = 'custody: {
+        if fresh && !fence.clear(wt, own.as_deref().unwrap_or(wt)) {
+            break 'custody Err(USED.to_owned());
         }
-    }
-    history::clear(git, checkout, wt, own.as_deref())?;
-    let took = super::remove::tree(&gitfile);
-    if !took.whole() {
-        let why = super::remove::named(&gitfile, 1)
-            .first
-            .first()
-            .map_or(super::remove::Why::StillRefusing, |(_, why)| *why);
-        let kept = super::remove::Named {
-            count: took.stayed,
-            first: vec![(PathBuf::from(".git"), why)],
-        };
-        return Err(format!(
-            "{}, so nothing else of it was touched",
-            kept.words(wt)
-        ));
+        // The private-history check may read for seconds (up to its own bound): it goes first, so
+        // the time and binding checks just below are the last thing before the first deletion.
+        if let Err(why) = history::clear(git, checkout, wt, own.as_deref()) {
+            break 'custody Err(why);
+        }
+        if let Some(removal) = &recovery {
+            if let Err(why) = pending::revalidate(checkout, wt, removal) {
+                break 'custody Err(why);
+            }
+        } else {
+            if let Err(why) = pending::unchanged_since(wt, cutoff, true) {
+                break 'custody Err(why);
+            }
+            if gitfile_text(&gitfile).as_ref() != Some(&text) {
+                break 'custody Err("snapshot Git binding changed during admission".to_owned());
+            }
+        }
+        let took = super::remove::tree(&gitfile);
+        if !took.whole() {
+            let why = super::remove::named(&gitfile, 1)
+                .first
+                .first()
+                .map_or(super::remove::Why::StillRefusing, |(_, why)| *why);
+            let kept = super::remove::Named {
+                count: took.stayed,
+                first: vec![(PathBuf::from(".git"), why)],
+            };
+            break 'custody Err(format!(
+                "{}, so nothing else of it was touched",
+                kept.words(wt)
+            ));
+        }
+        Ok(())
+    };
+    if let Err(why) = custody {
+        return Err(match &recovery {
+            Some(removal) if fresh => match pending::retract(checkout, wt, removal) {
+                Ok(()) => why,
+                Err(stayed) => format!("{why}; {stayed}"),
+            },
+            _ => why,
+        });
     }
     let left = super::remove::tree(wt);
     if left.whole()
@@ -1108,6 +1992,8 @@ fn remove_snapshot(
             let wt_arg = git_path(wt).to_string_lossy();
             let dropped = git.run(checkout, &["worktree", "remove", "--force", &wt_arg]);
             (dropped.code != Some(0)).then_some(dropped.err)
+        } else if shape == Shape::Linked {
+            Some("part of its tree stayed, so git's entry stays for the next look".to_owned())
         } else if entry.join("locked").symlink_metadata().is_ok() {
             Some(LOCKED.to_owned())
         } else {
@@ -1202,6 +2088,180 @@ fn retire_on(
         done.push((left, result));
     }
     done
+}
+
+/// Why a pass under `home` does not judge `wt` as a linked worktree of `checkout` at all: a
+/// folder it never looks into ([`looked_into`]), a `checkout` that is no main checkout, the
+/// retired gate's own snapshot, which `aterm pkg machine apply` judges by its own rule, or a
+/// worktree no agent made ([`agent_made`]).
+fn worktree_refused(home: &Path, checkout: &Path, wt: &Path) -> Option<String> {
+    if !looked_into(home, checkout) || !looked_into(home, wt) {
+        return Some(format!(
+            "{} lies where a pass never looks (`aterm_toolchain::checkout::never_looked_at`)",
+            wt.display()
+        ));
+    }
+    if !main_checkout(checkout) {
+        return Some(format!("{} is not a main checkout", checkout.display()));
+    }
+    let snapshot = beside(checkout, SNAPSHOT);
+    let at = pending::location(wt);
+    let is_snapshot = snapshot.as_deref() == Some(wt)
+        || (at.is_some() && snapshot.as_deref().and_then(pending::location) == at);
+    if is_snapshot {
+        return Some("the retired gate's snapshot: `aterm pkg machine apply` judges it".to_owned());
+    }
+    if !agent_made(checkout, wt) {
+        return Some(format!(
+            "{} is no worktree an agent makes (a `*.noindex` folder with a `.ubd` folder above \
+             it, or one in its checkout's .claude/worktrees/): a person's worktree stays",
+            wt.display()
+        ));
+    }
+    None
+}
+
+/// Whether `wt`, a worktree of `checkout`, has the shape of one aterm's agents make, read off its
+/// path alone: its name ends `.noindex` and a folder named `.ubd` lies above it (AGENTS.md's
+/// shape for an agent's worktree), or it is a folder of `checkout`'s `.claude/worktrees/`
+/// (Claude Code's own isolation worktrees). Only those are the worktree step's to judge: a
+/// person's worktree elsewhere (`~/myapp-develop`, a bare repository's `main/`) is their working
+/// folder, merged or not.
+fn agent_made(checkout: &Path, wt: &Path) -> bool {
+    let at = pending::location(wt).unwrap_or_else(|| wt.to_path_buf());
+    let Some(name) = at.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let noindex = name.len() > ".noindex".len() && name.ends_with(".noindex");
+    let ubd = at.parent().is_some_and(|p| {
+        p.ancestors()
+            .any(|a| a.file_name() == Some(".ubd".as_ref()))
+    });
+    if noindex && ubd {
+        return true;
+    }
+    let isolation = resolved(checkout).join(".claude").join("worktrees");
+    at.parent() == Some(isolation.as_path())
+}
+
+/// Why `checkout`'s repository is no candidate's: a bare one (`git rev-parse
+/// --is-bare-repository`), whose every worktree is a person's working folder (the
+/// `git clone --bare … proj/.git` layout), or one git cannot say that of.
+fn bare_refused(git: &dyn Git, checkout: &Path) -> Result<(), String> {
+    let bare = git.run(checkout, &["rev-parse", "--is-bare-repository"]);
+    match (bare.code, bare.out.trim()) {
+        (Some(0), "false") => Ok(()),
+        (Some(0), "true") => Err(format!(
+            "{} is a bare repository's folder, whose every worktree is a person's working folder",
+            checkout.display()
+        )),
+        _ => Err(format!(
+            "git could not say whether {} is a bare repository: {}",
+            checkout.display(),
+            bare.err
+        )),
+    }
+}
+
+/// Judge `wt`, a linked worktree of the main checkout `checkout`, as a pass under `home` may:
+/// only one an agent made ([`agent_made`]) of a repository that is not bare, by the snapshot's
+/// rule ([`plan`]) on a branch or detached, and beyond it no operation in
+/// progress, no per-worktree ref, no worktree inside it, no commit only its reflogs hold, and
+/// none of git's own files for it written for [`UNWRITTEN`]. Read only: nothing is written.
+///
+/// # Errors
+/// Why it stays, at this observation.
+pub fn judge_worktree(
+    git: &dyn Git,
+    home: &Path,
+    checkout: &Path,
+    wt: &Path,
+    now: SystemTime,
+) -> Result<Admitted, String> {
+    if let Some(why) = worktree_refused(home, checkout, wt) {
+        return Err(why);
+    }
+    bare_refused(git, checkout)?;
+    judge_tree(git, checkout, wt, now, Shape::Linked)
+}
+
+/// Remove `wt`, a linked worktree of the main checkout `checkout`, judged again just before as
+/// [`judge_worktree`] does, under its own durable receipt (`<checkout>/.git/aterm-retiring/`)
+/// and the live process-use fence, as [`remove_snapshot`] removes the snapshot. Its branch is
+/// not touched. `Ok(())` once its tree is gone and git no longer lists it.
+///
+/// # Errors
+/// Why it, or what is left of it, stays.
+pub fn remove_worktree(
+    git: &dyn Git,
+    home: &Path,
+    checkout: &Path,
+    wt: &Path,
+    now: SystemTime,
+) -> Result<(), String> {
+    remove_worktree_on(
+        git,
+        home,
+        checkout,
+        wt,
+        now,
+        &super::fence::Fence::default(),
+    )
+}
+
+/// [`remove_worktree`] with a process probe a headless fixture supplies.
+///
+/// # Errors
+/// As [`remove_worktree`].
+#[cfg(any(test, debug_assertions))]
+pub fn remove_worktree_with_processes(
+    git: &dyn Git,
+    home: &Path,
+    checkout: &Path,
+    wt: &Path,
+    now: SystemTime,
+    processes: super::fence::Processes<'_>,
+) -> Result<(), String> {
+    remove_worktree_on(
+        git,
+        home,
+        checkout,
+        wt,
+        now,
+        &super::fence::Fence::new(processes),
+    )
+}
+
+fn remove_worktree_on(
+    git: &dyn Git,
+    home: &Path,
+    checkout: &Path,
+    wt: &Path,
+    now: SystemTime,
+    fence: &super::fence::Fence<'_>,
+) -> Result<(), String> {
+    if let Some(why) = worktree_refused(home, checkout, wt) {
+        return Err(why);
+    }
+    bare_refused(git, checkout)?;
+    remove_tree(git, checkout, wt, now, Shape::Linked, fence)
+}
+
+/// The worktrees of `checkout` an interrupted removal holds a receipt for
+/// (`<checkout>/.git/aterm-retiring/`), at most 64: a removal that took the tree and stopped
+/// before git's entry for it leaves no folder discovery can find it by. An unreadable receipt
+/// names none, and its worktree stays.
+#[must_use]
+pub fn retiring(checkout: &Path) -> Vec<PathBuf> {
+    pending::listed(checkout)
+}
+
+/// Whether a receipt in `checkout`'s git directory names the worktree `wt` ([`retiring`]): its
+/// removal stopped part way, maybe before its `.git` was written back, so what is left is judged
+/// by its receipt ([`judge_worktree`]), not by what its `.git` says.
+#[must_use]
+pub fn in_retirement(checkout: &Path, wt: &Path) -> bool {
+    pending::location(wt).is_some_and(|at| retiring(checkout).contains(&at))
 }
 
 #[cfg(test)]

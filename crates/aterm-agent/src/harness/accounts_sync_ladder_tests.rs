@@ -1353,3 +1353,229 @@ fn a_row_changed_during_route_read_gets_no_stale_no_route_summary() {
         assert!(bench.handed().is_empty());
     }
 }
+
+/// A guard whose renewals read `reads` of the machine.
+#[cfg(unix)]
+fn guard_reading(reads: MachineReads) -> Arc<Mutex<AutoRenewGuard>> {
+    Arc::new(Mutex::new(AutoRenewGuard {
+        reads,
+        ..AutoRenewGuard::default()
+    }))
+}
+
+/// What a Mac with a desk reads, with nothing of another machine's in it.
+fn at_the_desk() -> MachineReads {
+    MachineReads {
+        desk: true,
+        ..MachineReads::default()
+    }
+}
+
+/// THE UPKEEP OPENS ATERM'S SIGN-IN WINDOW ONLY AT THIS MAC'S OWN DESK, FOR A ROW WHOSE LOGIN
+/// CODE THE WINDOW READS BY ITSELF: no desk (not macOS), an SSH connection, the mark of
+/// another machine's request, a session another Mac's drive typed into, a row in shared
+/// custody and a mailbox the window cannot read each open none. The mailbox is read only
+/// where everything else allows the window.
+#[test]
+fn the_upkeep_opens_the_window_only_at_this_macs_own_desk_for_a_mailbox_the_window_reads() {
+    let desk = at_the_desk();
+    assert!(upkeep_opens_window(desk, false, &|| true));
+    assert!(
+        !upkeep_opens_window(desk, false, &|| false),
+        "nobody is there to type a code the window cannot read"
+    );
+    let unread = || panic!("the mailbox is read only where the window may open");
+    assert!(!upkeep_opens_window(
+        MachineReads::default(),
+        false,
+        &unread
+    ));
+    assert!(!upkeep_opens_window(desk, true, &unread), "shared custody");
+    for reads in [
+        MachineReads {
+            var: |name| (name == "SSH_CONNECTION").then(|| "10.0.0.1 1 10.0.0.2 22".into()),
+            ..desk
+        },
+        MachineReads {
+            var: |name| (name == crate::harness::remote_renew::FOR_PEER_ENV).then(|| "1".into()),
+            ..desk
+        },
+        MachineReads {
+            driven: || true,
+            ..desk
+        },
+    ] {
+        assert!(!upkeep_opens_window(reads, false, &unread));
+    }
+}
+
+/// The upkeep's row `w3` with a mail folder in the store, which the window reads by itself.
+#[cfg(unix)]
+fn desk_with_a_mail_folder() -> Desk {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    fs::create_dir_all(
+        desk.store()
+            .dir
+            .join(crate::harness::open_url::DEFAULT_MAILBOX_DIR),
+    )
+    .unwrap();
+    desk
+}
+
+/// THE UPKEEP'S RUN IS HANDED THE WINDOW IT CHOSE, scripted or live: at this Mac's own desk a
+/// row whose mail folder gives the code is handed aterm's own window. The same row is handed
+/// the headless route where the run carries another machine's mark, and so is a row whose
+/// only mailbox is a webmail inbox, which a headless browser alone reads: the window would
+/// wait four minutes for a code nobody types.
+#[cfg(unix)]
+#[test]
+fn the_upkeeps_run_is_handed_the_window_only_where_the_window_reads_the_rows_mailbox() {
+    let desk = desk_with_a_mail_folder();
+    let bench = Bench {
+        guard: guard_reading(at_the_desk()),
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    assert!(bench.pass(&desk, NOW), "the mailbox route started");
+    assert!(
+        matches!(bench.handed().as_slice(), [RenewBrowser::Window { .. }]),
+        "{:?}",
+        bench.handed()
+    );
+
+    let desk = desk_with_a_mail_folder();
+    let bench = Bench {
+        guard: guard_reading(MachineReads {
+            var: |name| (name == crate::harness::remote_renew::FOR_PEER_ENV).then(|| "1".into()),
+            ..at_the_desk()
+        }),
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    assert!(bench.pass(&desk, NOW), "the mailbox route started");
+    assert!(
+        matches!(bench.handed().as_slice(), [RenewBrowser::Remote { .. }]),
+        "another machine's run opens nothing here: {:?}",
+        bench.handed()
+    );
+
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    let secrets = desk.home.join(".secrets");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(
+        secrets.join(crate::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+        "webmail_url = \"https://mail.example.test/inbox\"\npassword = \"a fixture's word\"\n",
+    )
+    .unwrap();
+    let store = desk.store();
+    assert!(has_configured_mailbox_for_row_with(
+        &|_| None,
+        Some(&desk.home),
+        &store,
+        Some("w3"),
+        Some("w3.m30.3@example.test"),
+    ));
+    assert!(
+        !window_reads_mailbox_for_row_with(
+            &|_| None,
+            Some(&desk.home),
+            &store,
+            Some("w3"),
+            Some("w3.m30.3@example.test"),
+        ),
+        "a webmail inbox is read only inside a headless browser"
+    );
+    let bench = Bench {
+        browser: true,
+        guard: guard_reading(at_the_desk()),
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    assert!(bench.pass(&desk, NOW), "the mailbox route started");
+    assert!(
+        matches!(bench.handed().as_slice(), [RenewBrowser::Remote { .. }]),
+        "{:?}",
+        bench.handed()
+    );
+}
+
+/// THE UPKEEP OPENS NO WINDOW AGAIN FOR A ROW ITS LAST SIGN-IN LEFT TO A PERSON: a sign-in
+/// that ended at a human check records the row's own renewal as the step a person owes it
+/// ([`accounts::SignInAction::Renew`]), and while that stands the upkeep, which would open
+/// the window, starts nothing, however long ago it was. CONTROL: with no such step the same
+/// row's window opens, and where this run opens no window the step holds nothing here.
+#[cfg(unix)]
+#[test]
+fn the_upkeep_opens_no_window_for_a_row_left_to_a_person() {
+    let long_ago = NOW - 2 * PERSON_BACKOFF_SECS;
+    let owed = |desk: &Desk| {
+        desk.store()
+            .transact_pool_logins_within(
+                &[],
+                &desk.roster(),
+                long_ago,
+                &mut None,
+                |_, _, logins| {
+                    accounts::admit_workflow(logins, "w3")?;
+                    accounts::note_sign_in_task(
+                        logins,
+                        "w3",
+                        accounts::SignInAction::Renew,
+                        long_ago,
+                    );
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+    };
+    let desk = desk_with_a_mail_folder();
+    owed(&desk);
+    let bench = Bench {
+        guard: guard_reading(at_the_desk()),
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    assert!(!bench.pass(&desk, NOW), "left to a person");
+    assert!(bench.handed().is_empty(), "{:?}", bench.handed());
+    bench.cool();
+    assert!(!bench.pass(&desk, NOW + 60), "and at every later upkeep");
+    assert!(bench.handed().is_empty(), "{:?}", bench.handed());
+
+    let desk = desk_with_a_mail_folder();
+    let bench = Bench {
+        guard: guard_reading(at_the_desk()),
+        ..Bench::ending(Renewal::AuthFailed)
+    };
+    assert!(bench.pass(&desk, NOW), "CONTROL: no step owed");
+    assert!(matches!(
+        bench.handed().as_slice(),
+        [RenewBrowser::Window { .. }]
+    ));
+
+    let desk = desk_with_a_mail_folder();
+    owed(&desk);
+    let bench = Bench::ending(Renewal::AuthFailed);
+    assert!(bench.pass(&desk, NOW), "CONTROL: no window to hold");
+    assert!(matches!(
+        bench.handed().as_slice(),
+        [RenewBrowser::Remote { .. }]
+    ));
+}
+
+/// The log's line for a window's token step holds the row's label and no address: the token
+/// verb names the account to a person, and the upkeep's log is read by nobody who asked.
+#[test]
+fn the_token_steps_log_line_holds_no_address() {
+    assert_eq!(
+        token_step_line("w3", "  \n"),
+        "w3: token: made in the sign-in window"
+    );
+    let line = token_step_line(
+        "w3",
+        "aterm harness accounts token: a token for w3.m30.3@example.test is being made in \
+         another tab\n",
+    );
+    assert_eq!(
+        line,
+        "w3: token: aterm harness accounts token: a token for <address> is being made in \
+         another tab"
+    );
+}

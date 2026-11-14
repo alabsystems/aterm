@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Cells collections (design §3.1–§3.2): one causal register per column. A key is
-//! `<pk>.<col>` for a scalar or list column and `<pk>.<col>.<elem>` for one element of a set; a
-//! value is `{"r": schema version, "x": typed value}`, plus `"s": <source pk>` when the
+//! `<pk>.<col>` for a scalar or list column and `<pk>.<col>.<elem>` for one element of a set (a
+//! text set's `<elem>` is a digest of the element's text, [`keys::text_elem`], and its cell
+//! carries the text); a value is `{"r": schema version, "x": typed value}`, plus `"s": <source pk>` when the
 //! importer wrote it and `"a": true` when an automatic path did. The Commons projection keeps
 //! each key's concurrent candidates and drops exactly the ones a later edit observed
 //! (`documents::apply`); this reads those cells back as typed rows: equal candidates
@@ -367,6 +368,11 @@ fn check_elem(column: &Column, elem: &str) -> std::result::Result<(), &'static s
     let Ty::Set(inner) = column.ty else {
         return Err("only a set column has elements");
     };
+    if column.ty.text_set().is_some() {
+        return keys::is_text_elem(elem)
+            .then_some(())
+            .ok_or("a text set's element key is the digest of its text");
+    }
     match inner {
         Ty::Enum(words) if !words.contains(&elem) => Err("this word is not one the column knows"),
         Ty::Label if !keys::is_label(elem) => Err("a machine label is m<N> or m<N>-xxxx"),
@@ -376,6 +382,115 @@ fn check_elem(column: &Column, elem: &str) -> std::result::Result<(), &'static s
         }
         _ => check(inner, &Value::String(elem.to_owned()), false),
     }
+}
+
+/// Check a text set member's text: in its normal form, not empty, within the column's size and
+/// past the guards. A comma is a member's own (a grid shows such a set as a JSON list).
+fn check_member_text(max: usize, text: &str) -> std::result::Result<(), &'static str> {
+    if text.is_empty() || keys::normal_text(text) != text {
+        return Err("a set member is trimmed with single spaces");
+    }
+    // `‖` parts a reopened conflict's sides in the grid (`⚠ mine ‖ theirs`).
+    if text.contains('‖') {
+        return Err("a set member never holds ‖");
+    }
+    guard::text(text, max).map_err(guard::Refusal::rule)
+}
+
+/// Check one stored value of the element `elem` of the set column `column`: `true` or `false`
+/// for a set of words or keys; for a text set, its member's text (present) or `false`
+/// (removed), the text's digest being `elem`, or a null, which a revert of its first add leaves
+/// (absent).
+fn check_elem_value(
+    column: &Column,
+    elem: &str,
+    x: &Value,
+) -> std::result::Result<(), &'static str> {
+    match (column.ty.text_set(), x) {
+        (Some(_), Value::Null | Value::Bool(false)) | (None, Value::Bool(_)) => Ok(()),
+        (Some(max), Value::String(text)) => {
+            check_member_text(max, text)?;
+            (keys::text_elem(text) == elem)
+                .then_some(())
+                .ok_or("a text set's element key is the digest of its text")
+        }
+        (Some(_), _) => Err("a text set's element holds its text, or false once removed"),
+        (None, _) => Err("a set element is true or false"),
+    }
+}
+
+/// Whether `x`, stored at the element `elem` of the set column `column`, adds a member: `true`
+/// under a set of words or keys, the text `elem` digests under a text set. What a projection
+/// reads as present ([`members`]) and a save settles against.
+pub fn adds(column: &Column, elem: &str, x: &Value) -> bool {
+    !matches!(x, Value::Bool(false) | Value::Null) && check_elem_value(column, elem, x).is_ok()
+}
+
+/// The present members of the set `field` of the set column `column` (add-wins): a text set's
+/// texts, each from a candidate whose text its element key digests ([`adds`]); else
+/// [`Field::members`], the elements a candidate adds with `true`.
+pub fn members<'a>(column: &Column, field: Option<&'a Field>) -> BTreeSet<&'a str> {
+    let Some(Field::Set(elements)) = field else {
+        return BTreeSet::new();
+    };
+    if column.ty.text_set().is_none() {
+        return field.map(Field::members).unwrap_or_default();
+    }
+    elements
+        .iter()
+        .filter_map(|(elem, field)| {
+            field.candidates().iter().find_map(|c| match &c.value.x {
+                Value::String(text) if adds(column, elem, &c.value.x) => Some(text.as_str()),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// Whether the element `elem` of the set column `column`, its cell's candidates' values
+/// `values`, reads present as [`project`] reads it: some candidate adds it ([`adds`]); for a
+/// text set, only where every candidate decodes (`unreadable` false) and is one its element
+/// holds, since a projection shows any other element raw and never as a member.
+pub fn element_present(column: &Column, elem: &str, values: &[Value], unreadable: bool) -> bool {
+    if column.ty.text_set().is_some()
+        && (unreadable
+            || !values
+                .iter()
+                .all(|x| check_elem_value(column, elem, x).is_ok()))
+    {
+        return false;
+    }
+    values.iter().any(|x| adds(column, elem, x))
+}
+
+/// `raw` as a member of a text set of `max`-byte texts: its normal form ([`keys::normal_text`]),
+/// checked as an element cell's text is.
+///
+/// # Errors
+/// The text set refuses it; the rule names no part of it.
+pub fn text_member(max: usize, raw: &str) -> std::result::Result<String, &'static str> {
+    let text = keys::normal_text(raw);
+    check_member_text(max, &text)?;
+    Ok(text)
+}
+
+/// One member of the set column `column` as written: its element key and the value that adds
+/// it. A set of words or keys keys an element by the member itself and adds it with `true`; a
+/// text set keys it by the digest of its normal form ([`keys::text_elem`]) and adds it with that
+/// text. Either removes an element with `false`.
+///
+/// # Errors
+/// The member is not one the column can hold; the rule names no part of it.
+pub fn element(
+    column: &Column,
+    member: &str,
+) -> std::result::Result<(String, Value), &'static str> {
+    if let Some(max) = column.ty.text_set() {
+        let text = text_member(max, member)?;
+        return Ok((keys::text_elem(&text), Value::String(text)));
+    }
+    check_elem(column, member)?;
+    Ok((member.to_owned(), Value::Bool(true)))
 }
 
 /// Whether `x` is a value of `ty` that passes the guards (null passes): what a reader checks
@@ -440,14 +555,9 @@ pub fn change(collection: &Collection, key: CellKey<'_>, value: &CellValue) -> R
         .ok_or_else(|| refuse(collection, key.col, "no such live column"))?;
     match key.elem {
         Some(elem) => {
-            check_elem(column, elem).map_err(|rule| refuse(collection, column.name, rule))?;
-            if value.x.as_bool().is_none() {
-                return Err(refuse(
-                    collection,
-                    column.name,
-                    "a set element is true or false",
-                ));
-            }
+            check_elem(column, elem)
+                .and_then(|()| check_elem_value(column, elem, &value.x))
+                .map_err(|rule| refuse(collection, column.name, rule))?;
         }
         None => validate(collection, column, &value.x)?,
     }
@@ -456,6 +566,35 @@ pub fn change(collection: &Collection, key: CellKey<'_>, value: &CellValue) -> R
         key: key.encode()?,
         value: Some(value.encode()),
     })
+}
+
+/// One change adding (`present`) or removing `member` of the set column `col` of row `pk`
+/// ([`element`]), its stored value made by `value` from the element's typed value.
+///
+/// # Errors
+/// As [`change`], or `col` is no set column of `collection`.
+pub fn member_change(
+    collection: &Collection,
+    pk: &str,
+    col: &str,
+    member: &str,
+    present: bool,
+    value: impl FnOnce(Value) -> CellValue,
+) -> Result<Change> {
+    let column = collection
+        .column(col)
+        .ok_or_else(|| refuse(collection, col, "no such live column"))?;
+    let (elem, added) = element(column, member).map_err(|rule| refuse(collection, col, rule))?;
+    let x = if present { added } else { Value::Bool(false) };
+    change(
+        collection,
+        CellKey {
+            pk,
+            col,
+            elem: Some(&elem),
+        },
+        &value(x),
+    )
 }
 
 /// One concurrent value of a cell.
@@ -508,7 +647,8 @@ impl Field {
         matches!(self, Self::Conflict { .. })
     }
 
-    /// For a set element: present when any candidate adds it (add-wins).
+    /// For a set element of a set of words or keys: present when any candidate adds it with
+    /// `true` (add-wins). A text set's element is read by [`members`].
     pub fn present(&self) -> bool {
         match self {
             Self::Value(candidate) => candidate.value.x == Value::Bool(true),
@@ -519,7 +659,7 @@ impl Field {
         }
     }
 
-    /// For a set: whether `elem` is present.
+    /// For a set of words or keys: whether `elem` is present.
     pub fn has_member(&self, elem: &str) -> bool {
         match self {
             Self::Set(elements) => elements.get(elem).is_some_and(Self::present),
@@ -527,7 +667,7 @@ impl Field {
         }
     }
 
-    /// For a set: its present elements.
+    /// For a set of words or keys: its present elements.
     pub fn members(&self) -> BTreeSet<&str> {
         match self {
             Self::Set(elements) => elements
@@ -849,14 +989,29 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
             && column.is_some_and(|column| match parsed.elem {
                 Some(elem) => {
                     check_elem(column, elem).is_ok()
-                        && candidates.iter().all(|c| c.value.x.as_bool().is_some())
+                        && candidates
+                            .iter()
+                            .all(|c| check_elem_value(column, elem, &c.value.x).is_ok())
                 }
                 None => candidates
                     .iter()
                     .all(|c| check(&column.ty, &c.value.x, true).is_ok()),
             });
+        let set = column.filter(|c| matches!(c.ty, Ty::Set(_)));
         if !readable {
             row.raw.insert(parsed.col.to_owned());
+            // A text set's element whose value it cannot hold (a text its key does not digest,
+            // a `true`) is shown raw, never as a member. A set of words or keys keeps such an
+            // element's candidates, its decodable `true` a member, as it always has.
+            if let (Some(elem), Some(set)) = (parsed.elem, set)
+                && set.ty.text_set().is_some()
+                && (unreadable
+                    || !candidates
+                        .iter()
+                        .all(|c| check_elem_value(set, elem, &c.value.x).is_ok()))
+            {
+                continue;
+            }
         }
         let Some(field) = field(rule, candidates) else {
             continue;

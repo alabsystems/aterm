@@ -85,16 +85,11 @@ pub(crate) fn put(collection: &Collection, pk: &str, col: &str, x: Value) -> Cha
     .unwrap()
 }
 
-pub(crate) fn elem(collection: &Collection, pk: &str, col: &str, elem: &str) -> Change {
-    cell::change(
-        collection,
-        CellKey {
-            pk,
-            col,
-            elem: Some(elem),
-        },
-        &CellValue::owner(1, Value::Bool(true)),
-    )
+/// The owner's add of `member` to the set column `col` (a text set's text, else a word or key).
+pub(crate) fn elem(collection: &Collection, pk: &str, col: &str, member: &str) -> Change {
+    cell::member_change(collection, pk, col, member, true, |x| {
+        CellValue::owner(1, x)
+    })
     .unwrap()
 }
 
@@ -804,6 +799,83 @@ fn a_set_cell_writes_only_the_members_that_changed() {
     );
 }
 
+crate::att_collection!(
+    /// A row with two free-text sets.
+    TEXT_SETS = Collection {
+        name: "machine",
+        version: 1,
+        kind: crate::typed::Kind::Cells,
+        writers: crate::typed::Writers::Owner,
+        prefix: "mc",
+        derive: crate::typed::Derive::BirthSha256,
+        columns: &[
+            Column::new("hosts", Ty::Set(&Ty::Text(253))),
+            Column::new("nickname_aliases", Ty::Set(&Ty::Text(64))),
+            Column::new("row", Ty::Enum(&["live", "retired"])),
+        ],
+        unique: &[],
+        max_row: 0,
+    }
+);
+
+const SETS: Table = Table {
+    application: "test",
+    role: "sets",
+    collections: &[&TEXT_SETS],
+    self_quota: 0,
+    ends: &[],
+};
+
+/// A text set one of whose members holds a comma (`Studio, upstairs`) shows as a JSON list, and
+/// a save of that JSON list, one member added, writes only the added member; a set of plain
+/// members stays comma-separated.
+/// NEGATIVE CONTROL: with `show_field` joining a set's members with commas whatever they hold,
+/// the save reads `Studio` and `upstairs` as two members: the `written` assertion fails.
+#[test]
+fn a_text_set_member_with_a_comma_shows_and_saves_as_a_json_list() {
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&TEXT_SETS, MC, "row", json!("live")),
+            elem(&TEXT_SETS, MC, "hosts", "a.lan"),
+            elem(&TEXT_SETS, MC, "hosts", "b.lan"),
+            elem(&TEXT_SETS, MC, "nickname_aliases", "Studio, upstairs"),
+            elem(&TEXT_SETS, MC, "nickname_aliases", "The Studio"),
+        ],
+    );
+    let cells = book.cells();
+    let exported = export(&SETS, &TEXT_SETS, &cells, &[], false).unwrap();
+    assert!(
+        exported
+            .text
+            .contains(r#""[""Studio, upstairs"",""The Studio""]""#),
+        "{}",
+        exported.text
+    );
+    assert!(
+        exported.text.contains("\na.lan, b.lan\t"),
+        "{}",
+        exported.text
+    );
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, MC),
+        "nickname_aliases",
+        r#"["Studio, upstairs", "The Studio", "Upstairs Mac"]"#,
+    );
+    let plan = super::plan(&SETS, &TEXT_SETS, &exported.base, &saved, &no_birth).unwrap();
+    let written: Vec<&str> = plan.rows[0].1.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(
+        written,
+        [format!(
+            "{MC}.nickname_aliases.{}",
+            keys::text_elem("Upstairs Mac")
+        )]
+    );
+}
+
 /// The baseline an export writes beside its file reads back as it was, candidates and set
 /// elements included, and an account's grid keeps its JSON column read-only.
 /// NEGATIVE CONTROL: with `to_json` leaving set elements out, the read-back baseline differs:
@@ -900,5 +972,296 @@ fn malformed_baselines_and_set_filters_fail_closed_and_canonicalize() {
             .unwrap()
             .matches(&MACHINE, MC, row)
             .is_err()
+    );
+}
+
+/// The present members of `row`'s set column `col` of `collection` ([`cell::members`]).
+fn members<'a>(collection: &Collection, row: &'a cell::Row, col: &str) -> BTreeSet<&'a str> {
+    cell::members(collection.column(col).unwrap(), row.fields.get(col))
+}
+
+/// A change at `key` of `collection` storing `value` as it is (`None`: a revert's absence).
+fn stored(collection: &Collection, key: String, value: Option<Value>) -> Change {
+    Change {
+        collection: collection.name.to_owned(),
+        key,
+        value,
+    }
+}
+
+/// A set of words or keys reads as every earlier build reads it: an add beside a revert's null,
+/// or beside a candidate this build cannot decode, is a member (the column read-only), and a
+/// text alone at an element, even one its key digests, is none. A text set's element holding an
+/// add and a revert's null is a member and its column stays editable; an element beside a
+/// candidate it cannot decode never takes its member, its column shown raw.
+/// NEGATIVE CONTROLS: with `cell::project` skipping such an element under every set (no
+/// `text_set` gate), the reverted `claude` leaves the set of keys: the first `clis` members
+/// assertion fails; with `check_elem_value` refusing a text set's null, `hosts` turns raw: the
+/// first `hosts` assertion fails; with `cell::members` reading a set of keys as a text set,
+/// `gemini` joins `clis`: the third `clis` members assertion fails.
+#[test]
+fn a_set_element_beside_a_null_or_unreadable_candidate_reads_as_before() {
+    let key = |col: &str, elem: &str| format!("{MC}.{col}.{elem}");
+    let undecodable = json!({"r": 1, "x": true, "z": 1});
+
+    // A revert's null concurrent with each add.
+    let mut book = Book::new();
+    book.write(1, &[], machine(MC));
+    book.write(2, &[], vec![stored(&MACHINE, key("clis", "claude"), None)]);
+    let row = cell::project(&MACHINE, &book.cells())
+        .rows
+        .remove(MC)
+        .unwrap();
+    assert!(row.raw.contains("clis"));
+    assert_eq!(
+        members(&MACHINE, &row, "clis"),
+        BTreeSet::from(["claude", "codex"])
+    );
+
+    // A candidate no build of this version decodes, beside an add.
+    let mut book = Book::new();
+    book.write(1, &[], machine(MC));
+    book.write(
+        2,
+        &[],
+        vec![stored(
+            &MACHINE,
+            key("clis", "codex"),
+            Some(undecodable.clone()),
+        )],
+    );
+    let row = cell::project(&MACHINE, &book.cells())
+        .rows
+        .remove(MC)
+        .unwrap();
+    assert!(row.raw.contains("clis"));
+    assert_eq!(
+        members(&MACHINE, &row, "clis"),
+        BTreeSet::from(["claude", "codex"])
+    );
+    let gemini = keys::text_elem("gemini");
+    book.write(
+        3,
+        &[],
+        vec![stored(
+            &MACHINE,
+            key("clis", &gemini),
+            Some(CellValue::owner(1, json!("gemini")).encode()),
+        )],
+    );
+    let row = cell::project(&MACHINE, &book.cells())
+        .rows
+        .remove(MC)
+        .unwrap();
+    assert_eq!(
+        members(&MACHINE, &row, "clis"),
+        BTreeSet::from(["claude", "codex"])
+    );
+
+    // A text set: the null beside an add keeps the member; the unreadable element goes.
+    let a = keys::text_elem("a.lan");
+    let b = keys::text_elem("b.lan");
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&TEXT_SETS, MC, "row", json!("live")),
+            elem(&TEXT_SETS, MC, "hosts", "a.lan"),
+        ],
+    );
+    book.write(2, &[], vec![stored(&TEXT_SETS, key("hosts", &a), None)]);
+    let row = cell::project(&TEXT_SETS, &book.cells())
+        .rows
+        .remove(MC)
+        .unwrap();
+    assert!(!row.raw.contains("hosts"), "{:?}", row.raw);
+    assert_eq!(
+        members(&TEXT_SETS, &row, "hosts"),
+        BTreeSet::from(["a.lan"])
+    );
+    book.write(1, &[], vec![elem(&TEXT_SETS, MC, "hosts", "b.lan")]);
+    book.write(
+        3,
+        &[],
+        vec![stored(&TEXT_SETS, key("hosts", &b), Some(undecodable))],
+    );
+    let row = cell::project(&TEXT_SETS, &book.cells())
+        .rows
+        .remove(MC)
+        .unwrap();
+    assert!(row.raw.contains("hosts"));
+    assert_eq!(
+        members(&TEXT_SETS, &row, "hosts"),
+        BTreeSet::from(["a.lan"])
+    );
+}
+
+/// A text set member that starts as a conflict does (`⚠ check`) shows the set as a JSON list,
+/// so the shown set reads back as its members: clearing the cell removes that member's own
+/// register, and a set shown as it is is never read as a reopened conflict.
+/// NEGATIVE CONTROLS: with `show_members` not listing a `⚠ ` member as JSON, the export shows
+/// it plainly: the `shown` assertion fails (the removal still holds: the strip takes `⚠ ` only
+/// from a reopened `mine ‖ theirs`); with that and the strip taking any `⚠ ` prefix (as both
+/// did), clearing it writes a removal of `check`, a register that never held a member: the
+/// `written` assertion fails.
+#[test]
+fn a_text_set_member_that_starts_as_a_conflict_does_reads_back_as_itself() {
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&TEXT_SETS, MC, "row", json!("live")),
+            elem(&TEXT_SETS, MC, "nickname_aliases", "⚠ check"),
+        ],
+    );
+    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[], false).unwrap();
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, MC),
+        "nickname_aliases",
+        "",
+    );
+    let plan = super::plan(&SETS, &TEXT_SETS, &exported.base, &saved, &no_birth).unwrap();
+    let written: Vec<&str> = plan.rows[0].1.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(
+        written,
+        [format!(
+            "{MC}.nickname_aliases.{}",
+            keys::text_elem("⚠ check")
+        )]
+    );
+    assert!(
+        exported.text.contains(r#""[""⚠ check""]""#),
+        "shown: {}",
+        exported.text
+    );
+}
+
+/// A save's add settles against what each candidate adds as a projection reads it: a string a
+/// text set's key does not digest, or one under a set of keys, adds nothing, so an owner's add
+/// beside one is stale (reopened for the owner), never counted as already held and dropped; so
+/// is an add of a text set's member whose element also holds a candidate no build of this
+/// version decodes, which a projection shows raw, never as a member.
+/// NEGATIVE CONTROLS: with `settle` counting any string as an add (as it did), the first two
+/// adds count as unchanged: their `stale` assertions fail; with `settle` reading an undecodable
+/// candidate as an absence, the third add counts as unchanged: its assertion fails.
+#[test]
+fn a_save_settles_a_set_add_against_what_the_projection_reads() {
+    // A text set.
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&TEXT_SETS, MC, "row", json!("live")),
+            elem(&TEXT_SETS, MC, "hosts", "a.lan"),
+        ],
+    );
+    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[], false).unwrap();
+    book.write(
+        2,
+        &[],
+        vec![stored(
+            &TEXT_SETS,
+            format!("{MC}.hosts.{}", keys::text_elem("c.lan")),
+            Some(CellValue::owner(1, json!("b.lan")).encode()),
+        )],
+    );
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, MC),
+        "hosts",
+        "a.lan, c.lan",
+    );
+    let plan = super::plan(&SETS, &TEXT_SETS, &exported.base, &saved, &no_birth).unwrap();
+    let settled = settle(&TEXT_SETS, &plan, &book.cells());
+    assert_eq!((settled.unchanged, settled.stale.len()), (0, 1));
+
+    // A set of keys.
+    let mut book = Book::new();
+    book.write(1, &[], machine(MC));
+    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[], false).unwrap();
+    book.write(
+        2,
+        &[],
+        vec![stored(
+            &MACHINE,
+            format!("{MC}.clis.gemini"),
+            Some(CellValue::owner(1, json!("gemini")).encode()),
+        )],
+    );
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, MC),
+        "clis",
+        "claude, codex, gemini",
+    );
+    let plan = super::plan(&REGISTRY, &MACHINE, &exported.base, &saved, &no_birth).unwrap();
+    let settled = settle(&MACHINE, &plan, &book.cells());
+    assert_eq!((settled.unchanged, settled.stale.len()), (0, 1));
+
+    // A text set's element a peer adds beside a candidate this build cannot decode.
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&TEXT_SETS, MC, "row", json!("live")),
+            elem(&TEXT_SETS, MC, "hosts", "a.lan"),
+        ],
+    );
+    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[], false).unwrap();
+    book.write(2, &[], vec![elem(&TEXT_SETS, MC, "hosts", "c.lan")]);
+    book.write(
+        3,
+        &[],
+        vec![stored(
+            &TEXT_SETS,
+            format!("{MC}.hosts.{}", keys::text_elem("c.lan")),
+            Some(json!({"r": 1, "x": "c.lan", "z": 1})),
+        )],
+    );
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, MC),
+        "hosts",
+        "a.lan, c.lan",
+    );
+    let plan = super::plan(&SETS, &TEXT_SETS, &exported.base, &saved, &no_birth).unwrap();
+    let settled = settle(&TEXT_SETS, &plan, &book.cells());
+    assert_eq!((settled.unchanged, settled.stale.len()), (0, 1));
+}
+
+/// A text set shown raw (one of its elements unreadable) lists its members as a JSON list when
+/// one holds a comma, as its editable form does, so `Paris, France` never reads as two.
+/// NEGATIVE CONTROL: with `show_raw` joining a set's members with commas (as it did), the
+/// export shows `Paris, France, Rome`: the assertion fails.
+#[test]
+fn a_raw_text_set_shows_a_member_with_a_comma_as_one() {
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&TEXT_SETS, MC, "row", json!("live")),
+            elem(&TEXT_SETS, MC, "nickname_aliases", "Paris, France"),
+            elem(&TEXT_SETS, MC, "nickname_aliases", "Rome"),
+            stored(
+                &TEXT_SETS,
+                format!("{MC}.nickname_aliases.{}", keys::text_elem("x")),
+                Some(CellValue::owner(1, json!("y")).encode()),
+            ),
+        ],
+    );
+    let cells = book.cells();
+    let row = cell::project(&TEXT_SETS, &cells).rows.remove(MC).unwrap();
+    assert!(row.raw.contains("nickname_aliases"));
+    let exported = export(&SETS, &TEXT_SETS, &cells, &[], false).unwrap();
+    assert!(
+        exported.text.contains(r#""[""Paris, France"",""Rome""]""#),
+        "{}",
+        exported.text
     );
 }

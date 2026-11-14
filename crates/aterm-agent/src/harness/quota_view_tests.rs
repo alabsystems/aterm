@@ -418,6 +418,186 @@ fn a_long_email_gives_way_to_its_local_part_before_it_is_cut() {
     assert_eq!(short("a-long-account-label"), "a-long-acco\u{2026}");
 }
 
+/// The footer's three widths in the outlook lab (`aterm-lab`'s `outlook_captures::WIDTHS`), as
+/// the most room line E has in a pane that wide.
+const LAB_WIDTHS: [usize; 3] = [170, 100, 70];
+
+/// `main` (this tab, 40% of its week used, read now) beside `other`, a row with an email whose
+/// login `login` makes, with `other`'s sign-in running on this Mac where `signing_in`.
+fn beside_main(login: fn(&mut Fx), signing_in: bool) -> Outlook {
+    let mut fx = Fx::new(&[("main", Class::Preferred), ("other", Class::Preferred)]);
+    fx.now = T5;
+    fx.roster.rows[0].email = Some("main.person@example.test".into());
+    fx.roster.rows[1].email = Some("other.person@example.test".into());
+    fx.read("main", None, Some((400, SAT7)), T5);
+    fx.ran("main", T5);
+    fx.session("s-main", "main", T5);
+    login(&mut fx);
+    outlook::outlook(&outlook::Inputs {
+        signing_in: signing_in.then_some("other"),
+        ..fx.inputs()
+    })
+}
+
+/// AN ACCOUNT WITH NO LOGIN ON THIS MAC SAYS SO WHERE ITS FIGURE WOULD BE (the owner: "aterm
+/// and claude code harness should make this obvious"). A row with no login made here and one
+/// whose login ended both say `signed out` after their name at every rung that lays the email
+/// whole, `no login` at the rungs that lay its local part, and `signing in` at both while their
+/// sign-in runs on this Mac; `?` is a signed-in row whose figure has not been read. The words
+/// are laid in the quiet ink, never bold and never the warning ink: a fact in the row. The
+/// hover title and the spoken row say the same. Each of the lab's three widths lays the row. Negative control: the same row signed in and unread says `?` at every
+/// rung and never a login.
+#[test]
+fn a_row_with_no_login_here_says_so_where_its_figure_would_be() {
+    const WHOLE: &str = "other.person@example.test";
+    const LOCAL: &str = "other.person";
+    let unmade: fn(&mut Fx) = |fx| {
+        fx.enrolled.remove("other");
+    };
+    let ended: fn(&mut Fx) = |fx| {
+        let _ = accounts::note_auth(&mut fx.state, "other", accounts::Auth::SignedOut, T5);
+    };
+    let unread: fn(&mut Fx) = |_| {};
+    for (what, login, signing_in, figure, wide, narrow, heard) in [
+        (
+            "no login made here",
+            unmade,
+            false,
+            Figure::SignedOut,
+            "signed out",
+            "no login",
+            "signed out on this Mac",
+        ),
+        (
+            "its login ended",
+            ended,
+            false,
+            Figure::SignedOut,
+            "signed out",
+            "no login",
+            "signed out on this Mac",
+        ),
+        (
+            "its sign-in runs",
+            unmade,
+            true,
+            Figure::SigningIn,
+            "signing in",
+            "signing in",
+            "signing in on this Mac",
+        ),
+        (
+            "an ended login's sign-in runs",
+            ended,
+            true,
+            Figure::SigningIn,
+            "signing in",
+            "signing in",
+            "signing in on this Mac",
+        ),
+        (
+            "signed in, unread",
+            unread,
+            false,
+            Figure::Unread,
+            "?",
+            "?",
+            "",
+        ),
+    ] {
+        let out = beside_main(login, signing_in);
+        let view = out.quota("main", None, true);
+        let other = view
+            .named
+            .iter()
+            .find(|n| n.label == "other")
+            .unwrap_or_else(|| panic!("{what}: the row is named"));
+        assert_eq!(other.figure, figure, "{what}");
+        let of_login = figure != Figure::Unread;
+        let (mut whole_rungs, mut local_rungs) = (0, 0);
+        for room in 0..=200 {
+            let Some(line) = laid(&view, room) else {
+                assert!(
+                    !LAB_WIDTHS.contains(&room),
+                    "{what}: a lab width lays the row: {room}"
+                );
+                continue;
+            };
+            let text = line.text();
+            let lead = line.text_of(&line.lead);
+            let (name, said) = if lead.contains(WHOLE) {
+                whole_rungs += 1;
+                (WHOLE, wide)
+            } else if lead.contains(LOCAL) {
+                local_rungs += 1;
+                (LOCAL, narrow)
+            } else {
+                // A rung that folds the other accounts into `+1` names no login.
+                for word in ["signed out", "no login", "signing in"] {
+                    assert!(!text.contains(word), "{what} at {room}: {text}");
+                }
+                continue;
+            };
+            let at = lead.find(name).unwrap() + name.len();
+            assert!(
+                lead[at..].starts_with(&format!(" {said}")),
+                "{what} at {room}: {lead}"
+            );
+            assert_eq!(
+                lead.contains('?'),
+                !of_login,
+                "{what} at {room}: `?` is a signed-in row not yet read: {lead}"
+            );
+            // The words' cells, after the name and its blank.
+            let from = line.lead.start + lead[..at].chars().count() + 1;
+            for (c, ink, bold) in &line.cells[from..from + said.chars().count()] {
+                if of_login {
+                    assert_eq!(
+                        (*ink, *bold),
+                        (Role::Quiet, false),
+                        "{what} at {room}: {c:?} of {lead}"
+                    );
+                } else {
+                    assert_ne!(*ink, Role::Warn, "{what} at {room}");
+                }
+            }
+        }
+        assert!(
+            whole_rungs > 0 && local_rungs > 0,
+            "{what}: both name forms are laid"
+        );
+        let widest = laid(&view, LAB_WIDTHS[0])
+            .expect("the widest lab width")
+            .text();
+        assert!(
+            widest.contains(&format!("{WHOLE} {wide}")),
+            "{what}: {widest}"
+        );
+        assert!(
+            view.title.contains(&format!("{WHOLE} {wide}")),
+            "{what}: {}",
+            view.title
+        );
+        if of_login {
+            assert!(
+                view.spoken.contains(&format!("{WHOLE} {heard}.")),
+                "{what}: {}",
+                view.spoken
+            );
+        } else {
+            for word in ["signed out", "signing in", "no login"] {
+                assert!(
+                    !words_now(&view).iter().any(|said| said.contains(word)),
+                    "NEGATIVE CONTROL: {what}: a signed-in row says no login"
+                );
+            }
+        }
+        // This tab's own lead is a reading, never a login.
+        let tab = view.tab().expect("this tab");
+        assert_eq!(tab.figure, Figure::Exact(400), "{what}");
+    }
+}
+
 /// THIS TAB AND THE CARRIER ARE ALWAYS NAMED: among six preferred rows, one outside the first
 /// three takes the place of the last named row that is neither, and the named stay in roster
 /// order. Negative control: naming the first three alone folds the carrier ranked fifth (`r4`).

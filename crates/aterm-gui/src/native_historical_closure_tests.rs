@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The host's `lapsed` answer (`historical_prepare`) bound to the `NativeHistoricalClosure`
-//! model by lockstep projection. The issuer's steps are the model's premises: the test drives
+//! The host's `lapsed` and `closed` answers (`historical_prepare`) bound to the
+//! `NativeHistoricalClosure` model by lockstep projection. The issuer's steps are the model's premises: the test drives
 //! them on the fake kernel (its journal, clock, custody and boot) or books them (a delivered
 //! grant, its grantee, the issuing epoch's end, the harness's fresh plan). The reader's steps
 //! are one real replay of the refused prepare, which reads the clock and then the journal.
@@ -13,7 +13,7 @@ use aterm_spec::interp::State;
 
 const EPOCH_CHANGED: &str = "ERR native host epoch changed\n";
 
-const ANSWERS: [&str; 3] = ["AnswerLapsed", "AnswerBoot", "AnswerNoExec"];
+const ANSWERS: [&str; 4] = ["AnswerLapsed", "AnswerBoot", "AnswerNoExec", "AnswerClosed"];
 
 /// The real host under one cold restart prepare an earlier epoch minted, and the history of
 /// it the model keeps and the host does not.
@@ -80,8 +80,13 @@ impl Host {
         aterm_agent::harness::native_act::lapsed_reply(&self.request.id).unwrap()
     }
 
+    fn closed(&self) -> String {
+        aterm_agent::harness::native_act::closed_reply(&self.request.id).unwrap()
+    }
+
     /// Project the host onto the model: the prepare's record in the custody its stamp names,
-    /// its stamps, the fake kernel's clock, boot and custody, and the history booked beside it.
+    /// its stamps, the fake kernel's clock (its deadline and its close), boot and custody, and
+    /// the history booked beside it.
     pub(super) fn probe(&self, model: &Model) -> State {
         let journal = {
             let current = self.facts.journal.lock().unwrap();
@@ -116,6 +121,10 @@ impl Host {
                 i64::from(self.facts.clock.load(Ordering::SeqCst) >= self.request.deadline_us),
             ),
             (
+                "close",
+                i64::from(self.facts.clock.load(Ordering::SeqCst) >= self.request.close_us()),
+            ),
+            (
                 "boot",
                 i64::from(self.facts.boot() != Some(self.origin.clone())),
             ),
@@ -143,9 +152,10 @@ impl Host {
         )
     }
 
-    /// Book the reader's clock read as the clock stands in `now`.
+    /// Book the reader's clock read as the clock stands in `now`: before the deadline, past it,
+    /// or past the close.
     fn read_clock(&mut self, now: &State) {
-        self.clock = if now["late"] == 1 { 2 } else { 1 };
+        self.clock = 1 + now["late"] + now["close"];
     }
 
     /// Book the reader's journal read as the journal stands in `now`: the stamped custody's
@@ -161,17 +171,19 @@ impl Host {
 
     /// Book the answer `reply` gives from the booked reads: from the journal where the record or
     /// an absence under the custody stamp proves it, else from the other boot the boot stamp
-    /// names.
+    /// names; or `closed`.
     fn answered(&mut self, model: &Model, reply: &str) {
         let now = self.probe(model);
         if reply == NOEXEC {
             self.answer = 3;
+        } else if reply == self.closed() {
+            self.answer = 4;
         } else if let Some(Reply::Lapsed(id)) = Reply::parse(reply) {
             assert_eq!(id, self.request.id);
             let (clock, seen) = (self.clock, self.seen);
             let journal = seen == 4
-                || (seen == 2 && clock == 2)
-                || (seen == 1 && now["cstamp"] == 1 && clock == 2);
+                || (seen == 2 && 2 <= clock)
+                || (seen == 1 && now["cstamp"] == 1 && 2 <= clock);
             self.answer = if !journal && now["bstamp"] == 1 && now["boot"] == 1 {
                 2
             } else {
@@ -226,6 +238,10 @@ impl Host {
                     .facts
                     .clock
                     .store(self.request.deadline_us, Ordering::SeqCst),
+                "PassClose" => self
+                    .facts
+                    .clock
+                    .store(self.request.close_us(), Ordering::SeqCst),
                 "Crash" => self.live = false,
                 "ChildExits" => self.child.set(false),
                 "RollbackExits" => self.rollback = false,
@@ -591,4 +607,91 @@ fn an_absence_read_from_a_replaced_custody_would_answer_a_delivered_grant() {
     assert!(!model.successors("AnswerLapsed", &state).contains(&bad));
     host.fresh = true;
     assert!(!model.check_invariant("NoDoubleExec", &host.probe(&model)));
+}
+
+/// A successor reads possible execution, sealed or not, as `closed` once the close has passed
+/// on the boot's clock, and keeps refusing before it, at or after the deadline; a boot stamp
+/// naming another boot still lapses it. `closed` licenses no fresh plan here: the harness's
+/// watch decides one (`NativeClosedWatch`).
+#[test]
+fn the_closed_answer_refines_the_historical_closure_model() {
+    let model = aterm_models_harness::native_historical_closure_model();
+    let closed = Some("AnswerClosed");
+    let paths: [(&[&str], Option<&str>, &[&str]); 6] = [
+        (&["Record", "May", "Deliver", "Crash"], None, &[]),
+        (&["Record", "May", "Deliver", "Crash", "Expire"], None, &[]),
+        (
+            &["Record", "May", "Deliver", "Crash", "Expire", "PassClose"],
+            closed,
+            &["ChildExits"],
+        ),
+        (
+            &[
+                "StampBoot",
+                "StampCustody",
+                "Record",
+                "May",
+                "Deliver",
+                "SealMay",
+                "Crash",
+                "Expire",
+                "PassClose",
+            ],
+            closed,
+            &["ChildExits"],
+        ),
+        // Unstamped, a later boot is read by the clock alone: past the close its old processes
+        // are gone and `closed` claims nothing.
+        (
+            &["Record", "May", "Deliver", "Reboot", "Expire", "PassClose"],
+            closed,
+            &[],
+        ),
+        (
+            &[
+                "StampBoot",
+                "Record",
+                "May",
+                "Deliver",
+                "Reboot",
+                "Expire",
+                "PassClose",
+            ],
+            Some("AnswerBoot"),
+            &["Fresh"],
+        ),
+    ];
+    for (case, (before, answer, after)) in paths.into_iter().enumerate() {
+        let mut host = Host::new(8470 + case as u64);
+        let mut state = model.init_state();
+        assert_eq!(host.probe(&model), state);
+        host.steps(&model, &mut state, before);
+        let unread = state.clone();
+        let reply = host.replay(&model, &mut state, answer);
+        let expected = match answer {
+            Some("AnswerClosed") => host.closed(),
+            Some(_) => host.lapsed(),
+            None => EPOCH_CHANGED.to_string(),
+        };
+        assert_eq!(reply, expected, "{before:?}");
+        if answer == closed {
+            // A closed answer licenses no fresh plan, the grantee alive or not.
+            assert!(!model.action_enabled("Fresh", &state));
+        }
+        if case == 1 {
+            // Negative control: a reader that answered `closed` past the deadline, before the
+            // close, is a step the model refuses.
+            host.answer = 4;
+            let bad = host.probe(&model);
+            assert!(!model.check_invariant("ClosedOnlyPastClose", &bad));
+            let mut read = unread;
+            for action in ["ReadClock", "ReadJournal"] {
+                assert!(model.fire(action, &mut read));
+            }
+            assert!(!model.successors("AnswerClosed", &read).contains(&bad));
+            host.answer = 0;
+        }
+        host.steps(&model, &mut state, after);
+        host.holds(&model, &state);
+    }
 }

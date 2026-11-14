@@ -449,6 +449,23 @@ fn leaked_branch_allocation_returns_but_shared_fifo_tokens_stay_lost() {
     let started = Instant::now();
     shares.finish(0);
     assert_eq!(
+        shares.qualify_allocations.lock().unwrap().last_recovery,
+        Some(Recovery {
+            branch: 0,
+            recipient: 1,
+            assigned: 3,
+            returned: Some(0),
+            read_error: None,
+        })
+    );
+    let lost = shares
+        .qualify_allocations
+        .lock()
+        .unwrap()
+        .first_shortfall
+        .unwrap();
+    assert_eq!(lost.shortfall(), Some(3));
+    assert_eq!(
         inherited_tree.slots(),
         4,
         "a child replans with the recovered share"
@@ -487,6 +504,13 @@ fn leaked_branch_allocation_returns_but_shared_fifo_tokens_stay_lost() {
         "duplicate completion cannot mint"
     );
     drop((recovered, tree_held));
+    shares.finish(1);
+    {
+        let state = shares.qualify_allocations.lock().unwrap();
+        assert_eq!(state.last_recovery.unwrap().shortfall(), Some(0));
+        assert_eq!(state.first_shortfall, Some(lost));
+    }
+    assert_eq!(take(tree).len(), 4);
 
     let shared = Jobserver::new(&dir.path().join("shared.jobs"), 4).unwrap();
     let other = shared.acquire_many(2, &|| false).unwrap();
@@ -501,6 +525,56 @@ fn leaked_branch_allocation_returns_but_shared_fifo_tokens_stay_lost() {
         "shared recovered=0 held_by_live_branch={} lost=2 cancelled=true",
         other.len(),
     );
+}
+
+#[test]
+fn recovery_distinguishes_returned_tokens_from_export_reservations() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = BranchShares::new(&dir.path().join("jobs"), 5, 1, [true, true]).unwrap();
+    shares.finish(2);
+    let export = shares
+        .qualify_allocations
+        .lock()
+        .unwrap()
+        .last_recovery
+        .unwrap();
+    assert_eq!(
+        (export.assigned, export.returned, export.shortfall()),
+        (1, None, None)
+    );
+    shares.finish(0);
+    let build = shares
+        .qualify_allocations
+        .lock()
+        .unwrap()
+        .last_recovery
+        .unwrap();
+    assert_eq!(
+        (build.assigned, build.returned, build.shortfall()),
+        (4, Some(4), Some(0))
+    );
+    shares.finish(1);
+    let tree = shares
+        .qualify_allocations
+        .lock()
+        .unwrap()
+        .last_recovery
+        .unwrap();
+    assert_eq!(
+        (tree.assigned, tree.returned, tree.shortfall()),
+        (5, Some(5), Some(0))
+    );
+    assert_eq!(take(shares.pool(true)).len(), 5);
+    assert_eq!(
+        shares.qualify_allocations.lock().unwrap().first_shortfall,
+        None
+    );
+    let unread = Recovery {
+        returned: Some(1),
+        read_error: Some(io::ErrorKind::Other),
+        ..tree
+    };
+    assert_eq!(unread.shortfall(), None);
 }
 
 /// One live Cargo-like tree client starts with one implicit token but retains the release's

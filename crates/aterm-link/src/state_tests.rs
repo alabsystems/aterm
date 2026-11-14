@@ -878,7 +878,9 @@ fn a_hand_off_taken_back_costs_barriers_and_no_full_flush() {
 }
 
 /// A receipt's pin file and a key's pin line hold no head (aterm-link B05 review): every
-/// build reads them, and a build before the heads parses them strictly.
+/// build reads them, and a build before the heads parses them strictly. A receipt's head is
+/// kept in a file beside its pin's (ATERM-KI-1111-7, [`ACK_HEADS`]), with its pin's sequence
+/// and its log; a key's is not kept.
 #[test]
 fn a_receipts_and_a_keys_pin_hold_no_head() {
     let dir = scratch("pin-files");
@@ -888,15 +890,28 @@ fn a_receipts_and_a_keys_pin_hold_no_head() {
         owner: Some(1),
         ..in_flight_entry(9).pin
     };
-    st.set_receipt_pin("s-a", 3, &pin).expect("a receipt's pin");
+    let log = astream_broker::LogIdentity {
+        id: [1; 16],
+        generation: 2,
+    };
+    st.set_receipt_pin("s-a", 3, &pin, Some(log))
+        .expect("a receipt's pin");
     st.set_key_pin("s-a", "k", &pin).expect("a key's pin");
     for file in ["acks/s-a.3", "keys/s-a"] {
         let text = std::fs::read_to_string(dir.join(file)).expect("written");
         assert!(!text.contains(" at "), "{file}: {text}");
     }
     assert_eq!(
+        std::fs::read_to_string(dir.join(format!("{ACK_HEADS}/s-a.3"))).expect("its head"),
+        format!("{} {log} 42\n", pin.seq)
+    );
+    assert_eq!(
         st.receipt_pin("s-a", 3).expect("reads"),
         Some(pin.without_head())
+    );
+    assert_eq!(
+        st.receipt_head("s-a", 3, pin.seq).expect("reads"),
+        Some((log, 42))
     );
     assert_eq!(
         st.key_pin("s-a", "k").expect("reads"),
@@ -1246,7 +1261,7 @@ fn retired_files_leave_the_set_the_clean_stop_flushes() {
             let entry = in_flight_entry(100 + i);
             st.set_post_pin(&sid, i, &entry.pin).expect("a reservation");
             st.set_in_flight(&entry).expect("in flight");
-            st.set_receipt_pin(&sid, i, &entry.pin)
+            st.set_receipt_pin(&sid, i, &entry.pin, None)
                 .expect("a receipt's reservation");
             st.set_topic_floors(&sid, &BTreeMap::from([("t".to_string(), i)]))
                 .expect("a refill floor");
@@ -2535,6 +2550,65 @@ fn a_pins_head_reads_back_from_0_only_on_another_log() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// **A RECEIPT'S PIN KEEPS ITS HEAD** (ATERM-KI-1111-7): its pin file's text holds none, so the
+/// head is kept beside it with its pin's sequence and the log it is an offset of, read back for
+/// that pin across a reopen and across a log move (which leaves it as written: the bridge reads
+/// it on its own log, `Bridge::receipt_pin_now`), never for another pin of the receipt's, and
+/// gone with the pin. A head with no log to name is not kept.
+#[test]
+fn a_receipts_pin_keeps_its_head_beside_it() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let none = astream_broker::Lineage::from_steps(&[]).expect("an empty lineage");
+    let headed = PublishPin {
+        at: Some(40),
+        ..in_flight_entry(7).pin
+    };
+    let dir = scratch("receipt-head");
+    let st = StateDir::open(&dir).expect("open");
+    st.take_incarnation(0).expect("an attach");
+    st.set_receipt_pin("s-a", 3, &headed, Some(log(1, 0)))
+        .expect("reserved");
+    assert_eq!(
+        StateDir::open(&dir)
+            .expect("reopen")
+            .receipt_head("s-a", 3, headed.seq)
+            .expect("reads"),
+        Some((log(1, 0), 40)),
+        "the head survives a reopen"
+    );
+    st.forget_log_offsets(20, Some(log(1, 0)), Some(log(2, 0)), None, Some(&none))
+        .expect("forgotten");
+    assert_eq!(
+        st.receipt_head("s-a", 3, headed.seq).expect("reads"),
+        Some((log(1, 0), 40)),
+        "a move leaves it naming the log it was written on"
+    );
+    assert_eq!(
+        st.receipt_head("s-a", 3, headed.seq + 1).expect("reads"),
+        None,
+        "never another pin's"
+    );
+    st.clear_receipt_seq("s-a", 3);
+    st.set_receipt_seq("s-a", 3, headed.seq)
+        .expect("an older shape");
+    assert_eq!(
+        st.receipt_head("s-a", 3, headed.seq).expect("reads"),
+        None,
+        "a retired receipt's head goes with its pin"
+    );
+    st.set_receipt_pin("s-a", 4, &headed, None)
+        .expect("reserved");
+    assert_eq!(
+        st.receipt_head("s-a", 4, headed.seq).expect("reads"),
+        None,
+        "no log, no head"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -5515,7 +5589,7 @@ fn after_a_clean_stop_damage_is_refused_across_a_reboot() {
             st.set_in_flight(&entry).expect("an entry");
             st.set_post_pin("s-a", 1, &entry.pin)
                 .expect("a reservation");
-            st.set_receipt_pin("s-a", 4, &entry.pin)
+            st.set_receipt_pin("s-a", 4, &entry.pin, None)
                 .expect("a receipt pin");
             let pending = st.unflushed.lock().unwrap().clone();
             assert_eq!(pending.len(), 2, "the journal and the receipt's pin");
@@ -5569,7 +5643,7 @@ fn after_a_clean_stop_damage_is_refused_across_a_reboot() {
         let st = StateDir::open(root).expect("its successor, in the same boot");
         st.set_inc_seam(in_boot(1));
         st.begin_run().expect("the second run");
-        st.set_receipt_pin("s-a", 4, &entry.pin)
+        st.set_receipt_pin("s-a", 4, &entry.pin, None)
             .expect("a receipt pin");
         if clean {
             st.refuse_writes_of(Some(journal::FILE));

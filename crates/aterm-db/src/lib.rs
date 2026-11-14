@@ -34,6 +34,8 @@ pub mod crypto;
 pub mod database;
 mod documents;
 #[cfg(unix)]
+pub mod file;
+#[cfg(unix)]
 pub mod fleet;
 #[cfg(unix)]
 pub mod fleet_db;

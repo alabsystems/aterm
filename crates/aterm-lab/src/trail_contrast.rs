@@ -285,6 +285,16 @@ impl Image {
         self.px[y * self.width + x]
     }
 
+    /// Paint `b`, clipped to the frame, in `c`.
+    pub(crate) fn paint(&mut self, b: PxBox, c: Rgb) {
+        let clip = |v: i64, hi: usize| usize::try_from(v.max(0)).unwrap_or(0).min(hi);
+        for y in clip(b.y0, self.height)..clip(b.y1, self.height) {
+            for x in clip(b.x0, self.width)..clip(b.x1, self.width) {
+                self.px[y * self.width + x] = c;
+            }
+        }
+    }
+
     /// The colours of `b`, clipped to the frame, row-major.
     pub(crate) fn region(&self, b: PxBox) -> Vec<Rgb> {
         let clip = |v: i64, hi: usize| usize::try_from(v.max(0)).unwrap_or(0).min(hi);

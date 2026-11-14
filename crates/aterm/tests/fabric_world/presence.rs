@@ -306,17 +306,7 @@ fn write_fake_claude(dir: &Path) -> String {
     );
     let path = dir.join("fake-claude.sh");
     std::fs::write(&path, script).expect("write the fake");
-    let claude = dir.join("claude");
-    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/bash"), &claude);
-    let mut proof = aterm_uds::spawnfd::command(&claude)
-        .env_clear()
-        .current_dir(dir)
-        .args(["-c", "printf 'presence-claude-ready\\n'"])
-        .stdout(aterm_uds::spawnfd::Stdio::piped())
-        .spawn()
-        .expect("run the named stand-in in place");
-    aterm_uds::deadline::prints(&mut proof, "presence-claude-ready", DEADLINE);
-    aterm_uds::deadline::kill_within(&mut proof, DEADLINE);
+    let claude = harness::own_image(dir, "claude");
     marked_line(dir, "claude", &claude, &path)
 }
 

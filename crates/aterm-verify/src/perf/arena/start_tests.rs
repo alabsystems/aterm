@@ -55,6 +55,7 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         )
         .expect("the stand-in");
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        aterm_spec::wait::first_exec(&source, &["--version"]);
         source
     };
     let sources = super::super::Scratch::new("atv-freeze-src").expect("scratch");

@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::harness::acts::FACT_SEPARATOR;
 
 /// Each row says its own mode, in [`Autopilot::ALL`]'s order, and [`mode_words`] finds it.
 #[test]
@@ -75,11 +76,7 @@ fn each_legs_words_come_from_one_source_and_say_what_git_said() {
             seen.insert(checked.clone()),
             "{leg:?} says another leg's words"
         );
-        for surface in [
-            checked.clone(),
-            landed_words(Some(&r)),
-            landed_tip(Some(&r)),
-        ] {
+        for surface in [checked.clone(), landed_words(Some(&r))] {
             assert!(!surface.contains("remote main"), "{leg:?}: {surface}");
         }
         let title = landed_words(Some(&r));
@@ -91,10 +88,6 @@ fn each_legs_words_come_from_one_source_and_say_what_git_said() {
         assert!(
             !title.contains(FACT_SEPARATOR) && !title.contains(" \u{2014} "),
             "the title splits on neither: {title}"
-        );
-        assert_eq!(
-            landed_tip(Some(&r)),
-            format!("{checked}{FACT_SEPARATOR}it said \u{201c}{said}\u{201d}")
         );
         let quiet = receipt(leg, "");
         assert_eq!(said_words(&quiet), "it said nothing is left");
@@ -148,7 +141,6 @@ fn each_legs_words_come_from_one_source_and_say_what_git_said() {
     }
     assert_eq!(landed_brief(None), format!("{NO_RECORD}; {LANDED_REST}"));
     assert_eq!(checked_words(None), NO_RECORD);
-    assert_eq!(landed_tip(None), NO_RECORD);
     let none = landed_words(None);
     assert_eq!(
         none,
@@ -212,7 +204,6 @@ fn a_landing_on_the_land_check_says_it_answered_it() {
         format!("{ANSWERED_CHECK}, after it said \u{201c}Nothing left: pushed.\u{201d}")
     );
     assert!(landed_words(Some(&r)).contains(ANSWERED_CHECK));
-    assert!(landed_tip(Some(&r)).contains(ANSWERED_CHECK));
     assert!(!landed_brief(Some(&r)).contains("land check"));
     r.said = "x".repeat(400);
     let cut = said_within(&r, 120);

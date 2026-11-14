@@ -26,7 +26,6 @@ fn mac(n: usize, build: &str) -> FleetMac {
         read_at_ms: NOW,
         build: Some(build.to_owned()),
         activity: Some(AgentTally::default()),
-        instances_read: 1,
         ..FleetMac::default()
     }
 }
@@ -46,11 +45,7 @@ fn need(sid: &str, word: NeedWord) -> FleetNeed {
         sid: sid.to_owned(),
         word,
         who: "claude".to_owned(),
-        worker_of: None,
         age_ms: Some(240_000),
-        what: None,
-        claim: None,
-        carries_on: false,
     }
 }
 
@@ -112,10 +107,7 @@ fn slot_of(snapshot: FleetSnapshot) -> FleetSlot {
     FleetSlot {
         generation: 3,
         snapshot: Some(Arc::new(snapshot)),
-        book: BookFacts {
-            in_fleet: true,
-            ..BookFacts::default()
-        },
+        book: BookFacts { in_fleet: true },
         ..FleetSlot::default()
     }
 }
@@ -1467,10 +1459,7 @@ fn a_drawn_field_does_not_tick_each_second() {
         .stats_bars = Some("off".into());
     app.network_source = None;
     app.fleet_glance = Some(crate::fleet_glance::FleetGlance::over(FleetSlot {
-        book: BookFacts {
-            in_fleet: true,
-            ..BookFacts::default()
-        },
+        book: BookFacts { in_fleet: true },
         ..FleetSlot::default()
     }));
     assert!(app.open_network_lens());

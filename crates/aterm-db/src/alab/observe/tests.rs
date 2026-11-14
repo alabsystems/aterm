@@ -559,6 +559,56 @@ fn owner_cell_beats_birth() {
     assert_eq!(of(&later, ACCOUNT.name), 0);
 }
 
+/// A login of an account the owner retired is that account's, and the account stays retired: the
+/// pass writes this Mac's first row of it and births nothing, and once that record lands after
+/// the owner's retire (it does: this Mac reads the row as retired only from that write), the row
+/// is still retired with the owner's status, and the next pass writes nothing. A birth there was
+/// appended after the retire, so its automatic `row=live` and `status=active` replaced the
+/// owner's cells and the account came back in use.
+///
+/// NEGATIVE CONTROL: `matched` without its not-live arm plans the birth at the retired row's own
+/// key: the first `assert_eq!` reads its account cells (`left: 7 right: 0`).
+#[test]
+fn a_login_of_a_retired_account_marks_it_and_never_revives_it() {
+    let pk = account_pk(BRONTO);
+    let mut book = Book::new();
+    let first_write = book.write(1, &[], bronto_registry());
+    let retire = book.write(
+        2,
+        &[first_write],
+        vec![
+            put(&ACCOUNT, &pk, LIFECYCLE, json!("retired")),
+            put(&ACCOUNT, &pk, "status", json!("banned")),
+        ],
+    );
+    let held = book.cells();
+    let first = run(
+        ME,
+        &[sighting(BRONTO, "running", 1, NOW)],
+        &held,
+        &OwnedRead::default(),
+        NOW,
+    );
+    assert_eq!(of(&first, ACCOUNT.name), 0, "{:?}", first.changes);
+    assert_eq!(of(&first, ADDRESS.name), 0);
+    assert_eq!((first.born, of(&first, ACCOUNT_OBS.name)), (0, 1));
+
+    book.write(3, &[retire], first.changes.clone());
+    let after = book.cells();
+    let accounts = cell::project(&ACCOUNT, &after);
+    let row = &accounts.rows[&pk];
+    assert!(!row.live(), "{row:?}");
+    assert_eq!(row.get("status"), Some(&json!("banned")));
+    let again = run(
+        ME,
+        &[sighting(BRONTO, "running", 1, NOW + DAY)],
+        &after,
+        &obs_after(OwnedRead::default(), &first.changes),
+        NOW + DAY,
+    );
+    assert!(again.changes.is_empty(), "{:?}", again.changes);
+}
+
 /// Every row a plan writes to `account-obs` carries this Mac's uuid as its suffix, the one key
 /// shape `SelfSuffix` admits from this signer.
 /// NEGATIVE CONTROL: with the key made `<uuid>.<account>`, `` assertion failed: key.ends_with(ME)

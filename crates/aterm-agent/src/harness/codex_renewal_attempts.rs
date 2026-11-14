@@ -21,6 +21,9 @@ pub use completion::{CompletionProgress, RootDriver, advance_root};
 mod index;
 pub use index::IndexKey;
 
+#[path = "codex_renewal_unattached.rs"]
+mod unattached;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptRef {
@@ -46,6 +49,9 @@ pub enum CancellationKind {
     ChangedRecord,
     ChangedSelection,
     PolicyRevoked,
+    /// The root's own budget and every continuation it may append closed without its
+    /// successor attaching; the session stays on the login it was on.
+    SuccessorNeverAttached,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +79,15 @@ pub trait NativeCancellationProof {
     fn closed_without_successor(&self, prepare: &super::super::native_act::Prepare) -> bool;
 }
 
+/// The trusted native host's retained kernel evidence that a root's last budget closed with no
+/// successor ([`CancellationKind::SuccessorNeverAttached`]). Implementations must recheck that
+/// this exact preparation's budget is retired, that no continuation or account successor claims
+/// it, and that the source and every launcher it granted Execute exited with their groups. A
+/// receipt, PID lookup, or serialized observation alone is not this proof.
+pub trait NativeUnattachedProof {
+    fn ended_without_successor(&self, prepare: &super::super::native_act::Prepare) -> bool;
+}
+
 impl<'a> ReceiptWriter<'a> {
     pub(super) fn held(env: &'a Env, guard: &'a accounts::Lock) -> Self {
         Self { env, _guard: guard }
@@ -84,7 +99,9 @@ impl<'a> ReceiptWriter<'a> {
     ///
     /// # Errors
     /// The initial receipt is invalid, cancellation exists or is unreadable,
-    /// an existing root differs, or the creation cannot be acknowledged.
+    /// a login renewal's successor is held off after it never attached, or its
+    /// record is unreadable, an existing root differs, or the creation cannot
+    /// be acknowledged.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -134,6 +151,19 @@ impl<'a> ReceiptWriter<'a> {
         }
         if read_cancellation(self.env, initial)?.is_some() {
             return Err("receipt-revoked");
+        }
+        // A login renewal's successor that never attached is held off: the session handed back
+        // on the login it left asks for it again, and would be moved onto it at once.
+        if initial.intent.purpose == Purpose::Login
+            && self
+                .unattached_login_until(
+                    &initial.intent.identity,
+                    &initial.new_auth,
+                    initial.generation,
+                )?
+                .is_some()
+        {
+            return Err("successor-never-attached");
         }
         write_immutable(
             &receipt_path(self.env, &initial.id).ok_or("receipt-id")?,
@@ -354,6 +384,83 @@ impl<'a> ReceiptWriter<'a> {
             return Err("cancelled-rotation-recipe");
         };
         self.retire_terminal_pool_record(expected, proof.closed_without_successor(&prepare))
+    }
+
+    /// A rotation root that ended because its successor never attached gives the pool back
+    /// what its move took, in one account write: its own canary on the destination is struck as
+    /// a failed move ([`accounts::strike_native_unattached`]), and its deduplication record is
+    /// retired. Without the strike the pool stays on a destination no session runs on, and every
+    /// later wall in it is moved there again once the canary's hold lapses. Only the native
+    /// host's proof that the active attempt closed with no successor admits either. A launcher
+    /// that attempt ran may have attached (the receipt's candidate): it never registered, and the
+    /// proof shows it exited with its group.
+    /// # Errors
+    /// The root is not a retired rotation its cancellation ended with no successor, its attempt
+    /// or recipe is unreadable, the proof fails, the receipt changed, or the account write failed.
+    pub fn retire_unattached_rotation(
+        &self,
+        expected: &Receipt,
+        proof: &impl NativeUnattachedProof,
+    ) -> Result<bool, &'static str> {
+        if expected.intent.purpose != super::Purpose::WeeklyQuota {
+            return Ok(false);
+        }
+        if expected.phase != Phase::Retired
+            || !expected.revoked
+            || expected.current_attempt.is_none()
+            || expected.successor_pid.is_some()
+            || expected.successor_birth.is_some()
+            || expected.accepted_turn.is_some()
+            || read_cancellation(self.env, expected)?.map(|cancellation| cancellation.reason)
+                != Some(CancellationKind::SuccessorNeverAttached)
+        {
+            return Err("unattached-rotation-not-terminal");
+        }
+        let attempt =
+            read_active_attempt(self.env, expected)?.ok_or("unattached-rotation-attempt")?;
+        let Some(super::super::native_act::Request::Prepare(prepare)) =
+            super::super::native_act::Request::parse(&attempt.native_prepare)
+        else {
+            return Err("unattached-rotation-recipe");
+        };
+        if !proof.ended_without_successor(&prepare)
+            || super::read_receipt(self.env, &expected.id).as_ref() != Some(expected)
+        {
+            return Err("rotation-not-terminal");
+        }
+        self.acknowledge(expected)?;
+        let binding = super::super::codex_rotation::receipt_binding(expected)?;
+        let store = self
+            .env
+            .accounts_store_for(accounts::Cli::Codex)
+            .ok_or("store")?;
+        let mut removed = false;
+        store
+            .transact_logins_held(self._guard, self.env.now, &mut None, |state, logins| {
+                match logins.native_rotations.get(&expected.id) {
+                    None => return Ok(Vec::new()),
+                    Some(current) if current != &binding => {
+                        return Err("rotation binding changed".into());
+                    }
+                    Some(_) => {}
+                }
+                let struck = accounts::strike_native_unattached(
+                    state,
+                    &expected.sid,
+                    &expected.id,
+                    "successor never attached",
+                    self.env.now,
+                );
+                logins.pending_native_retirement = Some(accounts::NativeRotationRetirement::new(
+                    &expected.id,
+                    &binding,
+                ));
+                logins.native_rotations.remove(&expected.id);
+                removed = true;
+                Ok(struck)
+            })
+            .map_err(|_| "rotation-retirement")?;
+        Ok(removed)
     }
 
     /// A launched rollback retires only after its exact native completion is

@@ -423,6 +423,7 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
         home: None,
         home_free_mb: None,
         repos: None,
+        update: None,
     };
     let mut reply_lines: Vec<String> = Vec::new();
     let base_wire = expected.to_survey_reply(
@@ -583,6 +584,28 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     assert!(!parsed_facts.window);
     assert_eq!(parsed_facts.sessions, 0);
     assert_eq!(parsed_facts.label.as_deref(), Some("m7"));
+    //    A survey a session asked for names it (`by=`) and answers as the plain one does; the
+    //    plain `version` after it is answered once this job has handed the read's row over.
+    let asked_by = "s-00000000000000000abc";
+    dialed
+        .transport
+        .stream()
+        .write_all(format!("survey by={asked_by}\nversion\n").as_bytes())
+        .unwrap();
+    dialed.transport.stream().flush().unwrap();
+    let head = read_line_raw(dialed.transport.stream(), 4096)
+        .expect("read survey head")
+        .expect("survey head");
+    assert_eq!(head.trim(), format!("OK {count}"), "the same survey");
+    for _ in 0..count {
+        read_line_raw(dialed.transport.stream(), 8192)
+            .expect("read row")
+            .expect("row");
+    }
+    let ver_line = read_line_raw(dialed.transport.stream(), 4096)
+        .expect("read version")
+        .expect("version line");
+    assert!(ver_line.starts_with("OK version="), "{ver_line}");
     drop(dialed);
 
     // 1b. Fleet access. Nothing stored a level in this state folder, so the node job enforces
@@ -590,7 +613,9 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     //     the level and launch no window, on a Mac whose person is logged in (so only the lock
     //     stands between the spawn and a window). The reads and the machine's own services
     //     still answer in their own words.
-    let drive_line = |line: &str| {
+    //     Each line's first answer line is returned once the node job hung the connection up,
+    //     which it does after it handed the line's row to the fleet activity record.
+    let drive_as = |requester: &Requester, line: &str| {
         let tcp = TcpStream::connect(addr).expect("connect drive");
         let mut drive =
             client_handshake_as(tcp, &secret, Some(&driver_id), FleetOp::Drive, DIAL_WITHIN)
@@ -598,13 +623,18 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         drive
             .transport
             .stream()
-            .write_all(drive_bytes(line).as_bytes())
+            .write_all(format!("{}{line}", requester.line()).as_bytes())
             .unwrap();
         drive.transport.stream().flush().unwrap();
-        read_line_raw(drive.transport.stream(), 4096)
+        let reply = read_line_raw(drive.transport.stream(), 4096)
             .expect("read the drive's answer")
-            .expect("an answer")
+            .expect("an answer");
+        while let Ok(Some(_)) = read_line_raw(drive.transport.stream(), 1 << 20) {}
+        reply
     };
+    let drive_line = |line: &str| drive_as(&Requester::default(), line);
+    let asker = "s-0123456789abcdef0123";
+    let session = Requester::of(Some(asker), Some("claude"), None, None);
     launcher.logged_in.store(true, Ordering::Release);
     for (line, needs) in [
         ("spawn agent=claude len=11\n", FleetAccess::Full),
@@ -638,8 +668,78 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
             "{line:?} is no act the lock refuses: {reply}"
         );
     }
+    //     A session of the driving Mac asks: its refused turn names it, and the board it reads
+    //     is a read of its own (the board keeper's, which names no session, is a poll).
+    let reply = drive_as(&session, "@s-1 turn hello\n");
+    assert_eq!(
+        FleetAccess::refused_at(&reply),
+        Some((FleetAccess::ReadOnly, FleetAccess::ReadWrite))
+    );
+    let reply = drive_as(&session, "board\n");
+    assert!(reply.starts_with("OK"), "the board is read: {reply}");
+    //     A fleet service's line is its own client's, whichever connection carries it: it has
+    //     no row though a session's drive asked.
+    let reply = drive_as(&session, "vault status\n");
+    assert!(
+        !reply.starts_with(aterm_types::control_verbs::DRIVE_LOCKED),
+        "{reply}"
+    );
     assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
     launcher.logged_in.store(false, Ordering::Release);
+    //     The fleet activity record of this state folder: the survey a session asked for, one
+    //     blocked row for each refused line, with the level in force and the level it needed,
+    //     and one admitted read for the board a session asked for. The reads nobody's session
+    //     asked for (the plain survey and `version`, the plain board) and the machine's own
+    //     services (vault, service-repair) have no row.
+    {
+        use aterm_types::fleet_activity::{Outcome, Plain, Way};
+        aterm_ctl::fleet_activity::settle();
+        let rows = aterm_ctl::fleet_activity::Record::in_state(&state_dir)
+            .read(aterm_ctl::fleet_activity::now_ms())
+            .rows;
+        let blocked = |needs| Outcome::Blocked {
+            level: FleetAccess::ReadOnly,
+            needs,
+        };
+        // The reads of one Mac in one minute are one row with their count, under the later
+        // one's session: the survey's and the board's, however the minute fell between them.
+        let (reads, acts): (Vec<_>, Vec<_>) = rows.iter().partition(|row| row.what == Plain::Read);
+        let mut read = 0;
+        for row in &reads {
+            assert_eq!((row.way, row.node.as_str()), (Way::In, driver_id.node()));
+            assert_eq!(row.outcome, Outcome::Admitted);
+            assert!(
+                [Some(asked_by), Some(asker)].contains(&row.by.as_deref()),
+                "{row:?}"
+            );
+            read += row.n;
+        }
+        assert_eq!(
+            read, 2,
+            "the survey and the board a session asked for: {reads:?}"
+        );
+        let seen: Vec<(Plain, Outcome, Option<&str>)> = acts
+            .iter()
+            .map(|row| {
+                assert_eq!((row.way, row.node.as_str()), (Way::In, driver_id.node()));
+                assert_eq!(row.n, 1);
+                (row.what, row.outcome, row.by.as_deref())
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (Plain::NewJob, blocked(FleetAccess::Full), None),
+                (Plain::NewJob, blocked(FleetAccess::Full), None),
+                (Plain::NewJob, blocked(FleetAccess::Full), None),
+                (Plain::NewJob, blocked(FleetAccess::Full), None),
+                (Plain::Typed, blocked(FleetAccess::ReadWrite), None),
+                (Plain::Message, blocked(FleetAccess::ReadWrite), None),
+                (Plain::Typed, blocked(FleetAccess::ReadWrite), Some(asker)),
+            ],
+            "the record after the Read Only lines"
+        );
+    }
     // The rest drives: this scratch Mac's person raises it, as `aterm fleet access full` does.
     aterm_agent::fleet_access::set(
         &state_dir,
@@ -1314,6 +1414,7 @@ fn custody_move_rejects_an_old_secrets_open_facts_push() {
             home: None,
             home_free_mb: None,
             repos: None,
+            update: None,
         }
         .to_survey_reply(
             1,

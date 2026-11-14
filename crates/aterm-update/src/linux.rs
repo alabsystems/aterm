@@ -271,8 +271,8 @@ fn native() -> Result<LinuxTarget, String> {
 fn context() -> Result<&'static Context, String> {
     CONTEXT
         .get_or_init(|| {
-            let target = std::env::current_exe().map_err(|e| e.to_string())?;
-            Context::at(target)
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            Context::running(exe)
         })
         .as_ref()
         .map_err(Clone::clone)
@@ -284,12 +284,26 @@ pub fn record_path() -> Option<PathBuf> {
     context().ok().map(Context::record)
 }
 
-/// Read this process's executable path into [`context`] now, if it is not read yet (it is read once per process).
-pub fn capture_context() {
-    let _ = context();
-}
+/// The suffix Linux puts on the path it gives for a process's executable (`/proc/self/exe`)
+/// once that file is unlinked, as an update's rename of a new build over it does.
+const UNLINKED_MARK: &[u8] = b" (deleted)";
 
 impl Context {
+    /// The context of the install this process runs from, `exe` as the kernel names the
+    /// executable: one an update replaced is named `<path> (deleted)` while no file has that
+    /// name, and the install is still `<path>`, so a process that reads it first after the
+    /// replacement (a node job a window kept quiet) gets the context a read at its start gave.
+    fn running(exe: PathBuf) -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let install = exe
+            .as_os_str()
+            .as_bytes()
+            .strip_suffix(UNLINKED_MARK)
+            .filter(|_| fs::symlink_metadata(&exe).is_err())
+            .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path)));
+        Self::at(install.unwrap_or(exe))
+    }
+
     fn at(target: PathBuf) -> Result<Self, String> {
         let context = Self::destination(target)?;
         checked_file(&context.target, BINARY_LIMIT, true)?;

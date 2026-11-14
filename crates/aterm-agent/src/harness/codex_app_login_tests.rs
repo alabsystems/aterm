@@ -507,6 +507,9 @@ mod stored_identity_tests;
 #[path = "codex_row_identity_tests.rs"]
 mod row_identity_tests;
 
+#[path = "codex_app_login_refusal_tests.rs"]
+mod refusal_tests;
+
 #[cfg(unix)]
 #[path = "codex_grant_completion_tests.rs"]
 mod grant_completion_tests;
@@ -6035,6 +6038,7 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     RefreshJournal::Rejected {
         token: refresh_token_digest(concat!("reused-", "refresh")),
         at: Some(1_790_000_000),
+        reason: RefusalReason::Reused,
     }
     .write(&relogin_home)
     .expect("write rejected journal");

@@ -21,7 +21,7 @@ default-members = [
     "crates/aterm-core", "crates/aterm-ctl",
     "crates/aterm-dbus", "crates/aterm-digest", "crates/aterm-dirfd", "crates/aterm-diskwalk", "crates/aterm-dl",
     "crates/aterm-durable", "crates/aterm-db", "crates/aterm-db-core",
-    "crates/aterm-effects", "crates/aterm-font", "crates/aterm-getrandom", "crates/aterm-gpu",
+    "crates/aterm-effects", "crates/aterm-file", "crates/aterm-value-guard", "crates/aterm-font", "crates/aterm-getrandom", "crates/aterm-gpu",
     "crates/aterm-gpu-web", "crates/aterm-grapheme", "crates/aterm-grid",
     "crates/aterm-gui", "crates/aterm-gui-consent", "crates/aterm-gui-documents",
     "crates/aterm-gui-fabric", "crates/aterm-gui-tabs", "crates/aterm-gui-timing",
@@ -42,7 +42,7 @@ default-members = [
     "crates/aterm-search", "crates/aterm-secrets", "crates/aterm-selection", "crates/aterm-serde", "crates/aterm-serde-derive",
     "crates/aterm-session", "crates/aterm-shell-integration", "crates/aterm-sixel", "crates/aterm-slog",
     "crates/aterm-spec", "crates/aterm-spec-anchor", "crates/aterm-spec-macros",
-    "crates/aterm-spec-models", "crates/aterm-stamp", "crates/aterm-sysprobe", "crates/aterm-telemetry", "crates/aterm-tempfile",
+    "crates/aterm-signin-window", "crates/aterm-spec-models", "crates/aterm-stamp", "crates/aterm-sysprobe", "crates/aterm-telemetry", "crates/aterm-tempfile",
     "crates/aterm-template-icon", "crates/aterm-theme-pack", "crates/aterm-time", "crates/aterm-toml", "crates/aterm-toolchain",
     "crates/aterm-tracing", "crates/aterm-tty", "crates/aterm-types", "crates/aterm-uds",
     "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals",
@@ -85,7 +85,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.200.0"
+version = "0.201.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -177,6 +177,10 @@ aterm-mesh-core-islands = { path = "crates/aterm-mesh-core-islands" }
 aterm-mesh-core-islands-no-lost-edit = { path = "crates/aterm-mesh-core-islands-no-lost-edit" }
 aterm-mesh-core-islands-p1 = { path = "crates/aterm-mesh-core-islands-p1" }
 aterm-effects = { path = "crates/aterm-effects" }
+# Shared files' reader: names, layout, snapshot and state codecs. No aterm-db dependency.
+aterm-file = { path = "crates/aterm-file" }
+# What a stored text value may not hold: aterm-db's typed cells and aterm-file's outbox.
+aterm-value-guard = { path = "crates/aterm-value-guard" }
 # First-party sfnt table reader, GSUB shaper, and optional `hint` autohinter.
 # Default features off so only grid-fitting consumers (aterm-render on Linux and
 # Windows) pull in `hint`.
@@ -238,6 +242,7 @@ aterm-net = { path = "crates/aterm-net" }
 aterm-netplace = { path = "crates/aterm-netplace" }
 aterm-objc = { path = "crates/aterm-objc" }
 aterm-macos-ui = { path = "crates/aterm-macos-ui" }
+aterm-signin-window = { path = "crates/aterm-signin-window" }
 aterm-observe = { path = "crates/aterm-observe" }
 aterm-parser = { path = "crates/aterm-parser" }
 aterm-phase = { path = "crates/aterm-phase" }

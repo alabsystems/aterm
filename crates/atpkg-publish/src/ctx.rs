@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::host::agh::AghHost;
+use crate::host::agh::{AghHost, ClientRefusal};
 use crate::host::rest::RestHost;
 use crate::host::{Hosts, Slug};
 
@@ -26,18 +26,19 @@ pub struct Accounts {
 /// The token files the two identities read (never an ambient credential in a lane).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tokens {
-    /// Write on the staging owner (`~/.secrets/gh_access_token`).
+    /// Write on the staging owner: the vault's dev token.
     pub staging: PathBuf,
-    /// Write on the public channel owner (`~/.secrets/gh_access_token_alabsystems`).
+    /// Write on the public channel owner: the vault's release token.
     pub channel: PathBuf,
 }
 
 impl Tokens {
-    /// The token files under `home`.
+    /// The token files under `home`: where the vault lands agh's two slots.
     fn under(home: &Path) -> Self {
+        use agh::identity::vault::Slot;
         Self {
-            staging: home.join(".secrets/gh_access_token"),
-            channel: home.join(".secrets/gh_access_token_alabsystems"),
+            staging: Slot::Dev.path(home),
+            channel: Slot::Release.path(home),
         }
     }
 }
@@ -215,8 +216,8 @@ impl Ctx {
     ///
     /// # Errors
     ///
-    /// As `from_env`; under `AghStaging` or `Agh`, a could-not-run for invalid configuration
-    /// or refused adopted identity, after recording the need. Also
+    /// As `from_env`; under `AghStaging` or `Agh`, a could-not-run for invalid configuration,
+    /// after recording its need, or for a refused adopted identity, with agh's step. Also
     /// could-not-run when agh's directories cannot be resolved from `HOME`, `XDG_CONFIG_HOME`
     /// and `XDG_STATE_HOME` (a relative root), when an owner of `accounts` is no valid slug
     /// owner. A missing file uses vault routing; it grants no publication permission.
@@ -318,9 +319,9 @@ impl Ctx {
         });
         let (staging, channel) = match built {
             Ok(built) => built,
-            Err(why) => {
-                // A view records nothing; a live adoption may have learned an identity.
-                // The need is a fact for later, never authority to add a profile or grant.
+            // A view records nothing and files nothing; a live adoption may have learned an
+            // identity. The need is a fact for later, never authority to add a profile or grant.
+            Err(ClientRefusal::Config(why)) => {
                 if learn {
                     let need = config_need(&why, u64::try_from(now_unix).unwrap_or(0));
                     let _ = agh::needs::raise(&dirs, &need);
@@ -330,6 +331,14 @@ impl Ctx {
                     &ctx.shown(&dirs.config_file()),
                     h,
                 )));
+            }
+            // agh.toml was read and judged sound: agh's adoption refused, which is no agh.toml
+            // fault.
+            Err(ClientRefusal::Adoption(why)) => {
+                if learn {
+                    clear_config_need(&dirs);
+                }
+                return Err(Error::cannot_run(format!("{why} (--host {h})")));
             }
         };
         if learn {

@@ -390,6 +390,50 @@ fn a_renewal_supersedes_the_login_it_replaces_and_wakes_the_waiting() {
     assert!(store.claim_staging_dir("Not A Label").is_err());
 }
 
+/// A sign-in task naming a step this build does not know, as a newer build sharing the file
+/// writes, reads as no task and leaves the binding and every other row known (measured: 0.199.0
+/// refused the whole file over a later build's `renew`). NEGATIVE CONTROL: a task with no step,
+/// or a known step with no timestamp, is damage and still refuses the file.
+#[test]
+fn a_sign_in_task_this_build_does_not_know_is_dropped_and_the_bindings_stay_known() {
+    let binding = |task: &str| {
+        format!(
+            r#"{{"schema":1,"labels":{{"main":{{"dir":"{}","was":[],"sign_in_task":{task}}},
+                "work-2":{{"dir":null,"was":[]}}}}}}"#,
+            abs("/s/current")
+        )
+    };
+    let newer = binding(&format!(r#"{{"action":"a-later-step","at":{NOW}}}"#));
+    let read = Logins::from_json(&newer, NOW).expect("a newer step leaves the file readable");
+    assert_eq!(read.labels.len(), 2, "every row stays known");
+    let main = &read.labels["main"];
+    assert_eq!(main.sign_in_task, None, "the unknown step is dropped");
+    assert_eq!(main.dir.as_deref(), Some(abs("/s/current").as_str()));
+
+    let known = binding(&format!(r#"{{"action":"login","at":{NOW}}}"#));
+    let read = Logins::from_json(&known, NOW).expect("a known step reads");
+    assert_eq!(
+        read.labels["main"].sign_in_task.map(|task| task.action),
+        Some(SignInAction::Login),
+        "CONTROL: a known step is kept"
+    );
+
+    for (case, task) in [
+        ("no step", format!(r#"{{"at":{NOW}}}"#)),
+        ("step not a word", format!(r#"{{"action":7,"at":{NOW}}}"#)),
+        ("no timestamp", r#"{"action":"login"}"#.to_owned()),
+        (
+            "unknown step, no timestamp",
+            r#"{"action":"a-later-step"}"#.to_owned(),
+        ),
+    ] {
+        assert!(
+            Logins::from_json(&binding(&task), NOW).is_err(),
+            "NEGATIVE CONTROL: {case} is damage and refuses the file"
+        );
+    }
+}
+
 #[test]
 fn uncertain_binding_bytes_refuse_mutation_instead_of_erasing_identities() {
     for (case, bytes) in [
@@ -1293,6 +1337,66 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
             .map(|(label, _)| label)
             .collect::<Vec<_>>(),
         ["work-2"]
+    );
+}
+
+/// A HAND RUN THAT FAILED FOR ANOTHER REASON NEVER LIFTS A PAGE'S HOLD: the page that stopped
+/// the row stays its current attempt, with the time its wait counts from, and the hand run is
+/// one ledger row. CONTROLS: with no page on record the hand failure is the row's last
+/// sign-in, and a hand run that signed the row in replaces the page's record.
+#[test]
+fn a_failed_hand_run_leaves_the_page_that_stopped_its_row_on_record() {
+    let page = "claude.ai bot-check";
+    let by_hand = "by hand: claude auth login exited 1 with no login made";
+    let stopped = SignInAttempt {
+        outcome: AttemptOutcome::Blocked,
+        routes: page.to_owned(),
+        since: NOW,
+        tried_at: NOW,
+    };
+    let attempt = |logins: &Logins| logins.get("main").and_then(|b| b.sign_in_attempt.clone());
+    let hand = |logins: &mut Logins, outcome: AttemptOutcome| {
+        admitted_observation(logins, "main", NOW + HOUR, |logins| {
+            note_hand_sign_in_attempt(logins, "main", outcome, by_hand, NOW + HOUR)
+        })
+    };
+
+    let mut logins = Logins::default();
+    admitted_observation(&mut logins, "main", NOW, |logins| {
+        note_sign_in_attempt(logins, "main", AttemptOutcome::Blocked, page, NOW)
+    });
+    assert_eq!(attempt(&logins), Some(stopped.clone()));
+    let events = hand(&mut logins, AttemptOutcome::Failed);
+    assert_eq!(events.len(), 1, "the hand run is on the ledger");
+    assert_eq!(events[0].why, format!("{HAND_SIGN_IN} failed: {by_hand}"));
+    assert_eq!(
+        attempt(&logins),
+        Some(stopped),
+        "the page's record, and the time its wait counts from, stand"
+    );
+
+    let events = hand(&mut logins, AttemptOutcome::SignedIn);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        attempt(&logins).map(|a| (a.outcome, a.since)),
+        Some((AttemptOutcome::SignedIn, NOW + HOUR)),
+        "CONTROL: a hand run that signed the row in replaces the page's record"
+    );
+
+    let mut plain = Logins::default();
+    admitted_observation(&mut plain, "main", NOW, |logins| {
+        note_sign_in_attempt(logins, "main", AttemptOutcome::NoRoute, "none", NOW)
+    });
+    assert_eq!(hand(&mut plain, AttemptOutcome::Failed).len(), 1);
+    assert_eq!(
+        attempt(&plain),
+        Some(SignInAttempt {
+            outcome: AttemptOutcome::Failed,
+            routes: by_hand.to_owned(),
+            since: NOW + HOUR,
+            tried_at: NOW + HOUR,
+        }),
+        "CONTROL: with no page on record the hand failure is the row's last sign-in"
     );
 }
 

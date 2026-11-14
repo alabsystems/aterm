@@ -289,6 +289,8 @@ pub(crate) struct JobsPass {
     view: Option<Arc<JobsView>>,
     /// The last requested jobs pass read a sweep rather than returning its cached view.
     naming_fresh: bool,
+    /// Exact input observation for the current view, set by the host after an actual pass.
+    observed_at: Option<Instant>,
     /// The tab a session-mate's environment ties each program outside every job that has not
     /// started to, by pid, as the leftover pass last judged it ([`Self::tie_held`]).
     ties: BTreeMap<u32, aterm_vitals::left::Tie>,
@@ -317,6 +319,7 @@ impl JobsPass {
             next_ms: None,
             view: None,
             naming_fresh: false,
+            observed_at: None,
             ties: BTreeMap::new(),
             calls: crate::telemetry_host::CallWatch::new(!cfg!(test)),
         }
@@ -329,6 +332,32 @@ impl JobsPass {
     /// tab and kind, where it has a job, override in the engine.
     pub(crate) fn tie_held(&mut self, ties: BTreeMap<u32, aterm_vitals::left::Tie>) {
         self.ties = ties;
+    }
+
+    /// The actual input observation, independent of publication and millisecond rounding.
+    pub(crate) fn observed_at(&self) -> Option<Instant> {
+        self.observed_at
+    }
+
+    /// Stamp only an actual new pass; a cached view retains its earlier observation.
+    pub(crate) fn note_observed(&mut self, at: Instant) {
+        if self.naming_fresh {
+            self.observed_at = Some(at);
+        }
+    }
+
+    /// Feed the real engine from a scripted, inert platform observation.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        &mut self,
+        at: Instant,
+        read: impl FnOnce(&mut Jobs) -> JobsView,
+    ) -> Arc<JobsView> {
+        let view = Arc::new(read(&mut self.jobs));
+        self.view = Some(Arc::clone(&view));
+        self.naming_fresh = true;
+        self.observed_at = Some(at);
+        view
     }
 
     /// Captures a naming ticket only from the jobs pass the host just forced.
@@ -492,6 +521,7 @@ impl JobsPass {
         crate::telemetry_host::jobs_passed(&mut self.jobs, clock, &self.calls);
         self.calls.watch(&view.rows);
         self.naming_fresh = true;
+        self.observed_at = None;
         self.next_ms = Some(at_ms + next_pass_ms(view.demand));
         self.view = Some(Arc::new(view));
         self.view.clone()

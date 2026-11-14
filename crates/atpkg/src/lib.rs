@@ -42,6 +42,8 @@ pub mod adoption;
 pub mod alab;
 pub mod apply;
 pub mod build_admit;
+/// The line each build started in a tab leaves, naming the tab's session and its workspace.
+pub mod build_start;
 /// Strict owned Cargo source-cache in-use custody, compatible with native fetch.
 pub use aterm_toolchain::cargo_cache;
 pub mod build_cache;

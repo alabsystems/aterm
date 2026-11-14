@@ -172,6 +172,12 @@ pub struct MailboxConfig {
     pub relay_enabled: bool,
     /// Home directory used to read this Mac's local age identity and swarm roster when relaying.
     pub relay_home: Option<PathBuf>,
+    /// The home this configuration was discovered in ([`discover_mailbox_config_with_env`]),
+    /// whose aterm mail folder and machine key hold its accounts' saved Google mail grants:
+    /// the poll reads a native Google route's grant there, and
+    /// [`MailboxConfig::window_reads`] asks there whether it loads. `None` (a configuration no
+    /// discovery with a home made) reads the process's own home ([`MailboxConfig::grant_home`]).
+    pub mail_home: Option<PathBuf>,
     /// State directory holding this Mac's fleet credentials and peer book when relaying.
     pub relay_state_dir: Option<PathBuf>,
     /// The `[[mailboxes]]` entries ([`super::mailbox_routes`]): the mailbox each AI email's
@@ -476,6 +482,7 @@ impl MailboxConfig {
             contested_labels: self.contested_labels.clone(),
             relay_enabled: self.relay_enabled,
             relay_home: self.relay_home.clone(),
+            mail_home: self.mail_home.clone(),
             relay_state_dir: self.relay_state_dir.clone(),
             mailboxes: Vec::new(),
             login_record: self.login_record.clone(),
@@ -598,8 +605,92 @@ impl MailboxConfig {
         cfg!(unix) && self.relay_enabled && target_email.is_some()
     }
 
+    /// Whether a poll of this mailbox for `target_email` reads anything on this machine with
+    /// no headless browser ([`poll_mailbox_config_for_credential`]), judged by the one plan the
+    /// poll acts on (`native_mail::plan`), with whether an account's saved Google mail grant
+    /// loads answered by `google_grant` ([`google_grant_in`] in the configuration's
+    /// [`Self::grant_home`]): a native Google route whose grant loads, or which signs in to
+    /// Gmail's IMAP with a password; Proton's own API; else the local folder, IMAP or the HTTP
+    /// mailbox. A native Google route whose saved grant does not load, or which has neither a
+    /// grant nor a password, is refused by every poll before anything else is read, so it reads
+    /// nothing. A login this Mac holds as refused on its source
+    /// ([`super::mailbox_routes::login_held`]) is not tried until its wait ends, so it reads
+    /// nothing either. A mailbox reached through another webmail page alone is read only inside
+    /// a headless browser's own drive, and the fleet's relay reads on another machine, so
+    /// neither counts.
+    #[must_use]
+    pub(super) fn reads_without_browser(
+        &self,
+        target_email: Option<&str>,
+        google_grant: &dyn Fn(&str) -> GoogleGrant,
+    ) -> bool {
+        let routed = self.routed_for(target_email);
+        #[cfg(unix)]
+        {
+            let plan =
+                native_mail::plan(self, target_email, |account| match google_grant(account) {
+                    GoogleGrant::Loads => Ok(Some(())),
+                    GoogleGrant::Absent => Ok(None),
+                    GoogleGrant::Broken => Err(String::new()),
+                });
+            if let Some(reads) = plan.reads(&routed, target_email) {
+                return reads;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = google_grant;
+        routed.dir.is_some()
+            || routed.http_url.is_some()
+            || (routed.effective_imap_url(target_email).is_some()
+                && !imap_login_held(&routed, target_email))
+    }
+
+    /// Whether aterm's sign-in window can read `target_email`'s login code by itself: a
+    /// mailbox is configured for it and one of its sources is read on this Mac with no
+    /// browser ([`Self::reads_without_browser`], asking [`google_grant_in`] in
+    /// [`Self::grant_home`]). This one answer decides both whether a sign-in nobody is watching
+    /// opens the window and whether the window's desk has a mailbox, so the two never disagree:
+    /// a webmail-only or relay-only mailbox is none, and so is a native Google route whose
+    /// account has no saved grant that loads there and no password.
+    #[must_use]
+    pub fn window_reads(&self, target_email: Option<&str>) -> bool {
+        let home = self.grant_home();
+        self.window_reads_with(target_email, &|account| {
+            google_grant_in(home.as_deref(), account)
+        })
+    }
+
+    /// [`Self::window_reads`] with whether an account's saved Google mail grant loads answered
+    /// by `google_grant` ([`Self::reads_without_browser`]).
+    #[must_use]
+    pub(super) fn window_reads_with(
+        &self,
+        target_email: Option<&str>,
+        google_grant: &dyn Fn(&str) -> GoogleGrant,
+    ) -> bool {
+        self.is_configured_for(target_email)
+            && self.reads_without_browser(target_email, google_grant)
+    }
+
+    /// The home whose aterm mail folder holds this configuration's saved Google mail grants:
+    /// the one it was discovered in ([`Self::mail_home`]), else the process's own.
+    #[must_use]
+    pub(super) fn grant_home(&self) -> Option<PathBuf> {
+        self.mail_home.clone().or_else(aterm_types::dirs::home_dir)
+    }
+
+    /// Turns the fleet's mail relay off in this configuration: every read it makes after
+    /// this is made on this machine. A sign-in in aterm's window calls it before it reads,
+    /// because the relay asks another Mac, with the account's address, for the code.
+    pub fn read_on_this_mac_alone(&mut self) {
+        self.relay_enabled = false;
+        self.relay_home = None;
+        self.relay_state_dir = None;
+    }
+
     /// A configured Gmail endpoint can use a saved OAuth grant without an app password.
-    /// This is route admission only; the native reader must still load and validate a grant.
+    /// This is route admission only; the native reader must still load and validate a grant
+    /// (what the poll does with the route is [`Self::reads_without_browser`]'s to judge).
     #[must_use]
     pub fn has_native_google_route(&self, target_email: Option<&str>) -> bool {
         #[cfg(unix)]
@@ -768,7 +859,10 @@ impl MailboxConfig {
     /// Effective IMAP/IMAPS URL for `target_email`, auto-discovering standard IMAPS endpoints
     /// or a running local ProtonMail Bridge (`127.0.0.1:1143`) when a password is configured.
     /// For an address a `[[mailboxes]]` entry receives: that entry's own URL, else the one its
-    /// login's domain implies where it names no URL, and none while it has no password.
+    /// login's domain implies where it names no URL, and none while it has no password. For an
+    /// address no route names: the top-level URL, else the one the top-level login's domain
+    /// implies ([`MailboxConfig::unrouted_login_domain`]), never the address's own provider's
+    /// for another provider's login.
     #[must_use]
     pub fn effective_imap_url(&self, target_email: Option<&str>) -> Option<String> {
         if let Some(route) = self.route_for(target_email) {
@@ -791,13 +885,24 @@ impl MailboxConfig {
             }
             return None;
         }
-        if has_pw
-            && let Some(email) = target_email
-            && let Some((_, domain)) = email.trim().rsplit_once('@')
-        {
-            return discovered_imap_url(&domain.to_ascii_lowercase());
+        if has_pw && target_email.is_some() {
+            return self
+                .unrouted_login_domain(target_email)
+                .and_then(|domain| discovered_imap_url(&domain));
         }
         None
+    }
+
+    /// The domain of the login an address no route names is read with
+    /// ([`MailboxConfig::webmail_user_for`]): the top-level `user`'s, or the address's own where
+    /// none is set. Only a server that domain implies is discovered for it, as a route's login
+    /// domain does for a route: the top-level login, another provider's, is never offered to the
+    /// address's provider. A login with no domain discovers nothing.
+    fn unrouted_login_domain(&self, target_email: Option<&str>) -> Option<String> {
+        let login = self.webmail_user_for(target_email)?;
+        let (_, domain) = login.trim().rsplit_once('@')?;
+        let domain = domain.trim().to_ascii_lowercase();
+        (!domain.is_empty()).then_some(domain)
     }
 
     /// Effective webmail inbox URL for `target_email` when headless CDP webmail polling is
@@ -824,11 +929,10 @@ impl MailboxConfig {
             }
             return None;
         }
-        if has_pw
-            && let Some(email) = target_email
-            && let Some((_, domain)) = email.trim().rsplit_once('@')
-        {
-            return discovered_webmail_url(&domain.to_ascii_lowercase());
+        if has_pw && target_email.is_some() {
+            return self
+                .unrouted_login_domain(target_email)
+                .and_then(|domain| discovered_webmail_url(&domain));
         }
         None
     }
@@ -886,6 +990,9 @@ impl MailboxConfig {
         }
         if self.relay_home.is_none() {
             self.relay_home = other.relay_home;
+        }
+        if self.mail_home.is_none() {
+            self.mail_home = other.mail_home;
         }
         if self.relay_state_dir.is_none() {
             self.relay_state_dir = other.relay_state_dir;
@@ -2336,7 +2443,12 @@ pub(super) fn discover_mailbox_config_with_env(
             .or_else(|| cfg.dir.as_deref().map(default_seen_file_for_path));
     }
 
-    cfg.is_configured().then_some(cfg)
+    // Its accounts' saved Google mail grants are read in the home it was discovered in, never
+    // in another one the process happens to have.
+    cfg.is_configured().then(|| {
+        cfg.mail_home = home.map(Path::to_path_buf);
+        cfg
+    })
 }
 
 /// A discovered headless-capable Chromium binary.
@@ -4847,6 +4959,30 @@ fn note_login(
 
 /// Why `target_email`'s mailbox login is not tried over IMAP in this authorization, where it
 /// was refused there or waits on an earlier refusal (its marker in `seen`).
+/// Whether the IMAP login a poll of `cfg` (a routed view) makes for `target_email` is held as
+/// refused on its source ([`super::mailbox_routes::login_held`]), so the poll does not try it
+/// until its wait ends: the login and source [`fetch_imap_credential`] and
+/// [`imap_login_refused_words`] name.
+fn imap_login_held(cfg: &MailboxConfig, target_email: Option<&str>) -> bool {
+    let Some(imap_url) = cfg.effective_imap_url(target_email) else {
+        return false;
+    };
+    let Some(parsed) = parse_imap_url(&imap_url) else {
+        return false;
+    };
+    let login = parsed
+        .user
+        .or_else(|| cfg.webmail_user_for(target_email))
+        .unwrap_or_else(|| "user".to_owned());
+    super::mailbox_routes::login_held(
+        cfg.login_record.as_deref(),
+        &super::mailbox_routes::login_source(&imap_url),
+        &login,
+        super::mailbox_routes::unix_now(),
+    )
+    .is_some()
+}
+
 fn imap_login_refused_words(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
@@ -5753,7 +5889,49 @@ fn network_poll_interval(cfg: &MailboxConfig, target_email: Option<&str>) -> Dur
 #[cfg(unix)]
 #[path = "headless_native_mail.rs"]
 mod native_mail;
-const MAILBOX_TIMEOUT: &str = "timed out waiting for verification email in mailbox";
+
+/// Whether `account`'s saved Google mail grant loads in `home`, as the mailbox poll loads it
+/// (`native_mail::saved_google_session`): no network request, no renewal lease, nothing logged
+/// or kept. No home is no grant; off unix no such route is read, so none is saved.
+pub(super) fn google_grant_in(home: Option<&Path>, account: &str) -> GoogleGrant {
+    #[cfg(unix)]
+    {
+        match home.map(|home| native_mail::saved_google_session(home, account)) {
+            Some(Ok(Some(_))) => GoogleGrant::Loads,
+            None | Some(Ok(None)) => GoogleGrant::Absent,
+            Some(Err(_)) => GoogleGrant::Broken,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (home, account);
+        GoogleGrant::Absent
+    }
+}
+
+/// Whether an account's saved Google mail grant loads, as the mailbox poll loads it
+/// ([`google_grant_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "off unix no Google grant is read, so only Absent is answered outside tests"
+    )
+)]
+pub(super) enum GoogleGrant {
+    /// It loads: the poll reads the account's Gmail with it.
+    Loads,
+    /// None is saved: the poll reads the route by its password, if it has one.
+    Absent,
+    /// One is saved and does not load (no machine key, another Mac's key, another account's
+    /// grant): every poll of the route ends at once on it.
+    Broken,
+}
+
+/// A mailbox poll's end where no sign-in email came within its wait: the one end that says the
+/// mailbox was read and holds nothing yet.
+pub(super) const MAILBOX_TIMEOUT: &str = "timed out waiting for verification email in mailbox";
 
 /// Poll `cfg` for either a magic link or a 6-digit OTP addressed to `target_email`.
 pub fn poll_mailbox_config_for_credential(
@@ -7556,6 +7734,176 @@ pub const BOT_CHECK_UNCLEARED: &str =
 pub const BLOCK_PAGE_MET: &str =
     "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
 
+/// A Claude sign-in's end where the sign-in in aterm's own window returned no callback
+/// ([`VisibleStop::Failed`]).
+pub const BROWSER_SIGN_IN_FAILED: &str = "the sign-in in aterm's sign-in window did not complete";
+
+/// A Claude sign-in's end where this process has no desktop session to open aterm's sign-in
+/// window in ([`VisibleStop::NoDesktop`]): an SSH session, a login with no display.
+pub const WINDOW_NO_DESKTOP: &str = "this session has no desktop to open aterm's sign-in window \
+                                     on; run the sign-in from a terminal on this Mac's own \
+                                     desktop";
+
+/// A Claude sign-in's end on Cloudflare's check in aterm's sign-in window, which stood until
+/// the sign-in's deadline ([`VisibleStop::BotCheck`]).
+pub const WINDOW_BOT_CHECK: &str = "Cloudflare's check in aterm's sign-in window did not clear; \
+                                    aterm never operates it, and a person at this Mac may \
+                                    complete it";
+
+/// A Claude sign-in's end on a consent page in aterm's sign-in window whose `Authorize` a
+/// human check (hCaptcha) held until the sign-in's deadline ([`VisibleStop::HumanCheck`]).
+pub const WINDOW_HUMAN_CHECK: &str = "the consent page in aterm's sign-in window held Authorize \
+                                      behind a human check (hCaptcha); aterm never operates \
+                                      it, and a person at this Mac may complete it there";
+
+/// A Claude sign-in's end on Cloudflare's block page in aterm's sign-in window
+/// ([`VisibleStop::BlockPage`]).
+pub const WINDOW_BLOCK_PAGE: &str =
+    "Cloudflare's block page answered the sign-in in aterm's sign-in window";
+
+/// A Claude sign-in's end where the window was closed before the sign-in finished
+/// ([`VisibleStop::Closed`]): a person closed it, so aterm does not open it again by itself.
+pub const WINDOW_CLOSED: &str = "aterm's sign-in window was closed before the sign-in finished";
+
+/// A Claude sign-in's end on a consent page that names another account
+/// ([`VisibleStop::WrongAccount`]).
+pub const WINDOW_WRONG_ACCOUNT: &str = "the consent page in aterm's sign-in window named another \
+                                        account, so nothing was authorized; the window's \
+                                        session was forgotten, and the next sign-in starts at \
+                                        the sign-in page";
+
+/// How the sign-in in aterm's own window ([`visible_sign_in`]) ended with its callback.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only the sign-in window's desk, which is macOS code, makes one"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VisibleDone {
+    /// A loopback flow: the window's page itself requested the callback, and the waiting
+    /// sign-in's listener answered it. Nothing is left to deliver, and nothing delivers it again.
+    Delivered,
+    /// A hosted flow's callback, read from the page's address: its one delivery is the
+    /// opener's.
+    Callback(String),
+}
+
+/// Why the sign-in in aterm's own window ([`visible_sign_in`]) returned no callback.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only the sign-in window's desk, which is macOS code, makes most of these"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VisibleStop {
+    /// This process has no desktop session, so no window was opened.
+    NoDesktop,
+    /// Cloudflare's check stood in the window until the sign-in's deadline, on this host.
+    BotCheck(Option<String>),
+    /// Cloudflare's block page answered in the window, on this host.
+    BlockPage(Option<String>),
+    /// The consent page held its `Authorize` behind a human check until the sign-in's
+    /// deadline, on this host.
+    HumanCheck(Option<String>),
+    /// A person closed the window before the sign-in finished.
+    Closed,
+    /// The consent page named an account that is not the row's.
+    WrongAccount,
+    /// It ran and returned no callback of this flow, for a reason another try may not meet
+    /// (a page that did not load, a mailbox that did not answer, a deadline): why, without
+    /// the callback or a code.
+    Failed(String),
+}
+
+/// The sign-in of `authorize_url` in a window of aterm's own, driven from this process
+/// (`signin_window`): the account's sign-in never leaves the Mac that owns it, so no other
+/// machine is asked and nothing about it is sent anywhere. `None` off macOS, where aterm has
+/// no sign-in window. Whether it may run is its caller's to have established: the opener's
+/// grant ([`super::open_url::WINDOW_ENV`]), which only a sign-in this Mac started for its own
+/// rows carries. `scope` is the caller's account-work scope, which ends the wait when
+/// cancelled; the opener process (`aterm-open-url`) has none. A test gets its thread's
+/// substituted result instead ([`set_visible_sign_in_for_tests`]) and opens nothing.
+pub(super) fn visible_sign_in(
+    authorize_url: &str,
+    email: Option<&str>,
+    scope: Option<&super::account_work::Scope>,
+) -> Option<Result<VisibleDone, VisibleStop>> {
+    #[cfg(test)]
+    {
+        let _ = scope;
+        Some(substituted_visible_sign_in(authorize_url, email))
+    }
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        Some(super::signin_window::authorize(authorize_url, email, scope))
+    }
+    #[cfg(all(not(test), not(target_os = "macos")))]
+    {
+        let _ = (authorize_url, email, scope);
+        None
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static VISIBLE_SIGN_IN: std::cell::RefCell<Option<Result<VisibleDone, VisibleStop>>> =
+        const { std::cell::RefCell::new(None) };
+    static VISIBLE_SIGN_INS: std::cell::RefCell<Vec<(String, Option<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Restores the thread's previous visible sign-in result when dropped.
+#[cfg(test)]
+pub(super) struct VisibleSignInGuard(Option<Result<VisibleDone, VisibleStop>>);
+
+#[cfg(test)]
+impl Drop for VisibleSignInGuard {
+    fn drop(&mut self) {
+        VISIBLE_SIGN_IN.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+/// Substitute this thread's visible sign-in result; without one a test's sign-in fails inertly
+/// and opens nothing.
+#[cfg(test)]
+pub(super) fn set_visible_sign_in_for_tests(
+    result: Result<VisibleDone, VisibleStop>,
+) -> VisibleSignInGuard {
+    VisibleSignInGuard(VISIBLE_SIGN_IN.with(|slot| slot.borrow_mut().replace(result)))
+}
+
+/// Every authorization URL and email this thread's drives handed to the visible sign-in since
+/// the last take.
+#[cfg(test)]
+pub(super) fn take_visible_sign_ins_for_tests() -> Vec<(String, Option<String>)> {
+    VISIBLE_SIGN_INS.with(|calls| std::mem::take(&mut *calls.borrow_mut()))
+}
+
+/// The thread's substituted result, or an inert failure, with the call recorded: no test
+/// opens a window.
+#[cfg(test)]
+fn substituted_visible_sign_in(
+    authorize_url: &str,
+    email: Option<&str>,
+) -> Result<VisibleDone, VisibleStop> {
+    VISIBLE_SIGN_INS.with(|calls| {
+        calls
+            .borrow_mut()
+            .push((authorize_url.to_owned(), email.map(str::to_owned)));
+    });
+    VISIBLE_SIGN_IN.with(|slot| {
+        slot.borrow().clone().unwrap_or_else(|| {
+            Err(VisibleStop::Failed(
+                "no visible sign-in is configured in this test".into(),
+            ))
+        })
+    })
+}
+
 thread_local! {
     /// Why this thread's last headless Claude sign-in ended without the callback
     /// ([`note_met`], [`take_met`]).
@@ -7573,6 +7921,12 @@ thread_local! {
 /// listener, or the hosted code's file): from here only the CLI knows whether it holds the code.
 pub(super) fn note_callback_offered() {
     CALLBACK_OFFERED.with(|offered| offered.set(true));
+}
+
+/// Whether this thread's sign-in has handed a callback to the waiting CLI, left standing: a
+/// failure after it is no terminal record (`open_url::open_reporting_to`).
+pub(super) fn callback_offered() -> bool {
+    CALLBACK_OFFERED.with(std::cell::Cell::get)
 }
 
 /// Whether this thread's sign-in handed a callback to the waiting CLI since the last take; a
@@ -7620,11 +7974,12 @@ pub(super) fn finish_deadline<T>(
 /// Drive an active CDP session (`cdp`) through the OAuth flow for `authorize_url`, passing
 /// `&mut CdpClient` to `mailbox_credential` so webmail inboxes can be polled in a secondary CDP
 /// tab. Cloudflare's bot check is waited on, its reads (and a gap of idle reads between two,
-/// [`BotCheckClock`]) not counted against the drive's steps. Once it has stood for the drive's
-/// stall, or its block page is read, the drive ends there ([`BOT_CHECK_UNCLEARED`],
-/// [`BLOCK_PAGE_MET`]): software never operates that challenge, and no other Mac is asked to
-/// open a browser for it. The account's own record of the stop is what a person acts on. Page
-/// outcomes are noted for [`take_met`], as is a drive that reached no callback in time.
+/// [`BotCheckClock`]) not counted against the drive's steps. Software never operates that
+/// challenge, no other browser is opened after it and no other machine is asked: the drive
+/// ends on the page it met ([`BOT_CHECK_UNCLEARED`], [`BLOCK_PAGE_MET`]). Page outcomes are
+/// noted for [`take_met`], as is a drive that reached no callback in time. (On macOS a Claude
+/// sign-in this Mac started runs in aterm's own window instead and never reaches this drive:
+/// [`visible_sign_in`].)
 pub fn drive_cdp_oauth_with_webmail(
     cdp: &mut CdpClient,
     authorize_url: &str,
@@ -7722,6 +8077,50 @@ fn drive_cdp_oauth_until(
         mailbox_credential,
         deliver_callback,
     )
+}
+
+/// Notes `stop` for [`take_met`], a sign-in that failed there with why
+/// ([`super::open_url::Met::because`]), and answers the drive's words for it.
+pub(super) fn note_visible_stop(stop: VisibleStop) -> &'static str {
+    match stop {
+        VisibleStop::NoDesktop => {
+            note_met(MetWord::WindowNoDesktop, None);
+            WINDOW_NO_DESKTOP
+        }
+        VisibleStop::BotCheck(host) => {
+            note_met(MetWord::WindowBotCheck, host.as_deref());
+            WINDOW_BOT_CHECK
+        }
+        VisibleStop::BlockPage(host) => {
+            note_met(MetWord::WindowBlockPage, host.as_deref());
+            WINDOW_BLOCK_PAGE
+        }
+        VisibleStop::HumanCheck(host) => {
+            note_met(MetWord::WindowHumanCheck, host.as_deref());
+            WINDOW_HUMAN_CHECK
+        }
+        VisibleStop::Closed => {
+            note_met(MetWord::WindowClosed, None);
+            WINDOW_CLOSED
+        }
+        VisibleStop::WrongAccount => {
+            note_met(MetWord::WindowWrongAccount, None);
+            WINDOW_WRONG_ACCOUNT
+        }
+        VisibleStop::Failed(why) => {
+            // The reason goes with the outcome, so the renewal that reads it prints and
+            // records why the window's sign-in ended, not only that it did. Standard error
+            // says the same admitted line and nothing more.
+            let met = super::open_url::Met::new(MetWord::BrowserSignIn, None).because(&why);
+            #[cfg(not(test))]
+            eprintln!(
+                "aterm: the sign-in in aterm's sign-in window failed: {}",
+                met.why.as_deref().unwrap_or("no reason it can print")
+            );
+            MET.with(|slot| *slot.borrow_mut() = Some(met));
+            BROWSER_SIGN_IN_FAILED
+        }
+    }
 }
 
 fn drive_cdp_oauth_flow_until(
@@ -8363,20 +8762,17 @@ fn authorize_pinned_browser_until(
                     )
                 },
                 |cb_url| {
-                    deadline.left()?;
-                    note_callback_offered();
+                    // A hosted code is a file the renewal reads, so it is handed over whatever
+                    // is left of the drive's own deadline; a loopback callback only the
+                    // headless page reaches here, inside it.
                     if cb_url.split('?').next()
                         == Some("https://platform.claude.com/oauth/code/callback")
                     {
-                        let credential = super::open_url::hosted_credential(cb_url)?;
-                        let outcome = std::env::var_os(super::open_url::OUTCOME_ENV)
-                            .ok_or("the hosted OAuth callback has no renewal input channel")?;
-                        super::open_url::write_oauth_code(
-                            Path::new(&outcome).with_extension("code"),
-                            &credential,
-                        )?;
+                        super::open_url::hand_over_hosted(cb_url)?;
                         return Ok(200);
                     }
+                    deadline.left()?;
+                    note_callback_offered();
                     let mut cookies = BTreeMap::new();
                     super::open_url::loopback_http_exchange_until(
                         "GET",
@@ -9013,7 +9409,7 @@ fn asks_to_agree(page: &Page) -> bool {
 
 /// Whether the page is a bot-protection block page (Cloudflare's `Sorry, you have been
 /// blocked`), which only a person past it can go on from.
-fn block_page(page: &Page) -> bool {
+pub(super) fn block_page(page: &Page) -> bool {
     let lower = page.text.to_ascii_lowercase();
     lower.contains("sorry, you have been blocked") && lower.contains("cloudflare")
 }
@@ -9081,7 +9477,7 @@ macro_rules! bot_check_helpers_js {
 }
 
 /// [`bot_check_helpers_js`] as a string.
-const BOT_CHECK_JS: &str = bot_check_helpers_js!();
+pub(super) const BOT_CHECK_JS: &str = bot_check_helpers_js!();
 
 /// Where `page` is: its host and path, without its query (which may carry a code or a
 /// challenge's token) or fragment.

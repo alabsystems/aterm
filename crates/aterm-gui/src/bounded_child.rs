@@ -124,38 +124,19 @@ pub(crate) fn run_bounded(
     args: &[String],
     cap: Option<Duration>,
 ) -> Result<Ran, String> {
-    run_bounded_observing(program, args, cap, Instant::now, || {})
-}
-
-/// The same owned command, with its start clock and observation of a live,
-/// unexpired child supplied by the caller.
-pub(crate) fn run_bounded_observing(
-    program: &Path,
-    args: &[String],
-    cap: Option<Duration>,
-    started: impl FnOnce() -> Instant,
-    pending: impl FnMut(),
-) -> Result<Ran, String> {
-    run_with_readers(
-        program,
-        args,
-        cap,
-        |which, work| {
-            std::thread::Builder::new()
-                .name(format!("aterm-child-{which}"))
-                .spawn(work)
-                .map(drop)
-        },
-        started,
-        pending,
-    )
+    run_with_readers(program, args, cap, |which, work| {
+        std::thread::Builder::new()
+            .name(format!("aterm-child-{which}"))
+            .spawn(work)
+            .map(drop)
+    })
 }
 
 /// `program args` as a command this window runs of its own: stdin null, stdout and stderr
 /// captured, and without `ATERM_PARENT_SESSION_ID`. A window started from another aterm's tab
-/// inherits that tab's session id, but nothing it runs is run in that tab: the `aterm ctl --host`
-/// its menu runs (Take Over, Hand Back, Step In) would otherwise name that tab as the fleet
-/// drive's requester (`aterm_ctl::requester_here`, ATERM-KI-1109-3).
+/// inherits that tab's session id, but nothing it runs is run in that tab: the fleet read its
+/// menus run (`aterm ctl survey --fleet`) would otherwise name that tab as the fleet request's
+/// requester (`aterm_ctl::requester_here`, ATERM-KI-1109-3).
 fn owned_command(program: &Path, args: &[String]) -> aterm_uds::spawnfd::Command {
     let mut command = aterm_uds::spawnfd::command(program);
     command
@@ -172,8 +153,6 @@ fn run_with_readers(
     args: &[String],
     cap: Option<Duration>,
     mut start: impl FnMut(&str, ReaderWork) -> io::Result<()>,
-    started: impl FnOnce() -> Instant,
-    mut pending: impl FnMut(),
 ) -> Result<Ran, String> {
     let stdout = reader("stdout", &mut start)?;
     let stderr = reader("stderr", &mut start)?;
@@ -193,7 +172,7 @@ fn run_with_readers(
     let stderr = stderr.hand_off(owned.child.stderr.take(), "stderr");
     let (stdout, stderr) = (stdout?, stderr?);
     let deadline = cap.map(|cap| {
-        let now = started();
+        let now = Instant::now();
         let at = now
             .checked_add(cap)
             .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
@@ -209,10 +188,7 @@ fn run_with_readers(
                 let secs = deadline.map_or(0, |(_, cap)| cap.as_secs());
                 break Err(format!("no answer in {secs} s: kill requested"));
             }
-            Ok(None) => {
-                pending();
-                std::thread::sleep(POLL);
-            }
+            Ok(None) => std::thread::sleep(POLL),
             Err(e) => {
                 break Err(format!("could not wait for it: {e}"));
             }

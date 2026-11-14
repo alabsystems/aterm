@@ -40,7 +40,6 @@ pub(crate) fn project(state: &State, action: &str) -> State {
                 state["held"] == 2,
                 u8::try_from(state["held"]).unwrap(),
             ))),
-            Instant::now(),
         );
     }
     let read = match state["read"] {
@@ -53,7 +52,7 @@ pub(crate) fn project(state: &State, action: &str) -> State {
     };
     if state["policy"] > 0 {
         // A completed read precedes a policy edit; the following refresh must retain it.
-        look(&mut held, read.clone(), Instant::now());
+        look(&mut held, read.clone());
     }
     let root = aterm_tempfile::tempdir().unwrap();
     let config = root.path().join("aterm.toml");
@@ -69,7 +68,7 @@ pub(crate) fn project(state: &State, action: &str) -> State {
         settled: None,
         held: Mutex::new(held),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     };
     cache.refresh_with(|| {
         assert_eq!(state["policy"], 0, "excluded policy read the source");

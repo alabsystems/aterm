@@ -7,7 +7,7 @@
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -108,6 +108,10 @@ pub(crate) enum Outcome {
     Todo { what: String, next: String },
     /// Something is wrong and the tool will not proceed past it.
     Blocked { what: String, fix: String },
+    /// This Mac's vault holds no copy of the credential (what): its caller files the want with
+    /// the lab ([`aterm_secrets::need::Want::DeveloperId`], [`aterm_secrets::need::Want::Notary`]).
+    /// Only a run that may change things yields it.
+    Unheld(String),
     /// Not a macOS host; the verdict says "skipped".
     Skipped(String),
 }
@@ -189,9 +193,7 @@ fn read_only(
             OnDisk::Unlooked(why) => unlooked(why, key),
             OnDisk::Nothing => Outcome::Todo {
                 what: format!("'{id}' holds a request key and no installed certificate"),
-                next:
-                    "re-run without --check to import the certificate once you have downloaded it"
-                        .into(),
+                next: format!("`{}` resumes the request out at Apple", mint_command(id)),
             },
         },
         (true, None) => Outcome::Todo {
@@ -200,20 +202,71 @@ fn read_only(
                 pins::APPLE_TEAM_ID
             ),
             next: format!(
-                "re-run without --check: it will ask before spending one of five permanent \
-                 certificate slots, then generate '{id}'s request"
+                "provision imports the vault's Developer ID pair, else files `aterm secrets \
+                 need developer-id:{id}`"
             ),
         },
     }
 }
 
-/// The driver: it re-reads the world each run, and only a confirmed [`generate`] makes a new
-/// key.
+/// The flag that lets provision mint a Developer ID request, spending one of the team's five
+/// permanent certificate slots: an explicit act on the release machine, never a question.
+pub(crate) const MINT_FLAG: &str = "--mint-developer-id";
+
+/// The command that mints or resumes machine `id`'s Developer ID request, as text names it.
+fn mint_command(id: &str) -> String {
+    format!(
+        "{} provision --id {id} {MINT_FLAG}",
+        crate::publish::SHIP_COMMAND
+    )
+}
+
+/// What this Mac's vault registry gives the Apple step when the keychains hold no identity
+/// ([`registry_pair`]).
+pub(crate) enum Vault {
+    /// The registry holds a Developer ID pair and it was imported and proved (the line).
+    Imported(String),
+    /// The registry holds a pair this Mac has not imported yet (why).
+    Pending(String),
+    /// The registry holds no Developer ID pair.
+    Absent,
+    /// The registry could not be read (why), which says nothing of what it holds.
+    Unread(String),
+}
+
+/// THE ONE SOURCE OF A DEVELOPER ID PAIR: this Mac's vault registry
+/// ([`aterm_secrets::registry::read`]). A `~/.aterm/apple/devid-<stem>.cer` entry there is
+/// imported into the release keychain and proved ([`aterm_secrets::client::release::sync_signing`]).
+fn registry_pair() -> Vault {
+    let paths = match aterm_secrets::client::Paths::live() {
+        Ok(paths) => paths,
+        Err(error) => return Vault::Unread(error.to_string()),
+    };
+    match aterm_secrets::registry::read(&paths) {
+        Err(why) => Vault::Unread(why),
+        Ok(entries)
+            if !entries.iter().any(|entry| {
+                aterm_secrets::entry_class::signing_material(&entry.name)
+                    && entry.name.ends_with(".cer")
+            }) =>
+        {
+            Vault::Absent
+        }
+        Ok(_) => match aterm_secrets::client::release::sync_signing(&paths) {
+            Ok(line) => Vault::Imported(line),
+            Err(error) => Vault::Pending(error.to_string()),
+        },
+    }
+}
+
+/// The driver: it re-reads the world each run, resolves a missing identity from the vault
+/// registry, and only `mint` ([`MINT_FLAG`]) makes a new key ([`generate`]).
 pub(crate) fn acquire(
     id: &str,
     may_change: bool,
     leave: Leave,
     cert_dir: Option<&Path>,
+    mint: bool,
 ) -> Outcome {
     if !cfg!(target_os = "macos") {
         return Outcome::Skipped("cuts run on macOS (Tier APPLE); no keychain on this host".into());
@@ -237,24 +290,42 @@ pub(crate) fn acquire(
     acquire_in(
         &Keychains::new(&home, &Bounded),
         id,
-        may_change,
-        leave,
+        Change {
+            may_change,
+            leave,
+            mint,
+        },
         cert_dir,
+        &registry_pair,
     )
 }
 
+/// What a run may do: change the keychains at all (`may_change`), re-assert the release
+/// keychain on a held identity's test signature (`leave`), and mint a new request (`mint`).
+#[derive(Clone, Copy)]
+pub(crate) struct Change {
+    pub may_change: bool,
+    pub leave: Leave,
+    pub mint: bool,
+}
+
 /// [`acquire`] for the user whose home `kc` names, every `security` and `codesign` call
-/// through it. With leave to change it first re-asserts an existing release keychain
-/// ([`Keychains::converge`]) and test-signs; without, it only opens it, and its test
-/// signature follows `leave` (a real release's audit may re-assert the partition list; a
-/// check or a dry run writes nothing).
+/// through it, and `vault` the registry's pair ([`registry_pair`]). With leave to change it
+/// first re-asserts an existing release keychain ([`Keychains::converge`]) and test-signs;
+/// without, it only opens it, and its test signature follows `leave` (a real release's audit
+/// may re-assert the partition list; a check or a dry run writes nothing).
 fn acquire_in(
     kc: &Keychains<'_>,
     id: &str,
-    may_change: bool,
-    leave: Leave,
+    change: Change,
     cert_dir: Option<&Path>,
+    vault: &dyn Fn() -> Vault,
 ) -> Outcome {
+    let Change {
+        may_change,
+        leave,
+        mint,
+    } = change;
     let dir = apple_dir_in(kc.home());
     if may_change {
         if let Err(refused) = kc.converge(pins::APPLE_TEAM_ID) {
@@ -316,6 +387,10 @@ fn acquire_in(
         return verdict(kc, id, seen.identities, Leave::Write);
     }
 
+    if !mint {
+        return resolve(kc, id, &seen, &watch, vault);
+    }
+
     if let (Some(key), Some(csr)) = (&seen.key, &seen.csr) {
         return await_then_install(kc, key, csr, id, &seen.invalid, &watch);
     }
@@ -366,21 +441,78 @@ fn acquire_in(
         };
     }
 
-    match confirm_slot(id, seen.invalid_present) {
-        Ok(true) => match generate(&dir, id) {
-            Ok(csr) => await_then_install(kc, &key_path(&dir, id), &csr, id, &seen.invalid, &watch),
-            Err(outcome) => outcome,
+    // The vault's pair comes first even here: a slot is spent only when the registry holds none.
+    match resolve(kc, id, &seen, &watch, vault) {
+        Outcome::Unheld(_) => {}
+        other => return other,
+    }
+    step(
+        APPLE_LABEL,
+        &format!(
+            "{MINT_FLAG}: generating '{id}''s request spends one of team {}'s five permanent \
+             Developer ID Application slots",
+            pins::APPLE_TEAM_ID
+        ),
+    );
+    match generate(&dir, id) {
+        Ok(csr) => await_then_install(kc, &key_path(&dir, id), &csr, id, &seen.invalid, &watch),
+        Err(outcome) => outcome,
+    }
+}
+
+/// No identity: a pair the vault filled for this id imports from disk, else the registry's
+/// pair is imported, else a request this Mac minted waits on Apple for the release machine's
+/// [`MINT_FLAG`] run, else the want is unheld. Nothing waits on a person.
+fn resolve(
+    kc: &Keychains<'_>,
+    id: &str,
+    seen: &Observed,
+    watch: &Watch,
+    vault: &dyn Fn() -> Vault,
+) -> Outcome {
+    if let Some(key) = &seen.key {
+        match look(key, watch, &seen.invalid, 0, &|leaf| {
+            issuer_in_keychain(kc, leaf)
+        }) {
+            Ok(Look {
+                cert: Some(cer), ..
+            }) => return install(kc, &cer, key, id),
+            Err(why) => return unlooked(why, key),
+            Ok(_) => {}
+        }
+    }
+    match vault() {
+        Vault::Imported(line) => {
+            step(APPLE_LABEL, &line);
+            let ids = Observed::look(kc, id).identities;
+            if ids.is_empty() {
+                Outcome::Blocked {
+                    what: "the vault's Developer ID pair imported and the keychains list no \
+                           identity for it"
+                        .into(),
+                    fix: "re-run once `security find-identity` lists it".into(),
+                }
+            } else {
+                verdict(kc, id, ids, Leave::Write)
+            }
+        }
+        Vault::Pending(why) => Outcome::Blocked {
+            what: format!("the vault's Developer ID pair is not imported here: {why}"),
+            fix: "provision imports it once the vault authorizes this Mac's release ring".into(),
         },
-        Ok(false) => Outcome::Waiting {
-            what: "declined to generate a certificate signing request".into(),
-            next: format!(
-                "re-run `{} provision --id {id}` when ready to spend a slot",
-                crate::publish::SHIP_COMMAND
-            ),
+        Vault::Absent if seen.key.is_some() && seen.csr.is_some() => Outcome::Waiting {
+            what: format!("'{id}' holds a request key and no installed certificate"),
+            next: format!("`{}` resumes the request out at Apple", mint_command(id)),
         },
-        Err(e) => Outcome::Blocked {
-            what: format!("could not ask before spending a Developer ID slot: {e}"),
-            fix: "run provision from a terminal — it will not spend a slot unasked".into(),
+        Vault::Absent => Outcome::Unheld(format!(
+            "no Developer ID Application identity for team {} here, and the vault registry \
+             holds no Developer ID pair",
+            pins::APPLE_TEAM_ID
+        )),
+        Vault::Unread(why) => Outcome::Blocked {
+            what: format!("the vault registry cannot be read: {why}"),
+            fix: "provision imports the vault's Developer ID pair once this Mac's vault applies"
+                .into(),
         },
     }
 }
@@ -819,70 +951,6 @@ fn waiting_text(
     s
 }
 
-/// Ask a question on the controlling terminal and read one whole line back.
-fn tty_line(prompt: &str, max: usize) -> Result<String, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(aterm_uds::atomic_file::TTY_OPEN_FLAGS)
-        .open("/dev/tty")
-        .map_err(|e| format!("cannot open /dev/tty: {e}"))?;
-    if !std::io::IsTerminal::is_terminal(&tty) {
-        return Err("/dev/tty is not a terminal".into());
-    }
-    write!(tty, "{prompt}").map_err(|e| format!("cannot write to /dev/tty: {e}"))?;
-    tty.flush().ok();
-    let mut raw = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match tty.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => {
-                if raw.len() < max {
-                    raw.push(byte[0]);
-                }
-            }
-            Err(e) => return Err(format!("cannot read from /dev/tty: {e}")),
-        }
-    }
-    Ok(String::from_utf8_lossy(&raw).trim().to_string())
-}
-
-/// Prints the confirmation prompt for generating a new certificate request.
-fn confirm_slot(id: &str, invalid: usize) -> Result<bool, String> {
-    let mut msg = format!(
-        "generating a CSR for '{id}' spends one of team {}'s five Developer ID Application \
-         slots, permanently. Revoking one later stops every app it already signed from \
-         launching.",
-        pins::APPLE_TEAM_ID
-    );
-    if invalid > 0 {
-        msg.push_str(&format!(
-            "\nNOTE: this keychain already holds {invalid} Developer ID certificate{} for \
-             this team that {} not valid (expired, or missing their private key). Those \
-             slots are already spent.",
-            plural(invalid),
-            if invalid == 1 { "is" } else { "are" },
-        ));
-    }
-    msg.push_str(
-        "\nN is safe: the rest of the audit still runs, nothing else here spends anything, \
-         and this question comes back on the next run.\nContinue? [y/N] ",
-    );
-    let prompt = format!("\n{}", crate::publish::grid_block(APPLE_LABEL, &msg));
-    let answer = tty_line(&prompt, 64)?.to_ascii_lowercase();
-    let yes = answer == "y" || answer == "yes";
-    if !yes && !answer.is_empty() && answer != "n" && answer != "no" {
-        step(
-            APPLE_LABEL,
-            &format!("'{answer}' is not 'y' — taking that as no; no slot spent"),
-        );
-    }
-    Ok(yes)
-}
-
 /// The keychain profile name the notarytool credential is stored under.
 pub(crate) const NOTARY_PROFILE: &str = "notary";
 
@@ -906,13 +974,10 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
             ids: Vec::new(),
             note: Some(note),
         },
-        Ok(None) => Outcome::Blocked {
-            what: format!(
-                "this Mac holds no {} entry to set notarytool profile '{NOTARY_PROFILE}' from",
-                aterm_secrets::need::catalog::NOTARY_ENTRY
-            ),
-            fix: "`aterm secrets need notary`".into(),
-        },
+        Ok(None) => Outcome::Unheld(format!(
+            "this Mac holds no {} entry to set notarytool profile '{NOTARY_PROFILE}' from",
+            aterm_secrets::need::catalog::NOTARY_ENTRY
+        )),
         Err(error) => Outcome::Waiting {
             what: format!("shared notary credential could not be materialized: {error}"),
             next: "retry after the authenticated vault credential or notary service recovers"

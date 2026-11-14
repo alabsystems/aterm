@@ -18,6 +18,7 @@ use crate::release::{
 };
 use crate::release_steps::Real;
 
+mod distribution;
 mod host_fit;
 mod open_next;
 mod qualify_model;
@@ -114,6 +115,9 @@ struct World {
     input_finding: Option<InputFinding>,
     /// A new engine policy's answer, installed by Sync for the next input judgment.
     sync_input_finding: Option<InputFinding>,
+    /// What step 1's released-shim early ask finds: the public release's refusal of R's tree,
+    /// or a judgment this Mac could not make.
+    shim_finding: Option<InputFinding>,
     fleet_refusal: Option<String>,
     fleet_panics: bool,
     supersede_preflight_refusal: Option<Refusal>,
@@ -344,6 +348,9 @@ struct World {
     /// stop fired by then.
     after_tree: bool,
     keep_build_on_test_red: bool,
+    /// The tree's `verify release` ends only once the build's and the export's ends are told:
+    /// the 0.200.0 cut's order (export 12m31s, build 2h05m, the tree's red 2h40m).
+    tree_ends_last: bool,
     /// How `ship cut --sign` (step 7's sign side) exits.
     sign_code: i32,
     /// The build whose copy `cut --sign` signed privately and kept the record of.
@@ -393,6 +400,10 @@ struct World {
     /// The fleet claim `existing_fleet_line` stands for is held by another Mac
     /// ([`Backend::fleet_held_elsewhere`]).
     fleet_elsewhere: bool,
+    /// What [`Backend::distribution`] finds.
+    distribution: Vec<Finding>,
+    /// Each ask of [`Backend::distribution`], by whether it was a dry run's.
+    distribution_dry: Vec<bool>,
 }
 
 /// The world's repair spawner, inside an aterm session unless `outside`: every failure the cut
@@ -445,6 +456,7 @@ impl World {
             gate_revision: false,
             input_finding: None,
             sync_input_finding: None,
+            shim_finding: None,
             fleet_refusal: None,
             fleet_panics: false,
             supersede_preflight_refusal: None,
@@ -592,6 +604,7 @@ impl World {
             build_admission_waits: 0,
             after_tree: false,
             keep_build_on_test_red: false,
+            tree_ends_last: false,
             sign_code: 0,
             signed: None,
             private_draft: None,
@@ -615,6 +628,8 @@ impl World {
             host_unfit: None,
             host_asked: 0,
             fleet_elsewhere: false,
+            distribution: Vec::new(),
+            distribution_dry: Vec::new(),
         }
     }
 
@@ -884,6 +899,9 @@ impl Branches for WorldBranches<'_> {
         if line.starts_with("        build: ") && !line.contains("; log: ") {
             self.mark("build-ended");
         }
+        if line.starts_with("        export: ") && !line.contains("; log: ") {
+            self.mark("export-ended");
+        }
         if line.contains(": RED at ") {
             self.mark("red");
         }
@@ -1040,7 +1058,15 @@ impl Branches for WorldBranches<'_> {
             self.held(Branch::Tree, stop);
             return Ok(ran_code(143));
         }
-        self.world().verify(step, c, run, artifact)
+        let ran = self.world().verify(step, c, run, artifact);
+        if tree && self.world().tree_ends_last {
+            self.wait(
+                "the build's and the export's ends",
+                |seen| seen.contains(&"build-ended") && seen.contains(&"export-ended"),
+                &|| false,
+            );
+        }
+        ran
     }
     fn side_log(&self, side: Side) -> PathBuf {
         let w = self.world();
@@ -1792,6 +1818,19 @@ impl Backend for World {
             .clone()
             .map_or_else(|| Ok("input clean".into()), Err)
     }
+    /// As the real backend: asked while R's tree owes its `test` check, and not of a tree
+    /// whose `test` record stands.
+    fn released_shim(&mut self, c: &Candidate) -> Result<String, InputFinding> {
+        let test = (c.commit.clone(), None, "test".to_owned());
+        if self.records.get(&test).copied() == Some("ok") {
+            return Ok("released-shim not asked again: the `test` record stands".into());
+        }
+        self.calls.push(format!("released-shim {}", c.commit));
+        self.shim_finding.clone().map_or_else(
+            || Ok("released-shim: aterm 0.5.0 built aterm-time".into()),
+            Err,
+        )
+    }
     fn ledger_versions(&mut self, _rev: &str) -> Vec<String> {
         self.ledger.clone()
     }
@@ -2245,6 +2284,10 @@ impl Backend for World {
         } else {
             self.audits.front().cloned().unwrap_or_default()
         }
+    }
+    fn distribution(&mut self, dry: bool) -> Vec<Finding> {
+        self.distribution_dry.push(dry);
+        self.distribution.clone()
     }
     fn ask(&mut self, words: &AskWords) -> Result<String, String> {
         self.calls.push(format!("ask {}", words.key));
@@ -3608,6 +3651,8 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         .expect("step 7 ran");
     order[seven..seven + 2].sort_unstable();
     let input = format!("input-checks {OLD} {BUMP}");
+    // The public release is asked of the written bump before its input judgment.
+    let shim = format!("released-shim {BUMP}");
     assert_eq!(
         order,
         [
@@ -3615,6 +3660,7 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "bump",
             "move cccc",
             "commit-gates",
+            shim.as_str(),
             input.as_str(),
             "sync",
             input.as_str(),
@@ -4787,6 +4833,196 @@ fn unchecked_input_refuses_at_step_one_including_a_dry_run() {
     assert_eq!(code, 0, "{last}");
     assert!(last.contains("would go ahead"), "{last}");
     assert!(w.calls.iter().any(|call| call.starts_with("input-checks ")));
+}
+
+/// What 0.199.0 said of every tree from the minute it was public (2026-11-13T03:57Z): its
+/// helper refused the first build in a home with no `Library/Caches`.
+const SHIM_REFUSED: &str = "released-shim: aterm 0.199.0 refuses candidate (exit status: 75); \
+    incompatible bootstrap inputs: explicit selection (all bootstrap inputs); error: the \
+    selected quiet build target could not be resolved safely; land shim support first, release \
+    it, then adopt the configuration";
+
+/// A judgment the installed app may not make: it is two releases behind the newest public tag.
+const SHIM_UNDECIDED: &str = "released-shim: installed aterm 0.197.0 is 2 releases behind the \
+    newest fetched public tag v0.199.0; only that release or the one before it judges \
+    bootstrap compatibility: update the installed app";
+
+/// THE CUT ASKS FIRST WHAT THE PUBLIC RELEASE SAYS OF R (R29). The released-shim judgment
+/// depends on which release is public, so a tree nobody changed can turn red; the 0.200.0 cut
+/// learned it from its tree's own test, 2h40m into step 4. Step 1 asks it of R before the
+/// input judgment, the sync and anything step 4 runs, and refuses with the row's own words and
+/// the line's remedy; a real red opens its repair worker, and a judgment this Mac could not
+/// make is a resumable stop that opens none. A dry run says the same and goes on planning.
+/// NEGATIVE CONTROLS: a tree the public release builds passes step 1 and is released, asked
+/// once and before the input judgment; drop the ask from `Run::checks` and the refused runs
+/// reach `verify --tree`.
+#[test]
+fn a_public_release_that_refuses_rs_tree_refuses_at_step_one_with_nothing_qualified() {
+    let asked = format!("released-shim {TIP}");
+    let qualified = |w: &World| {
+        w.calls
+            .iter()
+            .filter(|call| {
+                ["reserve", "build", "verify", "stage", "publish", "cut "]
+                    .iter()
+                    .any(|work| call.starts_with(work))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.shim_finding = Some(InputFinding::Failed(SHIM_REFUSED.into()));
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        last.starts_with(&format!("REFUSED at 1/10 checks: {SHIM_REFUSED}")),
+        "the row's own words: {last}"
+    );
+    assert!(
+        last.ends_with(&crate::release::fix_remedy(TIP)),
+        "the line's remedy: {last}"
+    );
+    assert_eq!(w.count(&asked), 1, "{:?}", w.calls);
+    assert_eq!(qualified(&w), Vec::<String>::new());
+    for later in ["input-checks ", "sync"] {
+        assert!(
+            !w.calls.iter().any(|call| call.starts_with(later)),
+            "{later}: {:?}",
+            w.calls
+        );
+    }
+    assert_eq!(w.repairs.asked.len(), 1, "a red of R opens its worker");
+    assert_eq!(w.repairs.asked[0].gate, "verify released-shim");
+    assert_eq!(w.repairs.asked[0].step, "1/10 checks");
+
+    let mut undecided = World::new();
+    undecided.versions.insert(TIP.into(), "0.6.0".into());
+    undecided.shim_finding = Some(InputFinding::Unanswered(SHIM_UNDECIDED.into()));
+    let (code, last) = undecided.run(mac());
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.starts_with(&format!(
+            "REFUSED at 1/10 checks: COULD NOT RUN — {SHIM_UNDECIDED}"
+        )),
+        "{last}"
+    );
+    assert!(
+        last.ends_with(&format!(
+            "remove the cause it names on this Mac, then {}",
+            crate::ledger::RELEASE_COMMAND
+        )),
+        "{last}"
+    );
+    assert_eq!(qualified(&undecided), Vec::<String>::new());
+    assert!(
+        undecided.repairs.asked.is_empty(),
+        "nothing of R was decided"
+    );
+
+    let mut dry = World::new();
+    dry.versions.insert(TIP.into(), "0.6.0".into());
+    dry.shim_finding = Some(InputFinding::Failed(SHIM_REFUSED.into()));
+    let (code, last) = dry.run(ReleaseOptions {
+        dry_run: true,
+        ..mac()
+    });
+    assert_ne!(code, 0, "{last}");
+    assert_eq!(
+        dry_fix(&dry.out, SHIM_REFUSED),
+        format!(
+            "land the fix on main, then {}",
+            crate::ledger::RELEASE_COMMAND
+        ),
+        "a dry run journals no line, so its fix starts one"
+    );
+    assert_eq!(dry.count(&asked), 1, "{:?}", dry.calls);
+    assert_eq!((dry.count("build"), dry.count("verify --tree")), (0, 0));
+
+    let mut accepted = World::new();
+    accepted.versions.insert(TIP.into(), "0.6.0".into());
+    let (code, last) = accepted.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", accepted.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+    assert_eq!(accepted.count(&asked), 1, "{:?}", accepted.calls);
+    let at = |call: &str| {
+        accepted
+            .calls
+            .iter()
+            .position(|c| c.starts_with(call))
+            .unwrap_or_else(|| panic!("no {call}: {:?}", accepted.calls))
+    };
+    assert!(at("released-shim ") < at("input-checks "));
+    assert!(at("released-shim ") < at("verify --tree"));
+    assert!(accepted.repairs.asked.is_empty());
+}
+
+/// The 0.200.0 line, as it would now go: taken before the fix was on main, refused at step 1
+/// in its first minute, then `--fix` carries the landed fix as a hop, whose own tree passes
+/// through the same ask. Only the hop's tree is ever qualified. Before the early ask the base's
+/// tree ran `verify --tree` too, to its red.
+/// A resume of a tree whose `test` record stands is not asked again: the ask foretells that
+/// check, and a release that qualified is not refused over a release published after it.
+/// NEGATIVE CONTROL: ask on every run and the resumed release below is refused at step 1.
+#[test]
+fn a_fix_hop_passes_the_early_ask_and_a_qualified_tree_is_not_asked_again() {
+    let mut w = World::new();
+    w.shim_finding = Some(InputFinding::Failed(SHIM_REFUSED.into()));
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("REFUSED at 1/10 checks"), "{last}");
+    assert!(
+        last.ends_with(&crate::release::fix_remedy(BUMP)),
+        "the remedy step 4's red names: {last}"
+    );
+    assert_eq!(w.count("verify --tree"), 0);
+    assert_eq!(w.count("build"), 0);
+
+    w.history.push(FIX.into());
+    w.versions.insert(FIX.into(), "0.6.0".into());
+    // The hop carries the fix: the public release builds its tree.
+    w.shim_finding = None;
+    // Its bundle check cannot run yet, so the run stops after the hop's tree passed.
+    w.verify_half = Some(Half::Bundle);
+    w.verify_step = Some(Step::Bundle);
+    w.verify_passes = false;
+    w.verify_code = 3;
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 3, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("REFUSED at 5/10 bundle"), "{last}");
+    let hop = hop_of(FIX);
+    assert_eq!(
+        w.calls
+            .iter()
+            .filter(|call| call.starts_with("released-shim "))
+            .collect::<Vec<_>>(),
+        [
+            &format!("released-shim {BUMP}"),
+            &format!("released-shim {hop}")
+        ],
+        "each head is asked once, before it is qualified"
+    );
+    assert_eq!(w.count("verify --tree"), 1, "only the hop's tree");
+
+    // A release that refuses becomes public while the qualified hop waits for its bundle check.
+    w.shim_finding = Some(InputFinding::Failed(SHIM_REFUSED.into()));
+    w.verify_half = None;
+    w.verify_step = None;
+    w.verify_passes = true;
+    w.verify_code = 0;
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+    assert_eq!(
+        w.calls
+            .iter()
+            .filter(|call| call.starts_with("released-shim "))
+            .count(),
+        2,
+        "the hop's `test` record stands: {:?}",
+        w.calls
+    );
+    assert_eq!(w.count("verify --tree"), 1);
 }
 
 /// A passing preflight cannot authorize Commit under a policy selected by Sync that
@@ -10910,6 +11146,73 @@ fn a_red_stops_the_other_branches_and_one_not_started_never_starts() {
     assert_eq!(phases(&w, "build"), ["started", "red"]);
     for branch in ["tree", "export"] {
         assert_eq!(phases(&w, branch), ["stopped"], "{branch}");
+    }
+}
+
+/// A RED NAMES EVERY BRANCH IT DID NOT STOP, AND WHY (R29). The 0.200.0 cut's tree went red at
+/// 2h40m, after its export (12m31s) and its build (2h05m) had ended, and its line said only
+/// `stopping nothing`: true, since `run_graph` fires the stop of every branch that has not
+/// ended, and unexplained. The line now names the branches that ended before the red, each
+/// with how and after how long. A build left running on purpose (the tree's only red is a test
+/// that ran, so the next hop reuses its product) is named as going on.
+/// NEGATIVE CONTROLS: a red that comes first names what it stops and no earlier end; a tree
+/// red that keeps no build stops it and says nothing of a build going on.
+#[test]
+fn a_red_says_which_branches_had_ended_and_that_a_kept_build_goes_on() {
+    let red_tree = || {
+        let mut w = World::new();
+        w.verify_half = Some(Half::Tree);
+        w.verify_outcomes.insert("test", "FAIL");
+        w.verify_code = 1;
+        w
+    };
+    let red_line = |w: &World| {
+        w.out
+            .iter()
+            .find(|line| line.contains("tree: RED at "))
+            .unwrap_or_else(|| panic!("no red line: {:#?}", w.out))
+            .clone()
+    };
+
+    let mut last_red = red_tree();
+    last_red.tree_ends_last = true;
+    let (code, last) = last_red.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", last_red.out);
+    assert!(last.starts_with("REFUSED at 4/10 qualify"), "{last}");
+    let line = red_line(&last_red);
+    assert!(
+        line.contains("; stopping nothing (ended before it: ")
+            && line.contains("build passed after ")
+            && line.contains("export passed after "),
+        "{line}"
+    );
+    assert!(!line.contains("the build goes on"), "{line}");
+    for branch in ["build", "export"] {
+        assert_eq!(phases(&last_red, branch), ["started", "passed"], "{branch}");
+    }
+
+    for keep in [true, false] {
+        let mut w = red_tree();
+        w.after_tree = true;
+        w.keep_build_on_test_red = keep;
+        let (code, last) = w.run(bump());
+        assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+        let line = red_line(&w);
+        assert!(!line.contains("ended before it"), "{line}");
+        if keep {
+            assert!(
+                line.contains(
+                    "; stopping export; the build goes on, its product kept for the next hop"
+                ),
+                "{line}"
+            );
+            assert!(
+                w.journal().unwrap().artifact.is_some(),
+                "the build finished"
+            );
+        } else {
+            assert!(line.ends_with("; stopping build, export"), "{line}");
+        }
     }
 }
 

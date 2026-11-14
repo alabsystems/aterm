@@ -51,6 +51,12 @@ aterm-update-core = { workspace = true }
 # The static bootstrap verifier a Linux worker builds beside the executable: its asset
 # name, its static build's flags and install.sh's pin, which the cut prints.
 aterm-bootstrap-verify = { workspace = true }
+# The Windows release handoff (`--windows-artifacts`): the receipt `aterm-winship
+# release-build` writes on a Windows host and the one admission of a handoff
+# directory (`aterm_winship::handoff`), so writer and cutter read one shape by
+# compilation. This crate does not build on Windows, so the writer cannot live
+# here. Its graph is first-party crates only.
+aterm-winship = { path = "../aterm-winship" }
 # The x86_64 slice's Rosetta session holds an `aterm_uds::lifeline`: a cut killed
 # mid-drive takes the translated instance with it.
 aterm-uds = { workspace = true }

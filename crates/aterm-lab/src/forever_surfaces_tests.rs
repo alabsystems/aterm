@@ -7,24 +7,14 @@
 use super::*;
 
 /// `chrome` as a headless instance printed it with one supervised tab
-/// needing its person: the strip, the chip, the menu.
+/// needing its person: the strip, the chip, the menu-bar item.
 const CHROME: &str = r#"toolbar (none)
 toolbar-tabs count=2 selected=1 labels=["aterm", "land-a"] icons=[None, None] states=[[], ["selected", "busy", "attention"]] tooltips=[None, Some("land-a\nactivity: idle\nNeeds you: rotate the deploy key\ndriven by aterm (land)")]
 menu (none)
 autopilot sid=s-aa window=2 program=claude face=land drawn="⤓" spoken="Autopilot: land."
 autopilot sid=s-bb window=2 program=claude face=cruise drawn=- why=not-drawn spoken=-
-statusitem title=❯1 needs=1 stuck=0 exceptions=4 done=0 fleet=off
-statusmenu "Needs you (1)" enabled=no at=0
-statusmenu "◇ land-a — rotate the deploy key · 6s" enabled=yes checked=no at=1
-statusmenu --- at=2
-statusmenu "This Mac — 1 need you · 2 shells" enabled=no at=3
-statusmenu --- at=4
-statusmenu "Done for you (1)" enabled=no at=5
-statusmenu "✓ land-ab — landed 2m" enabled=yes checked=no at=6
-statusmenu --- at=7
-statusmenu "To look at (1)" enabled=no at=8
-statusmenu "Claude Code is not installed" enabled=yes checked=no at=9
-statusmenu "Notify Me When I’m Needed" enabled=yes checked=no tip="One notice when something needs you, never for a wait." at=10"#;
+statusitem title=❯ fleet=off access=read shown=read blocked=no
+statusmenu "This Mac · not in a fleet" enabled=no at=0"#;
 
 /// `inspect app/v1 view <id> text` of Settings ▸ Harness, two sessions.
 const PAGE: &str = r#"text key="harness/status/row/sessions" role=Group label="Sessions: 2 of 2 supervised · 1 need you"
@@ -55,102 +45,6 @@ fn the_strip_is_read_tab_by_tab_through_its_quoted_lists() {
     assert_eq!(t[0].label, "a \"b\" ]c");
     assert_eq!(t[0].states, ["done"]);
     assert!(strip_tabs("toolbar (none)").is_empty());
-}
-
-#[test]
-fn the_menu_is_read_row_by_row_under_its_sections() {
-    let rows = menu_rows(CHROME);
-    let of = |label: &str| rows.iter().find(|r| r.label.starts_with(label)).unwrap();
-    assert_eq!(of("◇ land-a").section, "needs");
-    assert_eq!(of("◇ land-a").at, "1");
-    assert_eq!(of("This Mac").section, "here");
-    assert_eq!(of("✓ land-ab").section, "done");
-    assert_eq!(of("Claude Code is not").section, "look");
-    assert_eq!(of("Notify Me").section, "look");
-    assert_eq!(of("Notify Me").at, "10");
-    assert!(row_names("◇ land-a — rotate the deploy key · 6s", "land-a"));
-    assert!(!row_names("✓ land-ab — landed 2m", "land-a"));
-    assert!(!row_names("◇ land-a — x", "land"));
-    assert!(row_names("● fmt (worker of mgr) — working 2m", "fmt"));
-}
-
-/// This Mac's row is led by `This Mac` until the title's reader has read the name, then by the
-/// machine's title (`m8 Heron`), and its counts are what follows ` — ` either way; a row a word
-/// such as `macOS` leads, or one with no counts, is not it.
-#[test]
-fn this_mac_s_row_is_read_under_either_lead() {
-    for (label, counts) in [
-        (
-            "This Mac — 1 need you · 2 shells",
-            Some("1 need you · 2 shells"),
-        ),
-        ("m8 Heron — 3 landed", Some("3 landed")),
-        ("m0 Blue Heron — 1 shell", Some("1 shell")),
-        ("m14 — 2 shells", Some("2 shells")),
-        ("This Mac", None),
-        ("m8 Heron", None),
-        ("macOS 27 — update ready", None),
-        ("m — 1 shell", None),
-        ("m8x — 1 shell", None),
-        ("This Macintosh — 1 shell", None),
-    ] {
-        assert_eq!(here_counts(label), counts, "{label}");
-        assert_eq!(
-            section_of(label).is_some_and(|s| s == "here"),
-            counts.is_some(),
-            "{label}"
-        );
-    }
-    let titled = CHROME.replace("This Mac — 1 need you", "m8 Heron — 1 need you");
-    let rows = menu_rows(&titled);
-    let here = rows
-        .iter()
-        .find(|r| r.label.starts_with("m8 Heron"))
-        .unwrap();
-    assert_eq!(here.section, "here");
-    assert_eq!(
-        rows.iter()
-            .find(|r| r.label.starts_with("✓ land-ab"))
-            .unwrap()
-            .section,
-        "done"
-    );
-}
-
-/// A tab's menu entry carries the header of each section its rows are in,
-/// with the rows the menu lists under it (every tab's), and never This
-/// Mac's (whose counts move with every tab).
-#[test]
-fn a_tabs_menu_carries_its_sections_headers_and_their_rows() {
-    let rows = menu_rows(CHROME);
-    assert_eq!(
-        menu_of(&rows, "land-a"),
-        "needs-head|Needs you (1) rows=1\nneeds|◇ land-a — rotate the deploy key · #"
-    );
-    assert_eq!(
-        menu_of(&rows, "land-ab"),
-        "done-head|Done for you (1) rows=1\ndone|✓ land-ab — landed #"
-    );
-    assert_eq!(menu_of(&rows, "land"), "");
-    let two = CHROME.replace(
-        "statusmenu --- at=2",
-        "statusmenu \"◇ cruise-n — grant it · 2s\" enabled=yes checked=no at=11\n\
-         statusmenu \"and 3 more in Overview\" enabled=no at=12\nstatusmenu --- at=2",
-    );
-    let rows = menu_rows(&two);
-    assert_eq!(
-        menu_of(&rows, "cruise-n"),
-        "needs-head|Needs you (1) rows=2\nneeds|◇ cruise-n — grant it · #"
-    );
-    assert_eq!(
-        rows_in(&menu_of(&rows, "land-a"), "needs"),
-        ["◇ land-a — rotate the deploy key · #"]
-    );
-    assert_eq!(
-        head_of(&menu_of(&rows, "land-a"), "needs"),
-        Some((Some(1), 2))
-    );
-    assert_eq!(head_of("needs|◇ x — y", "needs"), None);
 }
 
 /// The page's counts are read by part: `<n> <word>` between `,`, `:` and
@@ -226,21 +120,6 @@ fn a_landing_is_counted_once_a_land_act() {
     assert_eq!(landings_of(&journal[1..3], |_| true), 1);
     assert_eq!(landings_of(&journal, |t| t >= 4), 1);
     assert_eq!(landings_of(&[], |_| true), 0);
-}
-
-#[test]
-fn an_age_is_masked_and_nothing_else_is() {
-    assert_eq!(
-        masked("◇ land-a — rotate the deploy key · 6s"),
-        "◇ land-a — rotate the deploy key · #"
-    );
-    assert_eq!(
-        masked("✓ land-e — landed 12m · 2.1 KB"),
-        "✓ land-e — landed # · 2.1 KB"
-    );
-    for keep in ["landed", "ds", "0.48.0", "3", "s", "12ms"] {
-        assert_eq!(masked(keep), keep, "{keep}");
-    }
 }
 
 #[test]
@@ -689,56 +568,6 @@ fn the_window_is_read_for_the_main_pass_and_end_needs_both_ends() {
     assert!(end_runs(&[Chain::LandK, Chain::LandJ]));
     assert!(!end_runs(&[Chain::LandJ, Chain::CruiseN]));
     assert_eq!(unread_why(true, &[Chain::Wall, Chain::CruiseN]), None);
-}
-
-/// `chrome`'s menu with a need's submenu and a manager's: a row one level in is its submenu's,
-/// a row two levels in and a row after a top-level separator are no one's.
-const SUBMENUS: &str = r#"statusmenu "Needs you (1)" enabled=no at=0
-statusmenu "◇ worker needs you: approve the notes · 2m" enabled=yes submenu at=1
-statusmenu   "● worker — asked 2m" enabled=yes checked=no at=1.0
-statusmenu --- at=2
-statusmenu "This Mac — 1 landing · 3 shells" enabled=no at=3
-statusmenu "mgr — 1 worker: 1 landing" enabled=yes submenu at=4
-statusmenu   "Go to mgr" enabled=yes checked=no at=4.0
-statusmenu   --- at=4.1
-statusmenu   "● worker — landing 3m" enabled=yes checked=no tip="not landed yet: no “Nothing left:” defense yet · 1 nudge" at=4.2
-statusmenu     "● worker — deeper 1m" enabled=no at=4.2.0
-statusmenu --- at=5
-statusmenu   "● stray — working 1s" enabled=yes checked=no at=6.0"#;
-
-/// The worker's row is read one level into its MANAGER's submenu (a need's submenu naming it is
-/// not its manager's), ages masked, its tip whole; the flat reader passes all of them over.
-#[test]
-fn a_workers_row_is_read_under_its_managers_submenu() {
-    let sub = sub_rows(SUBMENUS);
-    assert_eq!(
-        sub.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
-        ["● worker — asked 2m", "Go to mgr", "● worker — landing 3m"]
-    );
-    assert_eq!(
-        worker_of(&sub, "worker"),
-        "mgr|mgr — 1 worker: 1 landing\nrow|● worker — landing #\ntip|not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} 1 nudge"
-    );
-    assert_eq!(worker_of(&sub, "mgr"), "-");
-    assert_eq!(worker_of(&sub, "stray"), "-");
-    assert!(
-        !menu_rows(SUBMENUS)
-            .iter()
-            .any(|r| r.label.contains("worker \u{2014}")),
-        "the flat reader passes submenu rows over"
-    );
-    assert!(is_manager("lab-sweep — 3 workers: 1 landing, 2 landed"));
-    assert!(!is_manager("◇ worker needs you: approve the notes · 2m"));
-    let mut w = Window {
-        label: "worker".into(),
-        ..Window::default()
-    };
-    let said = w.note(&Glance::of(5, SUBMENUS, ""), "s-w");
-    assert!(said.iter().any(|(what, _)| *what == "worker"), "{said:?}");
-    assert_eq!(
-        w.worker.last().map(|(_, e)| worker_field(e, "row")),
-        Some(Some("● worker — landing #"))
-    );
 }
 
 /// A debug build's ` title=` is split off the chip line: the chip's reads stay as they were, and
@@ -1289,119 +1118,6 @@ fn the_forced_continues_row_counts_every_done_check() {
     .collect();
     assert_eq!(forced_continues_of(&journal, |_| true), 3);
     assert_eq!(forced_continues_of(&journal, |t| t < 35), 2);
-}
-
-/// L7 widened (§14.6): This Mac's `landing` is every Land tab that holds at rest, less those
-/// whose need it counts first. CONTROL: `b42ae72fc3`'s menu, which calls the held tabs `resting`.
-/// It never passes on `-` (§14.0 limit 7): no held tab, a hold no `status` names, or a wait This
-/// Mac counts first is UNOBSERVED, main's row included; a tab whose `status` END could not read
-/// FAILS it.
-#[test]
-fn this_mac_counts_every_held_landing() {
-    let rest = |here: &str, held: usize, needs: usize, unread: usize| {
-        format!(
-            "here=\"{here}\" landed_tabs=5 landing_tabs=7 held_landing={held} held_needs={needs} held_unread={unread} landings=5 today=\"5 landed today\" every=\"x\" did=\"-\" status_failed=\"-\""
-        )
-    };
-    let judge = |r: Option<String>| {
-        let s = Seen {
-            window: Window {
-                read: true,
-                rest: r,
-                ..Window::default()
-            },
-            ..Seen::default()
-        };
-        l7_here(&s, &title_cx(Chain::LandE, "claude"))
-    };
-    const NOW: &str = "This Mac \u{2014} 1 need you \u{b7} 6 landing \u{b7} 1 resting \u{b7} 5 landed \u{b7} 3 shells";
-    const MAIN: &str =
-        "This Mac \u{2014} 1 need you \u{b7} 7 resting \u{b7} 5 landed \u{b7} 3 shells";
-    let pass = judge(Some(rest(NOW, 7, 1, 0)));
-    assert!(matches!(pass, Verdict::Pass(_)), "{pass:?}");
-    let control = judge(Some(rest(MAIN, 7, 1, 0)));
-    assert!(
-        matches!(&control, Verdict::Fail(why) if why.contains("0 landing, not 6")),
-        "{control:?}"
-    );
-    // A held tab whose END status read failed is in no total: the row short by it (6 held, 5
-    // landing) would match, so the failed read fails, never a pass.
-    let short = "This Mac \u{2014} 1 need you \u{b7} 5 landing \u{b7} 2 resting \u{b7} 5 landed";
-    assert!(matches!(
-        judge(Some(rest(short, 6, 1, 0))),
-        Verdict::Pass(_)
-    ));
-    let failed = judge(Some(rest(short, 6, 1, 0).replace(
-        "status_failed=\"-\"",
-        "status_failed=\"land-b: `@s-2 status` answered 1: ERR busy\"",
-    )));
-    assert!(
-        matches!(&failed, Verdict::Fail(why) if why.contains("land-b: `@s-2 status`")),
-        "{failed:?}"
-    );
-    for (here, held, needs) in [
-        (NOW, 7, 2),
-        (NOW, 7, 0),
-        (
-            "This Mac \u{2014} 7 landing \u{b7} 1 resting \u{b7} 5 landed \u{b7} 3 shells",
-            7,
-            1,
-        ),
-        ("This Mac \u{2014} 2 landing \u{b7} 5 landed", 1, 0),
-    ] {
-        assert!(
-            matches!(judge(Some(rest(here, held, needs, 0))), Verdict::Fail(_)),
-            "{here} against {held} held, {needs} with a need"
-        );
-    }
-    for (why, r) in [
-        ("main's row, no tab held", Some(rest(MAIN, 0, 0, 0))),
-        (
-            "no tab held",
-            Some(rest("This Mac \u{2014} 5 landed", 0, 0, 0)),
-        ),
-        ("a hold no status named", Some(rest(MAIN, 0, 0, 8))),
-        ("one hold unread", Some(rest(NOW, 7, 1, 1))),
-        (
-            "a wait counted first",
-            Some(rest(
-                "This Mac \u{2014} 1 need you \u{b7} 1 waiting \u{b7} 6 landing \u{b7} 5 landed",
-                8,
-                1,
-                0,
-            )),
-        ),
-        ("no rest read", None),
-        (
-            "no held_needs",
-            Some(rest(NOW, 7, 1, 0).replace(" held_needs=1", "")),
-        ),
-        (
-            "no held_unread",
-            Some(rest(NOW, 7, 1, 0).replace(" held_unread=0", "")),
-        ),
-        (
-            "no status_failed",
-            Some(rest(NOW, 7, 1, 0).replace(" status_failed=\"-\"", "")),
-        ),
-        ("no This Mac row", Some(rest("", 7, 1, 0))),
-    ] {
-        let got = judge(r);
-        assert!(matches!(got, Verdict::Unobserved(_)), "{why}: {got:?}");
-    }
-    assert_eq!(
-        held_at_rest("autopilot=land task=open land_held=repo land_nudges=2 land_since=1792159320"),
-        Some(true)
-    );
-    assert_eq!(
-        held_at_rest("autopilot=land task=open land_held=- land_nudges=0 land_since=1792159320"),
-        Some(true)
-    );
-    assert_eq!(
-        held_at_rest("autopilot=land task=open land_held=- land_nudges=- land_since=-"),
-        Some(false)
-    );
-    assert_eq!(held_at_rest("autopilot=land task=open"), None);
 }
 
 /// END's wheel down the page reads the Landed row where a screen shows it, turns again while the

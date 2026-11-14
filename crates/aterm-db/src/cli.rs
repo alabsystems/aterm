@@ -22,18 +22,18 @@ mod network_place;
 
 /// Command help. Mutation request IDs are caller-held, so lost replies are safely retried.
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
-  The owner's tables (registry views once any Mac's import filled the registry; until then, on a\n\
-  Mac holding a fleet_db replica, the fleet tables below):\n\
+  The owner's tables, read from the registry and never from the fleet tables below:\n\
   emails|computers|phones|ai-accounts [--show-addresses] | --digest | --edit\n\
                     | set <row> <column> [<value> | --stdin]\n\
+                                       each answer says its `state` (live, held, never or off);\n\
+                                       ai-accounts and computers are the shared files\n\
+                                       ai/accounts and lab/machines, read from this Mac's\n\
+                                       snapshot whatever its Commons is doing (`aterm file`)\n\
   emails --show-passwords | phones --show-numbers\n\
                                        plaintext only in a person's own tab, at a terminal\n\
   Fleet relational tables (backed by astream + aterm-net at ~/.aterm/lab-db, no --dir needed):\n\
   tables                               summary, row counts and foreign-key integrity\n\
-  computers [<label>]                  list all computers or get one by label/alias\n\
-  emails [<email>] [--show-passwords]  list all emails/mailboxes or get one by address\n\
-  phones [<phone>]                     list all phone numbers or get one by number\n\
-  ai-accounts [<id>]                   list all AI service accounts or get one by ID\n\
+  scan [<table>] [--show-passwords]    every row of computers|emails|phones|ai_accounts\n\
   get <table> <key> [--show-passwords] get one row from computers|emails|phones|ai_accounts\n\
   put <table> <key> <json>             replace one row by its primary key; an email row without a\n\
                                        password keeps the stored one, and null clears it\n\
@@ -177,8 +177,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     if words[0] == "accounts-request" {
         return crate::accounts::broker::command::main_entry(&words[1..]);
     }
-    // The owner's tables as registry views (one-mesh design §4.7, A7), once the registry serves
-    // them on this Mac; until then a Mac holding a fleet_db replica keeps fleet_db's views.
+    // The owner's tables as registry views (one-mesh design §4.7, A7). A noun never falls
+    // through to fleet_db: `ai-accounts` and `computers` answer from their shared file's
+    // snapshot, `emails` and `phones` from the registry or with the word `never`
+    // (docs/DESIGN-shared-files-2026-11-11.md §12).
     if let Some(code) = crate::alab::command::views::main_entry(&words) {
         return code;
     }

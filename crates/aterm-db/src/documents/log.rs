@@ -349,6 +349,11 @@ impl Log {
         }
         cells
     }
+    /// Every record this log retains, by operation digest, eligible or not: what a projection
+    /// of it was made from. A log only grows, so a later read's set contains an earlier one's.
+    pub(crate) fn retained_ids(&self) -> impl Iterator<Item = &Digest> {
+        self.records.keys()
+    }
     pub(crate) fn history_complete(&self) -> bool {
         self.revert_refusals.is_empty()
             && self.opaque_authors.is_empty()
@@ -693,6 +698,30 @@ impl Log {
             return Ok(Some((id, command)));
         }
         Ok(None)
+    }
+    /// The earliest retained record published under `request`, by any actor of this table.
+    ///
+    /// [`Self::retry`] scopes a request to the actor that asks, so it does not find the record
+    /// a writer signed before its succession: its successor is another actor, and the imported
+    /// record still names the first. A shared file's publisher asks this before it signs an
+    /// intent, whose id is its record's request, so an intent a predecessor (or a pass killed
+    /// before its marker) already signed is never signed again. Eligibility is not asked: a
+    /// retained record that is withheld now may become eligible, and a second one would then
+    /// stand beside it.
+    pub(crate) fn carried(&self, request: [u8; 16]) -> Option<Digest> {
+        self.records
+            .iter()
+            .filter(|(_, (operation, _))| operation.request == Some(request))
+            .map(|(id, (operation, _))| (operation.header.sequence, *id))
+            .min()
+            .map(|(_, id)| id)
+    }
+    /// The value changes of the retained record `id`, where it is one this build reads.
+    pub(crate) fn record_changes(&self, id: &Digest) -> Option<&[Change]> {
+        self.records
+            .get(id)
+            .and_then(|(_, command)| command.as_ref())
+            .and_then(Command::changes)
     }
     pub(crate) fn revert_retry(
         &self,

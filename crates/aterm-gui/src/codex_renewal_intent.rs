@@ -33,22 +33,25 @@ impl IntentFence {
         if self.signalled.load(Ordering::Acquire)
             && ctx.human_input.counts().reached != self.reached
         {
-            self.cancel(renewal::CancellationKind::NewPersonTask);
+            let _first = self.cancel(renewal::CancellationKind::NewPersonTask);
         }
         self.reason().is_none()
     }
 
-    pub(super) fn cancel(&self, kind: renewal::CancellationKind) {
+    /// Fence the intent with `kind` unless an earlier kind already did, saying whether this
+    /// call's kind is now the intent's reason.
+    pub(super) fn cancel(&self, kind: renewal::CancellationKind) -> bool {
         let code = match kind {
             renewal::CancellationKind::OwnerStop => 1,
             renewal::CancellationKind::NewPersonTask => 2,
             renewal::CancellationKind::ChangedRecord => 3,
             renewal::CancellationKind::ChangedSelection => 4,
             renewal::CancellationKind::PolicyRevoked => 5,
+            renewal::CancellationKind::SuccessorNeverAttached => 6,
         };
-        let _first =
-            self.cancellation
-                .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+        self.cancellation
+            .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub(super) fn reason(&self) -> Option<renewal::CancellationKind> {
@@ -58,6 +61,7 @@ impl IntentFence {
             2 => Some(renewal::CancellationKind::NewPersonTask),
             3 => Some(renewal::CancellationKind::ChangedRecord),
             4 => Some(renewal::CancellationKind::ChangedSelection),
+            6 => Some(renewal::CancellationKind::SuccessorNeverAttached),
             _ => Some(renewal::CancellationKind::PolicyRevoked),
         }
     }

@@ -488,7 +488,9 @@ fn week_stand(ctx: &Ctx<'_>) -> Option<Stand> {
     if let Some((as_of, row)) = row
         && let Some(week) = row.window(Window::Week)
     {
-        let figure = row.figure(as_of);
+        // The tab's own account: its session is the evidence that it runs, so its week's
+        // reading is said whatever its login here ([`RowOutlook::week_figure`]).
+        let figure = row.week_figure(as_of);
         if figure != Figure::Unread {
             return Some(Stand {
                 figure,
@@ -699,10 +701,17 @@ fn login_half_words(ctx: &Ctx<'_>, half: LoginHalf) -> (Words, NoteTone) {
             Words::of("signed in").and(Words::of("ends").then(ctx.date(end))),
             NoteTone::Warn,
         ),
+        // Its forecast end passed with no record that it is signed out: the half's own word
+        // (`ended`), as the token view says `login ended`; only a recorded sign-out says
+        // `signed out`.
         LoginHalf::Ended { at: Some(at) } => {
+            (Words::of("ended").then(ctx.date(at)), NoteTone::Warn)
+        }
+        LoginHalf::Ended { at: None } => (Words::of("ended"), NoteTone::Warn),
+        LoginHalf::SignedOut { at: Some(at) } => {
             (Words::of("signed out").then(ctx.date(at)), NoteTone::Warn)
         }
-        LoginHalf::Ended { at: None } => (Words::of("signed out"), NoteTone::Warn),
+        LoginHalf::SignedOut { at: None } => (Words::of("signed out"), NoteTone::Warn),
     }
 }
 

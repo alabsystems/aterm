@@ -129,6 +129,10 @@ enum Action {
         auth: Option<registry::AuthState>,
     },
     Open,
+    ControlBegin,
+    ControlAck {
+        nonce: String,
+    },
     Preload,
     Ready {
         registration: String,
@@ -418,6 +422,16 @@ impl Request {
                 })
             }
             "member-open" => Action::Open,
+            "member-control-begin" => Action::ControlBegin,
+            "member-control-ack" => {
+                let nonce = fields.remove("nonce")?;
+                if !hex(nonce, 32) {
+                    return None;
+                }
+                Action::ControlAck {
+                    nonce: nonce.into(),
+                }
+            }
             "member-preload" => Action::Preload,
             "member-ready" | "member-reader-ready" => {
                 let registration = registration(&mut fields)?;
@@ -545,6 +559,8 @@ impl Request {
             Action::Census { .. } => "member-census",
             Action::Quiesce { .. } => "member-quiescent",
             Action::Open => "member-open",
+            Action::ControlBegin => "member-control-begin",
+            Action::ControlAck { .. } => "member-control-ack",
             Action::Preload => "member-preload",
             Action::Ready { .. } => "member-ready",
             Action::ReaderReady { .. } => "member-reader-ready",
@@ -777,6 +793,18 @@ fn execute(
                 .as_object_mut()
                 .ok_or(registry::Error::Unavailable)?
                 .insert("member".into(), aterm_json::json!(allocation.member));
+        }
+        Action::ControlBegin => {
+            registry.begin_owned_control(&peer, connection, member, &request.operation)?;
+        }
+        Action::ControlAck { nonce } => {
+            registry.acknowledge_owned_control(
+                &peer,
+                connection,
+                member,
+                &request.operation,
+                nonce,
+            )?;
         }
         Action::Preload => {
             let env = super::codex_account_env().map_err(|_| registry::Error::Unavailable)?;

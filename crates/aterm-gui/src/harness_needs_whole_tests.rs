@@ -54,37 +54,13 @@ fn land(app: &mut App, ctx: &crate::SessionCtx, text: Option<&str>) {
     app.on_meta_changed(0);
 }
 
-fn needs_lines(app: &App) -> Vec<String> {
-    let lines = app.status_item_chrome_lines();
-    let mut section = false;
-    let mut out = Vec::new();
-    for line in lines {
-        let Some(rest) = line.strip_prefix("statusmenu ") else {
-            continue;
-        };
-        if rest.starts_with("\"Needs you (") {
-            section = true;
-            continue;
-        }
-        if !section {
-            continue;
-        }
-        if rest.starts_with("---") {
-            break;
-        }
-        out.push(
-            rest.rsplit_once(" at=")
-                .map_or_else(|| rest.to_string(), |(row, _)| row.to_string()),
-        );
-    }
-    out
-}
-
-fn one_in(line: &str, need: &str) -> bool {
-    line.strip_prefix(&format!(
-        "{need:?} enabled=yes checked=no tip=\"Claude Code in "
-    ))
-    .is_some_and(|rest| rest.ends_with(" needs this too\" indent=1"))
+/// The needs session 0's tab says on its hover, each whole, in order: its `Needs you: ` lines.
+fn needs_said(app: &App) -> Vec<String> {
+    hover(app)
+        .iter()
+        .filter_map(|line| line.strip_prefix("Needs you: "))
+        .map(str::to_string)
+        .collect()
 }
 
 fn hover(app: &App) -> Vec<String> {
@@ -163,16 +139,7 @@ fn a_set_that_moves_under_the_same_entry_moves_what_is_drawn() {
         .need
         .as_ref()
         .map(|n| n.key);
-    let lines = needs_lines(&app);
-    assert_eq!(lines.len(), 2, "{lines:#?}");
-    assert!(
-        lines[0].starts_with("\"\u{25c7} ")
-            && lines[0].contains(" \u{2014} grant Screen Recording"),
-        "{lines:#?}"
-    );
-    assert!(!lines[0].contains("more)"), "{lines:#?}");
-    assert!(!lines[0].contains("indent="), "{lines:#?}");
-    assert!(one_in(&lines[1], NEED_B), "{lines:#?}");
+    assert_eq!(needs_said(&app), set(&[NEED_A, NEED_B]));
     let status = app.session_status_record(0).expect("status");
     assert!(status.contains("needs=ask needs_n=2"), "{status}");
 
@@ -184,101 +151,36 @@ fn a_set_that_moves_under_the_same_entry_moves_what_is_drawn() {
         "the published need moved with the set"
     );
     assert_eq!(moved.need.as_ref().map(|n| n.key), key, "its key did not");
-    let lines = needs_lines(&app);
-    assert!(
-        lines.get(1).is_some_and(|l| one_in(l, NEED_C)),
-        "{lines:#?}"
-    );
-    assert!(!lines.iter().any(|l| l.contains(NEED_B)), "{lines:#?}");
-    assert!(
-        hover(&app).contains(&format!("Needs you: {NEED_C}")),
-        "{:#?}",
-        hover(&app)
+    assert_eq!(
+        needs_said(&app),
+        set(&[NEED_A, NEED_C]),
+        "the hover moved with it"
     );
 }
 
 #[test]
 fn the_outgoing_set_is_never_drawn_cut() {
     let (mut app, sid, ctx) = desk();
-    let first_line = |app: &App| needs_lines(app).first().cloned().unwrap_or_default();
     tell(&mut app, &sid, &[NEED_A, NEED_B], ENTRY_AB);
     land(&mut app, &ctx, Some(ENTRY_AB));
     tell(&mut app, &sid, &[NEED_B], ENTRY_B);
     app.refresh_presence_session(0);
-    let standing = needs_lines(&app);
-    assert_eq!(standing.len(), 2, "{standing:#?}");
-    assert!(
-        standing[0].contains("grant Screen Recording"),
-        "{standing:#?}"
-    );
-    assert!(one_in(&standing[1], NEED_B), "{standing:#?}");
     assert_eq!(
-        hover(&app).first(),
-        Some(&format!("Needs you: {NEED_A}")),
-        "the hover too"
+        needs_said(&app),
+        set(&[NEED_A, NEED_B]),
+        "the set that describes the standing entry"
     );
     land(&mut app, &ctx, Some(ENTRY_B));
-    let lines = needs_lines(&app);
-    assert_eq!(lines.len(), 1, "{lines:#?}");
-    assert!(
-        first_line(&app).contains(&format!(" \u{2014} {NEED_B} \u{b7} ")),
-        "{lines:#?}"
-    );
+    assert_eq!(needs_said(&app), set(&[NEED_B]));
     tell(&mut app, &sid, &[], "");
     app.refresh_presence_session(0);
-    assert!(
-        first_line(&app).contains(&format!(" \u{2014} {NEED_B} \u{b7} ")),
-        "the entry that still stands keeps its words: {:#?}",
-        needs_lines(&app)
+    assert_eq!(
+        needs_said(&app),
+        set(&[NEED_B]),
+        "the entry that still stands keeps its words"
     );
     land(&mut app, &ctx, None);
-    assert_eq!(needs_lines(&app), Vec::<String>::new(), "gone");
-}
-
-/// A PRESS ON A FURTHER NEED'S ROW GOES TO ITS TAB (§12.2.6, §12.5.2's
-/// press seam): with the needing session's tab behind another, the
-/// stand-in for the person presses the row one level in by the path
-/// `chrome` prints for it (`person menubar press <at>`); the click it posts
-/// brings that session's tab in front, as a click on its own row does.
-#[cfg(target_os = "macos")]
-#[test]
-fn a_press_on_a_further_needs_row_brings_its_tab_in_front() {
-    let (mut app, sid, ctx) = desk();
-    let wid = crate::WindowId(0);
-    tell(&mut app, &sid, &[NEED_A, NEED_B], ENTRY_AB);
-    land(&mut app, &ctx, Some(ENTRY_AB));
-    let behind = app.next_session_id;
-    app.push_stub_tab(wid, crate::stub_session(behind));
-    assert_eq!(
-        app.focused_session_id(wid),
-        Some(behind),
-        "PRECONDITION: another tab in front"
-    );
-    let lines = app.status_item_chrome_lines();
-    let at = lines
-        .iter()
-        .find(|l| l.contains(" indent=1 at="))
-        .and_then(|l| l.rsplit_once(" at="))
-        .and_then(|(_, at)| crate::status_item::MenuAt::parse(at))
-        .unwrap_or_else(|| panic!("a row one level in: {lines:#?}"));
-    let mut posted = Vec::new();
-    let pressed = app.person_menubar_press(&at, &mut |wake| {
-        posted.push(wake);
-        true
-    });
-    assert_eq!(pressed, Ok(format!("pressed {NEED_B:?}")));
-    assert_eq!(posted.len(), 1, "one click posted: {posted:?}");
-    for wake in posted {
-        let crate::Wake::StatusAction { action } = wake else {
-            panic!("a status action: {wake:?}");
-        };
-        app.dispatch_status_action(action);
-    }
-    assert_eq!(
-        app.focused_session_id(wid),
-        Some(0),
-        "the needing session's tab in front"
-    );
+    assert_eq!(needs_said(&app), Vec::<String>::new(), "gone");
 }
 
 fn stamped_hover() -> String {
@@ -563,12 +465,6 @@ fn needs_line(entry: &str, needs: &[&str]) -> String {
     format!("set harness_needs entry={} {}", pct(entry), needs.join(" "))
 }
 
-/// A row one level in that says `need`, whoever's tab it names.
-fn one_in_any(line: &str, need: &str) -> bool {
-    line.strip_prefix(&format!("{need:?} enabled=yes checked=no tip=\""))
-        .is_some_and(|rest| rest.ends_with(" needs this too\" indent=1"))
-}
-
 fn status_field(app: &App, key: &str) -> Option<String> {
     let line = app.session_status_record(0).expect("status");
     let prefix = format!("{key}=");
@@ -579,22 +475,16 @@ fn status_field(app: &App, key: &str) -> Option<String> {
 
 /// A CODEX-ALAB'S OWN SET SHOWS EVERY NEED WHERE ATERM'S OWN LOOP'S DOES, WHILE ITS CLAIM STANDS
 /// (§14.3.4): three needs told on its proven claim (`meta set harness_needs`) beside the entry it
-/// set read whole on the menu bar, its first on the session's own row and the other two one level
-/// in, a hover line each, `status needs=ask needs_n=3 needs_told=3`, and the set told before its
-/// entry shows once the entry stands. NEGATIVE CONTROLS: the entry alone (no claim to tell it on,
-/// and the claim with nothing told) shows the first need and a count, as before, with no row one
-/// level in and `needs_told=-`; a set aterm's own loop left for the same entry is never shown
+/// set read whole on the tab's hover, a line each, `status needs=ask needs_n=3 needs_told=3`, and
+/// the set told before its entry shows once the entry stands. NEGATIVE CONTROLS: the entry alone
+/// (no claim to tell it on, and the claim with nothing told) shows the first need and a count, as
+/// before, and `needs_told=-`; a set aterm's own loop left for the same entry is never shown
 /// under the claim, and once the claim ends the window reads aterm's own loop's set again.
 #[test]
 fn a_codex_alabs_own_set_shows_every_need_while_its_claim_stands() {
     let (mut app, sid, ctx) = codex_desk();
     let first_and_count = |app: &App, case: &str| {
-        let lines = needs_lines(app);
-        assert_eq!(lines.len(), 1, "{case}: {lines:#?}");
-        assert!(
-            lines[0].contains(" (+2 more)"),
-            "{case}: the entry's count: {lines:#?}"
-        );
+        assert_eq!(needs_said(app).len(), 1, "{case}");
         let hover = hover(app);
         assert!(
             hover
@@ -613,16 +503,7 @@ fn a_codex_alabs_own_set_shows_every_need_while_its_claim_stands() {
         );
     };
     let every_need = |app: &App, needs: [&str; 3], case: &str| {
-        let lines = needs_lines(app);
-        assert_eq!(lines.len(), 3, "{case}: {lines:#?}");
-        assert!(
-            lines[0].contains(&format!(" \u{2014} {}", needs[0])) && !lines[0].contains("more)"),
-            "{case}: {lines:#?}"
-        );
-        assert!(
-            one_in_any(&lines[1], needs[1]) && one_in_any(&lines[2], needs[2]),
-            "{case}: {lines:#?}"
-        );
+        assert_eq!(needs_said(app), set(&needs), "{case}");
         let hover = hover(app);
         assert_eq!(
             hover.get(..3),
@@ -665,13 +546,13 @@ fn a_codex_alabs_own_set_shows_every_need_while_its_claim_stands() {
 
     assert_eq!(self_meta(&mut app, "unset harness_needs"), "OK\n");
     assert_eq!(self_meta(&mut app, "unset attention owner=needs"), "OK\n");
-    assert_eq!(needs_lines(&app), Vec::<String>::new(), "taken down");
+    assert_eq!(needs_said(&app), Vec::<String>::new(), "taken down");
     assert_eq!(
         self_meta(&mut app, &needs_line(CODEX_ENTRY, &CODEX_NEEDS)),
         "OK\n",
         "told before its entry stands"
     );
-    assert_eq!(needs_lines(&app), Vec::<String>::new(), "no entry yet");
+    assert_eq!(needs_said(&app), Vec::<String>::new(), "no entry yet");
     assert_eq!(self_meta(&mut app, &entry_line), "OK\n");
     every_need(&app, CODEX_NEEDS, "the set told before its entry");
 
@@ -689,13 +570,10 @@ fn a_codex_alabs_own_set_shows_every_need_while_its_claim_stands() {
     );
 }
 
-/// A CODEX-ALAB'S SET CUT AT 32 COUNTS EVERY NEED ITS ENTRY COUNTS, WITHIN THE MENU'S CAPS
-/// (§14.3.4, §12.2.12): 41 needs stand, so codex-alab's entry counts `(+40 more)` and it tells the
-/// first 32 (`HARNESS_NEEDS_MAX`). The menu bar draws the first on the session's row and only
-/// `NEED_MORE_ROWS` (2) further rows one level in, the last counting the 38 past them; the hover
-/// gives each of the 32 told a `Needs you:` line, the last counting the 9 nobody told; `status
-/// needs_n=41`, `needs_told=32`. NEGATIVE CONTROL: the needs told are each read whole where a
-/// surface lists them.
+/// A CODEX-ALAB'S SET CUT AT 32 COUNTS EVERY NEED ITS ENTRY COUNTS (§14.3.4, §12.2.12): 41 needs
+/// stand, so codex-alab's entry counts `(+40 more)` and it tells the first 32
+/// (`HARNESS_NEEDS_MAX`). The hover gives each of the 32 told a `Needs you:` line, the last
+/// counting the 9 nobody told; `status needs_n=41`, `needs_told=32`.
 #[test]
 fn a_codex_alabs_set_cut_at_32_counts_every_need_its_entry_counts() {
     // `control_session::HARNESS_NEEDS_MAX`, the most one line tells.
@@ -715,20 +593,6 @@ fn a_codex_alabs_set_cut_at_32_counts_every_need_its_entry_counts() {
     let told: Vec<&str> = needs[..TOLD].iter().map(String::as_str).collect();
     assert_eq!(self_meta(&mut app, &needs_line(entry, &told)), "OK\n");
 
-    let lines = needs_lines(&app);
-    assert_eq!(
-        lines.len(),
-        3,
-        "the session's row and two one level in: {lines:#?}"
-    );
-    assert!(
-        lines[0].contains(" \u{2014} need number 1 ") && !lines[0].contains("more)"),
-        "{lines:#?}"
-    );
-    assert!(
-        one_in_any(&lines[1], "need number 2") && one_in_any(&lines[2], "need number 3 (+38 more)"),
-        "{lines:#?}"
-    );
     let hover = hover(&app);
     assert_eq!(
         hover.get(30..32),
@@ -922,11 +786,10 @@ struct Seen {
     /// The loop decided the owner's standing go-ahead, typed or waiting out its own back-off.
     acted: bool,
     journal: Vec<String>,
-    /// The menu bar's `Needs you` rows, the tab's hover, its `status` and the whole menu.
+    /// The needs the tab's hover names, the hover whole, and its `status`.
     rows: Vec<String>,
     hover: Vec<String>,
     status: String,
-    menu: Vec<String>,
 }
 
 /// The window's hosted loop carrying session 0 of a fresh window under Cruise and `cfg` over a
@@ -1023,10 +886,9 @@ fn carried_over(said: &str, cfg: SupervisorConfig, tag: &str) -> Seen {
     app.refresh_presence_session(0);
     let seen = Seen {
         acted: acted.unwrap_or_else(|| panic!("not within 60 s: the loop's act: {lines:#?}")),
-        rows: needs_lines(app),
+        rows: needs_said(app),
         hover: hover(app),
         status: app.session_status_record(0).expect("status"),
-        menu: app.status_item_chrome_lines(),
         journal: lines,
     };
     host.shutdown_and_join();
@@ -1034,14 +896,15 @@ fn carried_over(said: &str, cfg: SupervisorConfig, tag: &str) -> Seen {
     seen
 }
 
-/// A GO-AHEAD THE HARNESS ANSWERS NEVER REACHES THE MENU BAR (DESIGN-harness-autopilot §15.6): the
+/// A GO-AHEAD THE HARNESS ANSWERS IS NEVER NAMED AS A NEED (DESIGN-harness-autopilot §15.6): the
 /// window's own hosted loop carries a Claude Code tab under Cruise whose report parks on the
 /// go-ahead beside a sign-in and a hosting decision. It decides the owner's standing go-ahead
-/// (and waits out its back-off, as at any point it attaches to), and the menu bar's rows, the
-/// tab's hover and `status` name the person's two needs and never the go-ahead's line. With the go-ahead's line alone nothing is on the menu bar. NEGATIVE CONTROL:
-/// with answers off the go-ahead is not typed and the menu bar names all three.
+/// (and waits out its back-off, as at any point it attaches to), and the tab's hover and
+/// `status` name the person's two needs and never the go-ahead's line. With the go-ahead's line
+/// alone the tab publishes no need. NEGATIVE CONTROL: with answers off the go-ahead is not typed
+/// and the hover names all three.
 #[test]
-fn a_go_ahead_the_harness_answers_never_reaches_the_menu_bar() {
+fn a_go_ahead_the_harness_answers_is_never_named_as_a_need() {
     let beside = format!(
         "Committed the parser fix on my branch.\n{GO_AHEAD_LINE}\nNEEDS YOU: {SIGN_IN}.\nNEEDS \
          YOU: {HOSTING}."
@@ -1072,10 +935,11 @@ fn a_go_ahead_the_harness_answers_never_reaches_the_menu_bar() {
     let seen = carried_over(&alone, on(), "alone");
     let journal = &seen.journal;
     assert!(seen.acted, "the go-ahead: {journal:#?}");
-    assert!(
-        !seen.menu.iter().any(|l| l.contains("\"Needs you (")),
+    assert_eq!(
+        seen.rows,
+        Vec::<String>::new(),
         "{:#?}\n{journal:#?}",
-        seen.menu
+        seen.hover
     );
     assert!(
         seen.status.contains(" needs=- needs_n=-"),

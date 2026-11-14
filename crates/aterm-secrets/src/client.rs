@@ -192,8 +192,8 @@ pub use retained_history::{
     RetainedHistoryReadCounts, RetainedHistoryReadOutcomes, test_retained_history_read_counts,
 };
 pub use retirement::{
-    Retirement, Revocation, StolenRevocation, admin_retire, admin_revoke, admin_revoke_stolen,
-    machine_named_in_vault, repair_half_done_revokes, rotate_fleet_code_text,
+    Exposure, Retirement, Revocation, StolenRevocation, admin_retire, admin_revoke,
+    admin_revoke_stolen, machine_named_in_vault, repair_half_done_revokes, rotate_fleet_code_text,
 };
 #[cfg(any(test, debug_assertions))]
 pub use roster::admin_seed_swarm_roster;
@@ -1990,8 +1990,8 @@ fn lab_set_aside_line(mark: crate::LabMark, kept: &Path) -> String {
 /// (first-run setup asks none); the new folder's [`LAB_SET_ASIDE_FILE`] names what was set aside.
 ///
 /// `None`, changing nothing: a process that would itself make a lab identity (a test binary, a
-/// debug build, a lab lane's, one in a virtual machine), whose identity a lab identity is meant to
-/// be; an unmarked identity; no identity.
+/// debug build, a lab lane's, one in a virtual machine, one whose home is not its login's own),
+/// whose identity a lab identity is meant to be; an unmarked identity; no identity.
 ///
 /// # Errors
 /// The identity file cannot be read, another process holds the folder's state lock past
@@ -2189,15 +2189,35 @@ impl crate::Making {
     /// What this process is, read now ([`crate::lab_identity`]): a test binary by its executable's
     /// name (`aterm_uds::test_binary::is_test_binary`), a build with debug assertions on, a
     /// process a lab lane marked ([`Self::lab_lane_of`]: `ATERM_LAB_MEMBER_SERVICE` or
-    /// `ATERM_LAB_VAULT_SERVICE` set, whatever its value), and
+    /// `ATERM_LAB_VAULT_SERVICE` set, whatever its value),
     /// whether it runs inside a virtual machine (macOS's `kern.hv_vmm_present`,
-    /// [`aterm_sysprobe::hv_vmm_present`]), as [`Self::reading`] reads them.
+    /// [`aterm_sysprobe::hv_vmm_present`]), and whether its home is a folder other than its
+    /// login's account home ([`Self::foreign_home_now`]), as [`Self::reading`] reads them.
     #[must_use]
     pub fn now() -> Self {
         Self::reading(
             std::env::current_exe().is_ok_and(|exe| aterm_uds::test_binary::is_test_binary(&exe)),
             aterm_sysprobe::hv_vmm_present,
+            Self::foreign_home_now,
         )
+    }
+
+    /// Whether this process's home (`HOME`, as [`aterm_types::dirs::home_dir`] reads it) is a
+    /// folder other than the one the account database names for its user: the process was handed
+    /// a scratch `HOME`. `None` off Unix, and where either home is unresolved.
+    fn foreign_home_now() -> Option<bool> {
+        #[cfg(unix)]
+        let account = aterm_uds::account::home();
+        #[cfg(not(unix))]
+        let account = None;
+        Self::foreign_home_of(aterm_types::dirs::home_dir().as_deref(), account.as_deref())
+    }
+
+    /// [`Self::foreign_home_now`] for a process whose home is `home` and whose account home is
+    /// `account`: whether they are two folders ([`crate::service::one_folder`], so a symlinked or
+    /// differently spelled home is the login's own), or `None` where either is unresolved.
+    pub(crate) fn foreign_home_of(home: Option<&Path>, account: Option<&Path>) -> Option<bool> {
+        Some(!crate::service::one_folder(home?, account?))
     }
 
     /// Whether a lab lane marked a process whose environment has each variable `set` says it
@@ -2209,18 +2229,25 @@ impl crate::Making {
     }
 
     /// [`Self::now`] for a process that is a test binary or not (`test_binary`), its
-    /// virtual-machine fact read through `virtual_machine`. A test binary, in any crate, reads no
+    /// virtual-machine fact read through `virtual_machine` and its home fact through
+    /// `foreign_home`. A test binary, in any crate, reads no
     /// probe: a test states the fact through [`crate::Making`], so no test's outcome hangs on the
     /// host it runs on, a macOS VM included, and every identity a test binary makes is marked
     /// [`crate::LabMark::TestBinary`] first anyway. A probe that does not answer (off macOS, a
-    /// kernel with no such name) is no virtual machine, so a Mac's own hardware never makes a lab
+    /// kernel with no such name; an account home the database does not name) is no virtual machine
+    /// and no foreign home, so a Mac's own hardware never makes a lab
     /// identity because a probe failed.
-    pub(crate) fn reading(test_binary: bool, virtual_machine: fn() -> Option<bool>) -> Self {
+    pub(crate) fn reading(
+        test_binary: bool,
+        virtual_machine: fn() -> Option<bool>,
+        foreign_home: fn() -> Option<bool>,
+    ) -> Self {
         Self {
             test_binary,
             debug_build: cfg!(debug_assertions),
             lab_lane: Self::lab_lane_of(|knob| std::env::var_os(knob).is_some()),
             virtual_machine: !test_binary && virtual_machine() == Some(true),
+            foreign_home: !test_binary && foreign_home() == Some(true),
         }
     }
 }
@@ -2245,7 +2272,7 @@ pub(crate) fn wire_mark(
 /// identity yet, the mark of the one this process would make ([`crate::lab_identity`] of
 /// [`crate::Making::now`]); and in a virtual machine, [`crate::LabMark::VirtualMachine`] for an
 /// identity an older build made there unmarked. `None` for an identity a release build made on a
-/// Mac's own hardware, whatever build reads it now.
+/// Mac's own hardware in its login's own home, whatever build reads it now.
 ///
 /// # Errors
 /// The identity file cannot be read or holds no key.
@@ -2269,8 +2296,27 @@ fn lab_standing(
             crate::LabMark::VirtualMachine,
             "this Mac runs in a virtual machine, so its vault identity is a lab identity",
         )),
-        None => crate::lab_identity(making).map(|mark| (mark, "this build makes lab identities")),
+        None => crate::lab_identity(making).map(|mark| (mark, makes_lab_identities(mark))),
     })
+}
+
+/// Why a process that holds no identity yet would make a lab identity marked `mark`, as its
+/// refusal says it.
+const fn makes_lab_identities(mark: crate::LabMark) -> &'static str {
+    match mark {
+        crate::LabMark::ForeignHome => {
+            "this process's HOME is not its login's own home, so the vault identity it would make \
+             there is a lab identity; run it from the login's own home to join ALab"
+        }
+        crate::LabMark::VirtualMachine => {
+            "this Mac runs in a virtual machine, so the vault identity it would make is a lab \
+             identity"
+        }
+        crate::LabMark::TestBinary
+        | crate::LabMark::DebugBuild
+        | crate::LabMark::LabLane
+        | crate::LabMark::Unnamed => "this build makes lab identities",
+    }
 }
 
 /// What a lab identity is told, before anything is dialed, when a join would ask the live ALab.
@@ -2295,10 +2341,11 @@ fn refuse_lab_identity_as(paths: &Paths, making: crate::Making) -> crate::Result
 
 /// The refusal of [`lab_standing`]'s `standing` for a process that is `making`. Where this build
 /// on this hardware would make no lab identity, the mark is a held identity's that a test, a debug
-/// build or a lab lane made, and the refusal says how the Mac rejoins with the release app: once
-/// its vault folder is set aside (kept, never deleted; a release app's start does that to this
-/// user's own folder, [`start_over_as`]), this build makes it a new, unmarked identity, which
-/// joins as a reinstalled Mac does, its node key proving it on the home LAN (`client/readmit.rs`).
+/// build, a lab lane or a process in a foreign home made, and the refusal says how the Mac rejoins
+/// with the release app: once its vault folder is set aside (kept, never deleted; a release app's
+/// start does that to this user's own folder, [`start_over_as`]), this build makes it a new,
+/// unmarked identity, which joins as a reinstalled Mac does, its node key proving it on the home
+/// LAN (`client/readmit.rs`).
 fn refused_as_lab(
     paths: &Paths,
     making: crate::Making,

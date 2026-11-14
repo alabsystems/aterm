@@ -24,7 +24,8 @@ pub struct AncestryQuery {
 pub struct CommitReadInput {
     /// Exact commit objects to make readable, without fetching their trees.
     pub commits: Vec<String>,
-    /// Exact questions; a negative requires a complete original parent walk.
+    /// Exact questions; both outcomes require hashed original parent edges.
+    /// A negative requires the complete reachable descendant parent walk.
     pub queries: Vec<AncestryQuery>,
 }
 

@@ -281,6 +281,8 @@ pub(crate) struct PaletteLive {
     pub front_person_hold: bool,
     /// Whether the front session's hold belongs to another Mac (`origin=remote`).
     pub front_remote_hold: bool,
+    /// Whether the person holds any tab, the front one or not: Hand Back All has one to lift.
+    pub any_person_hold: bool,
     /// Active View ▸ Stats Bars setting (`[sys] stats_bars`).
     pub stats_bars: Option<crate::stats_deck::StatsBars>,
     /// Active View ▸ Deck Size setting (`[sys] stats_deck_size`).
@@ -636,6 +638,9 @@ impl PaletteState {
                 }
                 MenuAction::HandBack => {
                     row.enabled = live.terminal_front && live.front_person_hold;
+                }
+                MenuAction::HandBackAll => {
+                    row.enabled = live.any_person_hold;
                 }
                 MenuAction::StatsBarsDeck
                 | MenuAction::StatsBarsSill

@@ -368,6 +368,9 @@ pub(in crate::harness) struct Host {
     person: Option<TestPerson>,
     pub(in crate::harness) logins: Vec<SessionLogin>,
     write_wait: Option<Duration>,
+    /// Whether another Mac's fleet drive typed into this run's session
+    /// ([`AccountsHost::driven_over_the_fleet`]).
+    fleet: bool,
 }
 
 impl Host {
@@ -382,6 +385,7 @@ impl Host {
             person: None,
             logins: Vec::new(),
             write_wait: None,
+            fleet: false,
         }
     }
 
@@ -451,6 +455,9 @@ impl AccountsHost for Host {
     }
     fn session_logins(&self, _env: &Env) -> Vec<SessionLogin> {
         self.logins.clone()
+    }
+    fn driven_over_the_fleet(&self) -> bool {
+        self.fleet
     }
 }
 
@@ -615,6 +622,15 @@ fn every_refusal_comes_before_any_spawn() {
                 ..Host::new(VaultOf::Fake(fake(Answer::Absent)))
             },
             says: "a person at this Mac's terminal",
+        },
+        // A terminal another Mac's drive typed into is that Mac's, not a person's here.
+        Case {
+            name: "another Mac's drive",
+            host: Host {
+                fleet: true,
+                ..Host::new(VaultOf::Fake(fake(Answer::Absent)))
+            },
+            says: "a tab another Mac's drive started or typed into",
         },
         Case {
             name: "not seated",
@@ -871,6 +887,145 @@ fn a_minted_token_is_in_the_vault_and_its_row_holds_every_field() {
         "{}",
         again.err
     );
+}
+
+/// A SIGN-IN'S OWN RUN MAKES THE ACCOUNT'S TOKEN, ONCE: for an account with no token in use
+/// here, the run that signed it in goes on to the bare verb, and the vault holds the token. An
+/// account whose token stands is left alone with nothing said or spawned, as is every run the
+/// verb itself would refuse without news: nobody at a terminal, a Mac other than macOS, a
+/// routed terminal, a vault this Mac does not write, a write still waiting.
+#[test]
+fn a_sign_in_makes_the_accounts_token_only_where_none_is_in_use() {
+    let after = |scratch: &Scratch, host: &Host| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = journal::with_keyer(keyer, || {
+            after_sign_in(&scratch.env(), host, "work", &mut out, &mut err)
+        });
+        let said = String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err);
+        assert!(!said.contains(&sentinel()[..24]), "it printed the token");
+        (code.map(|code| format!("{code:?}")), said)
+    };
+    let scratch = Scratch::new("after-sign-in");
+    let lab = Lab::new();
+    let world = World::new("success", false);
+    let host = Host::minting(VaultOf::Real(lab.paths.clone()), &world);
+    let (code, said) = after(&scratch, &host);
+    assert_eq!(code, Some(format!("{:?}", ExitCode::SUCCESS)), "{said}");
+    assert!(
+        said.contains("work: it has no year-long token in use here"),
+        "{said}"
+    );
+    assert!(
+        said.contains("stored a Claude Code token for person@example.com"),
+        "{said}"
+    );
+    assert!(lab.holds_the_token());
+
+    // The token made is in use here: the next sign-in makes none and says nothing.
+    host.asked_program.set(false);
+    assert_eq!(after(&scratch, &host), (None, String::new()));
+    assert!(!host.asked_program.get());
+
+    let fake = |found: Answer| FakeVault::new(found);
+    let absent = || VaultOf::Fake(fake(Answer::Absent));
+    for (what, host) in [
+        (
+            "nobody at a terminal",
+            Host {
+                tty: false,
+                ..Host::minting(absent(), &world)
+            },
+        ),
+        (
+            "not macOS",
+            Host {
+                macos: false,
+                ..Host::minting(absent(), &world)
+            },
+        ),
+        (
+            "a routed terminal",
+            Host {
+                env: vec![("ANTHROPIC_BASE_URL".into(), "http://gw.example:1".into())],
+                ..Host::minting(absent(), &world)
+            },
+        ),
+        (
+            "a vault this Mac does not write",
+            Host::minting(
+                VaultOf::Fake(FakeVault {
+                    route: WriteRoute::NotSeated,
+                    ..fake(Answer::Absent)
+                }),
+                &world,
+            ),
+        ),
+        (
+            "a write still waiting",
+            Host::minting(
+                VaultOf::Fake(FakeVault {
+                    pending: true,
+                    ..fake(Answer::Absent)
+                }),
+                &world,
+            ),
+        ),
+        (
+            "an active token",
+            Host::minting(VaultOf::Fake(fake(active())), &world),
+        ),
+    ] {
+        let scratch = Scratch::new("after-sign-in-none");
+        assert_eq!(after(&scratch, &host), (None, String::new()), "{what}");
+        assert!(!host.asked_program.get(), "{what}");
+    }
+}
+
+/// A SIGN-IN MADE WITH NO BROWSER WINDOW IS OFFERED THE STEP, AND NOTHING RUNS: no browser
+/// session is known to be the account's, so its run makes no token. Where the account's token
+/// is due the step is said once, with nothing spawned and nothing in the vault; where the
+/// bare verb would refuse without news (nobody at a terminal, a token in use) nothing is said.
+#[test]
+fn a_sign_in_with_no_browser_window_is_offered_the_token_step_and_makes_none() {
+    let offer = |scratch: &Scratch, host: &Host| {
+        let mut out = Vec::new();
+        journal::with_keyer(keyer, || {
+            offer_after_sign_in(&scratch.env(), host, "work", &mut out);
+        });
+        String::from_utf8(out).expect("UTF-8")
+    };
+    let scratch = Scratch::new("offer-after-sign-in");
+    let lab = Lab::new();
+    let world = World::new("success", false);
+    let host = Host::minting(VaultOf::Real(lab.paths.clone()), &world);
+    let said = offer(&scratch, &host);
+    assert_eq!(said.lines().count(), 1, "{said}");
+    assert!(
+        said.starts_with("work: it has no year-long token in use here")
+            && said.contains("`aterm harness accounts token work`"),
+        "{said}"
+    );
+    assert!(!host.asked_program.get(), "the offer spawned Claude Code");
+    assert!(!lab.holds_the_token(), "the offer made a token");
+
+    let absent = || VaultOf::Fake(FakeVault::new(Answer::Absent));
+    for (what, host) in [
+        (
+            "nobody at a terminal",
+            Host {
+                tty: false,
+                ..Host::minting(absent(), &world)
+            },
+        ),
+        (
+            "an active token",
+            Host::minting(VaultOf::Fake(FakeVault::new(active())), &world),
+        ),
+    ] {
+        let scratch = Scratch::new("offer-after-sign-in-none");
+        assert_eq!(offer(&scratch, &host), "", "{what}");
+        assert!(!host.asked_program.get(), "{what}");
+    }
 }
 
 #[test]
@@ -1483,3 +1638,126 @@ fn a_refusal_marks_the_token_rejected_here_once() {
 
 #[path = "accounts_tokens_served_tests.rs"]
 mod served;
+
+/// THE REPORT'S ROW AND ITS VAULT TOKENS SECTION SAY ONE THING OF A ROW'S LOGIN (the report once
+/// printed `not-enrolled` beside `login: idle` for a row and `login ok` for the same row under
+/// vault tokens). Both read [`accounts::login_here`] over the report's own rows: a row whose
+/// login ended says `signed-out` in both places; one whose login was never made on this Mac is
+/// `signed-out` in the row and `no login here` under vault tokens, and neither says a signed-in
+/// word; a row signed in here says a signed-in word in both. Negative control: the row signed in
+/// here is the one neither place calls signed out.
+#[test]
+fn the_reports_row_and_its_vault_tokens_section_agree_on_each_login() {
+    let scratch = Scratch::new("login-agree");
+    let logins = scratch.path().join("logins");
+    for made in ["made", "ended"] {
+        std::fs::create_dir_all(logins.join(made)).unwrap();
+        std::fs::write(logins.join(made).join(".claude.json"), "{}").unwrap();
+    }
+    let rows: Vec<accounts::Row> = ["made", "unmade", "ended"]
+        .iter()
+        .map(|label| accounts::Row {
+            label: (*label).to_owned(),
+            email: Some(format!("{label}@example.com")),
+            dir: Some(logins.join(label).to_str().unwrap().to_owned()),
+            ..accounts::Row::default()
+        })
+        .collect();
+    std::fs::write(
+        scratch.path().join("accounts.toml"),
+        accounts::append_rows_for(Cli::Claude, "", &rows).unwrap(),
+    )
+    .unwrap();
+    let env = scratch.env();
+    scratch
+        .store()
+        .transact_within(&accounts::LOCK_LADDER, env.now, &mut None, |state| {
+            Ok(accounts::note_auth(
+                state,
+                "ended",
+                accounts::Auth::SignedOut,
+                env.now,
+            ))
+        })
+        .unwrap();
+    let host = Host::new(VaultOf::Fake(FakeVault::new(Answer::Absent)));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    // Each account its own lab key, as the lab gives them.
+    let code = journal::with_keyer(
+        |_, email| {
+            let n = match email.split('@').next()? {
+                "made" => 1,
+                "unmade" => 2,
+                _ => 3,
+            };
+            Some(format!("ac-{n:016x}"))
+        },
+        || {
+            run_accounts(
+                &AccountsCmd::Report { json: false },
+                &env,
+                &host,
+                &mut out,
+                &mut err,
+            )
+        },
+    );
+    let (out, err) = (
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    );
+    assert_eq!(code, std::process::ExitCode::SUCCESS, "{out}{err}");
+    let (rows, tokens) = out
+        .split_once("vault tokens:\n")
+        .unwrap_or_else(|| panic!("the report ends with its vault tokens section: {out}"));
+    let word_after = |line: &str, lead: &str| {
+        let rest = &line[line
+            .find(lead)
+            .unwrap_or_else(|| panic!("{lead:?} in {line:?}"))..];
+        rest[lead.len()..]
+            .split([',', ';', ' ', '\n'])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let said = |label: &str| {
+        let row = rows
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(label))
+            .unwrap_or_else(|| panic!("{label}'s row: {out}"));
+        let token = tokens
+            .lines()
+            .find(|line| line.starts_with(&format!("  {label} (")))
+            .unwrap_or_else(|| panic!("{label}'s vault tokens line: {out}"));
+        (
+            row.to_owned(),
+            word_after(row, "login: "),
+            word_after(token, "; login "),
+        )
+    };
+    // A login that ended here is signed out in both places.
+    let (row, in_row, in_tokens) = said("ended");
+    assert!(row.contains("signed-out"), "{row}");
+    assert_eq!(in_row, accounts::LoginHere::SIGNED_OUT, "{row}");
+    assert_eq!(in_tokens, in_row, "ended: {out}");
+    // A login never made here: the row says it is not enrolled and signed out, and the vault
+    // tokens line that this Mac holds no login of it; neither says a signed-in word.
+    let row = rows
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some("unmade"))
+        .unwrap_or_else(|| panic!("unmade's row: {out}"));
+    assert!(row.contains("not-enrolled"), "{row}");
+    assert_eq!(
+        word_after(row, "login: "),
+        accounts::LoginHere::SIGNED_OUT,
+        "{row}"
+    );
+    let token = tokens
+        .lines()
+        .find(|line| line.starts_with("  unmade ("))
+        .unwrap_or_else(|| panic!("unmade's vault tokens line: {out}"));
+    assert!(token.contains("; no login here"), "unmade: {out}");
+    let (row, in_row, in_tokens) = said("made");
+    assert!(["ok", "idle"].contains(&in_row.as_str()), "{row}");
+    assert_eq!(in_tokens, "ok", "NEGATIVE CONTROL: {out}");
+}

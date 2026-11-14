@@ -156,13 +156,6 @@ fn cancellation_of_a_started_old_image_is_plan_bound_and_never_cancels_committin
     );
     assert!(model.fire("CancelUnresolved", &mut unresolved));
     assert!(model.check_invariant("UnknownMutationNeverProvesRollback", &unresolved));
-    facts
-        .clock
-        .store(original.deadline_us + 1, Ordering::Release);
-    assert_eq!(
-        run(&ctx, &facts, cancel(original.clone()), auxiliary()),
-        UNKNOWN
-    );
     let done = run(
         &ctx,
         &facts,
@@ -170,6 +163,11 @@ fn cancellation_of_a_started_old_image_is_plan_bound_and_never_cancels_committin
         caller(),
     );
     assert!(matches!(Reply::parse(&done), Some(Reply::Committed(_))));
+    // Committed history remains authoritative after expiry; an unfinished move instead
+    // closes Unknown at its deadline, without acquiring a rollback proof.
+    facts
+        .clock
+        .store(original.deadline_us + 1, Ordering::Release);
     assert_eq!(
         run(&ctx, &facts, cancel(original.clone()), auxiliary()),
         done

@@ -86,6 +86,148 @@ fn an_unsettled_pass_at_the_original_home_keeps_the_successors_snapshot_and_says
     assert_eq!(broken(&mutant, &replaced), ["SnapshotMonotone"]);
 }
 
+/// What a read of an original home after an invalidated completion can mislead, and what
+/// bounds it. The successor authored while its succession was complete and no pass read its
+/// home; the completion is invalidated, and the pass opens the original, which holds none of
+/// that. Its snapshot lacks its own lineage's newest record, so it is `held`, it authors
+/// nothing, and it contains what the last snapshot of that home held; the completion made
+/// again, the successor's home replaces it and the word is live. Over every walk: a snapshot
+/// that lacks a record is never under a live word, an unsettled pass never leaves a live word
+/// or moves a snapshot of the later home, and nothing is authored.
+#[test]
+fn an_unsettled_snapshot_can_lack_its_successors_records_and_is_never_live() {
+    let model = shared_file_model();
+    let steps = [
+        "ChooseRead",
+        "Grow",
+        "Materialize",
+        "Fence",
+        "Admit",
+        "Grow",
+        "Invalidate",
+    ];
+    let unsettled = walk(&model, &steps);
+    assert_eq!(
+        (
+            unsettled["custody"],
+            unsettled["era"],
+            unsettled["rfr"],
+            unsettled["ofr"]
+        ),
+        (2, 0, 1, 1),
+        "the original holds its own record, and its successor one more than it imported"
+    );
+    assert_eq!(
+        (unsettled["sera"], unsettled["sfr"], unsettled["word"]),
+        (0, 1, 1),
+        "the snapshot is the original's, read live before the fence"
+    );
+    let mut held = unsettled.clone();
+    assert!(model.fire("Materialize", &mut held));
+    assert_eq!(
+        (
+            held["sera"],
+            held["sfr"],
+            held["lacks"],
+            held["word"],
+            held["src"],
+            held["authored"]
+        ),
+        (0, 1, 1, 2, 2, 0),
+        "the unsettled view replaces the original's own older snapshot, lacks the successor's \
+         record, and is held"
+    );
+    assert_eq!(broken(&model, &held), [] as [&str; 0]);
+    let mut live = held.clone();
+    assert!(model.fire("Admit", &mut live));
+    assert!(model.fire("Materialize", &mut live));
+    assert_eq!(
+        (live["sera"], live["sfr"], live["lacks"], live["word"]),
+        (1, 1, 0, 1),
+        "the successor's home replaces it, with the record it lacked"
+    );
+
+    let (mut lacking, mut unsettled_passes) = (0, 0);
+    for state in interp::reachable_states(&model) {
+        if state["lacks"] == 1 {
+            lacking += 1;
+            assert_eq!(state["word"], 2, "{state:?}");
+        }
+        if state["area"] != 1 || state["custody"] != 2 {
+            continue;
+        }
+        for next in model.successors("Materialize", &state) {
+            unsettled_passes += 1;
+            assert_eq!((next["word"], next["src"], next["authored"]), (2, 2, 0));
+            if state["sera"] > state["era"] {
+                for kept in ["sera", "sfr", "lacks", "ssecret"] {
+                    assert_eq!(next[kept], state[kept], "{kept} at {state:?}");
+                }
+            } else {
+                assert!(next["sfr"] >= state["sfr"], "{state:?}");
+            }
+        }
+    }
+    assert!(
+        lacking > 3 && unsettled_passes > 3,
+        "the walk reached {lacking} lacking snapshots and {unsettled_passes} unsettled passes"
+    );
+
+    // NEGATIVE CONTROL: a pass that takes the unsettled home for a live one calls the
+    // snapshot that lacks the successor's record live.
+    let mutant = interp::with_buggy(&model, 3);
+    let mut called_live = walk(&mutant, &steps);
+    assert!(mutant.fire("Materialize", &mut called_live));
+    assert_eq!((called_live["word"], called_live["lacks"]), (1, 1));
+    assert_eq!(broken(&mutant, &called_live), ["HeldNeverLive"]);
+}
+
+/// A pass custody refused records its word and leaves the snapshot, and it is a recorded pass:
+/// a view of live custody taken before it records nothing after it, so the refused pass's
+/// `held` is never turned back into `live`.
+#[test]
+fn a_refused_pass_records_its_word_and_a_view_taken_before_it_records_nothing() {
+    let model = shared_file_model();
+    let steps = [
+        "ChooseRead",
+        "Grow",
+        "Materialize",
+        "RefreshLook",
+        "Refuse",
+        "Materialize",
+    ];
+    let live = walk(&model, &steps[..3]);
+    let refused = walk(&model, &steps);
+    assert_eq!(
+        (refused["word"], refused["src"], refused["look"]),
+        (2, 3, 2),
+        "the refused pass recorded, and the view is the older pass"
+    );
+    for kept in ["sera", "sfr", "lacks", "ssecret", "hera", "hfr"] {
+        assert_eq!(refused[kept], live[kept], "{kept}");
+    }
+    let mut after = refused.clone();
+    assert!(model.fire("RefreshWrite", &mut after));
+    for kept in [
+        "sera", "sfr", "word", "src", "lacks", "ssecret", "hera", "hfr",
+    ] {
+        assert_eq!(after[kept], refused[kept], "{kept}");
+    }
+    assert_eq!(broken(&model, &after), [] as [&str; 0]);
+    // A refresh custody refuses records `held` itself, and replaces nothing.
+    let mut own = walk(&model, &["ChooseRead", "Grow", "Materialize", "Refuse"]);
+    assert!(model.fire("RefreshLook", &mut own));
+    assert!(model.fire("RefreshWrite", &mut own));
+    assert_eq!((own["word"], own["src"], own["sfr"]), (2, 3, 1));
+
+    // NEGATIVE CONTROL: a refresh that records what it took turns the refused pass's word live.
+    let mutant = interp::with_buggy(&model, 2);
+    let mut turned = walk(&mutant, &steps);
+    assert!(mutant.fire("RefreshWrite", &mut turned));
+    assert_eq!((turned["word"], turned["custody"]), (1, 3));
+    assert_eq!(broken(&mutant, &turned), ["SnapshotMonotone"]);
+}
+
 /// `aterm file refresh` opens live custody, the Mac is fenced, and the runtime's pass records
 /// `held`: the view is the older pass by then, and it records nothing.
 #[test]

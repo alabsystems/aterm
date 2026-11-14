@@ -670,7 +670,7 @@ impl InitialRepositoryInputs {
         let source = configured.clone().unwrap_or_else(|| Github {
             account: String::new(),
             owner: String::new(),
-            token_file: Path::new(&user.home).join(super::TOKEN_FILE),
+            token_file: super::token_file(Path::new(&user.home)),
             token_key: None,
         });
         let token = Arc::new(read_token(sys, user, &source).map_err(Block::token)?);
@@ -1640,10 +1640,10 @@ impl Block {
         match self.wait {
             Some(Wait::Token) if unasked => Probe::NotApplicable {
                 why: format!(
-                    "no GitHub token on this {} yet: the ALab vault's sync writes ~/{} \
+                    "no GitHub token on this {} yet: the ALab vault's sync writes {} \
                      (init.toml [github] token_file names another)",
                     machine,
-                    super::TOKEN_FILE
+                    agh::identity::vault::Slot::Dev.pointer()
                 ),
             },
             Some(wait) if wait.kind() == FailureKind::NeedsPerson => Probe::Person {
@@ -1730,7 +1730,7 @@ impl NativeRepositories {
             Some(_) => return Err("the captured repository account changed".to_owned().into()),
             None if self.unasked
                 && sys
-                    .stat(&Path::new(&self.user.home).join(super::TOKEN_FILE))
+                    .stat(&super::token_file(Path::new(&self.user.home)))
                     .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
                 && configuration(sys, &self.user)
                     .map_err(Block::of(Wait::Settings))?
@@ -1866,7 +1866,7 @@ fn configuration(sys: &dyn System, user: &User) -> Result<Option<Github>, String
         config
             .token_file
             .file_name()
-            .is_some_and(|name| name == "gh_access_token_alabsystems")
+            .is_some_and(|name| name == agh::identity::vault::Slot::Release.entry())
     }) {
         return Err("public release credentials are not a development repository source".into());
     }

@@ -8,7 +8,7 @@
 //! GitHub CLI's helper gives way only where the token is here ([`super::token_here`]).
 
 use super::{
-    Asked, Github, KEYCHAIN_BLOCK, TOKEN_FILE, asked, helper, profile, read_token, token_here,
+    Asked, Github, KEYCHAIN_BLOCK, asked, helper, profile, read_token, token_file, token_here,
 };
 use crate::git_credential::{Git, Helper, Lookups};
 use crate::model::User;
@@ -36,8 +36,7 @@ fn prepare(sys: &dyn System) -> Result<(User, bool), GithubRead> {
             ));
         }
         Asked::Profile(config) => {
-            config.token_file != Path::new(&user.home).join(TOKEN_FILE)
-                || config.token_key.is_some()
+            config.token_file != token_file(Path::new(&user.home)) || config.token_key.is_some()
         }
         Asked::Scoped(_) | Asked::Default => false,
     };
@@ -82,7 +81,7 @@ pub fn vault_git_credentials(sys: &dyn System) -> Result<GithubRead, String> {
     let source = Github {
         account: String::new(),
         owner: String::new(),
-        token_file: Path::new(&user.home).join(TOKEN_FILE),
+        token_file: token_file(Path::new(&user.home)),
         token_key: None,
     };
     let token = match read_token(sys, &user, &source) {

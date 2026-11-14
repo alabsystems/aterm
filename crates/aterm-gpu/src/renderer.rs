@@ -3182,7 +3182,7 @@ trust_island! {
 
 #[cfg(target_os = "macos")]
 struct MetalArmCell {
-    live: MetalArmLive,
+    live: Box<MetalArmLive>,
     pinned: std::thread::ThreadId,
 }
 
@@ -3191,7 +3191,7 @@ impl MetalArmCell {
     #[inline]
     fn new(live: MetalArmLive) -> Self {
         Self {
-            live,
+            live: Box::new(live),
             pinned: std::thread::current().id(),
         }
     }
@@ -3701,6 +3701,15 @@ fn build_color_atlas(cpu: &mut Renderer, keys: &[GlyphKey], cap_h: u32) -> Atlas
 }
 
 fn build_kind(cpu: &mut Renderer, keys: &[GlyphKey], kind: AtlasKind, cap_h: u32) -> Atlas {
+    build_kind_checked(cpu, keys, kind, cap_h).0
+}
+
+fn build_kind_checked(
+    cpu: &mut Renderer,
+    keys: &[GlyphKey],
+    kind: AtlasKind,
+    cap_h: u32,
+) -> (Atlas, bool) {
     let mut atlas = Atlas {
         kind,
         width: ATLAS_WIDTH,
@@ -3713,6 +3722,7 @@ fn build_kind(cpu: &mut Renderer, keys: &[GlyphKey], kind: AtlasKind, cap_h: u32
         write_gen: 0,
     };
     let mut placed: Vec<GlyphKey> = Vec::new();
+    let mut truncated = false;
     for &key in keys {
         let img = cpu.glyph_image(key);
         let (sx, sy, sh) = (atlas.px, atlas.py, atlas.shelf_h);
@@ -3722,6 +3732,7 @@ fn build_kind(cpu: &mut Renderer, keys: &[GlyphKey], kind: AtlasKind, cap_h: u32
                 atlas.px = sx;
                 atlas.py = sy;
                 atlas.shelf_h = sh;
+                truncated = true;
                 break;
             }
             placed.push(key);
@@ -3734,7 +3745,7 @@ fn build_kind(cpu: &mut Renderer, keys: &[GlyphKey], kind: AtlasKind, cap_h: u32
         let img = cpu.glyph_image(key);
         atlas.blit(img, &slot);
     }
-    atlas
+    (atlas, truncated)
 }
 
 fn grow_atlas(
@@ -3918,6 +3929,9 @@ struct ResidentAtlas {
     tex_h: u32,
 }
 
+#[cfg(target_os = "macos")]
+type MetalApronSlots = [Option<(crate::device_layer::LayerTexture, u64)>; ARM_SUBMIT_B_SLOTS];
+
 /// Per-window GPU state.
 #[derive(Default)]
 pub struct WindowGpu {
@@ -3953,11 +3967,9 @@ pub struct WindowGpu {
     pub(crate) apron_rgba: Vec<u8>,
     pub(crate) apron_rgba_gen: u64,
     #[cfg(target_os = "macos")]
-    pub(crate) metal_apron_tex: Option<crate::metal::resources::SealedTexture>,
+    pub(crate) metal_apron_slot: Option<(crate::device_layer::LayerTexture, u64)>,
     #[cfg(target_os = "macos")]
-    pub(crate) metal_apron_bytes: Vec<u8>,
-    #[cfg(target_os = "macos")]
-    pub(crate) metal_apron_gen: u64,
+    pub(crate) metal_apron_slots: Option<Box<MetalApronSlots>>,
     pub(crate) offscreen_dirty_since_sync: Option<[u32; 4]>,
     pub(crate) present_offscreen_fx: Option<[u32; 4]>,
     #[cfg(target_os = "macos")]
@@ -4447,7 +4459,7 @@ pub(crate) struct ImagePlane {
 /// GPU terminal renderer.
 pub struct GpuRenderer {
     ctx: GpuContext,
-    cpu: Renderer,
+    cpu: Box<Renderer>,
     #[cfg(not(target_arch = "wasm32"))]
     font_family: Option<String>,
     theme: Theme,
@@ -4524,6 +4536,7 @@ pub struct GpuRenderer {
     gate_hits: u64,
     gate_misses: u64,
     dirty_scratch: Vec<bool>,
+    shift_scratch: Vec<bool>,
     row_plans: Vec<Vec<aterm_render::ColumnGlyph>>,
     deco_rects_scratch: Vec<[usize; 4]>,
     deco_skip_scratch: Vec<[usize; 4]>,
@@ -4953,7 +4966,7 @@ impl GpuRenderer {
         };
         let renderer = Self {
             ctx,
-            cpu,
+            cpu: Box::new(cpu),
             #[cfg(not(target_arch = "wasm32"))]
             font_family,
             theme,
@@ -5030,6 +5043,7 @@ impl GpuRenderer {
             gate_hits: 0,
             gate_misses: 0,
             dirty_scratch: Vec::new(),
+            shift_scratch: Vec::new(),
             row_plans: Vec::new(),
             deco_rects_scratch: Vec::new(),
             deco_skip_scratch: Vec::new(),
@@ -5141,7 +5155,7 @@ impl GpuRenderer {
         let prior_blending = self.cpu.text_blending();
         let prior_thicken = self.cpu.font_thicken();
         let prior_stem_gamma = self.cpu.stem_gamma();
-        self.cpu = cpu;
+        *self.cpu = cpu;
         self.cpu.set_text_shaping(prior_shaping);
         self.cpu.set_text_blending(prior_blending);
         self.cpu.set_font_thicken(prior_thicken);
@@ -6348,9 +6362,15 @@ impl GpuRenderer {
         self.cpu.resolve_cell_key_for_span(cluster, cell, cell_span)
     }
 
-    fn create_atlas_texture(&mut self, atlas: Atlas) -> ResidentAtlas {
+    fn create_atlas_texture_min_h(&mut self, atlas: Atlas, min_tex_h: u32) -> ResidentAtlas {
         let max_tex_dim = self.first_party_max_texture_dim();
-        let tex_h = (atlas.height + ATLAS_GROW_HEADROOM).min(max_tex_dim);
+        let base_h = atlas.height.saturating_add(ATLAS_GROW_HEADROOM);
+        let tex_h = base_h
+            .checked_next_power_of_two()
+            .unwrap_or(max_tex_dim)
+            .max(min_tex_h)
+            .min(max_tex_dim)
+            .max(atlas.height.min(max_tex_dim));
         self.atlas_tex_creations += 1;
         ResidentAtlas { atlas, tex_h }
     }
@@ -6440,13 +6460,33 @@ impl GpuRenderer {
 
     fn rebuild_atlases(&mut self, keys: &[GlyphKey]) {
         let cap_h = self.first_party_max_texture_dim();
-        {
-            self.atlas_epoch += 1;
+        let prev_mono_h = self.mono_res.as_ref().map_or(0, |r| r.tex_h);
+        let prev_color_h = self.color_res.as_ref().map_or(0, |r| r.tex_h);
+        self.atlas_epoch += 1;
+        if !self.resident_keys.is_empty() && self.resident_keys.len() <= 8192 {
+            let mut merged: Vec<GlyphKey> = self
+                .resident_keys
+                .iter()
+                .copied()
+                .chain(keys.iter().copied())
+                .collect();
+            merged.sort_unstable();
+            merged.dedup();
+            let (mono, mono_trunc) =
+                build_kind_checked(&mut self.cpu, &merged, AtlasKind::Mono, cap_h);
+            let (color, color_trunc) =
+                build_kind_checked(&mut self.cpu, &merged, AtlasKind::Color, cap_h);
+            if !mono_trunc && !color_trunc {
+                self.mono_res = Some(self.create_atlas_texture_min_h(mono, prev_mono_h));
+                self.color_res = Some(self.create_atlas_texture_min_h(color, prev_color_h));
+                self.resident_keys = merged.into_iter().collect();
+                return;
+            }
         }
         let mono = build_atlas(&mut self.cpu, keys, cap_h);
-        self.mono_res = Some(self.create_atlas_texture(mono));
+        self.mono_res = Some(self.create_atlas_texture_min_h(mono, prev_mono_h));
         let color = build_color_atlas(&mut self.cpu, keys, cap_h);
-        self.color_res = Some(self.create_atlas_texture(color));
+        self.color_res = Some(self.create_atlas_texture_min_h(color, prev_color_h));
         self.resident_keys = keys.iter().copied().collect();
     }
 
@@ -7543,17 +7583,28 @@ impl GpuRenderer {
             (fw / BLOOM_DOWNSCALE).max(1) as usize,
             (fh / BLOOM_DOWNSCALE).max(1) as usize,
         );
-        let half = live
-            .layer()
-            .try_create_texture_2d(
-                "aterm-gpu metal bloom half",
-                crate::device_layer::TexelFormat::Rgba8Unorm,
-                bw as u32,
-                bh as u32,
-                crate::device_layer::TexUsage::OFFSCREEN,
-                None,
-            )?
-            .into_metal();
+        if win.metal_bloom_half.as_ref().is_none_or(|t| {
+            (t.width(), t.height()) != (bw, bh)
+                || !std::sync::Arc::ptr_eq(t.latch(), live.session.latch())
+        }) {
+            win.metal_bloom_half = Some(
+                live.layer()
+                    .try_create_texture_2d(
+                        "aterm-gpu metal bloom half",
+                        crate::device_layer::TexelFormat::Rgba8Unorm,
+                        bw as u32,
+                        bh as u32,
+                        crate::device_layer::TexUsage::OFFSCREEN,
+                        None,
+                    )?
+                    .into_metal(),
+            );
+        }
+        let half = win
+            .metal_bloom_half
+            .as_ref()
+            .expect("ensured above")
+            .clone_handle();
         let mint_bytes = |live: &mut MetalArmLive, bytes: &[u8]| -> Result<mtl::Obj, String> {
             let layer = live.layer();
             let buf = layer
@@ -8468,11 +8519,8 @@ impl GpuRenderer {
             Some(_) => Some(self.metal_ensure_shift_scratch(win, fw, fh)?),
             None => None,
         };
-        let apron_strip = match band_shift {
-            Some(_) => match self.apron_strip_plan(win, input, fh as usize) {
-                Some(strip) => Some((strip, self.metal_ensure_apron_tex(win, strip)?)),
-                None => None,
-            },
+        let apron_plan = match band_shift {
+            Some(_) => self.apron_strip_plan(win, input, fh as usize),
             None => None,
         };
 
@@ -8523,6 +8571,23 @@ impl GpuRenderer {
         });
         let dest_mpix = dest_format.metal();
         live.advance_submit_b_slot();
+        let apron_strip = match apron_plan {
+            Some(strip) => {
+                let slots = win
+                    .metal_apron_slots
+                    .get_or_insert_with(|| Box::new(std::array::from_fn(|_| None)));
+                let slot = &mut slots[live.submit_b_idx];
+                let tex = Self::metal_ensure_apron_slot(
+                    live,
+                    slot,
+                    &win.apron_rgba,
+                    win.apron_rgba_gen,
+                    strip,
+                )?;
+                Some((strip, tex))
+            }
+            None => None,
+        };
 
         let (bw, bh) = (
             (fw / BLOOM_DOWNSCALE).max(1) as usize,
@@ -9937,44 +10002,41 @@ impl GpuRenderer {
     }
 
     #[cfg(target_os = "macos")]
-    fn metal_ensure_apron_tex(
-        &mut self,
-        win: &mut WindowGpu,
+    fn metal_ensure_apron_slot(
+        live: &MetalArmLive,
+        slot: &mut Option<(crate::device_layer::LayerTexture, u64)>,
+        apron_rgba: &[u8],
+        apron_rgba_gen: u64,
         strip: ApronStrip,
     ) -> Result<crate::metal::resources::SealedTexture, String> {
         let (w, h) = (strip.w as usize, strip.cell_h as usize);
-        let unchanged = win
-            .metal_apron_tex
-            .as_ref()
-            .is_some_and(|t| (t.width(), t.height()) == (w, h))
-            && (win.metal_apron_gen == win.apron_rgba_gen
-                || win.metal_apron_bytes.as_slice() == win.apron_rgba.as_slice());
-        if !unchanged {
-            let _pool = crate::metal::ffi::AutoreleasePool::new();
-            let cell = self.metal_arm.as_mut().ok_or("the Metal arm is not live")?;
-            let live = cell.live_mut();
-            let layer = live.layer();
-            let tex = layer
-                .try_create_texture_2d(
-                    "aterm-gpu metal apron row",
-                    crate::device_layer::TexelFormat::Rgba8Unorm,
-                    w as u32,
-                    h as u32,
-                    crate::device_layer::TexUsage::COPY_STAGING,
-                    None,
-                )
-                .map_err(|e| format!("apron row mint: {e}"))?;
-            layer.upload_texture_full(&tex, &win.apron_rgba, (w * 4) as u32, w as u32, h as u32);
-            win.metal_apron_tex = Some(tex.into_metal());
-            win.metal_apron_bytes.clear();
-            win.metal_apron_bytes.extend_from_slice(&win.apron_rgba);
+        let layer = live.layer();
+        if let Some((tex, held_gen)) = slot.as_mut()
+            && (tex.metal().width(), tex.metal().height()) == (w, h)
+            && std::sync::Arc::ptr_eq(tex.metal().latch(), live.session.latch())
+        {
+            if *held_gen != apron_rgba_gen {
+                let _pool = crate::metal::ffi::AutoreleasePool::new();
+                layer.upload_texture_full(tex, apron_rgba, (w * 4) as u32, w as u32, h as u32);
+                *held_gen = apron_rgba_gen;
+            }
+            return Ok(tex.metal().clone_handle());
         }
-        win.metal_apron_gen = win.apron_rgba_gen;
-        Ok(win
-            .metal_apron_tex
-            .as_ref()
-            .expect("ensured above")
-            .clone_handle())
+        let _pool = crate::metal::ffi::AutoreleasePool::new();
+        let tex = layer
+            .try_create_texture_2d(
+                "aterm-gpu metal apron row",
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                w as u32,
+                h as u32,
+                crate::device_layer::TexUsage::COPY_STAGING,
+                None,
+            )
+            .map_err(|e| format!("apron row mint: {e}"))?;
+        layer.upload_texture_full(&tex, apron_rgba, (w * 4) as u32, w as u32, h as u32);
+        let handle = tex.metal().clone_handle();
+        *slot = Some((tex, apron_rgba_gen));
+        Ok(handle)
     }
 
     #[cfg(target_os = "macos")]
@@ -9986,7 +10048,17 @@ impl GpuRenderer {
         let Some(strip) = self.apron_strip_plan(win, input, h) else {
             return;
         };
-        let tex = match self.metal_ensure_apron_tex(win, strip) {
+        let Some(cell) = self.metal_arm.as_mut() else {
+            return;
+        };
+        let live = cell.live_mut();
+        let tex = match Self::metal_ensure_apron_slot(
+            live,
+            &mut win.metal_apron_slot,
+            &win.apron_rgba,
+            win.apron_rgba_gen,
+            strip,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 metal_arm_note(&format!(
@@ -9998,10 +10070,6 @@ impl GpuRenderer {
         let Some(off) = win.metal_offscreen.as_ref() else {
             return;
         };
-        let Some(cell) = self.metal_arm.as_mut() else {
-            return;
-        };
-        let live = cell.live_mut();
         let _pool = crate::metal::ffi::AutoreleasePool::new();
         let copied = (|| -> Result<(), String> {
             let mut enc = FrameEncoder::metal(&live.session)?;
@@ -10516,8 +10584,30 @@ impl GpuRenderer {
                 self.cpu.row_bands(),
                 &mut dirty,
             ) {
-                DirtyDecision::Rows(_) => {
-                    self.cpu.mark_overshoot_rows(&prev_input, input, &mut dirty);
+                DirtyDecision::Rows(d) => {
+                    if !d.is_gate_hit() {
+                        let baseline = dirty.iter().filter(|&&b| b).count();
+                        if let Some(delta) = aterm_render::scroll_shift_plan(
+                            &prev_input,
+                            input,
+                            prev.blink_phase,
+                            prev.cursor_style_override,
+                            cur_blink,
+                            cur_override,
+                            self.cpu.row_bands(),
+                            aterm_render::RetainedRows::Diff,
+                            &mut self.shift_scratch,
+                        ) {
+                            let n = self.shift_scratch.iter().filter(|&&b| b).count();
+                            if n < baseline {
+                                scroll_delta = Some(delta);
+                                std::mem::swap(&mut dirty, &mut self.shift_scratch);
+                            }
+                        }
+                    }
+                    if scroll_delta.is_none() {
+                        self.cpu.mark_overshoot_rows(&prev_input, input, &mut dirty);
+                    }
                     RepaintScope::Dirty(&dirty)
                 }
                 DirtyDecision::FullRepaint => {

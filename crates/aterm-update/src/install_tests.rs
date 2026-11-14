@@ -2146,9 +2146,11 @@ fn every_gate_refuses_a_held_stage_until_its_hold_ends_and_an_unreadable_record_
     );
     assert!(!s.ready.exists(), "the swap retires a held stage");
     // Once its hold lapses (kept in the slot as history), the gates admit the same artifact.
+    // The hold was set by a later read of the clock than `now`; a lapse is judged at `now`, so
+    // it ends no later than that, whichever second the hold was set in.
     crate::hold::edit(&s, "test lapse", |record| {
         if let Some(hold) = &mut record.hold {
-            hold.until = hold.at;
+            hold.until = hold.at.min(now);
         }
     });
     let ready = publish_confirmed_stage(&s, 20, "m3", Some(now));

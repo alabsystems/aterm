@@ -18,6 +18,30 @@ const DELIVERS: Duration = Duration::from_secs(60);
 /// A read's patience where every route fails by construction.
 const FAILS: Duration = Duration::from_millis(300);
 
+#[cfg(unix)]
+#[test]
+fn linked_delivery_is_refused_before_reading() {
+    let dir = crate::test_scratch_dir("asset-file-kind");
+    let target = dir.path().join("target");
+    let body = dir.path().join("body");
+    std::fs::write(&target, b"payload").unwrap();
+    std::os::unix::fs::symlink(&target, &body).unwrap();
+    assert!(read_capped(&body, 32).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    std::fs::remove_file(&body).unwrap();
+    let path = std::ffi::CString::new(body.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: path is NUL-terminated and remains live for the call.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    assert!(read_capped(&body, 32).is_err());
+    std::fs::remove_file(&body).unwrap();
+    std::fs::create_dir(&body).unwrap();
+    assert!(read_capped(&body, 32).is_err());
+    std::fs::remove_dir(&body).unwrap();
+    std::fs::write(&body, b"payload").unwrap();
+    assert_eq!(read_capped(&body, 7).unwrap(), b"payload");
+    assert!(read_capped(&body, 6).is_err());
+}
+
 /// agh-fake holding the public `SLUG` with release `v1` (its latest) carrying `a.toml`.
 fn fixture() -> FakeGithub {
     let fake = FakeGithub::start();
@@ -595,4 +619,147 @@ fn an_api_allowance_of_one_release_lists_one_release_and_its_other_assets_stay_f
         Ok(BYTES)
     );
     assert_eq!(listings(&fake), 1);
+}
+
+/// The releases listing is one API request naming each release's tag, flags and assets, newest
+/// first and no more than asked; a draft is listed only to a token that may push; and a listed
+/// release's asset read through the API route asks for no listing of its own.
+#[test]
+fn the_releases_listing_is_one_request_and_its_releases_need_no_listing_of_their_own() {
+    let fake = fixture();
+    let v2 = fake.add_release(
+        SLUG,
+        ReleaseSpec::published("v2", "2026-11-01T00:00:00Z").prerelease(true),
+    );
+    fake.add_asset(v2, AssetSpec::uploaded("b.toml", BYTES));
+    fake.add_release(SLUG, ReleaseSpec::draft("v3", "2026-11-02T00:00:00Z"));
+    let listed = |fake: &FakeGithub| {
+        on(fake, FakeOrigin::Api)
+            .into_iter()
+            .filter(|s| {
+                s.path_and_query
+                    .starts_with("/repos/fixture-dev/app/releases?")
+            })
+            .count()
+    };
+
+    let reader = Reader::loopback(origins(&fake), None, DELIVERS);
+    let releases = reader.releases(OWNER, REPO, 30, 1).unwrap();
+    assert_eq!(
+        releases,
+        [
+            ListedRelease {
+                tag: "v2".into(),
+                draft: false,
+                prerelease: true,
+                assets: vec!["b.toml".into()],
+            },
+            ListedRelease {
+                tag: "v1".into(),
+                draft: false,
+                prerelease: false,
+                assets: vec!["a.toml".into()],
+            },
+        ],
+        "newest first; the draft is not listed to an anonymous reader"
+    );
+    assert_eq!(reader.api_requests(), 1);
+    assert_eq!(listed(&fake), 1);
+    assert!(
+        on(&fake, FakeOrigin::Api)
+            .iter()
+            .any(|s| s.path_and_query == "/repos/fixture-dev/app/releases?per_page=30&page=1"),
+        "one page of the asked size"
+    );
+
+    // A listed release's asset, its web route failing, costs the asset's request alone.
+    fake.fault_always(Match::web("/fixture-dev/app/releases/"), status(504));
+    fake.clear_seen();
+    assert_eq!(
+        reader
+            .bytes(&Asset::tagged(OWNER, REPO, "v1", "a.toml"), 1 << 16)
+            .as_deref(),
+        Ok(BYTES)
+    );
+    assert!(
+        !on(&fake, FakeOrigin::Api)
+            .iter()
+            .any(|s| s.path_and_query.contains("/releases/tags/")),
+        "the listing served the asset's id"
+    );
+    assert_eq!(reader.api_requests(), 2, "the listing and the asset");
+
+    // A page of one is the newest release alone; its second page the one before it, and its
+    // third the end of the listing. Each page is its own request; page 0 asks for nothing.
+    let one = Reader::loopback(origins(&fake), None, DELIVERS);
+    let page = |n| {
+        one.releases(OWNER, REPO, 1, n)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.tag)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(page(1), ["v2"]);
+    assert_eq!(page(2), ["v1"]);
+    assert_eq!(page(3), Vec::<String>::new());
+    assert_eq!(one.api_requests(), 3);
+    assert!(matches!(
+        one.releases(OWNER, REPO, 1, 0),
+        Err(AssetError::Refused(_))
+    ));
+    assert_eq!(one.api_requests(), 3);
+
+    // A token that may push is listed the draft too.
+    let secret = token("listing");
+    fake.add_token(&secret, LOGIN);
+    let pusher = Reader::loopback(
+        origins(&fake),
+        Some(Token::new(secret.as_bytes()).unwrap()),
+        DELIVERS,
+    );
+    let all = pusher.releases(OWNER, REPO, 30, 1).unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|r| (r.tag.as_str(), r.draft))
+            .collect::<Vec<_>>(),
+        [("v3", true), ("v2", false), ("v1", false)]
+    );
+
+    // An unknown repository is absent; an unsafe name is refused before any request.
+    assert!(
+        reader
+            .releases(OWNER, "missing", 30, 1)
+            .unwrap_err()
+            .is_absent()
+    );
+    fake.clear_seen();
+    assert!(matches!(
+        reader.releases(OWNER, "a/b", 30, 1),
+        Err(AssetError::Refused(_))
+    ));
+    assert!(fake.seen().is_empty());
+}
+
+/// The listing has the API route alone: when that try reaches no host (here nothing listens on
+/// the API's port), the listing is unavailable at once, after that one try, however much
+/// patience the reader has left, where waiting for a web leg it does not have kept it trying.
+#[test]
+fn a_listing_whose_api_host_is_unreachable_ends_after_one_try() {
+    let fake = fixture();
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let p = fake.ports();
+    let reader = Reader::loopback(
+        Origins::loopback(closed, p.uploads, p.web, p.cdn),
+        None,
+        DELIVERS,
+    );
+    let error = reader.releases(OWNER, REPO, 30, 1).unwrap_err();
+    assert!(
+        matches!(&error, AssetError::Unavailable { web, .. } if web.contains("lists no releases")),
+        "{error:?}"
+    );
+    assert_eq!(reader.api_requests(), 1, "one try, never a retry");
 }

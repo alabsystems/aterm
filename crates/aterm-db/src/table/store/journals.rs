@@ -41,22 +41,29 @@
 //! read does: a folder swapped in for that moment and back is judged in the journal's place by
 //! either read, and what such a read kept stands until the next read.
 //!
-//! What is kept is bounded by its charge, each table's wires' allocations and its records'
-//! links, plus [`FIXED`] for the rest: at most [`KEPT_TABLES`] tables, [`JOURNAL_BYTES`] for one
-//! and [`KEPT_BYTES`] for all of them. Asks of one table in a row count as one ask, as the opens
-//! of one table in a repair round are. Where a table's records do not fit, only tables last asked
-//! before its own previous ask (so that it was asked twice since they were) yield it their room,
-//! the oldest first; a table asked for the first time takes only free room. So a cycle of more
-//! tables than fit keeps those that fit and reads the rest as a fresh read does. A table nobody
-//! asks again stays until a table asked twice needs its room, within the bound. Outside the
-//! charge are the allocator's rounding, the copies each open's store makes of the records it
-//! exposes, and links an open still holds once its table let them go.
+//! A table whose bodies do not fit can instead retain content-bound cryptographic facts alone.
+//! Every such ask reads and hashes the journal again; compact facts never answer a physical read,
+//! attest a witness or supply historical authority. The freshly read bytes must identify the same
+//! complete wire before its signer check or non-cutoff key-comparison token is attached.
+//!
+//! What is retained is bounded by its allocation charge: owned path capacity and anchor bytes,
+//! shared table objects and inline cache metadata, the slot array's capacity, and either full
+//! wire/link allocations or compact facts' vector capacity and shared allocations. The bounds
+//! are [`KEPT_TABLES`] tables, [`JOURNAL_BYTES`] per table and [`KEPT_BYTES`] across all entries.
+//! Asks of one table in a row count as one ask, as the opens of one table in a repair round are.
+//! Where a table's payload does not fit, only tables last asked before its own previous ask (so
+//! it was asked twice since they were) yield room, oldest first; a first ask takes only free room.
+//! When all keys fit, a cycle with more payloads than fit retains those admitted and reads the
+//! rest freshly. New metadata can retire the least recently asked key to obey both bounds; a key
+//! that cannot fit alone is never listed. Outside the entry charge are the cache container and
+//! its single synchronization primitive, allocator rounding, each open's copies, and links still
+//! held by an open after the cache lets them go.
 
 use super::{
     group::Boundary,
     replay::{self, Linked, Replay},
 };
-use crate::{Error, Result};
+use crate::{Error, Result, table::signatures::Facts};
 use aterm_journal::{Committed, Limits, Prefix, Retain};
 use aterm_secrets::fsx::JournalSeen;
 use std::{
@@ -74,9 +81,6 @@ const KEPT_TABLES: usize = 32;
 const KEPT_BYTES: usize = 16 << 20;
 /// What one kept table may charge.
 const JOURNAL_BYTES: usize = 8 << 20;
-/// A kept table's charge besides its wires and links: its key (folder, anchor and limits), its
-/// prefix and its witness, rounded up.
-const FIXED: usize = 1024;
 /// Of each this many asks in a row that what a table keeps could answer, the last reads the
 /// journal again, as an ask after a change does.
 const REVALIDATE: u32 = 64;
@@ -85,7 +89,7 @@ static JOURNALS: Journals = Journals::new(KEPT_TABLES, KEPT_BYTES, JOURNAL_BYTES
 
 /// The kept tables, and the bounds on them.
 pub(super) struct Journals {
-    /// Lookup and the charges alone hold this lock; no journal is read under it.
+    /// Lookup, snapshots, publication and charges hold this lock; no journal is read under it.
     list: Mutex<List>,
     tables: usize,
     bytes: usize,
@@ -120,18 +124,17 @@ struct Slot {
     asked: u64,
     /// The count of the ask that asked this table before `asked`, if one did.
     before: Option<u64>,
-    /// What `table`'s kept records charge; zero while it keeps none.
-    charge: usize,
+    /// Optional pure replay data; publication and checkout use the list lock.
+    kept: Option<Kept>,
 }
 
 struct Table {
     dir: PathBuf,
     anchor: Box<[u8]>,
     limits: [usize; 3],
-    /// Held only to look, take or put: never while the journal is read.
-    kept: Mutex<Option<Kept>>,
 }
 
+#[derive(Clone)]
 struct Kept {
     /// Its acknowledgement alone ([`Retain::Digest`]).
     prefix: Prefix,
@@ -141,6 +144,31 @@ struct Kept {
     witnessed: Option<JournalSeen>,
     /// Consecutive answers from `links` since they were read.
     hits: u32,
+    /// For a journal whose bodies do not fit: content-bound facts alone. Such a
+    /// slot cannot answer a journal read or reuse its prefix without reading bytes.
+    detached: Option<Facts>,
+    /// Heap charge computed before publication, while no cache lock is held.
+    heap_bytes: usize,
+}
+
+impl Kept {
+    const fn charge(&self) -> usize {
+        self.heap_bytes
+    }
+
+    fn compact(&mut self) {
+        let facts = Facts::of(self.links.iter().map(|link| &link.wire));
+        self.links = Arc::new(Vec::new());
+        self.heap_bytes = charge(&self.links) + facts.allocation_bytes();
+        self.detached = Some(facts);
+        self.witnessed = None;
+    }
+}
+
+impl Slot {
+    fn charge(&self) -> usize {
+        self.table.allocation_bytes() + self.kept.as_ref().map_or(0, Kept::charge)
+    }
 }
 
 // What is kept crosses threads and borrows nothing: no session, no cell.
@@ -203,38 +231,60 @@ fn asked_now() -> SystemTime {
 }
 
 impl Table {
+    /// The shared identity object, owned key allocations and reference counts.
+    /// Allocator rounding is excluded.
+    fn allocation_bytes(&self) -> usize {
+        size_of::<Self>() + 2 * size_of::<usize>() + self.dir.capacity() + self.anchor.len()
+    }
+
     fn is(&self, dir: &Path, anchor: &[u8], limits: [usize; 3]) -> bool {
         self.limits == limits && *self.anchor == *anchor && self.dir == dir
     }
 }
 
 impl List {
-    /// Let go of what `table`'s kept records charge, where it is still listed. A table that
-    /// charges nothing lets go of nothing, so a second release changes nothing.
-    fn release(&mut self, table: &Arc<Table>) {
-        if let Some(slot) = self
+    fn allocation_bytes(&self) -> usize {
+        self.charged
+            .saturating_add(self.slots.capacity().saturating_mul(size_of::<Slot>()))
+    }
+
+    fn take(&mut self, table: &Arc<Table>) -> Option<Kept> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| Arc::ptr_eq(&slot.table, table))?;
+        let kept = slot.kept.take()?;
+        self.charged -= kept.charge();
+        Some(kept)
+    }
+
+    fn put(&mut self, table: &Arc<Table>, kept: Kept) {
+        let slot = self
             .slots
             .iter_mut()
             .find(|slot| Arc::ptr_eq(&slot.table, table))
-        {
-            self.charged -= std::mem::take(&mut slot.charge);
-        }
+            .expect("an admitted table is still listed");
+        assert!(
+            slot.kept.is_none(),
+            "publication follows checkout under the same lock"
+        );
+        self.charged += kept.charge();
+        slot.kept = Some(kept);
     }
 
-    /// Take the slots `leaves` names off the list, and their charges with them.
-    fn delist(&mut self, leaves: impl Fn(&Slot) -> bool) -> Vec<Slot> {
-        let (left, stay) = std::mem::take(&mut self.slots)
-            .into_iter()
-            .partition::<Vec<_>, _>(|slot| leaves(slot));
-        self.slots = stay;
-        self.charged -= left.iter().map(|slot| slot.charge).sum::<usize>();
+    /// Retire complete slots without reallocating the array that stays. Their
+    /// table allocations are dropped by the caller after releasing the lock.
+    fn delist(&mut self, leaves: impl FnMut(&mut Slot) -> bool) -> Vec<Slot> {
+        let left: Vec<_> = self.slots.extract_if(.., leaves).collect();
+        self.charged -= left.iter().map(|slot| slot.charge()).sum::<usize>();
         left
     }
 }
 
-/// What `links` charge: each wire's allocation, the links' own, and [`FIXED`].
+/// The shared vector object, link capacity and complete wire allocations.
 fn charge(links: &Vec<Linked>) -> usize {
-    FIXED
+    size_of::<Vec<Linked>>()
+        + 2 * size_of::<usize>()
         + links
             .iter()
             .map(|link| link.wire.allocation_bytes())
@@ -268,11 +318,17 @@ impl Journals {
         // Taken before the journal is read: a change after this moves the next witness, and a
         // file swapped in for the read is another than this one saw ([`JournalSeen::stands_for`]).
         let seen = JournalSeen::of(dir, NAME);
-        // Each step under this lock takes what is kept, puts it back or answers from it, so one
-        // that unwound left it whole or gone.
+        // Snapshot and publication share the metadata lock. A physical reread
+        // leaves immutable facts available to overlapping readers; no read or
+        // cryptographic work runs under this lock.
         let known = {
-            let mut kept = table.kept.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(kept) = kept.as_mut()
+            let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(kept) = list
+                .slots
+                .iter_mut()
+                .find(|slot| Arc::ptr_eq(&slot.table, &table))
+                .and_then(|slot| slot.kept.as_mut())
+                && kept.detached.is_none()
                 && seen.is_some()
                 && kept.witnessed == seen
                 && kept.hits + 1 < REVALIDATE
@@ -283,15 +339,11 @@ impl Journals {
                     refused: None,
                 });
             }
-            // An ask of this table while this one reads finds nothing kept and reads as well.
-            let known = kept.take();
-            if known.is_some() {
-                self.list
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .release(&table);
-            }
-            known
+            list.slots
+                .iter()
+                .find(|slot| Arc::ptr_eq(&slot.table, &table))
+                .and_then(|slot| slot.kept.as_ref())
+                .cloned()
         };
         #[cfg(test)]
         {
@@ -304,7 +356,10 @@ impl Journals {
             NAME,
             anchor,
             limits,
-            known.as_ref().map(|known| &known.prefix),
+            known
+                .as_ref()
+                .filter(|known| known.detached.is_none())
+                .map(|known| &known.prefix),
             Retain::Digest,
         )?;
         #[cfg(test)]
@@ -313,19 +368,19 @@ impl Journals {
         let unknown = || Error::new("table journal read extended an unknown prefix");
         let (prefix, links, refused) = match committed {
             Committed::Unchanged => {
-                let known = known.ok_or_else(unknown)?;
-                (known.prefix, known.links, None)
+                let known = known.as_ref().ok_or_else(unknown)?;
+                (known.prefix.clone(), Arc::clone(&known.links), None)
             }
             Committed::Extended { records, prefix } => {
-                let mut links = Arc::unwrap_or_clone(known.ok_or_else(unknown)?.links);
+                let mut links = known.as_ref().ok_or_else(unknown)?.links.as_ref().clone();
                 links.reserve_exact(records.len());
                 let refused = replay::identify_onto(&mut links, records).err();
                 (prefix, Arc::new(links), refused)
             }
             Committed::Rebuilt { records, prefix } => {
-                drop(known);
                 let mut links = Vec::with_capacity(records.len());
-                let refused = replay::identify_onto(&mut links, records).err();
+                let facts = known.as_ref().and_then(|known| known.detached.as_ref());
+                let refused = replay::identify_onto_with(&mut links, records, facts).err();
                 (prefix, Arc::new(links), refused)
             }
         };
@@ -338,7 +393,10 @@ impl Journals {
                     links: Arc::clone(&links),
                     witnessed,
                     hits: 0,
+                    detached: None,
+                    heap_bytes: charge(&links),
                 },
+                known,
             );
         }
         Ok(Read { links, refused })
@@ -347,7 +405,8 @@ impl Journals {
     /// The table kept for `dir`, `anchor` and `limits`, listed now if it was not, and the count of
     /// the ask that asked it before this one: asks of one table in a row are one ask, so another
     /// table's ask came between that ask and this. A table listed past [`Self::tables`] lets the
-    /// least recently asked one go.
+    /// least recently asked one go. Metadata also obeys the byte bound: an oversized key is
+    /// never listed, and metadata pressure retires the least recently asked listed keys.
     fn table(&self, dir: &Path, anchor: &[u8], limits: Limits) -> (Arc<Table>, Option<u64>) {
         let limits = [limits.records, limits.bytes, limits.record_bytes];
         let (found, retired) = {
@@ -370,20 +429,38 @@ impl Journals {
                     dir: dir.into(),
                     anchor: anchor.into(),
                     limits,
-                    kept: Mutex::new(None),
                 });
+                let base = table.allocation_bytes();
+                // An unretainable key must not displace useful existing entries.
+                if self.tables == 0
+                    || base.saturating_add(size_of::<Slot>()) > self.journal
+                    || base.saturating_add(size_of::<Slot>()) > self.bytes
+                {
+                    return (table, None);
+                }
+                slots.reserve_exact(1);
                 slots.push(Slot {
                     table: Arc::clone(&table),
                     asked: ask,
                     before: None,
-                    charge: 0,
+                    kept: None,
                 });
-                let retired = if list.slots.len() > self.tables {
-                    let oldest = list.slots.iter().map(|slot| slot.asked).min();
-                    list.delist(|slot| Some(slot.asked) == oldest)
-                } else {
-                    Vec::new()
-                };
+                list.charged += base;
+                let mut retired = Vec::new();
+                while list.slots.len() > self.tables || list.allocation_bytes() > self.bytes {
+                    if list.slots.len() <= self.tables && list.slots.capacity() > list.slots.len() {
+                        list.slots.shrink_to_fit();
+                        if list.slots.len() <= self.tables && list.allocation_bytes() <= self.bytes
+                        {
+                            break;
+                        }
+                    }
+                    let Some(oldest) = list.slots.iter().map(|slot| slot.asked).min() else {
+                        list.slots = Vec::new();
+                        break;
+                    };
+                    retired.extend(list.delist(|slot| slot.asked == oldest));
+                }
                 ((table, None), retired)
             }
         };
@@ -393,51 +470,109 @@ impl Journals {
         found
     }
 
-    /// Keep `kept` for `table` where its charge is admitted ([`Self::admit`]); otherwise keep
-    /// nothing for it. Of two reads of one table that overlap, the one put last is kept.
-    fn install(&self, table: &Arc<Table>, previous: Option<u64>, kept: Kept) {
-        let charge = charge(&kept.links);
-        let mut slot = table.kept.lock().unwrap_or_else(PoisonError::into_inner);
-        let (admitted, retired) = self.admit(table, previous, charge);
-        *slot = admitted.then_some(kept);
-        drop(slot);
+    /// Retain complete bodies where admitted, compact facts otherwise, and preserve an older
+    /// usable entry if neither optional replacement fits. Each reader snapshots immutable
+    /// data; none supplies authority or a witness without fresh admission.
+    fn install(
+        &self,
+        table: &Arc<Table>,
+        previous: Option<u64>,
+        mut kept: Kept,
+        known: Option<Kept>,
+    ) {
+        let base = table.allocation_bytes();
+        if base
+            .saturating_add(kept.charge())
+            .saturating_add(size_of::<Slot>())
+            > self.journal
+            || base.saturating_add(kept.charge()) > self.bytes
+        {
+            kept.compact();
+        }
+        let mut candidate = Some(kept);
+        let mut fallback: Vec<_> = known.into_iter().collect();
+        let mut retired = Vec::new();
+        let attempt =
+            |candidate: &mut Option<Kept>, fallback: &mut Vec<Kept>, retired: &mut Vec<Slot>| {
+                let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
+                fallback.extend(list.take(table));
+                let charge = base.saturating_add(candidate.as_ref().unwrap().charge());
+                let (fits, left) = self.admit(&mut list, table, previous, charge);
+                retired.extend(left);
+                if fits {
+                    list.put(table, candidate.take().unwrap());
+                }
+                fits
+            };
+        let mut admitted = attempt(&mut candidate, &mut fallback, &mut retired);
+        if !admitted && candidate.as_ref().unwrap().detached.is_none() {
+            candidate.as_mut().unwrap().compact();
+            admitted = attempt(&mut candidate, &mut fallback, &mut retired);
+        }
+        if !admitted {
+            let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
+            fallback.extend(list.take(table));
+            let restore = fallback.iter().rposition(|old| {
+                let (fits, left) =
+                    self.admit(&mut list, table, None, base.saturating_add(old.charge()));
+                retired.extend(left);
+                fits
+            });
+            if let Some(at) = restore {
+                list.put(table, fallback.swap_remove(at));
+            }
+        }
+        // The single lock protects only metadata, checkout and publication.
+        // Wire destruction, fact collection and all I/O remain outside it.
+        drop(candidate);
+        drop(fallback);
         drop(retired);
     }
 
-    /// Charge `charge` to `table`'s slot in place of what it charged, where `table` is still
-    /// listed, `charge` is within [`Self::journal`], and all charges then fit [`Self::bytes`]:
-    /// where they would not, the tables last asked before `table`'s `previous` ask (so that it was
-    /// asked twice since they were) yield their room, the oldest first, as many as it needs. A
-    /// table asked for the first time takes only free room. On a refusal `table` charges nothing.
-    /// Returns whether `charge` was admitted, and the slots let go for it, to be dropped once no
-    /// lock is held.
-    fn admit(&self, table: &Arc<Table>, previous: Option<u64>, charge: usize) -> (bool, Vec<Slot>) {
-        let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
+    /// Judge a replacement and retire enough eligible older slots to make room.
+    /// The caller checks out the old payload and publishes a successful replacement
+    /// under this same list lock; refusal leaves its immutable key charged.
+    ///
+    /// `charge` includes the key and payload. The per-table guard adds its inline
+    /// slot; the global guard adds the complete slot-array capacity. Only tables
+    /// last asked before this table's previous ask yield payload room, oldest first.
+    /// A first ask takes only free room. Retired values are dropped after the lock.
+    fn admit(
+        &self,
+        list: &mut List,
+        table: &Arc<Table>,
+        previous: Option<u64>,
+        charge: usize,
+    ) -> (bool, Vec<Slot>) {
         let Some(own) = list
             .slots
             .iter()
             .find(|slot| Arc::ptr_eq(&slot.table, table))
-            .map(|slot| slot.charge)
+            .map(|slot| slot.charge())
         else {
             return (false, Vec::new());
         };
         let others = list.charged - own;
         let mut retired = Vec::new();
-        if charge > self.journal {
-            list.release(table);
+        if charge.saturating_add(size_of::<Slot>()) > self.journal {
             return (false, retired);
         }
-        if let Some(need) = (others + charge).checked_sub(self.bytes).filter(|&n| n > 0) {
+        if let Some(need) = others
+            .saturating_add(charge)
+            .saturating_add(list.slots.capacity().saturating_mul(size_of::<Slot>()))
+            .checked_sub(self.bytes)
+            .filter(|&n| n > 0)
+        {
             let yields = |slot: &Slot| {
                 previous.is_some_and(|previous| slot.asked < previous)
-                    && slot.charge > 0
+                    && slot.charge() > slot.table.allocation_bytes()
                     && !Arc::ptr_eq(&slot.table, table)
             };
             let mut oldest: Vec<(u64, usize)> = list
                 .slots
                 .iter()
                 .filter(|slot| yields(slot))
-                .map(|slot| (slot.asked, slot.charge))
+                .map(|slot| (slot.asked, slot.charge()))
                 .collect();
             oldest.sort_unstable();
             let mut freed = 0;
@@ -450,21 +585,10 @@ impl Journals {
                 }
             }
             let Some(last) = last else {
-                list.release(table);
                 return (false, retired);
             };
             retired = list.delist(|slot| yields(slot) && slot.asked <= last);
         }
-        let List { slots, charged, .. } = &mut *list;
-        // Still listed: no slot that yields is `table`'s.
-        let Some(slot) = slots
-            .iter_mut()
-            .find(|slot| Arc::ptr_eq(&slot.table, table))
-        else {
-            return (false, retired);
-        };
-        *charged = *charged - slot.charge + charge;
-        slot.charge = charge;
         (true, retired)
     }
 

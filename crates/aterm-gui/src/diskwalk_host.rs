@@ -57,6 +57,9 @@ pub(crate) const GLANCE_REWALK_AFTER: Duration = Duration::from_secs(600);
 pub(crate) const GLANCE_COST_FACTOR: u32 = 50;
 /// How often the thread derives each demanded pane's folders again.
 pub(crate) const DISCOVER_EVERY: Duration = Duration::from_secs(5);
+/// The most build-start lines one pane's session names roots from, the newest first: a tab
+/// that built in more worktrees than this holds the newest.
+const MAX_BUILT_PER_PANE: usize = 64;
 /// How long a live directory's lift to its repository and build output is kept.
 pub(crate) const LIFT_FOR: Duration = Duration::from_secs(60);
 /// The growth window design T3 reads: a tab's roots grew ≥ 1 GiB in ten minutes.
@@ -83,8 +86,9 @@ pub(crate) const FACTS_IDLE_EVERY: Duration = Duration::from_secs(10);
 /// Which roots a reader asks about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum DiskScope {
-    /// One tab: the union of its panes' projects and their build output, keyed by its `TabId`
-    /// (never reused while aterm runs).
+    /// One tab: the union of its panes' projects and their build output, and of the workspaces
+    /// the builds started in its panes compiled and theirs, keyed by its `TabId` (never reused
+    /// while aterm runs).
     Tab(TabId),
     /// Every open tab's folders and aterm's own.
     Aterm,
@@ -123,11 +127,14 @@ pub(crate) enum Detail {
 /// Why a folder is a root (record §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RootKind {
-    /// A pane's repository: the nearest folder above its live directory holding `.git`.
+    /// A pane's repository: the nearest folder above its live directory, or above a workspace
+    /// a build started in it compiled, holding `.git`.
     Project,
-    /// A pane's live directory, with no repository above it.
+    /// A pane's live directory, or a workspace a build started in it compiled, with no
+    /// repository above it.
     Folder,
-    /// A project's build output: its `target` linked out of it, or its build mirror.
+    /// A project's build output: its `target` linked out of it, or its build mirror; and the
+    /// build folder a build-start line names outside both.
     Build,
     /// aterm's own folders.
     Own,
@@ -220,7 +227,8 @@ impl Claim {
     }
 }
 
-/// Why a pane adds nothing (`sys disk`'s pane `why=`).
+/// Why a pane's live directory adds nothing (`sys disk`'s pane `why=`). A pane with a why still
+/// holds what the builds started in it compiled ([`Engine::built_by`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneWhy {
     /// Its live directory or project failed the path test.
@@ -250,9 +258,10 @@ pub(crate) struct PaneView {
     pub(crate) live: Option<PathBuf>,
     /// Its project P.
     pub(crate) project: Option<PathBuf>,
-    /// Why it adds nothing, where it adds nothing.
+    /// Why its live directory adds nothing, where it adds nothing.
     pub(crate) why: Option<PaneWhy>,
-    /// The folders it holds now: its project and the project's build output, once joined.
+    /// The folders it holds now, once joined: its project and the project's build output, and
+    /// each workspace a build started in it compiled with that workspace's build output.
     pub(crate) members: Vec<Claim>,
 }
 
@@ -1186,7 +1195,8 @@ pub(crate) fn lift(live: &Path, home: Option<&Path>, policy: &Policy) -> Lift {
 
 /// What discovery reads of a process, injected so a test names its own: two `proc_pidinfo`
 /// reads at most for a pane's directory, and its program's name. No process table, no
-/// environment and no open files.
+/// environment and no open files. And what it reads of the builds started in the tabs: one
+/// bounded read of the build-start record for each discovery that reads a pane, however many.
 pub(crate) struct PaneReads {
     /// A process's working directory.
     pub(crate) cwd: Box<dyn Fn(u32) -> Option<PathBuf>>,
@@ -1194,6 +1204,9 @@ pub(crate) struct PaneReads {
     pub(crate) exe: Box<dyn Fn(u32) -> Option<String>>,
     /// A path's pool key in a mount table.
     pub(crate) pool: Box<PoolOf>,
+    /// The build-start record's lines ([`atpkg::build_start::read`]): none where there is no
+    /// record.
+    pub(crate) starts: Box<dyn Fn() -> Vec<atpkg::build_start::Start>>,
 }
 
 /// A path's pool key read from a mount table.
@@ -1208,6 +1221,11 @@ impl PaneReads {
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             }),
             pool: Box::new(pool_key),
+            starts: Box::new(|| {
+                atpkg::build_start::record()
+                    .map(|record| atpkg::build_start::read(&record))
+                    .unwrap_or_default()
+            }),
         }
     }
 }
@@ -1749,7 +1767,9 @@ impl Engine {
 
     /// One discovery. A periodic one reads every demanded pane and applies the join and leave
     /// hysteresis; one at once (a pane opened or closed, a scope newly demanded) reads only the
-    /// panes no recent discovery read, as their first.
+    /// panes no recent discovery read, as their first. A pane names what its live directory
+    /// lifts to ([`Self::see_pane`]) and what the builds started in it compiled
+    /// ([`Self::built_by`]), wherever the pane is now.
     fn discover(&mut self, now: Instant, periodic: bool) {
         let live = self.live(now);
         let Some(mut policy) = self.policy.clone() else {
@@ -1769,7 +1789,14 @@ impl Engine {
         }
         self.lifts
             .retain(|_, (at, _)| now.saturating_duration_since(*at) < LIFT_FOR);
-        for pane in self.wanted_panes(&live) {
+        let wanted = self.wanted_panes(&live);
+        // One bounded read of the record, and none where no pane is read.
+        let starts = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            (self.reads.starts)()
+        };
+        for pane in wanted {
             let fresh = self
                 .panes
                 .get(&pane.key)
@@ -1777,7 +1804,12 @@ impl Engine {
             if !periodic && fresh {
                 continue;
             }
-            let seen = self.see_pane(&pane, &policy, home.as_deref(), now);
+            let mut seen = self.see_pane(&pane, &policy, home.as_deref(), now);
+            for claim in self.built_by(&pane.session, &starts, &policy, home.as_deref(), now) {
+                if !seen.named.iter().any(|c| c.path == claim.path) {
+                    seen.named.push(claim);
+                }
+            }
             let named: BTreeSet<PathBuf> = seen.named.iter().map(|c| c.path.clone()).collect();
             let round = self.round;
             let life = self.panes.entry(pane.key).or_default();
@@ -1814,9 +1846,10 @@ impl Engine {
         self.dirty = true;
     }
 
-    /// What one pane is now: its live directory, its project, why it adds nothing, and what it
-    /// names. L and P each pass the path test before any syscall touches them; a refused one
-    /// is named, not counted, and nothing under it is opened.
+    /// What one pane's live directory is now: the directory, its project, why it adds nothing,
+    /// and what it names (what the builds started in the pane compiled is
+    /// [`Self::built_by`]'s). L and P each pass the path test before any syscall touches them; a
+    /// refused one is named, not counted, and nothing under it is opened.
     fn see_pane(
         &mut self,
         pane: &PaneFacts,
@@ -1895,6 +1928,93 @@ impl Engine {
                 .map(|b| Claim::of(b.clone(), RootKind::Build, false)),
         );
         Seen { view, named }
+    }
+
+    /// `path` as a root a build-start line may name: canonical, past the path test, a directory
+    /// by one no-follow `stat` in its parent, and on home's pool or one unknown. A line is what
+    /// some build wrote, so its paths get every test a pane's live directory gets before
+    /// anything under them is opened.
+    fn built_root(&self, path: &Path, policy: &Policy) -> Option<PathBuf> {
+        let path = canonical(&firmlinked(path))?;
+        if refuse(None, &path, &policy.mounts, &policy.deny).is_some() {
+            return None;
+        }
+        let leaf = path.file_name().and_then(|n| n.to_str())?;
+        if !matches!(
+            marker_at(path.parent()?, leaf, policy),
+            Ok(Some(Marker::Dir))
+        ) {
+            return None;
+        }
+        let pool = Pool::of(
+            (self.reads.pool)(&path, &policy.mounts).as_ref(),
+            self.home_pool.as_ref(),
+        );
+        (pool != Pool::Other).then_some(path)
+    }
+
+    /// What the builds started in the pane whose session is `session` compiled, from the
+    /// build-start lines `starts` (oldest first): for each of that session's newest
+    /// [`MAX_BUILT_PER_PANE`] lines whose workspace is still a root a line may name
+    /// ([`Self::built_root`]), the workspace's project and the project's build output ([`lift`],
+    /// as a live directory's), and the line's build folder where it is such a root too and lies
+    /// in neither. Each path once. "Newest" is the record's own order, the order the lines were
+    /// appended in, never a line's `at_ms`: that is its writer's word, and a line dated ahead of
+    /// the clock (a forged one, or one a clock that stepped back wrote) would outrank every line
+    /// written after it. A line names roots and nothing else: it gives no leave to remove
+    /// anything.
+    fn built_by(
+        &mut self,
+        session: &str,
+        starts: &[atpkg::build_start::Start],
+        policy: &Policy,
+        home: Option<&Path>,
+        now: Instant,
+    ) -> Vec<Claim> {
+        let fold = policy.deny.fold_case();
+        let mine = starts
+            .iter()
+            .rev()
+            .filter(|s| s.session == session)
+            .take(MAX_BUILT_PER_PANE);
+        let mut named: Vec<Claim> = Vec::new();
+        for start in mine {
+            let Some(workspace) = self.built_root(&start.workspace, policy) else {
+                continue;
+            };
+            let lift = match self.lifts.get(&workspace) {
+                Some((_, l)) => l.clone(),
+                None => {
+                    let l = lift(&workspace, home, policy);
+                    self.lifts.insert(workspace, (now, l.clone()));
+                    l
+                }
+            };
+            if refuse(None, &lift.project, &policy.mounts, &policy.deny).is_some() {
+                continue;
+            }
+            let mut claims = vec![Claim::of(lift.project.clone(), lift.kind, lift.linked)];
+            claims.extend(
+                lift.builds
+                    .iter()
+                    .map(|b| Claim::of(b.clone(), RootKind::Build, false)),
+            );
+            if let Some(build) = start
+                .build
+                .as_deref()
+                .and_then(|b| self.built_root(b, policy))
+                && !within(&build, &lift.project, fold)
+                && !lift.builds.iter().any(|b| within(&build, b, fold))
+            {
+                claims.push(Claim::of(build, RootKind::Build, false));
+            }
+            for claim in claims {
+                if !named.iter().any(|c| c.path == claim.path) {
+                    named.push(claim);
+                }
+            }
+        }
+        named
     }
 
     /// Each claimed root's pool, from the mount table the discovery read.
@@ -3151,6 +3271,7 @@ impl crate::App {
                     };
                     panes.push(PaneFacts {
                         key,
+                        session: s.ctx.self_id.as_str().to_owned(),
                         shell_pid: shell,
                         front_pid: front,
                         report,
@@ -3190,6 +3311,32 @@ impl crate::App {
             own,
         }
     }
+}
+
+/// The board one discovery at `now` derives from `facts` with `reads`, each of `scopes`
+/// demanded at look pace: an engine with no thread, which walks nothing. Another module's
+/// tests read what a discovery names through it (`sys disk`'s).
+#[cfg(all(test, unix))]
+pub(crate) fn discovered_board(
+    facts: Facts,
+    reads: PaneReads,
+    scopes: &[DiskScope],
+    now: Instant,
+) -> Published {
+    let (_to, inbox) = std::sync::mpsc::channel();
+    let mut engine = Engine::new(inbox, Arc::default(), None);
+    engine.reads = reads;
+    engine.take_facts(facts);
+    for &scope in scopes {
+        engine.apply(ToWalker::Demand {
+            scope,
+            detail: Detail::Sizes,
+            pace: Pace::Look,
+            at: now,
+        });
+    }
+    engine.discover_if_due(now);
+    engine.published()
 }
 
 /// Unix only: the tests build scratch trees with links and modes, and on any

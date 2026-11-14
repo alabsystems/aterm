@@ -18,6 +18,12 @@ struct World {
     lock: TrustLock,
 }
 
+fn native_controller() -> PathBuf {
+    let exe = aterm_tempfile::bin_exe("atpkg-publish");
+    aterm_spec::wait::first_exec(&exe, &["__build_admit", "--capabilities"]);
+    exe
+}
+
 fn clean_compiler_environment(child: &mut aterm_uds::spawnfd::Command) {
     // Verify sets RUSTDOC for its recording pass; these children model a clean hop.
     for name in [
@@ -569,7 +575,7 @@ fn actual_native_explicit_hop_never_reselects_by_source_or_pristine_cwd() {
     let w = World::new();
     let pristine = w.root.join("pristine with no lock");
     std::fs::create_dir(&pristine).expect("pristine");
-    let exe = aterm_tempfile::bin_exe("atpkg-publish");
+    let exe = native_controller();
     let mut capability = aterm_uds::spawnfd::command(&exe);
     capability.args(["__build_admit", "--capabilities"]);
     let answer = aterm_uds::deadline::output_until_complete_stdout(
@@ -617,7 +623,7 @@ fn native_hop_checks_actual_config_and_arguments_before_compiler_birth() {
     let target = root.join("bin/targo");
     let marker = root.join("compiler-was-born");
     put_exe(&target, b"#!/bin/sh\nprintf born > \"$HOP_MARKER\"\n");
-    let exe = aterm_tempfile::bin_exe("atpkg-publish");
+    let exe = native_controller();
     let run = |args: &[&str], env: &[(&str, &str)], accepted: bool| {
         let mut child = aterm_uds::spawnfd::command(&exe);
         child

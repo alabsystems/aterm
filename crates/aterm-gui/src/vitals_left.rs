@@ -174,11 +174,6 @@ impl LeftPass {
         }
     }
 
-    /// The last view, for a reading with no sweep.
-    pub(crate) fn last(&self) -> Option<Arc<LeftView>> {
-        self.view.clone()
-    }
-
     /// The live tab a session-mate's environment ties each program that has not started to, by
     /// pid, as the last reading judged it (W-session: orphaned, born in that tab's window), with
     /// whether it was born after that tab's agent started ([`left::Tie::after_agent`]).

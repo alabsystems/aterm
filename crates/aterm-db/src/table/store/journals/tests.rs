@@ -230,14 +230,14 @@ fn after_read(journals: &Journals, hook: impl Fn(&Path) + Send + Sync + 'static)
 /// charged, which is within the bound; each table charges what it keeps; no more tables are
 /// listed than may be.
 fn accounting(journals: &Journals) -> Vec<(PathBuf, usize)> {
-    let (charged, slots) = {
+    let (charged, allocated, slots) = {
         let list = journals.list.lock().unwrap();
         let slots: Vec<_> = list
             .slots
             .iter()
-            .map(|slot| (Arc::clone(&slot.table), slot.charge))
+            .map(|slot| (Arc::clone(&slot.table), slot.charge()))
             .collect();
-        (list.charged, slots)
+        (list.charged, list.allocation_bytes(), slots)
     };
     assert!(slots.len() <= journals.tables, "within the tables kept");
     assert_eq!(
@@ -245,28 +245,37 @@ fn accounting(journals: &Journals) -> Vec<(PathBuf, usize)> {
         slots.iter().map(|(_, charge)| charge).sum::<usize>(),
         "what is charged is what the tables charge"
     );
-    assert!(charged <= journals.bytes, "within the bound");
+    assert!(
+        allocated <= journals.bytes,
+        "including the slot array capacity"
+    );
     slots
         .into_iter()
         .map(|(table, charge)| {
-            let keeps = table
-                .kept
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map_or(0, |kept| super::charge(&kept.links));
-            assert_eq!(charge, keeps, "a table charges what it keeps");
+            assert!(
+                charge + size_of::<Slot>() <= journals.journal,
+                "including inline per-entry metadata"
+            );
             (table.dir.clone(), charge)
         })
         .collect()
 }
 
-/// The folders of the tables that keep records.
+/// The folders of the tables that retain complete replay bodies.
 fn keeping(journals: &Journals) -> Vec<PathBuf> {
-    accounting(journals)
-        .into_iter()
-        .filter(|(_, charge)| *charge > 0)
-        .map(|(dir, _)| dir)
+    accounting(journals);
+    journals
+        .list
+        .lock()
+        .unwrap()
+        .slots
+        .iter()
+        .filter(|slot| {
+            slot.kept
+                .as_ref()
+                .is_some_and(|kept| kept.detached.is_none())
+        })
+        .map(|slot| slot.table.dir.clone())
         .collect()
 }
 
@@ -641,10 +650,79 @@ fn table_journal_reads_do_not_wait_for_unrelated_tables() {
     });
 }
 
+/// A paused physical reread must not withdraw immutable facts from another reader.
+/// Both readers still hash every wire and reconstruct the independently witnessed prefix.
+#[test]
+fn overlapping_physical_reads_retain_facts_and_independently_hash_wires() {
+    let journal = Journal::new(16);
+    let journals = Journals::new(4, 1 << 20, 4096);
+    let claim = whole(&journal.dir);
+    let original = journals
+        .read_at(&journal.dir, ANCHOR, limits(), hour_on())
+        .unwrap();
+    let identity = crate::crypto::payload_key_identity(&[41; 32]);
+    // Synthetic journal records exercise fact ownership, not payload authentication.
+    // Store-level regressions separately require fresh keys and historical eligibility.
+    for link in original.links.iter() {
+        link.wire.remember_non_cut(identity);
+    }
+    assert!(
+        journals.list.lock().unwrap().slots[0]
+            .kept
+            .as_ref()
+            .unwrap()
+            .detached
+            .is_some(),
+        "the fixture retains facts rather than complete bodies"
+    );
+    let (started, observed) = mpsc::channel();
+    let (release, blocked) = mpsc::channel::<()>();
+    let (started, blocked) = (Mutex::new(started), Mutex::new(blocked));
+    let first = AtomicBool::new(true);
+    before_read(&journals, move |_| {
+        if first.swap(false, Ordering::Relaxed) {
+            started.lock().unwrap().send(()).unwrap();
+            let _ = blocked.lock().unwrap().recv();
+        }
+    });
+    let dir = journal.dir.as_path();
+    let read = || {
+        let hashed = test_hashed();
+        let current = journals.read_at(dir, ANCHOR, limits(), hour_on()).unwrap();
+        let all_facts = current
+            .links
+            .iter()
+            .all(|link| link.wire.verified_non_cut(&identity));
+        let hashed = test_hashed() - hashed;
+        (all_facts, hashed, answer(current.witnessed(claim)))
+    };
+    let results = std::thread::scope(|scope| {
+        let first = scope.spawn(read);
+        observed.recv_timeout(HANG).unwrap();
+        let (completed, completion) = mpsc::channel();
+        let read = &read;
+        let second = scope.spawn(move || completed.send(read()).unwrap());
+        let result = completion.recv_timeout(HANG);
+        // Release the first read before inspecting either result, including the negative control.
+        drop(release);
+        let first = first.join().unwrap();
+        second.join().unwrap();
+        [
+            first,
+            result.expect("the overlapping reader could not finish"),
+        ]
+    });
+    for (all_facts, hashed, result) in results {
+        assert!(all_facts, "a physical reread withdrew reusable facts");
+        assert_eq!(hashed, 16, "each reader hashes its own freshly read wires");
+        assert_eq!(result, fresh(&journal.dir, claim));
+    }
+    assert_eq!(reads(&journals), 3, "neither overlapping read skips I/O");
+}
+
 /// Two asks of one table at once each read it: neither holds the table while it reads, so both
-/// reach their read before either finishes (the second finding nothing kept, the first having
-/// taken it), each answers as a fresh read does, and the table is listed once, charging what it
-/// keeps.
+/// reach their read before either finishes, each answers as a fresh read does, and the table
+/// is listed once, charging what it keeps. Neither reader withdraws the immutable snapshot.
 /// NEGATIVE CONTROL: the table's lock held from before the `before_read` hook that begins the read
 /// through it keeps the second ask from its read until the first finishes, and the wait for both
 /// fails at its hang detector.
@@ -731,8 +809,13 @@ fn kept_journals_stay_within_budget_and_yield_only_to_a_table_asked_again() {
         accounting(&scratch)[0].1
     };
     let [a, b, c, d, e, g, p, q] = [K, K, K, K, K, 3 * K, K, K].map(Journal::new);
-    let s = charge_of(&a);
-    assert_eq!(charge_of(&c), s, "the tables are alike");
+    // Temporary directory names can have different lengths. Bound the common
+    // payload case by the largest actual retained key among these fixtures.
+    let s = [&a, &b, &c, &d, &e, &p, &q]
+        .map(charge_of)
+        .into_iter()
+        .max()
+        .unwrap();
     // Room for two of them, and one of them twice over.
     let journals = Journals::new(4, 2 * s + s / 2, 2 * s);
     assert!(charge_of(&g) > 2 * s, "over the per-journal bound");
@@ -855,6 +938,49 @@ fn kept_journals_stay_within_budget_and_yield_only_to_a_table_asked_again() {
     }
 }
 
+#[test]
+fn an_unretainable_upgrade_preserves_the_old_prefix_without_answering_from_it() {
+    let journal = Journal::new(2);
+    let scratch = roomy();
+    let old_claim = whole(&journal.dir);
+    assert!(asked(&scratch, &journal.dir, old_claim, hour_on()).is_ok());
+    let old_charge = accounting(&scratch)[0].1;
+    let journals = Journals::new(
+        1,
+        old_charge + size_of::<Slot>(),
+        old_charge + size_of::<Slot>(),
+    );
+    assert!(asked(&journals, &journal.dir, old_claim, hour_on()).is_ok());
+    journal.append(80);
+    let current_claim = whole(&journal.dir);
+    let current = fresh(&journal.dir, current_claim);
+    assert!(current.is_ok());
+    for _ in 0..2 {
+        let before = reads(&journals);
+        assert_eq!(
+            asked(&journals, &journal.dir, current_claim, hour_on()),
+            current
+        );
+        assert_eq!(
+            reads(&journals) - before,
+            1,
+            "the old prefix cannot answer the changed journal"
+        );
+        assert_eq!(
+            accounting(&journals)[0].1,
+            old_charge,
+            "a refused optional upgrade preserves useful old data"
+        );
+        let list = journals.list.lock().unwrap();
+        let kept = list.slots[0]
+            .kept
+            .as_ref()
+            .expect("the original prefix remains retained");
+        assert!(kept.detached.is_none());
+        assert_eq!(kept.links.len(), 2);
+    }
+}
+
 /// A table answered from what it keeps is read again at every [`REVALIDATE`]th ask, as an ask
 /// after a change is, so a fault that moves no stamp is seen within that many asks: kept and
 /// unchanged, a read every [`REVALIDATE`] asks, each answering as before; a byte flipped in place
@@ -884,18 +1010,17 @@ fn a_kept_table_journal_is_read_again_every_revalidate_asks() {
     let refused = fresh(&dir, claim);
     assert!(refused.is_err());
     {
-        let table = journals
-            .list
-            .lock()
-            .unwrap()
+        let witnessed = JournalSeen::of(&dir, NAME);
+        let mut list = journals.list.lock().unwrap();
+        let kept = list
             .slots
-            .iter()
+            .iter_mut()
             .find(|slot| slot.table.dir == dir)
-            .map(|slot| Arc::clone(&slot.table))
+            .unwrap()
+            .kept
+            .as_mut()
             .unwrap();
-        let mut slot = table.kept.lock().unwrap();
-        let kept = slot.as_mut().unwrap();
-        kept.witnessed = JournalSeen::of(&dir, NAME);
+        kept.witnessed = witnessed;
     }
     for ask in 1..REVALIDATE {
         assert_eq!(
@@ -1068,28 +1193,28 @@ fn a_kept_table_read_holds_no_plaintext() {
             .any(|row| holds(row.payload())),
         "CONTROL: the decrypted row holds the marker"
     );
-    let table = journals
-        .list
-        .lock()
-        .unwrap()
+    let list = journals.list.lock().unwrap();
+    let kept = &list
         .slots
         .iter()
         .find(|slot| slot.table.dir == dir)
-        .map(|slot| Arc::clone(&slot.table))
-        .expect("the observed table is kept");
-    let kept = table.kept.lock().unwrap();
+        .expect("the observed table is kept")
+        .kept;
     let Some(Kept {
         prefix,
         links,
         witnessed,
         hits,
-    }) = &*kept
+        detached,
+        heap_bytes,
+    }) = kept
     else {
         panic!("the observed table keeps its read");
     };
+    assert!(detached.is_none(), "this roomy fixture retains wire bodies");
     assert!(!prefix.retains_bytes(), "the kept prefix holds no bytes");
     // An `lstat` of each path and a count.
-    let _: (&Option<JournalSeen>, &u32) = (witnessed, hits);
+    let _: (&Option<JournalSeen>, &u32, &usize) = (witnessed, hits, heap_bytes);
     assert!(!links.is_empty());
     for link in links.iter() {
         let Linked {
@@ -1101,5 +1226,106 @@ fn a_kept_table_read_holds_no_plaintext() {
         assert!(!holds(wire.wire()), "a kept wire is ciphertext");
         // A time, a flag and a count with a hash.
         let _: (&u64, &bool, &Witness) = (received_ms, conflict, through);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[path = "payload_measurement_tests.rs"]
+mod measurements;
+
+#[test]
+fn empty_metadata_slots_and_spare_slot_capacity_obey_the_real_heap_budget() {
+    let make = |budget, entries| {
+        let journals = Journals::new(32, budget, usize::MAX);
+        for entry in 0..entries {
+            let dir = PathBuf::from(format!("cache/{entry:03}/{}", "part/".repeat(400)));
+            // No journal read or payload is needed to retain a key. These
+            // allocations must be bounded even for absent or refused journals.
+            drop(journals.table(&dir, &[7; 512], limits()));
+        }
+        journals
+    };
+    // The one container lock is infrastructure, independent of entry count.
+    // Measure it instead of assuming a particular standard-library backend.
+    let empty = make(0, 1);
+    let (_, infrastructure) = aterm_heap_count::bytes_freed_in(|| drop(empty));
+    let one = make(usize::MAX, 1);
+    let (_, one_total) = aterm_heap_count::bytes_freed_in(|| drop(one));
+    let one_bytes = one_total.checked_sub(infrastructure).unwrap();
+    assert!(
+        one_bytes > 2048,
+        "CONTROL: the allocator sees the long retained key"
+    );
+    for budget in [
+        0,
+        one_bytes - 1,
+        one_bytes,
+        2 * one_bytes - 1,
+        2 * one_bytes,
+        8192,
+    ] {
+        let journals = make(budget, 64);
+        let retained = journals.list.lock().unwrap().slots.len();
+        let (_, freed) = aterm_heap_count::bytes_freed_in(|| drop(journals));
+        assert!(
+            freed <= budget + infrastructure,
+            "retained {freed} allocator bytes under entry budget {budget} and fixed container {infrastructure}"
+        );
+        assert_eq!(
+            retained,
+            budget / one_bytes,
+            "spare array capacity must not displace an entry that fits"
+        );
+    }
+}
+
+#[test]
+fn full_and_compact_replay_entries_obey_allocator_measured_byte_limits() {
+    let journal = Journal::new(8);
+    let make = |bytes, per_table| {
+        let journals = Journals::new(32, bytes, per_table);
+        drop(
+            journals
+                .read_at(&journal.dir, ANCHOR, limits(), hour_on())
+                .unwrap(),
+        );
+        journals
+    };
+    let empty = make(0, 0);
+    let (_, infrastructure) = aterm_heap_count::bytes_freed_in(|| drop(empty));
+    let full = make(usize::MAX, usize::MAX);
+    let (_, full_total) = aterm_heap_count::bytes_freed_in(|| drop(full));
+    let full_bytes = full_total.checked_sub(infrastructure).unwrap();
+    assert!(
+        full_bytes > WIRE * 8,
+        "CONTROL: complete wire allocations are counted"
+    );
+    let compact = make(usize::MAX, full_bytes / 2);
+    let (_, compact_total) = aterm_heap_count::bytes_freed_in(|| drop(compact));
+    let compact_bytes = compact_total.checked_sub(infrastructure).unwrap();
+    assert!(
+        compact_bytes > 0 && compact_bytes < full_bytes / 2,
+        "CONTROL: the compact cache retains facts without bodies"
+    );
+    for bytes in [
+        0,
+        compact_bytes - 1,
+        compact_bytes,
+        full_bytes - 1,
+        full_bytes,
+    ] {
+        for per_table in [usize::MAX, compact_bytes - 1, full_bytes - 1] {
+            let journals = make(bytes, per_table);
+            let (_, total) = aterm_heap_count::bytes_freed_in(|| drop(journals));
+            let retained = total.checked_sub(infrastructure).unwrap();
+            assert!(
+                retained <= bytes,
+                "allocator retained {retained} entry bytes under budget {bytes}"
+            );
+            assert!(
+                retained <= per_table,
+                "allocator retained {retained} entry bytes under per-table limit {per_table}"
+            );
+        }
     }
 }

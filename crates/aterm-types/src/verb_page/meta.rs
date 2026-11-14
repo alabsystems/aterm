@@ -145,8 +145,8 @@ pub(crate) const PAGE: Page = Page {
                  unset attention owner=<k>` (`<k>` in `[A-Za-z0-9._:@/-]{1,64}`, text <= 200 B, \
                  at most 8 owners with the bare `-`, else `ERR attention owners full`) lets \
                  writers track escalations apart. `kind=ask` (the default, unless the text starts \
-                 `limited:` while the harness handles the wall) counts in the menu bar (`status \
-                 needs=ask`); `kind=wait` is a record that never counts and never wakes `await \
+                 `limited:` while the harness handles the wall) is a need (`status needs=ask`: \
+                 the tab's hover, the Overview, Next That Needs You); `kind=wait` is a record that never counts and never wakes `await \
                  task`, and one written on the connection a proven claim (`supervisor_proven=1`) \
                  is bound to lapses when that claim ends or that connection closes. \
                  `attention_kinds=` lists `<ask|wait|->:<owner>`; `attention=` shows the newest \
@@ -162,7 +162,7 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "SUPERVISOR: `meta set supervisor <holder> [ttl=<1..600000>]` / `meta unset \
                      supervisor [holder=<holder>]` (Owner-only; `ERR busy supervisor=<holder>` \
-                     while another holds it) quiets menu-bar alerts while the supervisor \
+                     while another holds it) raises no need for a prompt while the supervisor \
                      handles prompts (`supervisor_proven=1`: a direct foreground \
                      `codex-alab@<pid>` connection, or a contract 3 claim).",
                 ),
@@ -204,8 +204,8 @@ pub(crate) const PAGE: Page = Page {
                      harness_held` (`OK`; `ERR denied` from anything but the session's standing \
                      proven self-claim) tell that claim's own stop, the arm of the hold that \
                      stopped its typing, or its lift: while the claim stands it is `status held=` \
-                     and the stop the Overview, the tab's hover, the Settings ▸ Harness state line \
-                     and the menu bar's worker row say in codex-alab's name, none of them while \
+                     and the stop the Overview, the tab's hover and the Settings ▸ Harness state \
+                     line say in codex-alab's name, none of them while \
                      the tab reads landed or quiet, as for aterm's own stop, and it lapses with \
                      the claim (its release or replacement, its connection's close, its process \
                      gone; the claim after a `ttl=` lapse starts with none).",
@@ -225,8 +225,8 @@ pub(crate) const PAGE: Page = Page {
                      and once a yield was judged its legs, up to four percent-encoded open words, \
                      the repository's counts and the processes its agent left running, neither \
                      ended nor kept (`left`). While the claim stands it is `status land_held= \
-                     land_nudges= land_since=`, the menu bar's `landing`, and the hold the worker \
-                     row, the Overview, the tab's hover and the Settings ▸ Harness state line say \
+                     land_nudges= land_since=`, and the hold the Overview, the tab's hover and \
+                     the Settings ▸ Harness state line say \
                      in codex-alab's name, only while the tab reads Land and neither landed nor \
                      quiet, as for aterm's own hold, and it lapses with the claim as \
                      HARNESS_HELD's stop does.",
@@ -245,10 +245,8 @@ pub(crate) const PAGE: Page = Page {
                      entry's text is never shown.",
                 ),
                 para(
-                    "While the claim stands the menu bar's row says the first need and gives the \
-                     next two a row each one level in (8 such rows in the whole menu, the rest \
-                     counted as `(+N more)`), the tab's hover a `Needs you:` line each, and \
-                     `status needs_n=` counts them and any the entry's `(+N more)` counts past the \
+                    "While the claim stands the tab's hover gives each need a `Needs you:` line, \
+                     and `status needs_n=` counts them and any the entry's `(+N more)` counts past the \
                      32 told, as for aterm's own harness's set; it lapses with the claim as \
                      HARNESS_HELD's stop does, and a codex-alab that tells none is shown by its \
                      entry's first need and count.",

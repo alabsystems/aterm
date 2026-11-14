@@ -187,6 +187,26 @@ impl ModelDef {
     }
 
     fn expand(&self) -> Result<TokenStream, Error> {
+        // Emitted operators and authored declarations share TLA+'s namespace.
+        let mut declared: HashSet<String> = ["vars", "Init", "Next", "Spec"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for name in self
+            .consts
+            .iter()
+            .map(|(name, _)| name)
+            .chain(self.vars.iter().map(|(name, _)| name))
+            .chain(self.actions.iter().map(|action| &action.name))
+            .chain(self.invariants.iter().map(|(name, _, _)| name))
+        {
+            if !declared.insert(name.to_string()) {
+                return Err(Error::new(
+                    name.span(),
+                    format!("duplicate or reserved TLA+ declaration `{name}`"),
+                ));
+            }
+        }
         let const_names: HashSet<String> =
             self.consts.iter().map(|(id, _)| id.to_string()).collect();
         let name_str = str_lit(&self.name);

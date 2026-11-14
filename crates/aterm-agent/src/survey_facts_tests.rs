@@ -101,6 +101,7 @@ fn sample_facts() -> SwarmSurveyFacts {
             ],
             cut: 0,
         }),
+        update: None,
     }
 }
 
@@ -841,6 +842,7 @@ fn a_mac_with_no_vault_says_no_token_state_on_its_account_lines() {
                 logins: &[],
                 now: env.now,
                 offers: view::OFFERED_HERE,
+                enrolled: &accounts::enrolled,
             },
             &crate::harness::accounts_tokens::Vault(aterm_secrets::client::Paths::for_home(&home)),
         )
@@ -1015,4 +1017,62 @@ fn resolve_machine_label_enforces_roster_deny_lists_and_rejects_non_canonical_va
     assert_eq!(parsed.accounts_unread, ["claude", "codex"]);
 
     running.stop();
+}
+
+/// SURVEY FACTS UPDATE (ATERM-KI-1111-23): where the updater stands crosses the wire as the
+/// `update*=` words on the `instance` header, at facts as at content, and reads back whole, so the
+/// node job's re-serialized push of a window's facts keeps it. An aterm older than the words sends
+/// none and reads as unknown (`None`); a word outside its grammar reads as nothing alone, and the
+/// rest of the facts still read.
+/// NEGATIVE CONTROL: a strict parse (an `Err` for a malformed `update*=` word) fails "the rest of
+/// the facts still read"; a header that drops the words fails the round trip.
+#[test]
+fn the_updaters_standing_crosses_the_wire_and_an_older_member_sends_none() {
+    use aterm_types::update_standing::{UpdateFact, UpdateStanding};
+    let held = UpdateFact {
+        checked_at: Some(1_793_159_400),
+        to: Some("0.199.0".to_owned()),
+        until: Some(1_793_170_000),
+        why: Some("crash-loop"),
+        tries: Some(2),
+        checks: Some(true),
+        // The reply's own `at_ms=`, which a reader takes the fact's clock from.
+        said_at: Some(1_793_160_000),
+        ..UpdateFact::of(UpdateStanding::Held)
+    };
+    let facts = SwarmSurveyFacts {
+        update: Some(held.clone()),
+        ..sample_facts()
+    };
+    let access = (aterm_types::fleet_access::FleetAccess::ReadOnly, false);
+    for content in [false, true] {
+        let wire = facts.to_survey_reply_at(content, 1, Some("m22"), 1_793_160_000_000, 1, access);
+        let header = wire.lines().nth(1).expect("an instance header");
+        assert!(
+            header.contains(" update=held update_at=1793159400 update_to=0.199.0 "),
+            "{header}"
+        );
+        let parsed = SwarmSurveyFacts::from_survey_reply(&wire).expect("valid facts");
+        assert_eq!(parsed.update.as_ref(), Some(&held), "content={content}");
+    }
+    let wire = facts.to_survey_reply(1, Some("m22"), 1_793_160_000_000, 1, access);
+    let older = wire
+        .split(' ')
+        .filter(|word| !word.starts_with("update"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_ne!(older, wire);
+    let parsed = SwarmSurveyFacts::from_survey_reply(&older).expect("an older member's facts");
+    assert_eq!(parsed.update, None, "an older member sends none");
+    assert_eq!(parsed.version, facts.version);
+
+    let soon = wire
+        .replacen(" update_at=1793159400 ", " update_at=soon ", 1)
+        .replacen(" update_why=crash-loop ", " update_why=%2FUsers%2Fx ", 1);
+    let parsed =
+        SwarmSurveyFacts::from_survey_reply(&soon).expect("the rest of the facts still read");
+    let update = parsed.update.expect("the standing still reads");
+    assert_eq!((update.checked_at, update.why), (None, None));
+    assert_eq!((update.until, update.tries), (held.until, held.tries));
+    assert_eq!(parsed.accounts, facts.accounts);
 }

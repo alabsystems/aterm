@@ -11,7 +11,7 @@ fn legacy_history_moves_only_after_its_writer_releases_it() {
     let config = root.path().join("config");
     let legacy = config.with_file_name("network-state");
     let mut observer = Observer::open(&config, handle()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     let at = Instant::now();
     observer.accounts_exchange(account_exchange::Candidate {
         observation: exchange(),
@@ -371,7 +371,7 @@ fn journal_reopen_preserves_exchange_without_renewing_contact_or_sample() {
     let at = Instant::now();
     let expected = exchange();
     let mut observer = Observer::open(&config, handle()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     observer.accounts_exchange(account_exchange::Candidate {
         observation: expected.clone(),
         sampled_at: at,
@@ -418,7 +418,7 @@ fn unchanged_account_exchanges_publish_live_and_checkpoint_periodically() {
     let at = Instant::now();
     let published = handle();
     let mut observer = Observer::open(&config, published.clone()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     observer.contact(peer(2, 1), 1000, at);
     observer.contact(peer(3, 1), 1000, at);
     let projection = |observer: &Observer| {
@@ -663,7 +663,7 @@ fn history_restores_stable_slots_but_never_live_reachability() {
     let now = Instant::now();
     let out = handle();
     let mut observer = Observer::open(&config, out.clone()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     observer.contact(peer(2, 1), 1000, now);
     observer.observe(Visibility::Active, 12, "observing", 1000, now);
     assert!(
@@ -702,7 +702,7 @@ fn history_restores_stable_slots_but_never_live_reachability() {
         Some(peer(1, 1)),
         "retain the identity guard internally"
     );
-    reopened.local(peer(1, 2), trust()).unwrap();
+    reopened.local(peer(1, 2), trust(), Vec::new).unwrap();
     assert_eq!(reopened.state.peers[0].reachability, Reachability::Unknown);
     reopened.contact(peer(2, 2), 62_000, checkpoint_at + Duration::from_secs(1));
     reopened.contact(peer(3, 1), 62_000, checkpoint_at + Duration::from_secs(1));
@@ -730,9 +730,9 @@ fn history_restores_stable_slots_but_never_live_reachability() {
     assert_eq!(restarted.snapshot().observer, None);
     assert_eq!(reopened.state.observer, Some(peer(1, 2)));
     assert_eq!(restarted.snapshot().peers.len(), 2);
-    reopened.local(peer(1, 2), trust()).unwrap();
+    reopened.local(peer(1, 2), trust(), Vec::new).unwrap();
     assert!(
-        reopened.local(peer(9, 1), trust()).is_err(),
+        reopened.local(peer(9, 1), trust(), Vec::new).is_err(),
         "another observer cannot inherit prior contacts"
     );
     reopened.publish();
@@ -740,10 +740,249 @@ fn history_restores_stable_slots_but_never_live_reachability() {
     let mut foreign = trust();
     foreign.network = [7; 16];
     assert!(
-        reopened.local(peer(1, 1), foreign).is_err(),
+        reopened.local(peer(1, 1), foreign, Vec::new).is_err(),
         "another network cannot inherit identity slots"
     );
 }
+/// An observer's history as this Mac's earlier writer seat (machine 1) left it: `peers`
+/// contacted at wall 1000, an exchanged repair round with the first of them, an account exchange
+/// retained, every transition checkpointed and the history closed. Returns its config and the
+/// instant it observed at.
+fn history_of_an_earlier_seat(root: &Path, peers: &[MachineIdentity]) -> (PathBuf, Instant) {
+    let config = root.join("config");
+    let at = Instant::now();
+    let mut observer = Observer::open(&config, handle()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
+    for contacted in peers {
+        observer.contact(contacted.clone(), 1000, at);
+    }
+    observer.repair(
+        &peers[0],
+        round(aterm_types::network_state::RepairOutcome::Exchanged, 1000),
+        at,
+    );
+    observer.accounts_exchange(account_exchange::Candidate {
+        observation: exchange(),
+        sampled_at: at,
+    });
+    observer.observe(Visibility::Active, 0, "observing", 1000, at);
+    drop(observer);
+    (config, at)
+}
+
+/// After a Commons writer succession this Mac observes as its successor seat (machine 9), and
+/// the history its earlier seat (machine 1) left is its own: an observer that confirms the new
+/// identity with machine 1 among the generations it succeeds takes that history up and observes
+/// into it, as any observer of its own history does. Its peers are this Mac's evidence of whom it
+/// heard and when, so each keeps its slot and its first and last contact; what the earlier seat's
+/// rounds made as another actor goes (each peer's repair round, the account exchange, the live
+/// contacts), so a peer reads reachable again only once this observer contacts it. A peer this
+/// observer no longer hears keeps the earlier seat's last contact, so it reads unheard once the
+/// presence window (20 minutes) has passed, as across a restart. A peer that is the successor
+/// itself leaves the list. The next run reopens the history as this observer's, and the lineage
+/// is asked only while the retained observer is another machine.
+///
+/// Negative controls: with the identity guard refusing every other machine, as before this
+/// observer could take up its own history, the successor was refused for good
+/// (`called Result::unwrap() on an Err value: Error("network observer identity differs from
+/// retained history")`), its history unavailable and every contact dropped. With `take_up`
+/// clearing the peer list (2026-11-13), the earlier seat's peers were gone (`the earlier seat's
+/// peers are kept`, `left: []`), so a peer that left before the succession was never
+/// heard again and never went unheard, and the registry import's empty-view guard read no peer
+/// as known (`alab::command::tests::a_writer_successors_import_waits_for_a_round_it_made`).
+#[test]
+fn a_writer_successor_takes_up_its_own_history() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (config, at) =
+        history_of_an_earlier_seat(root.path(), &[peer(2, 1), peer(3, 1), peer(9, 1)]);
+    let published = handle();
+    let mut successor = Observer::open(&config, published.clone()).unwrap();
+    assert_eq!(
+        successor.state.peers.len(),
+        3,
+        "PRECONDITION: the earlier seat's peers"
+    );
+    assert!(
+        successor.state.peers[0].last_repair.is_some(),
+        "PRECONDITION: the earlier seat's round"
+    );
+    let first = head(&successor);
+    successor
+        .local(peer(9, 1), trust(), || vec![[5; 16], [1; 16]])
+        .unwrap();
+    assert!(successor.accepting && successor.local_verified);
+    assert_eq!(successor.state.history, HistoryState::Ready);
+    assert_eq!(successor.state.observer, Some(peer(9, 1)));
+    assert_eq!(
+        successor
+            .state
+            .peers
+            .iter()
+            .map(|peer| (
+                peer.slot,
+                peer.identity.clone(),
+                peer.first_seen_ms,
+                peer.last_seen_ms
+            ))
+            .collect::<Vec<_>>(),
+        [(1, peer(2, 1), 1000, 1000), (2, peer(3, 1), 1000, 1000)],
+        "the earlier seat's peers are kept"
+    );
+    assert!(
+        successor
+            .state
+            .peers
+            .iter()
+            .all(|peer| peer.last_repair.is_none()),
+        "no round the earlier seat made is kept"
+    );
+    assert_eq!(successor.state.accounts_exchange, None);
+    assert!(successor.seen.is_empty() && successor.repair_sampled.is_empty());
+    // Peer 3 is heard again; peer 2 left the LAN before the succession and never is.
+    let later = at + Duration::from_secs(1);
+    successor.contact(peer(3, 1), 2000, later);
+    successor.observe(Visibility::Active, 0, "observing", 2000, later);
+    assert_eq!(head(&successor), first + 1);
+    let snapshot = published.snapshot();
+    assert_eq!(snapshot.history, HistoryState::Ready);
+    assert_eq!(snapshot.observer, Some(peer(9, 1)));
+    assert_eq!(snapshot.peers.len(), 2);
+    assert_eq!(
+        (
+            snapshot.peers[1].identity.clone(),
+            snapshot.peers[1].slot,
+            snapshot.peers[1].first_seen_ms,
+            snapshot.peers[1].last_seen_ms
+        ),
+        (peer(3, 1), 2, 1000, 2000)
+    );
+    assert_eq!(snapshot.peers[1].reachability, Reachability::Reachable);
+    assert_eq!(snapshot.peers[0].reachability, Reachability::LastSeen);
+    assert_eq!(snapshot.accounts_exchange, None);
+    let window = Duration::from_secs(20 * 60);
+    let past = 2000 + u64::try_from(window.as_millis()).unwrap() + 1000;
+    successor.contact(peer(3, 1), past, later + window);
+    successor.observe(Visibility::Active, 0, "observing", past, later + window);
+    let snapshot = published.snapshot();
+    assert_eq!(snapshot.observer, Some(peer(9, 1)), "a confirmed observer");
+    assert_eq!(snapshot.visibility, Visibility::Active);
+    assert_eq!(
+        snapshot.peers[0].last_seen_ms, 1000,
+        "the departed peer keeps the earlier seat's last contact"
+    );
+    assert!(
+        Duration::from_millis(snapshot.observed_at_ms - snapshot.peers[0].last_seen_ms) > window,
+        "the departed peer reads unheard past the presence window"
+    );
+    assert_eq!(snapshot.peers[1].last_seen_ms, past);
+    drop(successor);
+    let mut reopened = Observer::open(&config, handle()).unwrap();
+    assert_eq!(reopened.state.observer, Some(peer(9, 1)));
+    assert_eq!(reopened.state.peers.len(), 2);
+    reopened
+        .local(peer(9, 1), trust(), || {
+            panic!("its own retained history asks no lineage")
+        })
+        .unwrap();
+    assert_eq!(reopened.state.history, HistoryState::Ready);
+}
+
+/// A machine that is not among the generations this home succeeds gets no history another
+/// machine observed, whatever lineage it names: it is refused as before, the history
+/// unavailable, its peers and rounds kept for their own observer and no contact taken into it.
+/// A later confirmation whose lineage proves the succession takes it up.
+///
+/// Negative control: with the lineage ignored, so any other machine took the history up, the
+/// stranger was accepted (`a stranger took up another observer's history`). With every other
+/// machine refused, the last confirmation was (`called Result::unwrap() on an Err value:
+/// Error("network observer identity differs from retained history")`).
+#[test]
+fn a_stranger_cannot_take_up_another_observers_history() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (config, at) = history_of_an_earlier_seat(root.path(), &[peer(2, 1), peer(3, 1)]);
+    let published = handle();
+    let mut observer = Observer::open(&config, published.clone()).unwrap();
+    for lineage in [Vec::new(), vec![[7; 16]], vec![[9; 16]]] {
+        assert!(
+            observer.local(peer(9, 1), trust(), || lineage).is_err(),
+            "a stranger took up another observer's history"
+        );
+        assert!(!observer.accepting);
+        assert_eq!(observer.state.history, HistoryState::Unavailable);
+        assert_eq!(observer.state.observer, Some(peer(1, 1)));
+        assert_eq!(observer.state.peers.len(), 2);
+        assert!(observer.state.peers[0].last_repair.is_some());
+        assert!(observer.state.accounts_exchange.is_some());
+    }
+    let later = at + Duration::from_secs(1);
+    observer.contact(peer(4, 1), 2000, later);
+    observer.observe(Visibility::Active, 0, "observing", 2000, later);
+    let snapshot = published.snapshot();
+    assert_eq!(snapshot.history, HistoryState::Unavailable);
+    assert_eq!(snapshot.observer, None);
+    assert_eq!(snapshot.peers.len(), 2, "no contact is taken into it");
+    assert!(
+        snapshot
+            .peers
+            .iter()
+            .all(|peer| peer.reachability == Reachability::Unknown)
+    );
+    observer
+        .local(peer(9, 1), trust(), || vec![[1; 16]])
+        .unwrap();
+    assert_eq!(observer.state.history, HistoryState::Ready);
+    assert_eq!(observer.state.peers.len(), 2);
+    assert!(observer.state.peers[0].last_repair.is_none());
+}
+
+/// An observer whose checkpoint failed (a journal or projection write, as on a full disk) stays
+/// unable to keep its history for its lifetime, yet it still takes every authenticated contact,
+/// and its publication keeps naming the observer it confirmed: its peers' last contacts stay
+/// current, so a peer that stops being heard goes unheard by them while one still heard does not.
+/// What account claims read presence from (the named observer) is therefore still here, unlike
+/// an observer that refused its history or never confirmed this Mac, whose publication names
+/// none (`a_stranger_cannot_take_up_another_observers_history`).
+///
+/// Negative control: with `checkpoint`'s failure also stopping contacts (`accepting` cleared), the
+/// heard peer's last contact stood still (`left: Some(1000)`, `right: Some(1500000)`).
+#[test]
+fn a_failed_checkpoint_keeps_hearing_peers_and_naming_its_observer() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let at = Instant::now();
+    let published = handle();
+    let mut observer = Observer::open(&config, published.clone()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
+    observer.contact(peer(2, 1), 1000, at);
+    observer.contact(peer(3, 1), 1000, at);
+    observer.observe(Visibility::Active, 0, "observing", 1000, at);
+    // The projection can no longer be replaced: the next checkpoint fails.
+    let projection = directory(&config).join("projection.json");
+    std::fs::remove_file(&projection).unwrap();
+    std::fs::create_dir(&projection).unwrap();
+    std::fs::write(projection.join("held"), b"").unwrap();
+    let failed = at + CHECKPOINT;
+    observer.observe(Visibility::Active, 0, "observing", 61_000, failed);
+    assert!(observer.poisoned, "PRECONDITION: the checkpoint failed");
+    // Peer 2 is heard after the failure; peer 3 is not.
+    let later = failed + Duration::from_secs(1);
+    observer.contact(peer(2, 1), 1_500_000, later);
+    observer.observe(Visibility::Active, 0, "observing", 1_500_000, later);
+    let snapshot = published.snapshot();
+    assert_eq!(snapshot.history, HistoryState::Unavailable);
+    assert_eq!(snapshot.visibility, Visibility::Active);
+    assert_eq!(snapshot.observer, Some(peer(1, 1)));
+    let last_seen = |snapshot: &NetworkObservation, n: u8| {
+        snapshot
+            .peers
+            .iter()
+            .find(|p| p.identity == peer(n, 1))
+            .map(|p| p.last_seen_ms)
+    };
+    assert_eq!(last_seen(&snapshot, 2), Some(1_500_000));
+    assert_eq!(last_seen(&snapshot, 3), Some(1000));
+}
+
 #[test]
 fn wall_time_jump_and_unavailable_observer_withdraw_current_claims() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -922,7 +1161,7 @@ fn unavailable_storage_keeps_network_health_independent_without_rebuilding_histo
 /// checkpoint written at `at`.
 fn observing(config: &Path, at: Instant) -> Observer {
     let mut observer = Observer::open(config, handle()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     observer.observe(Visibility::Active, 0, "observing", 1000, at);
     observer
 }
@@ -957,7 +1196,7 @@ fn transitions_inside_one_settle_interval_make_one_checkpoint() {
     let at = Instant::now();
     let published = handle();
     let mut observer = Observer::open(&config, published.clone()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     observer.observe(Visibility::Active, 0, "observing", 1000, at);
     let first = head(&observer);
     let first_projection = projection_bytes(&config);
@@ -1014,7 +1253,7 @@ fn own_identity_and_trust_are_checkpointed_without_waiting() {
     let mut observer = Observer::open(&config, handle()).unwrap();
     observer.observe(Visibility::Active, 0, "observing", 1000, at);
     let first = head(&observer);
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     observer.observe(
         Visibility::Active,
         0,
@@ -1024,7 +1263,7 @@ fn own_identity_and_trust_are_checkpointed_without_waiting() {
     );
     assert_eq!(head(&observer), first + 1);
     // This Mac's next incarnation, with its trust context unchanged.
-    observer.local(peer(1, 2), trust()).unwrap();
+    observer.local(peer(1, 2), trust(), Vec::new).unwrap();
     observer.observe(
         Visibility::Active,
         0,
@@ -1038,7 +1277,7 @@ fn own_identity_and_trust_are_checkpointed_without_waiting() {
     drop(observer);
     let mut reopened = Observer::open(&config, handle()).unwrap();
     assert_eq!(reopened.state.observer, Some(peer(1, 2)));
-    assert!(reopened.local(peer(9, 1), trust()).is_err());
+    assert!(reopened.local(peer(9, 1), trust(), Vec::new).is_err());
 }
 
 #[test]
@@ -1052,7 +1291,7 @@ fn a_steady_contact_cadence_makes_no_reachability_transition() {
     let at = Instant::now();
     let published = handle();
     let mut observer = Observer::open(&config, published.clone()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     observer.contact(peer(2, 1), 1000, at);
     tick(&mut observer, at, 0, PERIOD - 1);
     // The first gap is past the lease of a peer not yet measured: a candidate. The second
@@ -1228,7 +1467,7 @@ fn an_absence_does_not_lengthen_the_lease() {
     let config = root.path().join("config");
     let published = handle();
     let mut observer = Observer::open(&config, published.clone()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     let contact = |observer: &mut Observer, second: u64| {
         observer.contact(peer(2, 1), 1000 + second * 1000, at + secs(second));
         tick(observer, at, second, second);
@@ -1403,7 +1642,7 @@ fn a_crash_loses_at_most_the_settle_interval_and_a_drop_loses_nothing() {
         "the projection is that same checkpoint"
     );
     // The same transition again, and this time the observer is dropped: it is written.
-    reopened.local(peer(1, 1), trust()).unwrap();
+    reopened.local(peer(1, 1), trust(), Vec::new).unwrap();
     let later = at + SETTLE + Duration::from_secs(100);
     reopened.observe(Visibility::Active, 0, "observing", 200_000, later);
     let before = head(&reopened);
@@ -1474,7 +1713,7 @@ fn a_history_is_closed_only_by_its_observers_drop() {
     // without dropping its observer.
     let later = at + Duration::from_secs(1000);
     let mut observer = Observer::open(&config, handle()).unwrap();
-    observer.local(peer(1, 1), trust()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     observer.observe(Visibility::Active, 0, "observing", 1_000_000, later);
     let written = head(&observer);
     observer.repair(

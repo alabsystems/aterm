@@ -663,7 +663,29 @@ fn capture_progress(
     window: Duration,
     waiting_on: String,
     stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
+    stopped: Option<&mut dyn FnMut() -> bool>,
+) -> Result<Output, CompleteProgressError> {
+    let mut probe = ProcessProgressProbe::default();
+    capture_progress_with(
+        cmd,
+        window,
+        waiting_on,
+        stdout_reader,
+        stopped,
+        &mut deadline_now,
+        &mut |pid| probe.read(pid),
+    )
+}
+
+/// [`capture_progress`] on the clock `now`, reading the child's tree through `work`.
+fn capture_progress_with(
+    cmd: &mut Command,
+    window: Duration,
+    waiting_on: String,
+    stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
     mut stopped: Option<&mut dyn FnMut() -> bool>,
+    now: &mut dyn FnMut() -> Instant,
+    work: &mut dyn FnMut(u32) -> Option<u64>,
 ) -> Result<Output, CompleteProgressError> {
     #[cfg(unix)]
     cmd.process_group(0);
@@ -675,9 +697,7 @@ fn capture_progress(
         .map_err(|error| CompleteOutputError::Run(RunError::Spawn(error)))?;
     let owned = CaptureGuard { child: &mut child };
     let mut reaped = false;
-    let mut progress = ProgressWindow::new(window, deadline_now());
-    let mut probe = ProcessProgressProbe::default();
-    let mut left = |pid, bytes| progress.remaining(deadline_now(), bytes, probe.read(pid));
+    let mut left = ProgressWindow::collector(window, now, work);
     let mut timed_out = || RunError::TimedOut;
     let can_stop = stopped.is_some();
     let cancelled = std::cell::Cell::new(false);
@@ -746,7 +766,7 @@ fn collect_started_with(
     stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
     reaped: &mut bool,
     stopped: &mut Option<&mut dyn FnMut() -> bool>,
-    left: &mut dyn FnMut(u32, u64) -> Duration,
+    left: &mut dyn FnMut(Option<u32>, u64) -> Duration,
     overrun: &mut dyn FnMut() -> RunError,
     stderr_capture: StderrCapture,
 ) -> Result<Output, CompleteOutputError> {
@@ -781,7 +801,7 @@ fn collect_started_with(
                 break status;
             }
             Ok(None) => {
-                let remaining = left(child.id(), captured(&stdout, &stderr));
+                let remaining = left(Some(child.id()), captured(&stdout, &stderr));
                 if remaining.is_zero() {
                     return Err(CompleteOutputError::Run(overrun()));
                 }
@@ -798,10 +818,7 @@ fn collect_started_with(
     };
     let grace = Grace {
         by: Instant::now() + DRAIN_GRACE,
-        until: super::saturating_after(
-            Instant::now(),
-            left(child.id(), captured(&stdout, &stderr)),
-        ),
+        until: super::saturating_after(Instant::now(), left(None, captured(&stdout, &stderr))),
         group: Some(child.id()),
     };
     let stdout = stdout.collect_unless(&grace, stopped)?;
@@ -921,10 +938,14 @@ impl CompleteDrain {
             super::receive_unless(&self.ended, wait, stopped).map_err(CompleteOutputError::Run)
         };
         let ended = match receive(grace.by.saturating_duration_since(Instant::now()), stopped)? {
-            Err(mpsc::RecvTimeoutError::Timeout) => match grace.read_on(self.pipe.as_ref()) {
-                Some(wait) => receive(wait, stopped)?,
-                None => Err(mpsc::RecvTimeoutError::Timeout),
-            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A live group can close its writer before the caller's budget ends.
+                // The short diagnostic-tail grace cannot establish incomplete protocol data.
+                let wait = grace
+                    .read_on(self.pipe.as_ref())
+                    .unwrap_or_else(|| grace.until.saturating_duration_since(Instant::now()));
+                receive(wait, stopped)?
+            }
             ended => ended,
         };
         ended.map_err(|_| CompleteOutputError::StdoutIncomplete)?

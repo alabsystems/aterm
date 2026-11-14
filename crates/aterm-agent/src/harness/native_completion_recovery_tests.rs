@@ -515,9 +515,13 @@ fn a_saved_completion_needs_no_host_and_survives_its_original_deadline() {
             let key = format!("renewal-{}", expected.id);
             upgrade_drive::save_checked(&options, &key, &state).unwrap();
             assert!(codex_renewal::prepare_restart(&options, SID, &expected).is_ok());
+            let resume_only = |options: &Opts, sid: &str, expected: &Prepare| {
+                codex_renewal::drive_resume_only(options, sid, expected, ImagePhase::Forward)
+            };
             for drive in [
-                codex_renewal::drive_restart,
-                codex_renewal::drive_resume_only,
+                &codex_renewal::drive_restart
+                    as &dyn Fn(&Opts, &str, &Prepare) -> Option<RestartCompletion>,
+                &resume_only,
             ] {
                 let returned = drive(&options, SID, &expected).unwrap();
                 assert_eq!(matches!(returned, RestartCompletion::Rollback(_)), rollback);
@@ -590,7 +594,9 @@ fn completion_without_an_observation_is_saved_and_never_replayed() {
     assert!(saved.native_observation.is_none());
     assert!(saved.native.is_none() && saved.native_prepare.is_empty());
     assert!(codex_renewal::drive_restart(&options, SID, &expected).is_none());
-    assert!(codex_renewal::drive_resume_only(&options, SID, &expected).is_none());
+    assert!(
+        codex_renewal::drive_resume_only(&options, SID, &expected, ImagePhase::Forward).is_none()
+    );
     assert!(codex_renewal::completed_restart(&options, SID, &expected).is_none());
 }
 

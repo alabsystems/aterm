@@ -581,11 +581,18 @@ fn owned_fd_stays_open_until_last_clone_drops() {
         5
     );
 
+    let native = clone.owned_master().expect("sink owns the descriptor");
+    assert_eq!(native.as_raw_fd(), clone.master(), "no duplicated master");
+    assert_eq!(
+        aterm_pty::write_some(native.as_raw_fd(), b"borrow").unwrap(),
+        6
+    );
+
     drop(clone);
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).expect("read_to_end");
     assert_eq!(
-        &buf, b"alive",
+        &buf, b"aliveborrow",
         "peer got the bytes then EOF — fd closed on last clone drop"
     );
 }
@@ -863,4 +870,18 @@ fn contended_nonparking_write_concedes_within_a_bounded_spin() {
     let mut buf = [0u8; 4];
     let n = reader.read(&mut buf).expect("read");
     assert_eq!(&buf[..n], b"K");
+}
+
+#[test]
+fn a_borrowed_sink_cannot_supply_an_owned_descriptor_borrow() {
+    let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let sink = SinkWriter::new(writer.as_raw_fd());
+    assert!(sink.owned_master().is_none());
+    drop(writer);
+    let mut byte = [0];
+    assert_eq!(
+        reader.read(&mut byte).unwrap(),
+        0,
+        "sink did not retain the descriptor"
+    );
 }

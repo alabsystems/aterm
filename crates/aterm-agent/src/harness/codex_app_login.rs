@@ -43,6 +43,8 @@ pub(super) use enrollment_artifact_bridge::{
 mod code_rejection;
 #[path = "codex_app_login_refresh_transport.rs"]
 mod refresh_transport;
+#[path = "codex_app_login_refusal.rs"]
+mod refusal;
 pub(in crate::harness) use code_rejection::{
     CodeRejection, MAX_REJECTION_BODY, is_definitive_code_rejection,
 };
@@ -54,6 +56,12 @@ pub(in crate::harness) use refresh_transport::with_refresh_fixture_endpoint;
 pub(in crate::harness) use refresh_transport::{
     ReceivedRefresh, RefreshExchange, exchange_owned_refresh, merge_owned_refresh,
     owned_refresh_refusal_settled_at, owned_refresh_refused, owned_refresh_token_digest,
+};
+#[cfg(any(test, debug_assertions))]
+pub use refusal::record_refusal_for_test;
+pub use refusal::{
+    OtherRefusal, RefusalReason, RefusalStanding, refusal_standing, row_refusal,
+    row_signed_out_reason, settled_refusal,
 };
 
 /// Per-account credential file inside a Codex login directory (`CODEX_AUTH_PATH`).
@@ -712,6 +720,9 @@ enum RefreshJournal {
         /// When the issuer refused it (Unix seconds). Absent in a journal written before the
         /// refusal was dated, which is read as long settled ([`refusal_settled`]).
         at: Option<i64>,
+        /// Why, as one closed word ([`RefusalReason`]): a journal written before the reason was
+        /// kept, or one naming a word outside the set, reads [`RefusalReason::UNKNOWN`].
+        reason: RefusalReason,
     },
     Response {
         base: String,
@@ -1038,11 +1049,12 @@ impl RefreshJournal {
                 "state": "attempted",
                 "refresh_token_digest": token,
             }),
-            Self::Rejected { token, at } => {
+            Self::Rejected { token, at, reason } => {
                 let mut doc = json!({
                     "aterm_codex_refresh": 2,
                     "state": "rejected",
                     "refresh_token_digest": token,
+                    "reason": reason.code(),
                 });
                 if let (Some(at), Some(doc)) = (at, doc.as_object_mut()) {
                     doc.insert("rejected_at".into(), json!(at));
@@ -1119,6 +1131,10 @@ impl RefreshJournal {
                     "rejected" => Some(Self::Rejected {
                         token: token?,
                         at: value.get("rejected_at").and_then(Value::as_i64),
+                        reason: value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map_or(RefusalReason::UNKNOWN, RefusalReason::of_code),
                     }),
                     _ => None,
                 };
@@ -1640,7 +1656,8 @@ enum Refreshed {
     Done(Box<StoredAuth>),
     /// The provider refused the refresh token for good (codex-alab's rule: a `401`, an
     /// `invalid_grant` `400`, or `refresh_token_expired`, `refresh_token_reused` or
-    /// `refresh_token_invalidated`): the login is signed out until it signs in again.
+    /// `refresh_token_invalidated`): the login is signed out until it signs in again. Its journal
+    /// keeps why, as one closed word ([`RefusalReason`]).
     Rejected,
     /// Nothing is known: no request was sent, the network, a timeout, another answer, or a
     /// response that could not be published (kept in the journal then, [`RefreshJournal`]).
@@ -1859,6 +1876,7 @@ fn refresh_admitted(
             let _ = (RefreshJournal::Rejected {
                 token,
                 at: Some(now),
+                reason: RefusalReason::of_answer(resp.body()),
             })
             .write(home);
             Refreshed::Rejected
@@ -2663,11 +2681,10 @@ fn refusal_settled(home: &Path, stored: &StoredAuth, now: i64) -> bool {
     let Some(held) = stored.refresh_token.as_deref().map(refresh_token_digest) else {
         return false;
     };
-    let hang = i64::try_from(ROTATION_HANG.as_secs()).unwrap_or(i64::MAX);
     matches!(
         RefreshJournal::read(home),
-        Ok(Some(RefreshJournal::Rejected { token, at }))
-            if token == held && at.is_none_or(|at| now.saturating_sub(at) >= hang)
+        Ok(Some(RefreshJournal::Rejected { token, at, .. }))
+            if token == held && refusal::settled(at, now)
     )
 }
 

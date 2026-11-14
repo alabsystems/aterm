@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 35, "0.35");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 36, "0.36");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]

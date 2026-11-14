@@ -41,10 +41,6 @@ use crate::identity::{Credential, EnvSource, Profile, TokenKind, tilde};
 use crate::identity::{LoadError, Source};
 use crate::policy::{RefusalCode, Router, Tier};
 
-/// The dev token the vault writes, under the home directory.
-pub const DEV_TOKEN_FILE: &str = ".secrets/gh_access_token";
-/// The release token the vault writes for the public owner, under the home directory.
-pub const RELEASE_TOKEN_FILE: &str = ".secrets/gh_access_token_alabsystems";
 /// The adoption record, in `Dirs::config`.
 pub const RECORD_FILE: &str = "vault.toml";
 /// The lock the record is written under, in `Dirs::config`: adoption's own, so a read that
@@ -65,10 +61,43 @@ const ONE_TOKEN: &str = "L7: the vault's dev and release files hold one token, s
 #[must_use]
 pub fn pair_next() -> String {
     format!(
-        "aterm secrets sync applies the vault's current tokens: agh routes neither until ~/{} is \
-         the dev tier's token and ~/{} the release login's",
-        DEV_TOKEN_FILE, RELEASE_TOKEN_FILE
+        "aterm secrets sync applies the vault's current tokens: agh routes neither until {} is \
+         the dev tier's token and {} the release login's",
+        Slot::Dev.pointer(),
+        Slot::Release.pointer()
     )
+}
+
+/// The step for an owner no token agh routes writes: its token is a vault entry, which
+/// `aterm secrets need entry:NAME` asks the lab's Macs for, and an agh.toml row routes the file
+/// it lands in. `name` is the entry and the profile (`NAME` when unknown); `tier` the row's.
+#[must_use]
+pub fn owner_step(owner: &str, name: &str, tier: &str) -> String {
+    format!(
+        "aterm secrets need entry:{name} asks the lab's Macs for a token that writes {owner}; agh \
+         auth add {name} --file {} --tier {tier} --owner {owner} --write routes it",
+        aterm_types::vault_entry::plain_entry_pointer(name)
+    )
+}
+
+/// The step for profile `profile`'s token when its file is absent: a vault slot's
+/// [`Slot::sync_step`], else, for a file the vault lands (`~/.secrets/NAME`), `aterm secrets
+/// need entry:NAME`; `None` for a token the vault does not hold.
+#[must_use]
+pub fn absent_step(profile: &Profile) -> Option<String> {
+    let crate::identity::Source::File(path) = &profile.source else {
+        return None;
+    };
+    if let Some(slot) = Slot::ALL
+        .into_iter()
+        .find(|slot| path.ends_with(slot.path(Path::new(""))))
+    {
+        return Some(slot.sync_step());
+    }
+    let name = path.file_name()?.to_str()?;
+    path.parent()
+        .is_some_and(|dir| dir.ends_with(aterm_types::vault_entry::SECRETS_DIR))
+        .then(|| format!("aterm secrets need entry:{name} asks the lab's Macs for it"))
 }
 
 /// One of the vault's two tokens.
@@ -108,19 +137,25 @@ impl Slot {
         }
     }
 
-    /// Its file, relative to the home directory.
+    /// The vault entry it is (`aterm_types::vault_entry`, the names aterm-secrets classes).
     #[must_use]
-    pub const fn file(self) -> &'static str {
+    pub const fn entry(self) -> &'static str {
         match self {
-            Slot::Dev => DEV_TOKEN_FILE,
-            Slot::Release => RELEASE_TOKEN_FILE,
+            Slot::Dev => aterm_types::vault_entry::DEV_GH_TOKEN,
+            Slot::Release => aterm_types::vault_entry::RELEASE_GH_TOKEN,
         }
     }
 
-    /// Its file under `home`.
+    /// Its file under `home`: where the vault's subscriber lands its entry.
     #[must_use]
     pub fn path(self, home: &Path) -> PathBuf {
-        home.join(self.file())
+        aterm_types::vault_entry::plain_entry_path(home, self.entry())
+    }
+
+    /// Its file as `~/…`, the spelling the secrets registry's pointer gives.
+    #[must_use]
+    pub fn pointer(self) -> String {
+        aterm_types::vault_entry::plain_entry_pointer(self.entry())
     }
 
     /// The other slot.
@@ -146,9 +181,9 @@ impl Slot {
     #[must_use]
     pub fn sync_step(self) -> String {
         format!(
-            "aterm secrets sync writes ~/{} from the vault, else aterm secrets need {} asks the \
+            "aterm secrets sync writes {} from the vault, else aterm secrets need {} asks the \
              lab's Macs for it",
-            self.file(),
+            self.pointer(),
             self.want()
         )
     }
@@ -352,8 +387,8 @@ impl Adoption {
     /// `sync_step`, never an agh.toml edit; an owner with no writer or no reader
     /// left is the public owner's release file's (`~/.secrets/gh_access_token_alabsystems`) or
     /// the dev token's (its `sync_step` when absent, else its found-and-not-routed step), and
-    /// with no agh.toml, an owner the adopted dev token does not write is a profile of its own
-    /// (`agh auth add`), since there is no row to edit. `None` keeps the error's.
+    /// with no agh.toml, an owner the adopted dev token does not write is [`owner_step`]'s, since
+    /// there is no row to edit. `None` keeps the error's.
     #[must_use]
     pub fn next_for(&self, error: &Error) -> Option<String> {
         if error.kind == Kind::Unauthenticated
@@ -381,10 +416,7 @@ impl Adoption {
             Some(Vaulted {
                 found: Found::Adopted { .. },
                 ..
-            }) => Some(format!(
-                "agh auth add NAME --file PATH --tier dev|external --owner {owner} --write, with \
-                 a NAME other than dev or release: its rows join the vault's"
-            )),
+            }) => Some(owner_step(owner, "NAME", "dev|external")),
             _ => self.slot_step(Slot::Dev),
         }
     }
@@ -636,9 +668,9 @@ fn faulted_next(slot: Slot, joined: bool) -> String {
         )
     } else {
         format!(
-            "~/{} is not used until it holds a {} tier token of its own login: aterm secrets \
-             sync applies the vault's current tokens",
-            slot.file(),
+            "{} is not used until it holds a {} tier token of its own login: aterm secrets sync \
+             applies the vault's current tokens",
+            slot.pointer(),
             slot.tier().slug()
         )
     }
@@ -739,7 +771,7 @@ fn rows_of(vaulted: &[Vaulted], keep: &[Slot]) -> AghConfig {
         config.profiles.insert(
             name.to_string(),
             ProfileRow {
-                token_file: Some(format!("~/{}", v.slot.file())),
+                token_file: Some(v.slot.pointer()),
                 tier: v.slot.tier().slug().to_string(),
                 login: Some(login.clone()),
                 drafts_fp: Some(fingerprint.clone()),
@@ -845,7 +877,7 @@ pub(crate) fn any_file(dirs: &Dirs) -> bool {
 pub fn names_vault_path(path: &Path) -> bool {
     Slot::ALL
         .into_iter()
-        .any(|slot| path.ends_with(slot.file()))
+        .any(|slot| path.ends_with(slot.path(Path::new(""))))
 }
 
 /// Whether `file` is one of the vault's two token files, as named or once both resolve.
@@ -1071,10 +1103,9 @@ fn unlearned_names(vaulted: &[Vaulted]) -> String {
 #[cfg(unix)]
 fn misplaced_token(slot: Slot) -> String {
     format!(
-        "L7: ~/{} holds the token agh recorded for ~/{}, so its tier is unknown and neither \
-         routes",
-        slot.file(),
-        slot.other().file()
+        "L7: {} holds the token agh recorded for {}, so its tier is unknown and neither routes",
+        slot.pointer(),
+        slot.other().pointer()
     )
 }
 

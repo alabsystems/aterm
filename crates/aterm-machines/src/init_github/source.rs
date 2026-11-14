@@ -5,7 +5,7 @@
 //! its selected credential and default inventory, so unrelated init settings do not stop work.
 //! Readiness observation also tracks the actual admitted Git command and payload.
 
-use super::{Asked, Github, INPUT_MAX, TOKEN_FILE, asked, decode, inventory, profile, read_token};
+use super::{Asked, Github, INPUT_MAX, asked, decode, inventory, profile, read_token, token_file};
 use crate::model::User;
 use crate::port::{OwnedFileMetadata, Stat, System};
 use aterm_secrets::converge::{
@@ -484,7 +484,7 @@ fn selected_paths(profile: Result<Option<super::Config>, String>, user: &User) -
     let mut paths = Vec::new();
     match profile.and_then(|profile| asked(profile.and_then(|p| p.github), user)) {
         Ok(Asked::Default) => {
-            paths.push(home.join(TOKEN_FILE));
+            paths.push(token_file(home));
             paths.push(inventory::file(&user.home));
         }
         Ok(Asked::Scoped(source) | Asked::Profile(source)) => paths.push(source.token_file),
@@ -588,7 +588,7 @@ impl Stamp {
                 Github {
                     account: String::new(),
                     owner: String::new(),
-                    token_file: Path::new(&user.home).join(TOKEN_FILE),
+                    token_file: token_file(Path::new(&user.home)),
                     token_key: None,
                 },
                 true,

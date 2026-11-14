@@ -301,6 +301,34 @@ fn the_places_kind_is_netplaces_own() {
     assert_eq!(place_kind(&checking), PlaceKind::Checking);
 }
 
+/// The menu-bar menu's first line names the internet only where it was measured down: an
+/// internet that answers, one nothing measured yet and one nothing says anything of add no
+/// word to the place. NEGATIVE CONTROL: naming every state but `Ok` gives a Mac that has just
+/// started `internet unknown` in its menu.
+#[test]
+fn the_identity_line_names_the_internet_only_where_it_is_down() {
+    use aterm_netplace::InternetState;
+    let mut place = aterm_netplace::sample::home(SINCE_MS, 4);
+    let at = words::where_words(&place);
+    for state in [
+        InternetState::Ok,
+        InternetState::PathUp,
+        InternetState::Unknown,
+    ] {
+        place.internet.state = state;
+        assert_eq!(identity_words_of(&place), at, "{state:?}");
+    }
+    place.internet.state = InternetState::Down;
+    let down = identity_words_of(&place);
+    assert_eq!(
+        down.strip_prefix(at.as_str())
+            .map(|rest| rest.ends_with(words::internet_short(&place))),
+        Some(true),
+        "{down}"
+    );
+    assert_ne!(down, at);
+}
+
 /// With a current, history-ready observer, the network band leads with the place away from the
 /// ALab LAN (`Away from ALab LAN · phone
 /// hotspot · 41 known`, short `Away · hotspot`), and on the ALab LAN, before any place was read,

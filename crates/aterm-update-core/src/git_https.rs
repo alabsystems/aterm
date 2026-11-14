@@ -241,7 +241,7 @@ fn observe_trace(path: &Path) -> GitObservation {
     const KEEP: u64 = 256 * 1024;
     let mut bytes = Vec::new();
     let read = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::open(path)?;
+        let (mut file, _) = aterm_uds::regular_file::open(path)?;
         let len = file.metadata()?.len();
         if len > KEEP {
             file.seek(SeekFrom::Start(len - KEEP))?;

@@ -1607,17 +1607,13 @@ fn systemctl() -> crate::Result<PathBuf> {
     systemctl_path(&SYSTEMCTL_PATHS, &|path| path.is_file())
 }
 
-/// Refuses an unresolved account home or a `home` that is not `account`.
-pub fn own_home(home: &Path, account: Option<&Path>) -> crate::Result<()> {
-    let Some(account) = account else {
-        return Err(Error::new(
-            "cannot resolve this login's account home for a per-login service",
-        ));
-    };
+/// Whether `a` and `b` name one folder: one device and inode where both can be read (so a
+/// symlinked or differently spelled home is the same one), else one canonical path.
+pub(crate) fn one_folder(a: &Path, b: &Path) -> bool {
     #[cfg(unix)]
     let same = {
         use std::os::unix::fs::MetadataExt as _;
-        match (std::fs::metadata(home), std::fs::metadata(account)) {
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
             (Ok(a), Ok(b)) => Some((a.dev(), a.ino()) == (b.dev(), b.ino())),
             _ => None,
         }
@@ -1625,7 +1621,17 @@ pub fn own_home(home: &Path, account: Option<&Path>) -> crate::Result<()> {
     #[cfg(not(unix))]
     let same = None;
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if same.unwrap_or_else(|| canonical(home) == canonical(account)) {
+    same.unwrap_or_else(|| canonical(a) == canonical(b))
+}
+
+/// Refuses an unresolved account home or a `home` that is not `account`.
+pub fn own_home(home: &Path, account: Option<&Path>) -> crate::Result<()> {
+    let Some(account) = account else {
+        return Err(Error::new(
+            "cannot resolve this login's account home for a per-login service",
+        ));
+    };
+    if one_folder(home, account) {
         return Ok(());
     }
     Err(Error::new(format!(

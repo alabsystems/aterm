@@ -854,3 +854,240 @@ fn typed_claim_readiness_refines_live_state_and_rejects_history_as_admission() {
     assert!(!model.check_invariant("Published", &state));
     assert!(!model.check_invariant("Confirmed", &state));
 }
+
+/// Account closure is opaque: it ends custody, never licenses another candidate.
+#[test]
+fn typed_account_close_releases_custody_and_replays_the_existing_terminal_seal() {
+    for (case, phase, used) in [
+        (0, ImagePhase::Forward, false),
+        (1, ImagePhase::Rollback, false),
+        (2, ImagePhase::Forward, true),
+        (3, ImagePhase::Rollback, true),
+    ] {
+        let mut w = world(8890 + case, phase);
+        let _home = attach_journal(&mut w);
+        let relation = relation(&w, phase, "fa");
+        let binding = claimed(claim(&w, &relation), ChildState::Prepared);
+        // A fresh cohort read is unavailable after admission. Closure must not
+        // manufacture a NoExec witness merely because the deadline passed.
+        let NativePlan::Restart { process, .. } = &w.original.plan else {
+            unreachable!()
+        };
+        w.facts
+            .group_observations
+            .lock()
+            .unwrap()
+            .insert(process.group, None);
+        let child = lookup(&w.handle.ctx, &binding).unwrap();
+        let guard = {
+            let mut op = child.lock().unwrap();
+            if used {
+                op.grant_record = GrantRecord::Recorded;
+            }
+            Arc::downgrade(&op.custody.as_ref().unwrap().handoff_guard().unwrap())
+        };
+        if used {
+            w.facts
+                .native_journal
+                .as_ref()
+                .unwrap()
+                .record(relation.candidate(), &binding, Append::MayExecute)
+                .unwrap();
+        }
+        let close = relation.candidate().close_us();
+        w.facts.clock.store(close - 1, Ordering::SeqCst);
+        assert!(close_at_close(&mut child.lock().unwrap(), &w.facts).is_none());
+        assert!(guard.upgrade().is_some());
+        w.facts.clock.store(close, Ordering::SeqCst);
+        // An outstanding append must finish even at the close.
+        child.lock().unwrap().grant_record = GrantRecord::Writing(1);
+        reconcile_extinct_by(&w.handle.ctx, &w.facts);
+        assert!(guard.upgrade().is_some());
+        child.lock().unwrap().grant_record = if used {
+            GrantRecord::Recorded
+        } else {
+            GrantRecord::None
+        };
+        reconcile_extinct_by(&w.handle.ctx, &w.facts);
+        assert_eq!(
+            child.lock().unwrap().phase,
+            Phase::Completed(Decision::Closed)
+        );
+        assert!(guard.upgrade().is_none());
+        // A failed terminal append cannot acknowledge closure or the former
+        // Prepared state. Prior possible-execution evidence remains valid.
+        let before = w
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .record_count()
+            .unwrap();
+        w.facts.seal_journal_allowed.store(false, Ordering::SeqCst);
+        let failed = claim(&w, &relation);
+        if used {
+            assert_eq!(claimed(failed, ChildState::MayExecute), binding);
+        } else {
+            assert_eq!(failed, AccountReply::Unknown);
+        }
+        assert_eq!(
+            w.facts
+                .native_journal
+                .as_ref()
+                .unwrap()
+                .record_count()
+                .unwrap(),
+            before
+        );
+        w.facts.seal_journal_allowed.store(true, Ordering::SeqCst);
+        let terminal = claim(&w, &relation);
+        assert_eq!(
+            claimed(terminal.clone(), ChildState::Sealed { may_execute: used }),
+            binding
+        );
+        let count = w
+            .facts
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .record_count()
+            .unwrap();
+        assert_eq!(claim(&w, &relation), terminal);
+        assert_eq!(
+            w.facts
+                .native_journal
+                .as_ref()
+                .unwrap()
+                .record_count()
+                .unwrap(),
+            count
+        );
+    }
+}
+
+/// Count the custody boundary with an idle operation, an append, a sealed
+/// producer with pending work, and a producer that has not sealed its batch.
+#[test]
+fn account_close_boundary_matrix_preserves_inflight_input_custody() {
+    let mut before_held = 0;
+    let mut blocked_held = 0;
+    let mut premature = 0;
+    let mut closed_at_close = 0;
+    let mut settled_closed = 0;
+    let mut sealed = 0;
+    let mut case = 0;
+    for phase in [ImagePhase::Forward, ImagePhase::Rollback] {
+        for used in [false, true] {
+            for gate in 0..4 {
+                if used && gate == 1 {
+                    continue;
+                }
+                let mut w = world(48900 + case, phase);
+                case += 1;
+                let _home = attach_journal(&mut w);
+                let relation = relation(&w, phase, "fb");
+                let binding = claimed(claim(&w, &relation), ChildState::Prepared);
+                let child = lookup(&w.handle.ctx, &binding).unwrap();
+                let NativePlan::Restart { process, .. } = &w.original.plan else {
+                    unreachable!()
+                };
+                w.facts
+                    .group_observations
+                    .lock()
+                    .unwrap()
+                    .insert(process.group, None);
+                let (guard, input) = {
+                    let mut op = child.lock().unwrap();
+                    op.resume_sent = true;
+                    op.grant_record = if used {
+                        GrantRecord::Recorded
+                    } else {
+                        GrantRecord::None
+                    };
+                    let custody = op.custody.as_ref().unwrap().clone();
+                    let guard = Arc::downgrade(&custody.handoff_guard().unwrap());
+                    let input = (gate >= 2).then(|| {
+                        Arc::new(NativeInput::new(
+                            &w.handle.ctx,
+                            custody,
+                            w.handle.ctx.human_input.seq(),
+                            op.authority.snapshot.clone(),
+                            op.request.deadline_us,
+                            Arc::clone(&op.effect_started),
+                            op.authority.conversation.clone(),
+                            op.clock.clone(),
+                        ))
+                    });
+                    op.resume_attempt = input.clone();
+                    (guard, input)
+                };
+                let work = (gate == 2).then(|| {
+                    let input = input.as_ref().unwrap();
+                    let work = input.reserve().unwrap();
+                    work.attempted();
+                    input.seal();
+                    work
+                });
+                let producer = (gate == 3).then(|| input.as_ref().unwrap().producer());
+                if used {
+                    w.facts
+                        .native_journal
+                        .as_ref()
+                        .unwrap()
+                        .record(relation.candidate(), &binding, Append::MayExecute)
+                        .unwrap();
+                }
+                let close = relation.candidate().close_us();
+                w.facts.clock.store(close - 1, Ordering::SeqCst);
+                assert!(close_at_close(&mut child.lock().unwrap(), &w.facts).is_none());
+                before_held += usize::from(guard.upgrade().is_some());
+                w.facts.clock.store(close, Ordering::SeqCst);
+                if gate == 1 {
+                    child.lock().unwrap().grant_record = GrantRecord::Writing(1);
+                }
+                reconcile_extinct_by(&w.handle.ctx, &w.facts);
+                let completed = matches!(child.lock().unwrap().phase, Phase::Completed(_));
+                if gate == 0 {
+                    closed_at_close += usize::from(completed && guard.upgrade().is_none());
+                } else {
+                    blocked_held += usize::from(guard.upgrade().is_some());
+                    premature += usize::from(completed);
+                }
+                drop(producer);
+                drop(work);
+                child.lock().unwrap().grant_record = if used {
+                    GrantRecord::Recorded
+                } else {
+                    GrantRecord::None
+                };
+                reconcile_extinct_by(&w.handle.ctx, &w.facts);
+                let closed = child.lock().unwrap().phase == Phase::Completed(Decision::Closed);
+                settled_closed += usize::from(closed && guard.upgrade().is_none());
+                if closed {
+                    assert_eq!(
+                        claimed(
+                            claim(&w, &relation),
+                            ChildState::Sealed { may_execute: used }
+                        ),
+                        binding
+                    );
+                    sealed += 1;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "account-close-matrix cases={case} before-held={before_held} blocked-held={blocked_held} premature={premature} closed-at-close={closed_at_close} settled-closed={settled_closed} sealed={sealed}"
+    );
+    assert_eq!(
+        (
+            before_held,
+            blocked_held,
+            premature,
+            closed_at_close,
+            settled_closed,
+            sealed
+        ),
+        (14, 10, 0, 4, 14, 14)
+    );
+}

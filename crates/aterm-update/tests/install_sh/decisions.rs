@@ -631,29 +631,39 @@ fn a_ctrl_c_in_a_check_leaves_none_of_its_files() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
-    lib.step(
-        "mkdir -p \"$TMPDIR/bin\" \"$TMPDIR/app/Contents/MacOS\" && cat >\"$TMPDIR/bin/mktemp\" <<'EOF'
-#!/bin/sh
+    // Prepare executable paths before the functional group interrupt is armed.
+    let program = scratch.stand_in(
+        "tmp/bin/mktemp",
+        r#"#!/bin/sh
+[ "$1" != --fixture-ready ] || { echo ready; exit 0; }
 u=
-[ \"$1\" != -u ] || { u=1; shift; }
-f=\"$(\"$REAL_MKTEMP\" \"$@\")\" || exit
-[ \"$ROW\" = read ] || [ -e \"$O/sent-$ROW\" ] || { : >\"$O/sent-$ROW\"; kill -s INT 0; }
-[ -z \"$u\" ] || rm -f \"$f\"
-echo \"$f\"
-EOF
-cat >\"$TMPDIR/bin/mkdir\" <<'EOF'
-#!/bin/sh
-\"$REAL_MKDIR\" \"$@\" || exit
-case $ROW in stage | app | linux) [ -e \"$O/sent-$ROW\" ] || { : >\"$O/sent-$ROW\"; kill -s INT 0; } ;; esac
-EOF
-cat >\"$TMPDIR/bin/head\" <<'EOF'
-#!/bin/sh
-[ \"$ROW\" != read ] || kill -s INT 0
-exec \"$REAL_HEAD\" \"$@\"
-EOF
-printf '#!/bin/sh\\necho aterm 1.0\\n' >\"$TMPDIR/aterm\" && \
-chmod +x \"$TMPDIR/bin/mktemp\" \"$TMPDIR/bin/mkdir\" \"$TMPDIR/bin/head\" \"$TMPDIR/aterm\" && \
-cat >\"$TMPDIR/make.bash\" <<'EOF'
+[ "$1" != -u ] || { u=1; shift; }
+f="$("$REAL_MKTEMP" "$@")" || exit
+[ "$ROW" = read ] || [ -e "$O/sent-$ROW" ] || { : >"$O/sent-$ROW"; kill -s INT 0; }
+[ -z "$u" ] || rm -f "$f"
+echo "$f"
+"#,
+    );
+    aterm_spec::wait::first_exec(&program, &["--fixture-ready"]);
+    let program = scratch.stand_in("tmp/bin/mkdir", r#"#!/bin/sh
+[ "$1" != --fixture-ready ] || { echo ready; exit 0; }
+"$REAL_MKDIR" "$@" || exit
+case $ROW in stage | app | linux) [ -e "$O/sent-$ROW" ] || { : >"$O/sent-$ROW"; kill -s INT 0; } ;; esac
+"#);
+    aterm_spec::wait::first_exec(&program, &["--fixture-ready"]);
+    let program = scratch.stand_in(
+        "tmp/bin/head",
+        r#"#!/bin/sh
+[ "$1" != --fixture-ready ] || { echo ready; exit 0; }
+[ "$ROW" != read ] || kill -s INT 0
+exec "$REAL_HEAD" "$@"
+"#,
+    );
+    aterm_spec::wait::first_exec(&program, &["--fixture-ready"]);
+    let program = scratch.program("tmp/aterm", "#!/bin/sh\necho aterm 1.0\n");
+    aterm_spec::wait::first_exec(&program, &["--version"]);
+    lib.step(
+        "mkdir -p \"$TMPDIR/app/Contents/MacOS\" && cat >\"$TMPDIR/make.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 export ROW=$1 O=$TMPDIR REAL_MKTEMP=\"$(command -v mktemp)\" REAL_HEAD=\"$(command -v head)\" REAL_MKDIR=\"$(command -v mkdir)\"

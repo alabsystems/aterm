@@ -156,7 +156,6 @@ impl ClaudeOauth {
             .host
             .renew_outcome_with_inputs(path, email, browser, staged.path())
         {
-            Ok(exit) if exit.is_deferred() => Execution::Deferred(exit.failure_words()),
             Ok(exit) if exit.code == 0 => Execution::Completed,
             Ok(exit) => Execution::Unknown(exit.failure_words()),
             Err(why) if why.is_deferred() => Execution::Deferred(why.to_string()),
@@ -261,7 +260,6 @@ impl Provider for ClaudeOauth {
             return Execution::Unknown("approved account has no sign-in email".into());
         };
         match context.host.renew_outcome(path, email, browser) {
-            Ok(exit) if exit.is_deferred() => Execution::Deferred(exit.failure_words()),
             Ok(exit) if exit.code == 0 => Execution::Completed,
             Ok(exit) => Execution::Unknown(exit.failure_words()),
             Err(why) if why.is_deferred() => Execution::Deferred(why.to_string()),

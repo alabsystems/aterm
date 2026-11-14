@@ -1727,7 +1727,7 @@ fn compiler_output_separates_host_codegen_from_checked_metadata() {
     assert_eq!(linked.codegen_requested, Some(true));
 }
 
-/// A COMMAND LINE NAMES ITS UNIT by `--crate-name`, `--test` or `--crate-type`, and
+/// A COMMAND LINE NAMES ITS UNIT by `--crate-name`, `--test`, `--crate-type` or `--cfg test`, and
 /// `CARGO_PKG_NAME`. NEGATIVE CONTROLS: a command with no crate name, and a compiler whose
 /// environment names no package, name none.
 #[test]
@@ -1757,6 +1757,33 @@ fn a_command_line_names_its_unit() {
         )
         .map(|n| n.kind),
         Some("aterm_gui lib".to_owned())
+    );
+    // A `harness = false` test target, as Cargo spelled `aterm-uds`'s `tether_image`
+    // (2026-11-13): no `--test`, no `--crate-type`, and `--cfg test`.
+    assert_eq!(
+        unit_of(
+            words(&[
+                "trustc",
+                "--crate-name",
+                "tether_image",
+                "--edition=2024",
+                "--cfg",
+                "test",
+                "--check-cfg",
+                "cfg(docsrs,test)",
+            ]),
+            env.clone()
+        )
+        .map(|n| n.kind),
+        Some("tether_image test".to_owned())
+    );
+    assert_eq!(
+        unit_of(
+            words(&["rustc", "--crate-name", "x", "--cfg", "feature=\"test\""]),
+            env.clone()
+        ),
+        None,
+        "NEGATIVE CONTROL: with no `--cfg test`, a call with no crate type names no kind"
     );
     assert_eq!(unit_of(words(&["ld", "-o", "x"]), env), None);
     assert_eq!(

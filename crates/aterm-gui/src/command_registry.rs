@@ -152,6 +152,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::FleetMachines => spec("agents.fleet_machines", S::Process, A::Owner, C::Any),
         M::TakeOver => spec("session.take_over", S::Tab, A::Owner, C::Terminal),
         M::HandBack => spec("session.hand_back", S::Tab, A::Owner, C::Terminal),
+        M::HandBackAll => spec("agents.hand_back_all", S::Process, A::Owner, C::Any),
         M::FabricStatus => spec("fabric.status", S::Process, A::Owner, C::Any),
         M::FabricOn => spec("fabric.on", S::Process, A::Owner, C::Any),
         M::FabricOff => spec("fabric.off", S::Process, A::Owner, C::Any),

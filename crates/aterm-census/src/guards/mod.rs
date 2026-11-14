@@ -25,6 +25,7 @@ mod build_path;
 mod captures;
 mod census_thread;
 mod changelog_repeat;
+mod clippy_mirror;
 mod closure_anchor;
 mod conflict_marker;
 mod credential_claim;
@@ -107,6 +108,7 @@ pub const GUARDS: &[Rule] = &[
     lifeline::HEADLESS_LIFELINE,
     rules::STD_COMMAND,
     rules::FLOCK_DOOR,
+    clippy_mirror::CLIPPY_MIRROR,
     rules::SUPERVISE_FX,
     bridge_fx::BRIDGE_FX,
     aos_step::AOS_STEP_CLOCK,

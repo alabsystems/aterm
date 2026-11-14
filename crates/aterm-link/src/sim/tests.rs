@@ -24,8 +24,9 @@ const SIBLING_SEEDS: u64 = 32;
 
 const RARE_SEEDS: u64 = 20000;
 
-/// The search for a rule rarer still: since the asks journal (C04) the first seed that reaches
-/// the incarnation lease's collision is 84750, where 54518 had been the first in 60,000 and,
+/// The search for a rule rarer still: since the receipt heads (ATERM-KI-1111-7) the first seed
+/// that reaches the incarnation lease's collision is 46058; after the asks journal (C04) one was
+/// 84750, where 54518 had been the first in 60,000 and,
 /// before the post journal (B19), 8483 the first in 20,000. Four and sixteen times the power
 /// cuts reach it nowhere in the first 8,000 seeds.
 const RAREST_SEEDS: u64 = 100_000;
@@ -467,7 +468,7 @@ fn a_landed_posts_entry_stands_until_its_post_left_aterms_outbox() {
             Mutant::LandedBeforeAcked,
             Box::new(|s| Opts::seed(s).with(Mutant::LandedBeforeAcked)),
             "forged-self",
-            11,
+            12,
             COMMITTED_SEEDS,
         ),
         (
@@ -515,13 +516,20 @@ fn a_landed_posts_entry_stands_until_its_post_left_aterms_outbox() {
 /// 478 (515 until a drain read the subject budget once, critic item G04) kills a bridge between
 /// its receipt's ack and the retirement; the next bridge's attach hands the record over, its
 /// entry ended, a cut gives it up, and the drain's retry at the pin finds no entry to read back
-/// from (a receipt's pin holds no head) and lands the answer again. The committed worlds, with
-/// no rate limit, reached it in no seed to 20,000 (searched with
-/// `ATERM_SIM_DISCOVER_WITNESSES=1`, F15). With the rule on, seed 478 holds every law.
+/// from and lands the answer again. That control keeps no head beside the receipt's pin
+/// ([`Mutant::ReceiptPinKeepsNoHead`], as before ATERM-KI-1111-7): with one, the retry reads
+/// the record back from the head unless the cut came first, and no seed to 20,000 of this world
+/// breaks the law (searched with `ATERM_SIM_DISCOVER_WITNESSES=1`, 2026-11-13). The committed
+/// worlds, with no rate limit, reached it in no seed to 20,000 (F15). With the rule on, seed 478
+/// holds every law.
 #[test]
 fn a_landed_receipts_entry_stands_until_aterm_retired_it() {
     const LAW: &str = "decision on";
-    let control = |s| rate_bound(s).with(Mutant::ReceiptRetiredAtAck);
+    let control = |s| {
+        rate_bound(s)
+            .with(Mutant::ReceiptRetiredAtAck)
+            .with(Mutant::ReceiptPinKeepsNoHead)
+    };
     let off = breaking_at(&control, LAW, 478, RARE_SEEDS).unwrap_or_else(|| {
         panic!(
             "NEGATIVE CONTROL: with ReceiptRetiredAtAck, no seed within {RARE_SEEDS} breaks `{LAW}`"
@@ -967,7 +975,7 @@ fn each_rule_switched_off_is_caught() {
                 )
             }),
             "cap-compromised",
-            64594,
+            46058,
         ),
         (
             "a move of the log drops the mirror's pinned batch",
@@ -1062,7 +1070,7 @@ fn each_rule_switched_off_is_caught() {
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
-            219,
+            59,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
@@ -1217,7 +1225,7 @@ fn each_rule_switched_off_is_caught() {
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            878,
+            602,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -1241,19 +1249,19 @@ fn each_rule_switched_off_is_caught() {
             "a topic replay tells aterm what retention gave up of the topic (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayTellsNoGap)),
             "silent skip",
-            14,
+            13,
         ),
         (
             "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayDropsAnUncountedNotice)),
             "silent skip",
-            583,
+            46,
         ),
         (
             "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
             Box::new(|s| asking(s).with(Mutant::SayFaceGapUntold)),
             "silent skip",
-            14,
+            25,
         ),
         (
             "the deadline sweep reads the asker's lane for an answer (F4)",
@@ -1271,7 +1279,7 @@ fn each_rule_switched_off_is_caught() {
             "an answer is delivered only once the deadline it settles is off the disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::DeliverOverAnUnwrittenSettle)),
             "was handed",
-            614,
+            1662,
         ),
         // This committed witness still reaches the hand-off bug after both scheduling changes.
         (
@@ -1284,13 +1292,13 @@ fn each_rule_switched_off_is_caught() {
             "an adoption names the attach of the hand-off it takes (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptWithoutTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            2766,
+            60,
         ),
         (
             "a post retires only once its deadline is on disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
             "neither answered nor expired",
-            19,
+            36,
         ),
         // The keyed world's own bug (F23): a keyed re-post published past a cut that carried
         // its key's winner unread and dropped its dedup key lands a second copy of the key. The
@@ -1343,7 +1351,7 @@ fn each_rule_switched_off_is_caught() {
             "another log takes every pin's offset out (KI-1111-4)",
             Box::new(|s| lossy_keyed(s).with(Mutant::ForgetPinResetsOnAnotherLog)),
             "key:",
-            536,
+            3113,
         ),
         (
             "a replay that lands a key's winner tells the key where (KI-1111-4)",
@@ -1351,11 +1359,20 @@ fn each_rule_switched_off_is_caught() {
             "key:",
             216,
         ),
+        // A key's own post, its pin rebuilt from its key's after its own write was refused,
+        // took the key pin's missing head: its retry read nothing back, and past a cut that
+        // carried its first attempt unread and dropped its dedup key, landed a second copy.
+        (
+            "a key's own post rebuilt from its key's pin keeps a head",
+            Box::new(|s| lossy_keyed(s).with(Mutant::OwnersPinFromItsKeyHeadless)),
+            "key:",
+            590,
+        ),
         (
             "another log keeps no offset of the old one (KI-1111-4)",
             Box::new(|s| Opts::lossy_logs(s).with(Mutant::KeepFloorOnAnotherLog)),
             "lost:|dup|key:|order:",
-            16892,
+            82994,
         ),
         (
             "another log is not read as a move (KI-1111-4)",
@@ -1418,16 +1435,24 @@ fn each_rule_switched_off_is_caught() {
         // unverifiable answer, or a replay past one, sends a sender's later post ahead of it.
         "an unverifiable answer leaves the link up (F21)",
         "the attach's replay holds an unverifiable entry's lane (F21)",
-        // KI-1111-4's: none within 64 of its world; the first seeds are 4748, 2201, 536, 216,
-        // 16892 and 974 (of the keyed lossy world none within 20,000 meets the kept floor).
+        // KI-1111-4's: none within 64 of its world; the seeds are 4748, 2201, 3113, 216 and 974
+        // (of the keyed lossy world none within 20,000 meets the kept floor). The kept floor
+        // moved from 16892 past 20,000, to 82994 (RAREST below).
         "an entry journaled before another log is read back from its start (KI-1111-4)",
         "another log takes every pin's offset out (KI-1111-4)",
         "another log brings a pin's head to its start (KI-1111-4)",
         "a replay that lands a key's winner tells the key where (KI-1111-4)",
-        "another log keeps no offset of the old one (KI-1111-4)",
         "another log is not read as a move (KI-1111-4)",
+        // Met where a key's own post's pin write is refused after its key's took, its attempt
+        // then landing unanswered and carried past a cut: none within 64; 590 is the first.
+        "a key's own post rebuilt from its key's pin keeps a head",
     ];
-    const RAREST: &[&str] = &["the incarnation lease is trusted only in the boot that wrote it"];
+    const RAREST: &[&str] = &[
+        "the incarnation lease is trusted only in the boot that wrote it",
+        // Since the receipt heads (ATERM-KI-1111-7) no seed of its world to 20,000 reaches it;
+        // 82994 is the first to 100,000.
+        "another log keeps no offset of the old one (KI-1111-4)",
+    ];
     for rare in RARE.iter().chain(RAREST) {
         assert!(
             rules.iter().any(|(rule, _, _, _)| rule == rare),
@@ -1566,9 +1591,10 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     // read back ends the entry it finds standing) moved 171 and 187 off their bugs (each holds
     // every law still). Each replacement is the first seed to 60,000 that breaks its law with the
     // rule off and holds all with it on ([`found_again`]). Critic item F20's floor, written at
-    // the attach, moved 59 to 47, and G04's one subject-budget read a drain 47 to 219.
+    // the attach, moved 59 to 47, G04's one subject-budget read a drain 47 to 219, and the
+    // receipt heads' writes (ATERM-KI-1111-7) 219 to 59.
     (
-        219,
+        59,
         400,
         "a sweep a write error stopped, closed by the run record",
     ),
@@ -1638,9 +1664,10 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     // steps, and 6751's, 7755's, 735's, 2270's, 3018's and 6371's trajectories off this bug (each
     // holds every law still); the first seed of this world to 60,000 that reaches it with its
     // rule off ([`found_again`]). G04's one subject-budget read a drain moved 210 to 7759;
-    // composing C3b moved it to 22763, discovered within the same 60,000-seed bound.
+    // composing C3b moved it to 22763, discovered within the same 60,000-seed bound, and the
+    // receipt heads' writes (ATERM-KI-1111-7) to 7759.
     (
-        22763,
+        7759,
         400,
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
     ),
@@ -1695,10 +1722,11 @@ const FOUND_QUITTING: &[FoundIn] = &[
     // These rare bugs were found scanning the quitting world, which no regular sweep runs.
     // Each row reaches its bug with the rule off and holds every law with it on. After
     // composing G04 and C3b, the first witness still does; explicit discovery found 2375
-    // first for the second within the original 60,000-seed bound.
+    // first for the second within the original 60,000-seed bound. The receipt heads' writes
+    // (ATERM-KI-1111-7) moved the first's 3397 to 2403.
     (
         both_ways_erring_quitting,
-        3397,
+        2403,
         400,
         "a clean stop left the heads it kept unflushed",
     ),
@@ -3769,7 +3797,7 @@ fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
         .expect("the clean stop's entry cleared");
     st.set_post_pin("s-a", 1, &pin(11))
         .expect("the reservation rewritten");
-    st.set_receipt_pin("s-a", 5, &pin(11))
+    st.set_receipt_pin("s-a", 5, &pin(11), None)
         .expect("a second receipt's");
     st.set_key_seq("s-a", "k2", 11).expect("a second key's");
     st.set_topic_floors(
@@ -4100,7 +4128,8 @@ fn write_every_torn_kind(st: &crate::state::StateDir) {
     st.set_post_pin("s-a", 1, &pin(7)).expect("a reservation");
     st.set_post_pin("s-a", 1, &pin(9))
         .expect("the reservation again");
-    st.set_receipt_pin("s-a", 4, &pin(7)).expect("a receipt's");
+    st.set_receipt_pin("s-a", 4, &pin(7), None)
+        .expect("a receipt's");
     st.set_key_seq("s-a", "k1", 9).expect("a key's");
     st.set_topic_floors(
         "s-a",
@@ -4946,4 +4975,46 @@ fn held_across_a_cut(arm: &str, out: &super::world::ReclaimedAcrossACut, held_af
             out.trace.join("\n")
         );
     }
+}
+
+/// **A RETRY WHOSE WORDS LEFT ITS PIN IS READ BACK, AND NEVER HELD FOR GOOD** (ATERM-KI-1111-7):
+/// a post is pinned, its first attempt lands or is refused, and aterm then lists it with another
+/// `re=` ([`super::world::run_reworded`]), on one of this node's own lanes and on another
+/// principal's. Its retry reads the pin's face back from the pin's head by the pin's identity:
+/// one that landed is settled where it is, one that did not is published in its current words
+/// at its pin and lands once; every law of a world holds, `liveness` and `dup post` among them.
+/// NEGATIVE CONTROL: the retry reads nothing and holds its sender until aterm gives the post up,
+/// as before the fix ([`Mutant::HoldAReworded`]), and no arm settles (`liveness`). The read
+/// back's own control needs a cut no world makes there
+/// ([`Mutant::RewordedWithoutReadingBack`]).
+#[test]
+fn a_retry_whose_words_left_its_pin_is_read_back_and_never_held_for_good() {
+    let opts = || Opts::reclaiming(7, Tier::Strict);
+    let mut failed = Vec::new();
+    for other_node in [false, true] {
+        for landed in [true, false] {
+            let arm = format!("other_node={other_node} landed={landed}");
+            let out = super::world::run_reworded(&opts(), other_node, landed);
+            assert!(
+                out.reworded,
+                "{arm}: the seam did not meet a pinned first attempt:\n{}",
+                out.trace.join("\n")
+            );
+            if !out.violations.is_empty() || !out.retired || out.copies != 1 {
+                failed.push(format!(
+                    "{arm}: retired {} with {} copies on the bus; {:#?}",
+                    out.retired, out.copies, out.violations
+                ));
+            }
+            let held =
+                super::world::run_reworded(&opts().with(Mutant::HoldAReworded), other_node, landed);
+            if !held.violations.iter().any(|v| v.starts_with("liveness:")) {
+                failed.push(format!(
+                    "CONTROL HoldAReworded {arm}: the endless hold settled: {:#?}",
+                    held.violations
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
 }

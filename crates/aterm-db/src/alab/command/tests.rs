@@ -416,7 +416,7 @@ fn the_latest_rounds_are_the_live_observers_before_they_reach_its_history() {
         authority: [2; 32],
         genesis: [3; 32],
     };
-    observer.local(identity(1), trust).unwrap();
+    observer.local(identity(1), trust, Vec::new).unwrap();
     let at = std::time::Instant::now();
     let wall = aterm_time::unix_millis().unwrap();
     observer.contact(identity(2), wall, at);
@@ -452,6 +452,78 @@ fn the_latest_rounds_are_the_live_observers_before_they_reach_its_history() {
     let retained = latest_rounds(&config).unwrap();
     assert_eq!(retained.via_local_process, None);
     assert_eq!(retained.peers[0].last_repair, Some(round));
+}
+
+/// After a Commons writer succession this Mac's observer takes up the history its earlier seat
+/// left (`network_state::Observer::local`). Until the successor has made a round of its own, the
+/// registry import's empty-view guard still knows the earlier seat's peers and waits for a fresh
+/// round with one, as it does after a restart; it never reads the taken-up history as a lab with
+/// no peer, which would let an import write concurrent candidates over every row.
+///
+/// Negative control: with the taken-up history's peer list cleared (2026-11-13), the live
+/// observation held no peer and the guard let the import go (`a taken-up history let an import
+/// go before any round of its own`).
+#[test]
+fn a_writer_successors_import_waits_for_a_round_it_made() {
+    use crate::network_state::{ObservationHandle, Observer};
+    use aterm_types::network_state::{
+        MachineIdentity, RepairObservation, RepairOutcome, Visibility,
+    };
+    let identity = |n: u8| MachineIdentity {
+        machine_id: [n; 16],
+        incarnation: [n; 16],
+        label: None,
+    };
+    let trust = aterm_secrets::commons::journal::Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+    // The observer's socket needs a short path.
+    let root = aterm_tempfile::Builder::new()
+        .prefix("rounds-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let config = root.path().join("aterm.toml");
+    let at = std::time::Instant::now();
+    let wall = aterm_time::unix_millis().unwrap();
+    // The earlier seat (machine 1) heard machine 2 and drained a round with it, then stopped.
+    let mut earlier = Observer::open(&config, ObservationHandle::default()).unwrap();
+    earlier.local(identity(1), trust, Vec::new).unwrap();
+    earlier.contact(identity(2), wall, at);
+    let drained = RepairObservation {
+        completed_at_ms: wall,
+        outbound: true,
+        stage: None,
+        outcome: RepairOutcome::Exchanged,
+        table: Some([3; 32]),
+        sent: Some(0),
+        received: Some(0),
+        deferred: Some(0),
+    };
+    earlier.repair(&identity(2), drained, at);
+    earlier.observe(Visibility::Active, 0, "observing", wall, at);
+    drop(earlier);
+    // Its successor (machine 9) takes the history up and has contacted nobody yet.
+    let mut successor = Observer::open(&config, ObservationHandle::default()).unwrap();
+    successor
+        .local(identity(9), trust, || vec![[1; 16]])
+        .unwrap();
+    successor.observe(Visibility::Active, 0, "observing", wall, at);
+    let live = latest_rounds(&config).unwrap();
+    assert_eq!(live.via_local_process, Some(std::process::id()));
+    assert_eq!(live.observer, Some(identity(9)), "PRECONDITION: taken up");
+    assert!(
+        empty_view_wait(
+            Some([3; 32]),
+            None,
+            live.peers.iter().map(|peer| peer.last_repair.as_ref()),
+            wall
+        )
+        .is_some(),
+        "a taken-up history let an import go before any round of its own"
+    );
+    drop(successor);
 }
 
 /// A history its observer has not closed does not speak for the latest rounds: that observer is
@@ -503,7 +575,7 @@ fn an_open_history_does_not_speak_for_the_latest_rounds() {
     let config = root.path().join("aterm.toml");
     let published = ObservationHandle::default();
     let mut observer = Observer::open(&config, published.clone()).unwrap();
-    observer.local(identity(1), trust).unwrap();
+    observer.local(identity(1), trust, Vec::new).unwrap();
     let at = std::time::Instant::now();
     let wall = aterm_time::unix_millis().unwrap();
     observer.contact(identity(2), wall, at);
@@ -573,7 +645,7 @@ fn an_open_history_does_not_speak_for_the_latest_rounds() {
     assert!(latest_rounds(&config).is_err());
     // The next observer has the peer and none of its rounds, so the guard waits for one.
     let mut restarted = Observer::open(&config, ObservationHandle::default()).unwrap();
-    restarted.local(identity(1), trust).unwrap();
+    restarted.local(identity(1), trust, Vec::new).unwrap();
     let wall = aterm_time::unix_millis().unwrap();
     restarted.observe(
         Visibility::Active,

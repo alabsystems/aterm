@@ -775,7 +775,8 @@ pub fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
     let out = ctl(inst, args);
     assert!(
         out.status.success(),
-        "aterm ctl {args:?} failed: stdout={:?} stderr={:?}",
+        "aterm ctl {args:?} failed ({}): stdout={:?} stderr={:?}",
+        out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );

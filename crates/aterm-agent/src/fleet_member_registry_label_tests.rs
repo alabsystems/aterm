@@ -130,3 +130,42 @@ fn typed_label_words_are_canonical_before_lookup() {
     );
     assert!(registry_label("m7.local").is_none());
 }
+
+/// A seat's machine is the one its enrollment's facts row says it is: a folded successor's
+/// `merged_into`, not the born row its `mac` still binds, so its Mac answers its own label.
+/// NEGATIVE CONTROL: with `seat_machine` reading `mac` alone, the seat names the born row:
+/// `` left: Some("mc-1111111111111111") right: Some("mc-0000000000000007") ``.
+#[test]
+fn a_folded_enrollment_answers_the_machine_it_was_folded_into() {
+    use aterm_db::typed::owned::{OwnedRead, OwnedRow};
+    let uuid = "11111111111111111111111111111111";
+    let mut facts = OwnedRead::default();
+    facts.rows.insert(
+        uuid.into(),
+        OwnedRow {
+            machine: [0; 16],
+            actor: [0; 48],
+            value: json!({"mac": "mc-1111111111111111", "merged_into": "mc-0000000000000007"}),
+            rank: (0, 1, 1),
+            operation: [0; 32],
+        },
+    );
+    let mac = seat_machine(Some(&facts), uuid);
+    assert_eq!(mac.as_deref(), Some("mc-0000000000000007"));
+    let folded = LabelSeat { mac, ..seat() };
+    assert_eq!(
+        resolve_registry_label("m7", &registry(), &[folded]).unwrap(),
+        "00112233445566778899aabbccddeeff"
+    );
+    let row = facts.rows.get_mut(uuid).unwrap();
+    row.value = json!({"mac": "mc-0000000000000007"});
+    assert_eq!(
+        seat_machine(Some(&facts), uuid).as_deref(),
+        Some("mc-0000000000000007")
+    );
+    assert_eq!(
+        seat_machine(Some(&facts), "22222222222222222222222222222222"),
+        None
+    );
+    assert_eq!(seat_machine(None, uuid), None);
+}

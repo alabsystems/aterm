@@ -194,6 +194,7 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         artifact: Some("aa".repeat(32)),
         macho_sha256: Some("bb".repeat(32)),
         linux: None,
+        windows: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

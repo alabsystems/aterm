@@ -1673,7 +1673,7 @@ fn a_busy_reader_keeps_its_pending_messages_and_forgoes_newer_work() {
     };
     let pid_of = |m: Msg| match m {
         Msg::Read(r) | Msg::Facts(r) => r.self_pid,
-        Msg::Pull | Msg::CpuPolicy(_) | Msg::Name(_) | Msg::Told(_) => 0,
+        Msg::Pull | Msg::AssessmentReady | Msg::CpuPolicy(_) | Msg::Name(_) | Msg::Told(_) => 0,
     };
     assert!(host.offer(request(1)));
     assert!(
@@ -3021,7 +3021,15 @@ fn allocation_delayed_handover_keeps_the_worker_observation_time() {
         at: read,
         value: aterm_capacity::CpuObservation::Absent,
     });
-    hand_over_allocation(&host.latest, &snapshot, vec![], read, Some(leases));
+    hand_over_allocation(
+        &host.latest,
+        &snapshot,
+        vec![],
+        read,
+        Some(leases),
+        None,
+        true,
+    );
     assert!(host.adopt(now));
     assert_eq!(host.sampled_at, Some(read));
     assert_eq!(host.cpu_leases.as_ref().unwrap().at, read);
@@ -7025,6 +7033,9 @@ fn the_verdict_refresh_waits_out_a_backed_up_episode() {
     app.vitals.board = &BOARD;
     test_arms::stand_in(&mut app, test_arms::opening());
     adopt(&mut app, 1, backed_up());
+    let old = Instant::now() - Duration::from_secs(60);
+    app.vitals.adopted_at = Some(old);
+    app.vitals.read_began = Some(old);
     let _ = app.devtools_watch.observe(DevToolGrant::NotGranted, true);
     let step = app.devtools_watch.observe(DevToolGrant::Granted, true);
     let _ = app.apply_devtools_step(step);

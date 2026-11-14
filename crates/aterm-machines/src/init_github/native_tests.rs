@@ -64,7 +64,7 @@ fn source(sys: &Fake, path: &str) {
 /// [`source`] at `user`'s synced token file, owned by `user`: a live account, in a test whose
 /// git runs for real, is not the fixtures' 501.
 pub(crate) fn owned_source(sys: &Fake, user: &User) {
-    let path = Path::new(&user.home).join(crate::init_github::TOKEN_FILE);
+    let path = crate::init_github::token_file(Path::new(&user.home));
     let path = path.to_str().unwrap();
     source(sys, path);
     sys.stat_of(
@@ -90,10 +90,7 @@ pub(in crate::init_github) fn converged(sys: &Fake, user: &User, name: &str) {
     script::launcher(sys, user);
     sys.stat_of(&user.home, stat(true, 0o700));
     let home = Path::new(&user.home);
-    source(
-        sys,
-        home.join(crate::init_github::TOKEN_FILE).to_str().unwrap(),
-    );
+    source(sys, crate::init_github::token_file(home).to_str().unwrap());
     answer(sys, user, "/user", aterm_json::json!({"login": user.name}));
     present_repository(sys, user, name);
     script::lookups_hold(sys, user, GITHUB, &user.name, TOKEN);
@@ -794,7 +791,7 @@ fn materialized_fixture(
     if git {
         sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
     }
-    let token = home.join(super::super::TOKEN_FILE);
+    let token = super::super::token_file(home);
     sys.file(token.to_str().unwrap(), TOKEN.as_bytes())
         .stat_of(token.to_str().unwrap(), stat(false, 0o600));
     metadata(&sys, &who, inventory["repositories"].clone());
@@ -3062,7 +3059,9 @@ fn native_dependency_batch_checks_stop_and_real_input_changes_after_each_downloa
                     "stop" => pressed.store(true, Ordering::SeqCst),
                     "token" => {
                         sys.file(
-                            &format!("{}/{}", who.home, super::super::TOKEN_FILE),
+                            super::super::token_file(Path::new(&who.home))
+                                .to_str()
+                                .unwrap(),
                             b"fixture_rotated_token",
                         );
                     }
@@ -3334,7 +3333,7 @@ fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs(
             sys.logged_in(&who);
             sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
             sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
-            let token_path = home.join(super::super::TOKEN_FILE);
+            let token_path = super::super::token_file(&home);
             sys.file(token_path.to_str().unwrap(), TOKEN.as_bytes())
                 .stat_of(token_path.to_str().unwrap(), stat(false, 0o600));
             metadata(
@@ -3449,7 +3448,9 @@ fn ordinary_local_repository_batches_refuse_input_changes_and_allow_unrelated_se
                     "inventory" => metadata(sys, &who, aterm_json::json!([])),
                     "token" => {
                         sys.file(
-                            &format!("{}/{}", who.home, super::super::TOKEN_FILE),
+                            super::super::token_file(Path::new(&who.home))
+                                .to_str()
+                                .unwrap(),
                             b"fixture_rotated_local_token",
                         );
                     }
@@ -3496,7 +3497,7 @@ fn ordinary_local_repository_batches_refuse_input_changes_and_allow_unrelated_se
 fn an_unready_lazy_capture_can_retry_but_a_successful_generation_cannot_rebase() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (sys, item) = fixture();
-    let path = Path::new(&item.user.home).join(super::super::TOKEN_FILE);
+    let path = super::super::token_file(Path::new(&item.user.home));
     let path_for_hook = path.clone();
     let changed = AtomicBool::new(false);
     sys.on_owned_read(move |sys, path| {

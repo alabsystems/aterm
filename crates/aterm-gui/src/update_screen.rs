@@ -216,21 +216,9 @@ impl UpdateProjection {
     }
 }
 
-/// How long before `now` the instant `at` was, as a person says it.
-pub(crate) fn ago_words(at: i64, now: i64) -> String {
-    let age = now.saturating_sub(at);
-    if age < 60 {
-        "just now".to_string()
-    } else if age < 3600 {
-        format!("{} min ago", age / 60)
-    } else if age < 86_400 {
-        format!("{} h ago", age / 3600)
-    } else if age < 2 * 86_400 {
-        "1 day ago".to_string()
-    } else {
-        format!("{} days ago", age / 86_400)
-    }
-}
+// How long before `now` the instant `at` was, as a person says it: the one copy `aterm update
+// status` and the fleet's readers of a peer's last check share.
+pub(crate) use aterm_types::update_standing::ago_words;
 
 impl UpdateState {
     /// Project the process-owned updater reducer into UI state.

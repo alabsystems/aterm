@@ -866,7 +866,7 @@ fn the_default_join_stays_automatic_after_its_initial_observation_interval() {
         !quiet.needs_attention(),
         "the tab is not lit for a calm wait"
     );
-    assert!(crate::system_state_access::menu_line(&quiet.status).is_none());
+    assert!(crate::system_state_access::signal_line(&quiet.status).is_none());
 
     let long = reading(&status_of("vault-asking-long"));
     assert!(long.status.joins_quietly());

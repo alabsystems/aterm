@@ -692,6 +692,10 @@ impl Book {
                 inert(entry.id, "the catalog never posts this want");
                 continue;
             }
+            if !purpose.asks_the_lab() {
+                inert(entry.id, "a stolen Mac's rotation is never posted");
+                continue;
+            }
             let derived = body
                 .get("nonce")
                 .and_then(hex_field::<16>)
@@ -1332,7 +1336,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
             } else {
                 None
             };
-            let allowed = context.policy.allows(&need.want);
+            let allowed = need.purpose.asks_the_lab() && context.policy.allows(&need.want);
             let room = open < need::MAX_OPEN;
             match (need.state, thread) {
                 (State::Local, None) if writer && allowed && room => {

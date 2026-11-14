@@ -19,7 +19,9 @@
 //! - **A new seat under another seat's label is on the record.** Where an admin's approver lets
 //!   a Mac in (a member's Allow, a join password) under the `m<N>` label of a standing seat
 //!   ([`seat_named`]), it is let in under the next free label, and the approver's log says so.
-//!   `aterm members list` names the pair ([`splits`]), read from the log on demand: no entry,
+//!   `aterm members list` names the pair ([`splits`]), read from the log on demand (a seat its
+//!   own Mac admitted on a writer-succession statement is named as that, [`SplitBy::Successor`],
+//!   since there the log does tie the two): no entry,
 //!   alert or step asks a person to act on it, since a name proves nothing about which of the
 //!   two seats is gone (a second account on one Mac asks under that Mac's name too, and a
 //!   stranger can ask under any).
@@ -72,13 +74,26 @@ pub enum SplitBy {
     /// `Node` record, or move by proof): one Mac, or a copy of its disk, holds both. A `Remove`
     /// of either reads that node key as removed and so takes the other seat out with it.
     Node,
+    /// The newer seat came in as a Commons writer's successor in the older seat's line
+    /// ([`super::successor::Lineages`]): the older seat, or a successor of it that no longer
+    /// stands, signed it in under its own name with no fleet node key, whatever name either seat
+    /// goes by. That is what a home signs for the writer it made to succeed its fenced one; the
+    /// log holds the `Admit`, not the statement behind it, and reads the two as one home's, as a
+    /// person's removal does. One home, not one machine: a copy of that home's disk signs the
+    /// same.
+    Successor,
+    /// The newer seat came in as the successor ([`SplitBy::Successor`]) of a seat that no longer
+    /// stands and has none above it that does, and the older seat holds the label it asked
+    /// under now (a seat moved onto a new key keeps its label). The log ties the newer seat to
+    /// the seat that is out, not to the one that holds its label.
+    Former,
     /// The newer seat asked under the older seat's `m<N>` label, and nothing in the log ties the
     /// two: a stranger, a second account on that Mac, or that Mac back with a new key.
     Name,
 }
 
-/// Two standing seats of one Mac, or of a Mac that asked under another seat's label: a fact read
-/// from the log ([`splits`]).
+/// Two standing seats of one Mac, of one home (a writer successor beside a seat of its line), or
+/// of a Mac that asked under another seat's label: a fact read from the log ([`splits`]).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Split {
     /// The newer seat's label (`m160`).
@@ -99,6 +114,18 @@ impl Split {
                  seat takes the other out",
                 self.label, self.of
             ),
+            SplitBy::Successor => format!(
+                "split {} of={} by=successor: {} came in as a Commons writer's successor in {}'s \
+                 line (signed in under that seat's own name, with no fleet node key), so the log \
+                 reads them as one home's",
+                self.label, self.of, self.label, self.of
+            ),
+            SplitBy::Former => format!(
+                "split {} of={} by=former: {} came in as the Commons writer's successor of a seat \
+                 that no longer stands, under the name {}'s seat holds now, and the log ties it \
+                 to that seat, not to {}'s",
+                self.label, self.of, self.label, self.of, self.of
+            ),
             SplitBy::Name => format!(
                 "split {} of={} by=name: {} asked as {}, whose seat stands, and nothing proves one \
                  Mac holds both",
@@ -109,8 +136,10 @@ impl Split {
 }
 
 /// Every pair of standing seats [`SplitBy`] ties in `log`, newer seat first, by its label; a pair
-/// the node key ties is not listed again by name. Read from the log alone, so every member lists
-/// the same pairs.
+/// the node key ties is not listed again as a successor's, nor a successor by name: a successor
+/// is paired with the nearest seat above it in its line that stands, through any that no longer
+/// do, else with the seat that holds the label it asked under ([`SplitBy::Former`]). Read from
+/// the log alone, so every member lists the same pairs.
 #[must_use]
 pub fn splits(log: &Log) -> Vec<Split> {
     let membership = log.membership();
@@ -120,6 +149,7 @@ pub fn splits(log: &Log) -> Vec<Split> {
         .filter(|(actor, member)| stands(log, actor, member))
         .collect();
     let index = |member: &Member| log.record_index(&member.entry).unwrap_or(0);
+    let lineages = super::successor::Lineages::of(log);
     let mut out = BTreeSet::new();
     for &(actor, member) in &standing {
         let by_node = member
@@ -145,6 +175,31 @@ pub fn splits(log: &Log) -> Vec<Split> {
             });
             continue;
         }
+        // A successor: the nearest seat above it in its line that stands, level by level
+        // through the seats that no longer do.
+        let mut above: Vec<MemberId> = lineages.above(actor).copied().collect();
+        let successor = !above.is_empty();
+        let mut seen = BTreeSet::from([*actor]);
+        let mut line = None;
+        while line.is_none() && !above.is_empty() {
+            line = standing
+                .iter()
+                .filter(|(other, _)| above.contains(*other))
+                .min_by_key(|(_, held)| index(held));
+            above = above
+                .iter()
+                .filter(|seat| seen.insert(**seat))
+                .flat_map(|seat| lineages.above(seat).copied().collect::<Vec<_>>())
+                .collect();
+        }
+        if let Some((_, older)) = line {
+            out.insert(Split {
+                label: member.label.clone(),
+                of: older.label.clone(),
+                by: SplitBy::Successor,
+            });
+            continue;
+        }
         let Some((_, asked)) = leading_m_label(&member.name) else {
             continue;
         };
@@ -158,7 +213,11 @@ pub fn splits(log: &Log) -> Vec<Split> {
             out.insert(Split {
                 label: member.label.clone(),
                 of: older.label.clone(),
-                by: SplitBy::Name,
+                by: if successor {
+                    SplitBy::Former
+                } else {
+                    SplitBy::Name
+                },
             });
         }
     }

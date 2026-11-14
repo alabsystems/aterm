@@ -45,6 +45,7 @@ fn pending_child(child: Process) -> (Registry, RestartReservation, aterm_tempfil
             expected_env: Vec::new(),
             expected_unset: Vec::new(),
             process: None,
+            binding: LaunchBinding::Consumer,
             typed: true,
             gate: Some(Arc::new(SourceWorkLease::for_home(home.path()).unwrap())),
             _scope: Some(lifetime.enter().unwrap()),

@@ -1199,9 +1199,7 @@ fn the_base_y_memo_is_bounded_and_pruned_with_the_panes() {
     let mut buf = Vec::new();
     let mut scan = |flash: &mut TrickFlash, pane: u64, base_y: Option<i64>, cursor| {
         flash.declare_base_y(Some(pane), base_y);
-        flash.on_rescan(Some(pane), t0, 4, 40, cursor, true, &mut buf, |_, row| {
-            row.clear();
-        });
+        flash.on_rescan(Some(pane), t0, 4, 40, cursor, true, &mut buf, EmptyRows);
     };
     for pane in 0..40u64 {
         scan(&mut flash, pane, Some(pane as i64), Some((0, 0)));
@@ -1224,18 +1222,7 @@ fn the_base_y_memo_is_bounded_and_pruned_with_the_panes() {
             .all(|(pane, _)| *pane != Some(39))
     );
     flash.declare_base_y(Some(30), Some(7));
-    flash.on_rescan(
-        Some(31),
-        t0,
-        4,
-        40,
-        Some((0, 0)),
-        true,
-        &mut buf,
-        |_, row| {
-            row.clear();
-        },
-    );
+    flash.on_rescan(Some(31), t0, 4, 40, Some((0, 0)), true, &mut buf, EmptyRows);
     assert!(
         flash
             .base_y_slice()

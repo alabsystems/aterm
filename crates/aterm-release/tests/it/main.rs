@@ -235,6 +235,9 @@ mod trust_oblig;
 #[path = "../../src/verify.rs"]
 #[allow(dead_code)]
 mod verify;
+#[path = "../../src/windows_pin.rs"]
+#[allow(dead_code)]
+mod windows_pin;
 
 mod apple_tier;
 mod build_once;

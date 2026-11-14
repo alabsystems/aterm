@@ -278,8 +278,8 @@ fn a_done_the_owner_saw_stays_seen_across_a_seamless_update() {
     );
 }
 
-/// AN EXITED WORKER'S END IS CLEARED BY A LOOK AS A DONE ONE'S IS, with no dot on its tab: its
-/// Done for you row says it, and the look covers it. Going to it from that row clears it as well.
+/// AN EXITED WORKER'S END IS CLEARED BY A LOOK AS A DONE ONE'S IS, with no dot on its tab: the
+/// look covers it, and going to it clears it as well.
 /// NEGATIVE CONTROL: where nobody looks it stays unread.
 #[test]
 fn an_exited_workers_end_is_seen_by_a_look_and_by_going_to_it() {

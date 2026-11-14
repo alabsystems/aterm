@@ -5,8 +5,25 @@ use super::*;
 use crate::control_input_ack::{InputMark, testing};
 use crate::input::{Delivery, EgressReceipt};
 
-fn ready(
+/// A signalled restart whose source exited, its Resume settled and its launcher (pid 600, its
+/// connection 80) attached: the next step is the launcher's Execute.
+pub(super) fn ready(
     local: u64,
+) -> (
+    crate::session_store::SessionHandle,
+    Facts,
+    Binding,
+    SupervisorInputCaller,
+    SupervisorInputCaller,
+) {
+    ready_after_signal(local, true)
+}
+
+/// [`ready`], its signal refused by the kernel where `accepted` is false: the source exits on its
+/// own before the Resume all the same.
+pub(super) fn ready_after_signal(
+    local: u64,
+    accepted: bool,
 ) -> (
     crate::session_store::SessionHandle,
     Facts,
@@ -18,9 +35,14 @@ fn ready(
     let (handle, facts, prepare, actor) = closed_restart::fixture_on(handle);
     let ctx = &handle.ctx;
     let binding = admitted_binding(&run(ctx, &facts, Request::prepare(prepare), actor.clone()));
+    facts.signal_refused.store(!accepted, Ordering::SeqCst);
     assert_eq!(
         run(ctx, &facts, Request::Signal(binding.clone()), actor.clone()),
-        "OK native-act state=signalled\n"
+        if accepted {
+            "OK native-act state=signalled\n"
+        } else {
+            UNKNOWN
+        }
     );
     facts.processes.lock().unwrap().remove(&4242);
     facts.foreground.store(400, Ordering::SeqCst);

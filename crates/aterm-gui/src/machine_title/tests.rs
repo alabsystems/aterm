@@ -548,9 +548,9 @@ fn an_authoritative_name_file_reset_replaces_the_windows_higher_revision() {
 }
 
 /// A read name reaches the status item: the glance the item is built from carries the title, and
-/// the read owes the item a rebuild though no session row moved (machine names §5.5).
+/// the read owes the item a rebuild though nothing else moved (machine names §5.5).
 #[test]
-fn a_read_name_leads_the_status_items_tooltip_and_this_mac_row() {
+fn a_read_name_leads_the_status_items_tooltip_and_identity_line() {
     let mut app = crate::App::headless_for_test();
     let _ = app.take_status_rebuild();
     let before = app.status_glance();
@@ -565,13 +565,12 @@ fn a_read_name_leads_the_status_items_tooltip_and_this_mac_row() {
     assert_eq!(after.machine.as_deref(), Some("m8 Heron"));
     assert_eq!(after.tooltip(), "aterm \u{b7} m8 Heron");
     assert!(
-        crate::status_item::compose_status_menu(&after, 0)
-            .iter()
-            .any(|row| matches!(
-                row,
-                crate::status_item::StatusRow::Info(line) if line.starts_with("m8 Heron \u{2014} ")
-            )),
-        "This Mac's row is led by the title"
+        matches!(
+            crate::status_item::compose_status_menu(&after, 0).first(),
+            Some(crate::status_item::StatusRow::Info { text, .. })
+                if text.starts_with("m8 Heron \u{b7} ")
+        ),
+        "the menu's identity line is led by the title"
     );
     assert_ne!(before.fingerprint(), after.fingerprint());
 }

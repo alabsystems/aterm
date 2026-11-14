@@ -7,7 +7,11 @@
 //! inert. The row's body is the harness's (`aterm_agent::harness::claims::Row`); a table holds it
 //! whole, at most [`MAX_ROW`] bytes, and gives each writer's latest one back. A fresh row advances
 //! its counter exactly once under the table writer, so a stale whole-set replacement cannot erase
-//! another local client's claims. Any current Writer writes its row; nothing brokers.
+//! another local client's claims. Any current Writer writes its row; nothing brokers. A row an
+//! earlier writer generation of this home signed (its seat stays a member after a writer
+//! succession) is this Mac's past: this Mac's read gives it apart from the members' rows
+//! ([`Read::former`]), so its claims' seniority can go on in the current seat's row, and every
+//! other Mac reads it as any peer's row until it lapses.
 //!
 //! Rows ride a ring of UTC-day tables (`crate::catalog::ring`, [`EPOCH_S`]) that no catalog
 //! declares, so nothing fills however long the lab runs. A row goes into its writer's day table,
@@ -134,8 +138,17 @@ pub(crate) const LEGACY_GRACE_S: u64 = 2 * EPOCH_S;
 pub struct Read {
     /// This Mac's Commons machine.
     pub me: [u8; 16],
-    /// Each current member's latest row: its machine and the row's body.
+    /// Each current member's latest row: its machine and the row's body. A member the swarm
+    /// roster denies, and a seat of this home's own earlier writer generation
+    /// (`former_seats`), has none here.
     pub rows: Vec<([u8; 16], Value)>,
+    /// The body of the newest row this home's own earlier writer generations signed: that of
+    /// the latest seat in the lineage that holds one (`former_seats`). It is this Mac's past,
+    /// not a peer's claim, so it is not among `rows`. A claim in it began this Mac's
+    /// uninterrupted use, so where the current seat has no row yet a reader keeps the `since` of
+    /// each claim it still uses in that seat's first row, its counter still starting at 1.
+    /// None for a home that succeeds none, or whose earlier seats hold no row.
+    pub former: Option<Value>,
     /// Whether this Mac may write its row, and why not.
     pub writable: std::result::Result<(), String>,
     /// What this Mac's peers say of its clock, and the peers it reads as skewed
@@ -496,6 +509,7 @@ fn read_started(paths: &Paths, now: u64, caps: Caps, started: Instant) -> Result
     let paths = &selected;
     let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::observe_named_until(&bootstrap, deadline)?;
+    let former = former_seats(&session);
     let directory = Directory::new(paths, bootstrap.trust());
     let state = directory.ring_view(&session, &CLAIMS);
     let mut logs = ring_logs(&session, &directory, &state, now)?;
@@ -537,6 +551,11 @@ fn read_started(paths: &Paths, now: u64, caps: Caps, started: Instant) -> Result
             })
             .map_err(|why| why.to_string())
     };
+    let former_row = former
+        .iter()
+        .rev()
+        .find_map(|actor| latest.get(actor))
+        .map(|latest| latest.body.clone());
     let denied_actors: std::collections::BTreeSet<Actor> = match &roster {
         Some(r) => bindings
             .iter()
@@ -549,12 +568,33 @@ fn read_started(paths: &Paths, now: u64, caps: Caps, started: Instant) -> Result
         me,
         rows: latest
             .into_iter()
-            .filter(|(actor, _)| !denied_actors.contains(actor))
+            .filter(|(actor, _)| !denied_actors.contains(actor) && !former.contains(actor))
             .map(|(_, latest)| (latest.machine, latest.body))
             .collect(),
+        former: former_row,
         writable,
         clock,
     })
+}
+
+/// The writer actors of this home's own earlier generations, oldest first: the seats a writer
+/// succession left behind on this disk, each still a Commons member, as the generation
+/// observation `session` opened with proved them ([`Session::succeeded_writers`]), so the read
+/// observes no predecessor twice. [`read`] leaves their rows out of [`Read::rows`] and gives the
+/// newest apart ([`Read::former`]). None for a home that succeeds none.
+///
+/// A former seat's row is this Mac's past, not its claim set: its writer is gone, so nobody
+/// renews or releases it, and a peer that stops hearing its machine lapses its leases once the
+/// harness's presence window has passed. Taken as a peer's here, it held this Mac's own home
+/// accounts for that other machine; taken as this Mac's own written row, its counter would
+/// refuse the current seat's first row (which starts at 1). What it does carry is when this
+/// Mac's use of each account began, which the current seat's first row keeps.
+fn former_seats(session: &Session<'_>) -> Vec<Actor> {
+    session
+        .succeeded_writers()
+        .map(aterm_secrets::commons::binding::Binding::actor)
+        .filter(|actor| *actor != session.actor())
+        .collect()
 }
 
 /// Hand this Mac's latest row to its peers now through `pusher`, this process's Commons runtime

@@ -738,6 +738,10 @@ pub const SPARK_PX: i32 = 3;
 /// The alpha under which a spark loses its halo and a pixel of arm.
 pub const SPARK_SHRINK_ALPHA: f32 = 0.6;
 
+/// The latest age, ms, a spark is born at ([`Spark::stand`]): the shortest life's hold, so every
+/// spark is born at its brightest and while every other is still at its own.
+pub const SPARK_STAND_LAST_MS: f32 = SPARK_LIFE_MIN_MS * SPARK_HOLD_U;
+
 /// Where the light-theme train's rail sits below the row's centre, in `ch`.
 pub const LIGHT_RAIL_CH: f32 = 0.62;
 
@@ -1057,6 +1061,14 @@ pub struct Spark {
     pub life: f32,
     /// The star's arm half-length while bright, px ([`SPARK_ARM_MIN_PX`]..=[`SPARK_ARM_MAX_PX`]).
     pub arm: u8,
+    /// The age, ms, the spark is born at ([`FLASH_BURST_MS`]..=[`SPARK_STAND_LAST_MS`]).
+    pub stand: f32,
+    /// The age of its throw, ms, whose point it stands at for its life
+    /// ([`FLASH_BURST_MS`]..=`life`).
+    pub at: f32,
+    /// The ages, ms, its halo is lit from and to on a dark page, granted when its landing comes
+    /// ([`grant_halos`]); none when they are equal.
+    pub halo: (f32, f32),
 }
 
 impl Spark {
@@ -1066,6 +1078,9 @@ impl Spark {
         vy: 0.0,
         life: 0.0,
         arm: 0,
+        stand: 0.0,
+        at: 0.0,
+        halo: (0.0, 0.0),
     };
 }
 
@@ -1549,13 +1564,11 @@ impl Meteors {
                         hero: landing.fan.hero,
                     },
                 });
-                if landings.len() >= LANDING_POOL {
-                    landings.remove(0);
-                }
-                landings.push(landing);
+                admit(landings, landing, ctx.geom);
             }
         }
-        let halo_cap = frame.halos.len() + SPARK_HALO_CAP;
+        // Every live landing's spark halos together lay at most SPARK_HALO_CAP quads.
+        let halo_cap = frame.halos.len().saturating_add(SPARK_HALO_CAP);
         let mut li = 0;
         while li < landings.len() {
             let l = &landings[li];
@@ -1591,10 +1604,7 @@ impl Meteors {
             },
         });
         if ring {
-            if self.landings.len() >= LANDING_POOL {
-                self.landings.remove(0);
-            }
-            self.landings.push(landing);
+            admit(&mut self.landings, landing, ctx.geom);
         }
     }
 
@@ -2788,6 +2798,7 @@ impl Flight {
         if s > 1 { s } else { 1 }
     }
 
+    /// How many body stations a flying train spreads evenly over `span`.
     #[inline]
     const fn stations(&self, span: f32) -> usize {
         let s = ((span / self.stride).ceil() as usize) + 1;
@@ -2798,6 +2809,23 @@ impl Flight {
         } else {
             s
         }
+    }
+
+    /// A standing train's body stations between `from` and `to` px behind the head, as the
+    /// first and last index `k` of the lattice `k * stride` px measured back along the path from
+    /// the landing (none when the first is past the last). A station keeps its place on the
+    /// glass while the root sucks in, so the slabs laid between two of them do too: spread
+    /// evenly over the shrinking span instead, every station slid a little each frame, the slab
+    /// that covered a pixel of a thin slanted train stood a fraction of a pixel higher or lower
+    /// from one frame to the next, and as the train faded and narrowed under a pixel its light
+    /// there dipped and returned (GitHub Light's Return, 99 px over three flashes a second in
+    /// `lab trail-film`'s enter-long, each at one fixed hue).
+    #[inline]
+    const fn lattice(&self, from: f32, to: f32) -> (usize, usize) {
+        let first = ((self.to_go + from) / self.stride).ceil().max(0.0) as usize;
+        let last = ((self.to_go + to) / self.stride).floor().max(0.0) as usize;
+        let cap = first + STATIONS_MAX - 1;
+        (first, if last < cap { last } else { cap })
     }
 
     #[inline]
@@ -2936,7 +2964,6 @@ fn build_stations(
                 .min(f.white_shoulder + f.white_fall * WHITE_TAIL_EFOLDS)
         }
     };
-    let n = f.stations(span);
     let alpha = match layer {
         Layer::Colour => f.fade_c,
         Layer::White => f.fade_w,
@@ -2993,8 +3020,19 @@ fn build_stations(
     let inv_white_shoulder = 1.0 / f.white_shoulder.max(1.0);
     let fine = END_EASE_STATIONS as f32;
     let inv_fine = 1.0 / fine;
-    let inv_body_n = 1.0 / ((n - 1) as f32);
     let tail_start = span - ease_tail;
+    // A flying train's body spreads evenly over its span, which moves with the head anyway; once
+    // the head stands (landed, or retired where it was) the body stands on the lattice.
+    let still = f.to_go <= 0.0 || m.retired_at.is_some();
+    #[cfg(any(test, debug_assertions))]
+    let still = still && !TRAINS_SPREAD.with(std::cell::Cell::get);
+    let n = f.stations(span);
+    let inv_body_n = 1.0 / ((n - 1) as f32);
+    let (body_first, body_last) = if still {
+        f.lattice(ease_head, tail_start)
+    } else {
+        (0, n - 1)
+    };
     let light_cap = if rail > 0.0 {
         LIGHT_RAIL_ALPHA_CAP
     } else {
@@ -3041,15 +3079,19 @@ fn build_stations(
                     s
                 } else {
                     phase = 1;
-                    idx = 0;
+                    idx = body_first;
                     continue;
                 }
             }
             1 => {
-                if idx < n {
-                    let s = span * (idx as f32) * inv_body_n;
+                if idx <= body_last {
+                    let s = if still {
+                        idx as f32 * f.stride - f.to_go
+                    } else {
+                        span * (idx as f32) * inv_body_n
+                    };
                     idx += 1;
-                    if s < ease_head || s > tail_start {
+                    if !still && (s < ease_head || s > tail_start) {
                         continue;
                     }
                     s
@@ -3073,8 +3115,20 @@ fn build_stations(
         if end_ease <= 0.0 {
             continue;
         }
-        let px = f.head.0 - f.unit.0 * s;
-        let py = f.head.1 - f.unit.1 * s + rail;
+        // A standing body's station stands at its lattice point, measured from the landing
+        // itself: taken from the head, its place carried the head's rounding, a slab's edge
+        // then fell a pixel either side from frame to frame, and the pixel it crossed blinked.
+        // Its colour is read at the same place, so a stop's edge stays put too.
+        let (px, py, along) = if phase == 1 && still {
+            let d = (idx - 1) as f32 * f.stride;
+            (m.x1 - f.unit.0 * d, m.y1 - f.unit.1 * d + rail, d)
+        } else {
+            (
+                f.head.0 - f.unit.0 * s,
+                f.head.1 - f.unit.1 * s + rail,
+                f.to_go + s,
+            )
+        };
         // Across a lettered row the train passes behind the letters.
         let shows = text.at(px, py);
         if shows <= 0.0 {
@@ -3107,7 +3161,7 @@ fn build_stations(
                     if cov < 1.0 {
                         continue;
                     }
-                    let stop = spectrum(walk_pace(tri(m.t_land - (f.to_go + s) * lay_step)));
+                    let stop = spectrum(walk_pace(tri(m.t_land - along * lay_step)));
                     let key = (
                         stop,
                         if rail > 0.0 && warm {
@@ -3157,7 +3211,7 @@ fn build_stations(
                     if cov < 1.0 {
                         continue;
                     }
-                    let stop = spectrum(walk_pace(tri(m.t_land - (f.to_go + s) * lay_step)));
+                    let stop = spectrum(walk_pace(tri(m.t_land - along * lay_step)));
                     let cov = if warm && clean && !square {
                         let g = match last_warm_gain {
                             Some((prev, cached)) if prev == stop => cached,
@@ -3701,7 +3755,13 @@ fn burst_lance(
             let side = (thick.round() as i32).max(1);
             let half_side = side / 2;
             let stride = (thick * BURST_LIGHT_STEP_SHARE).max(1.0);
-            let mut s = s0;
+            // Squares on a lattice from the landing, as a jet's stations: the section's
+            // ends grow with the ring, and squares stepped from its start slid every frame.
+            let mut s = if bursts_spread() {
+                s0
+            } else {
+                (s0 / stride).ceil() * stride
+            };
             while s <= s1 {
                 let a = (light_ink * (1.0 - (s - root) * tip_fade_inv_span)) as u8;
                 let px = ox + dir.0 * s;
@@ -3767,6 +3827,7 @@ fn burst_jet(
     let step = burst_step(ch, JET_STEP_CH_SHARE, JET_STEP_PX);
     let sec_end = [root + span * JET_SEC_SHARE[0], tip];
     let inv_cw = 1.0 / cw;
+    let pitch = cw * (1.0 / JET_STATIONS_PER_CELL as f32);
     let inv_span = 1.0 / span;
     let mut s0 = root;
     let mut k = 0;
@@ -3780,21 +3841,49 @@ fn burst_jet(
             continue;
         }
         let thick = (JET_SEC_THICK_CH[cur_k] * ch).max(1.0);
-        let stations = ((seg * inv_cw) * JET_STATIONS_PER_CELL as f32)
-            .ceil()
-            .max(1.0) as usize
-            + 1;
-        let denom = (stations - 1) as f32;
-        let inv_denom = 1.0 / denom;
-        let w = ((seg * inv_denom).round() as i32).max(1) + 1;
+        // The stations stand on a lattice measured from the landing, not spread over the
+        // section: the section grows with the ring, and stations spread over it slid a little
+        // every frame, so a light square fell on and off a pixel at its edge and a station
+        // crossed between a blank cell and a lettered one (`row_blank`), the jet's piece in a
+        // word's gap blinking with it (`lab trail-film`'s jump, at Home and End). A light
+        // jet's stations are squares a pitch and a pixel wide, which meet across the lattice; a
+        // dark jet's are a beam's vertices, so each section takes its own two ends as well: the
+        // sections then meet at `s1` (from the lattice alone the first ended at the last station
+        // short of `s1` and the second began at the first past it, a dark gap a pitch long
+        // walking out as the ring grew, each pixel it crossed lit, dark and lit again), and a
+        // section shorter than two pitches still draws. An end moves with the ring, but only
+        // ever outward, and a beam's light along its line does not hang on where its vertices
+        // fall; a light square at a moving end would slide over a standing one, its ink laid
+        // twice where they meet.
+        let (first, last) = jet_lattice(s0, s1, pitch);
+        let ends = usize::from(!light);
+        let (n, w) = if bursts_spread() {
+            let n = ((seg * inv_cw) * JET_STATIONS_PER_CELL as f32)
+                .ceil()
+                .max(1.0) as usize
+                + 1;
+            (n, ((seg / (n - 1) as f32).round() as i32).max(1) + 1)
+        } else {
+            (
+                (last + 1).saturating_sub(first) + 2 * ends,
+                (pitch.round() as i32).max(1) + 1,
+            )
+        };
         let h = (thick.round() as i32).max(1);
         let (half_w, half_h) = (w / 2, h / 2);
         frame.beams.clear();
         let mut j = 0;
-        while j < stations {
-            let share = j as f32 * inv_denom;
+        while j < n {
+            let d = if bursts_spread() {
+                s0 + seg * j as f32 / (n - 1) as f32
+            } else if ends == 1 && j == 0 {
+                s0
+            } else if ends == 1 && j + 1 == n {
+                s1
+            } else {
+                (first + j - ends) as f32 * pitch
+            };
             j += 1;
-            let d = s0 + seg * share;
             let dx = dir.0 * d;
             let cell = (dx * inv_cw).round() as i32;
             if !sky.row_blank(cell) {
@@ -3839,6 +3928,16 @@ fn burst_jet(
         }
         s0 = s1;
     }
+}
+
+/// The first and last index `k` of the lattice `k * pitch` px out from the landing that fall in
+/// `from..=to` (none when the first is past the last).
+#[inline]
+#[must_use]
+const fn jet_lattice(from: f32, to: f32, pitch: f32) -> (usize, usize) {
+    let first = (from / pitch).ceil().max(0.0) as usize;
+    let last = (to / pitch).floor().max(0.0) as usize;
+    (first, last)
 }
 
 #[inline]
@@ -3965,11 +4064,19 @@ const fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
     };
     let arm = SPARK_ARM_MIN_PX + idx;
     let (sa, ca) = crate::supernova::sin_cos_f32(a);
+    // Births come evenly over their fifth of a second, inner points first; the points
+    // themselves are spread evenly over the shower's area (the square root), out to the end of
+    // the throw, so the shower reaches about as far as a thrown one was seen.
+    let born = unit01(s, 5);
+    let along = crate::color_math::sqrt_f32(born);
     Spark {
         vx: v * ca * SPARK_SPREAD,
         vy: -v * sa,
         life,
         arm: arm as u8,
+        stand: FLASH_BURST_MS + (SPARK_STAND_LAST_MS - FLASH_BURST_MS) * born,
+        at: FLASH_BURST_MS + (life - FLASH_BURST_MS) * along,
+        halo: (0.0, 0.0),
     }
 }
 
@@ -3977,19 +4084,23 @@ const fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
 #[inline]
 #[must_use]
 const fn spark_at(spark: Spark, age_ms: f32, ch: f32) -> Option<((f32, f32), f32)> {
-    let g = SPARK_G_CH_PER_S2 * ch * (1.0 / 1_000_000.0);
-    spark_at_with_gravity(spark, age_ms, 0.5 * g * age_ms * age_ms)
+    spark_at_with_gravity(spark, age_ms, SPARK_G_CH_PER_S2 * ch * (1.0 / 1_000_000.0))
 }
 
+/// Where a spark stands, from the landing, and its alpha at `age_ms`, under gravity `g` px/ms²;
+/// none before it is born or once it is spent.
+///
+/// A spark stands at the point its throw reaches at [`Spark::at`], born there at
+/// [`Spark::stand`] at its brightest, and only cools, as paper's stars do. Thrown, forty to sixty
+/// of them crossed the pixels round the landing one after another, a mark on and off a pixel
+/// eight to fourteen times in a second (`lab trail-film`'s jump, both themes). Standing, the
+/// shower keeps its count, its stars' size and brightness and its reach (each stands as far out
+/// as its throw went), and spreads from the landing in the fifth of a second the births take.
 #[inline]
 #[must_use]
-const fn spark_at_with_gravity(
-    spark: Spark,
-    age_ms: f32,
-    gravity_dy: f32,
-) -> Option<((f32, f32), f32)> {
+const fn spark_at_with_gravity(spark: Spark, age_ms: f32, g: f32) -> Option<((f32, f32), f32)> {
     let u = age_ms / spark.life.max(1.0);
-    if !(u >= 0.0 && u < 1.0) {
+    if !(u >= 0.0 && u < 1.0) || age_ms < spark.stand {
         return None;
     }
     let alpha = if u <= SPARK_HOLD_U {
@@ -4000,21 +4111,285 @@ const fn spark_at_with_gravity(
     if alpha < CHROMA_CULL_ALPHA {
         return None;
     }
-    let dx = spark.vx * age_ms;
-    let dy = spark.vy * age_ms + gravity_dy;
-    Some(((dx, dy), alpha))
+    let at = spark.at;
+    Some(((spark.vx * at, spark.vy * at + 0.5 * g * at * at), alpha))
 }
 
 /// The most quads one spark's star may spend.
 pub const SPARK_STAR_QUAD_CAP: usize = 24;
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static SPARKS_THROWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TRAINS_SPREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BURSTS_SPREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HALOS_REGRANTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HALOS_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with a spark's halo granted for its whole bright life or
+/// not at all, never for the part of it the cap has room for ([`grant_halos`]). Debug and test
+/// builds only; the flag is this thread's.
+#[cfg(any(test, debug_assertions))]
+pub fn with_halos_whole_or_none<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            HALOS_WHOLE.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(HALOS_WHOLE.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether a test's negative control grants a spark's halo for its whole bright life or not at
+/// all (`with_halos_whole_or_none`); never in a release build.
+#[inline]
+fn halos_whole_or_none() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        HALOS_WHOLE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// A test's negative control: `f` run with every bright spark wearing a halo while the frame's
+/// cap has room, as the cap once was, instead of as granted when its landing came
+/// ([`grant_halos`]). Debug and test builds only; the flag is this thread's.
+#[cfg(any(test, debug_assertions))]
+pub fn with_halos_regranted<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            HALOS_REGRANTED.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(HALOS_REGRANTED.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether a test's negative control spreads a landing burst's stations over each section
+/// (`with_bursts_spread`); never in a release build.
+#[inline]
+fn bursts_spread() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        BURSTS_SPREAD.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// A test's negative control: `f` run with a landing burst's light squares and its jets'
+/// stations spread evenly over each section from its moving start, as they were before they
+/// stood on a lattice from the landing ([`jet_lattice`]). Debug and test builds only; the flag
+/// is this thread's.
+#[cfg(any(test, debug_assertions))]
+pub fn with_bursts_spread<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            BURSTS_SPREAD.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(BURSTS_SPREAD.with(|c| c.replace(true)));
+    f()
+}
+
+/// A test's negative control: `f` run with a landing's sparks thrown, each drawn where its throw
+/// is at every age from the landing, as they were before they stood ([`Spark::at`]). Debug and
+/// test builds only; the flag is this thread's.
+#[cfg(any(test, debug_assertions))]
+pub fn with_sparks_thrown<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            SPARKS_THROWN.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(SPARKS_THROWN.with(|c| c.replace(true)));
+    f()
+}
+
+/// A test's negative control: `f` run with a standing train's body spread evenly over its span,
+/// as a flying train's is, instead of standing on its lattice ([`Flight::lattice`]). Debug and
+/// test builds only; the flag is this thread's.
+#[cfg(any(test, debug_assertions))]
+pub fn with_trains_spread<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            TRAINS_SPREAD.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(TRAINS_SPREAD.with(|c| c.replace(true)));
+    f()
+}
+
+/// The spark as it is drawn at `age_ms`: standing, or in a test's negative control thrown
+/// (`with_sparks_thrown`), where its throw is at that age.
+#[inline]
+fn spark_seen(spark: Spark, age_ms: f32) -> Spark {
+    #[cfg(any(test, debug_assertions))]
+    if SPARKS_THROWN.with(std::cell::Cell::get) {
+        return Spark {
+            stand: 0.0,
+            at: age_ms,
+            ..spark
+        };
+    }
+    let _ = age_ms;
+    spark
+}
+
+/// The row bands a halo of radius `r` px centred on `cy` spans: the quads it takes at most
+/// (`push_halo_quads` lays one per band, the glass's edge only cutting some).
+#[inline]
+#[must_use]
+const fn halo_bands(geom: Geom, cy: i32, r: i32) -> usize {
+    let ch = if geom.ch > 1 { geom.ch as i32 } else { 1 };
+    let oy = geom.origin_y as i32;
+    let r = if r > 1 { r } else { 1 };
+    ((cy + r - 1 - oy).div_euclid(ch) - (cy - r - oy).div_euclid(ch) + 1) as usize
+}
+
+/// The step, ms, a landing's spark halos are granted in ([`grant_halos`]).
+pub const SPARK_HALO_GRANT_MS: f32 = 4.0;
+
+/// The steps of a landing's life its spark halos are granted in.
+const HALO_GRANT_STEPS: usize = (SPARK_LIFE_MAX_MS / SPARK_HALO_GRANT_MS) as usize + 1;
+
+/// The least, ms, a halo the cap cuts short of its spark's bright life is lit for
+/// ([`grant_halos`]): a tenth of a second, so a cut halo reads as a glow and not a glint.
+pub const SPARK_HALO_PART_MIN_MS: f32 = 100.0;
+
+/// The age, ms, a spark's star falls under [`SPARK_SHRINK_ALPHA`] and loses its halo. Past its
+/// hold its alpha is `spend` of the rest of its life, `(1 − v)²`, at or over the shrink while
+/// `v ≤ 1 − √SPARK_SHRINK_ALPHA`.
+#[inline]
+#[must_use]
+const fn spark_bright_until(spark: Spark) -> f32 {
+    let v = 1.0 - crate::color_math::sqrt_f32(SPARK_SHRINK_ALPHA);
+    spark.life * (SPARK_HOLD_U + (1.0 - SPARK_HOLD_U) * v)
+}
+
+/// The halo quads a spark of `l` lays while it is bright: the row bands round its standing point.
+#[inline]
+#[must_use]
+fn spark_halo_quads(l: &Landing, spark: Spark, geom: Geom) -> usize {
+    let g = SPARK_G_CH_PER_S2 * geom.ch as f32 * (1.0 / 1_000_000.0);
+    let at = spark.at;
+    let dy = spark.vy * at + 0.5 * g * at * at;
+    let r = (f32::from(spark.arm).max(1.0) + SPARK_HALO_R_ADD_PX).round() as i32;
+    halo_bands(geom, (l.y + dy).round() as i32, r)
+}
+
+/// `landing` into the pool: a full pool's oldest leaves, and its sparks' halos are granted
+/// beside the landings still live ([`grant_halos`]).
+#[inline]
+fn admit(landings: &mut Vec<Landing>, mut landing: Landing, geom: Geom) {
+    if landings.len() >= LANDING_POOL {
+        landings.remove(0);
+    }
+    grant_halos(&mut landing, landings, geom);
+    landings.push(landing);
+}
+
+/// Grants `new`'s sparks their halos ([`Spark::halo`]) beside those `live`'s hold, so that every
+/// live landing's together lay at most [`SPARK_HALO_CAP`] quads in any frame.
+///
+/// Each spark's halo is lit for one stretch of its bright life (its birth to
+/// [`spark_bright_until`]) or not at all, so it lights once and goes out once: its whole bright
+/// life when every step of it has room, else the longest run of steps that has (the earliest of
+/// the longest), and none when that run is under [`SPARK_HALO_PART_MIN_MS`]. The latest born are
+/// granted first, so on a full frame the outer stars of a shower, born last, keep their halos and
+/// the inner ones, born first, give theirs up as the outer ones come. The landings before keep
+/// theirs. The grant is made once, when the landing comes, and kept with its sparks, so neither a
+/// later landing nor an earlier one leaving the pool changes it. A step is
+/// [`SPARK_HALO_GRANT_MS`] long, and a halo takes every step it is lit in any part of.
+///
+/// A grant read from the halos laid each frame changed as the sparks before a spark were born
+/// and cooled, and its halo came and went with them (`with_halos_regranted`). A grant held for
+/// the landing's whole life, of the first sparks whose halos fit, left a quarter of a lone
+/// shower bare for good and lit a later landing's halos mid-life when the one before it ended.
+fn grant_halos(new: &mut Landing, live: &[Landing], geom: Geom) {
+    fn steps((on, off): (f32, f32)) -> (usize, usize) {
+        let at = |ms: f32| (ms / SPARK_HALO_GRANT_MS).clamp(0.0, HALO_GRANT_STEPS as f32);
+        (at(on).floor() as usize, at(off).ceil() as usize)
+    }
+    let mut used = [0_usize; HALO_GRANT_STEPS];
+    for l in live {
+        let d = ms_since(l.pin.at, new.pin.at) - ms_since(new.pin.at, l.pin.at);
+        for &spark in l.spark.iter().take(usize::from(l.sparks)) {
+            if spark.halo.1 > spark.halo.0 {
+                let quads = spark_halo_quads(l, spark, geom);
+                let (first, end) = steps((spark.halo.0 - d, spark.halo.1 - d));
+                for n in &mut used[first..end.max(first)] {
+                    *n += quads;
+                }
+            }
+        }
+    }
+    let count = usize::from(new.sparks).min(SPARK_N_MAX);
+    let mut order = [0_usize; SPARK_N_MAX];
+    for (k, o) in order.iter_mut().enumerate().take(count) {
+        *o = k;
+    }
+    order[..count].sort_by(|&a, &b| new.spark[b].stand.total_cmp(&new.spark[a].stand));
+    let parts = !halos_whole_or_none();
+    for &k in &order[..count] {
+        let spark = new.spark[k];
+        let (born, until) = (spark.stand, spark_bright_until(spark));
+        let quads = spark_halo_quads(new, spark, geom);
+        let (from, end) = steps((born, until));
+        let (mut best, mut run) = ((from, from), from);
+        for (i, &n) in used.iter().enumerate().take(end).skip(from) {
+            if n + quads > SPARK_HALO_CAP {
+                run = i + 1;
+            } else if i + 1 - run > best.1 - best.0 {
+                best = (run, i + 1);
+            }
+        }
+        let (first, last) = best;
+        let on = if first == from {
+            born
+        } else {
+            first as f32 * SPARK_HALO_GRANT_MS
+        };
+        let off = if last == end {
+            until
+        } else {
+            last as f32 * SPARK_HALO_GRANT_MS
+        };
+        let whole = first == from && last == end;
+        if off <= on || (!whole && (!parts || off - on < SPARK_HALO_PART_MIN_MS)) {
+            continue;
+        }
+        for n in &mut used[first..last] {
+            *n += quads;
+        }
+        new.spark[k].halo = (on, off);
+    }
+}
+
+/// A landing's sparks, each a star standing where its throw was drawn ([`spark_at_with_gravity`]),
+/// with a halo on a dark page while it is bright and its grant ([`grant_halos`]) holds.
+///
+/// `halo_cap` is the length the frame's halos may reach: [`SPARK_HALO_CAP`] past those laid
+/// before the first landing's. The grants keep under it, so it holds back only a test's
+/// controls, whose halos are not the ones granted.
 #[inline]
 fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usize) {
     if l.sparks == 0 || ctx.cfg.reduced_motion {
         return;
     }
     let age = ms_since(l.pin.at, ctx.now);
-    if !(FLASH_BURST_MS..SPARK_LIFE_MAX_MS).contains(&age) {
+    if age >= SPARK_LIFE_MAX_MS {
         return;
     }
     let geom = ctx.geom;
@@ -4025,8 +4400,15 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         return;
     }
     let g = SPARK_G_CH_PER_S2 * ch * (1.0 / 1_000_000.0);
-    let gravity_dy = 0.5 * g * age * age;
     let light = !ctx.cfg.dark_theme;
+    let limit = usize::from(l.sparks).min(l.spark.len());
+    #[cfg(any(test, debug_assertions))]
+    let regranted = HALOS_REGRANTED.with(std::cell::Cell::get);
+    #[cfg(not(any(test, debug_assertions)))]
+    let regranted = false;
+    if age < FLASH_BURST_MS {
+        return;
+    }
     let (table_opt, y_bg) = if light {
         let table = crate::color_math::relative_luminance_table();
         (
@@ -4037,12 +4419,12 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         (None, 0.0)
     };
     let mut light_stops = [None; SPECTRUM_STOPS];
-    let limit = usize::from(l.sparks).min(l.spark.len());
     let mut si = 0;
     while si < limit {
-        let spark = l.spark[si];
+        let spark = spark_seen(l.spark[si], age);
+        let wears = regranted || (spark.halo.0 <= age && age < spark.halo.1);
         si += 1;
-        let Some(((dx, dy), alpha)) = spark_at_with_gravity(spark, age, gravity_dy) else {
+        let Some(((dx, dy), alpha)) = spark_at_with_gravity(spark, age, g) else {
             continue;
         };
         let cov = TRANSIENT_STAR_COV_CEIL * alpha * intensity;
@@ -4080,9 +4462,12 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
             }
             continue;
         }
-        if alpha >= SPARK_SHRINK_ALPHA && frame.halos.len() < halo_cap {
+        let r = arm as f32 + SPARK_HALO_R_ADD_PX;
+        if wears
+            && alpha >= SPARK_SHRINK_ALPHA
+            && frame.halos.len() + halo_bands(geom, y, r.round() as i32) <= halo_cap
+        {
             let rgb = landing_stop_ink(stop);
-            let r = arm as f32 + SPARK_HALO_R_ADD_PX;
             push_halo_add(
                 frame.halos,
                 geom,

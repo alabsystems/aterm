@@ -98,6 +98,23 @@ impl Reason {
         )
     }
 
+    /// A start the run's live share refused ([`crate::test_share::Live::refuses`]).
+    pub(super) fn share(
+        b: &Planned,
+        held: u32,
+        live: f64,
+        refused: crate::test_share::Refused,
+    ) -> Self {
+        Self::new(
+            "dispatcher",
+            vec!["core"],
+            format!(
+                "charge={} held={held} live_share={} asked={} live_cores={live}",
+                b.charge, refused.share, refused.asked
+            ),
+        )
+    }
+
     fn ordered() -> Self {
         Self::new(
             "dispatcher",

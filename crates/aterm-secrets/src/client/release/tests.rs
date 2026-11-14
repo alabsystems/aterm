@@ -959,3 +959,26 @@ fn the_legacy_ring_copies_are_never_read() {
         "the 0.145 copies alone authorize nothing"
     );
 }
+
+/// A profile Apple refuses (401, 403, a lapsed agreement) is replaced from the vault's entry;
+/// an answer that says nothing of the credential (no network, Apple down) replaces nothing.
+/// NEGATIVE CONTROL: before this, only a missing keychain item was replaced, so a Mac holding an
+/// older credential kept answering 403 after the owner updated the vault's entry.
+#[test]
+fn a_profile_apple_refuses_is_replaced_and_an_outage_replaces_nothing() {
+    for refused in [
+        "Error: No Keychain password item found for profile: notary",
+        "Error: HTTP status code: 401. Invalid credentials. Username or password is incorrect.",
+        "Error: HTTP status code: 403. A required agreement is missing or has expired.",
+    ] {
+        assert!(profile_unusable(refused), "{refused}");
+    }
+    for kept in [
+        "Error: The Internet connection appears to be offline.",
+        "Error: HTTP status code: 500. Internal Server Error",
+        "Error: HTTP status code: 503. Service Unavailable",
+        "",
+    ] {
+        assert!(!profile_unusable(kept), "{kept}");
+    }
+}

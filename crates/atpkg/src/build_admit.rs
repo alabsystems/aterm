@@ -2246,6 +2246,12 @@ pub fn run_if_claimed(
 /// plus their directory exported for a call that
 /// [`loses_config`](crate::build_cache::loses_config) (tippy, clippy), `env` only its export of
 /// `CARGO_BUILD_BUILD_DIR` (the trust lane)), so the registration reads the call as typed.
+/// Where that call produces build output in a workspace whose root it resolves and was started
+/// in an aterm tab ([`crate::build_start::tab`]), the shim's form then leaves its start line
+/// ([`crate::build_start`]: the tab's session, the workspace, the build folder), on macOS,
+/// whether or not the call claims and before any claim is asked for, so a refused or
+/// interrupted call leaves one too; a line that cannot be written is dropped unsaid and changes
+/// nothing that follows.
 /// Then a call that claims runs `target` under its claim in this pid ([`front_exec`]); other calls
 /// become `target` by exec, their words handed on unchanged. A shim refuses non-UTF-8 words
 /// because its cache placement cannot be established; a non-shim front still passes them on.
@@ -2304,6 +2310,15 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
         .iter()
         .map(|a| a.to_str().map(str::to_owned))
         .collect::<Option<Vec<String>>>();
+    // Where a build started in a tab leaves its line, and what the shim's call builds, for that
+    // line: none for a call that builds nothing, and none asked for outside a tab.
+    #[cfg(unix)]
+    let tab = crate::build_start::tab();
+    #[cfg(unix)]
+    let in_tab = tab.is_some();
+    #[cfg(not(unix))]
+    let in_tab = false;
+    let mut built = None;
     if let Some((tool, placed)) = shim {
         let registered = words
             .as_deref()
@@ -2314,13 +2329,19 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
                     tool,
                     placed.to_str().unwrap_or(""),
                     std::env::current_dir().ok().as_deref(),
+                    in_tab,
                 )
             });
-        if let Err(error) = registered {
-            eprintln!("atpkg: build cache ownership refused: {error}; no build started");
-            return std::process::ExitCode::from(75);
+        match registered {
+            Ok(observed) => built = observed,
+            Err(error) => {
+                eprintln!("atpkg: build cache ownership refused: {error}; no build started");
+                return std::process::ExitCode::from(75);
+            }
         }
     }
+    #[cfg(not(unix))]
+    let _ = built;
     #[cfg(unix)]
     if let Some(args) = words
         && let Ok(cwd) = std::env::current_dir()
@@ -2349,6 +2370,12 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
                 &|file| aterm_uds::ownerlock::probe_any(file) == aterm_uds::ownerlock::Owner::Live,
             )
         };
+        // One line for a build started in a tab, before admission: `classify` reads `run`
+        // and the aliases over it (`verify`, `ship`, `lab`) as claiming nothing, and they
+        // compile too.
+        if let (Some(tab), Some(built)) = (&tab, &built) {
+            crate::build_start::note(tab, &built.workspace, built.build_dir.as_deref());
+        }
         return front_exec_bounded(target, &args, tool, &cwd, &seat, &possible_lock);
     }
     exec(target, rest)

@@ -9,22 +9,31 @@
 
 use crate::{Ctx, Scope, ladder::Report};
 
-fn bootstrap_input(path: &str) -> bool {
-    path.split('/').any(|part| part == ".cargo")
+fn bootstrap_input(path: &str, confined: &[String]) -> bool {
+    if path.split('/').any(|part| part == ".cargo")
         || matches!(
             path.rsplit('/').next().unwrap_or(path),
             "Cargo.toml" | "Cargo.lock" | "trust.lock" | "rust-toolchain" | "rust-toolchain.toml"
         )
-        || [
-            "crates/atpkg/",
-            "crates/aterm-toolchain/",
-            "crates/aterm-tempfile/",
-            "crates/aterm-release/",
-            "crates/aterm-verify/src/released_shim",
-            "tools/install.sh",
-        ]
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
+    {
+        return true;
+    }
+    let package = [
+        ("crates/atpkg/", "atpkg"),
+        ("crates/aterm-toolchain/", "aterm-toolchain"),
+        ("crates/aterm-tempfile/", "aterm-tempfile"),
+        ("crates/aterm-release/", "aterm-release"),
+        ("crates/aterm-verify/src/released_shim", "aterm-verify"),
+    ]
+    .iter()
+    .find(|(prefix, _)| path.starts_with(prefix))
+    .map(|(_, name)| *name);
+    match package {
+        // The cone's `alone` evidence proves that no build without tests reads changed
+        // code or bytes. A filename alone supplies no such evidence; uncertainty runs the rig.
+        Some(name) => !path.ends_with(".rs") || !confined.iter().any(|member| member == name),
+        None => path.starts_with("tools/install.sh"),
+    }
 }
 
 /// The line of a refused build that says why.
@@ -37,43 +46,120 @@ fn refusal(output: &std::process::Output) -> String {
         .to_owned()
 }
 
+/// What makes the judgment owed where no change cone narrows it: `verify released-shim`, `-p`,
+/// `--all`, and a release's early ask of its own tree ([`judge`]).
+pub const WHOLE_TREE: &str = "explicit selection (all bootstrap inputs)";
+
+/// How the judgment of one checkout ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The installed public release built the checkout.
+    Accepted,
+    /// The installed public release refused it: red.
+    Refused,
+    /// Nothing was decided (no installed public release that may judge, no fetched public tag,
+    /// a rig that could not be made): COULD NOT RUN, never green.
+    Undecided,
+    /// This host is no Mac: the lane is judged on one.
+    NotThisHost,
+}
+
+/// The judgment of one checkout: how it ended, the words its row says, and what the judging
+/// build wrote (its stderr; its stdout too where it refused).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Judged {
+    pub verdict: Verdict,
+    pub row: String,
+    pub output: String,
+}
+
+/// THE RELEASED-SHIM JUDGMENT of the checkout at `root`: the installed public release's shim
+/// and helper build its tracked files' `aterm-time` offline in a disposable home. `inputs`
+/// names what makes it owed, for its row. The check's stage ([`run`]) and a release's early ask
+/// of its own tree (`ship release`, step 1) both make it here, so both say the same words.
+/// What it finds depends on which release is public and installed as well as on the tree: it
+/// can turn red with no change to the tree.
+#[must_use]
+pub fn judge(root: &std::path::Path, env: &crate::EnvSnapshot, inputs: &[String]) -> Judged {
+    #[cfg(target_os = "macos")]
+    {
+        match mac::judge(root, env) {
+            Ok((judging, output)) if output.status.success() => Judged {
+                verdict: Verdict::Accepted,
+                row: format!(
+                    "released-shim: {} built aterm-time; inputs: {}",
+                    judging.who(),
+                    inputs.join(", ")
+                ),
+                output: String::from_utf8_lossy(&output.stderr).into_owned(),
+            },
+            Ok((judging, output)) => Judged {
+                verdict: Verdict::Refused,
+                row: format!(
+                    "released-shim: {} refuses candidate ({}); incompatible bootstrap inputs: \
+                     {}; {}; land shim support first, release it, then adopt the configuration",
+                    judging.who(),
+                    output.status,
+                    inputs.join(", "),
+                    refusal(&output)
+                ),
+                output: format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            },
+            Err(why) => Judged {
+                verdict: Verdict::Undecided,
+                row: format!("released-shim: {why}"),
+                output: String::new(),
+            },
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (root, env, inputs);
+        Judged {
+            verdict: Verdict::NotThisHost,
+            row: "released-shim: macOS installed-app bootstrap lane (run on a Mac)".into(),
+            output: String::new(),
+        }
+    }
+}
+
 pub(crate) fn run(ctx: &Ctx, report: &mut Report) {
     let inputs = match &ctx.scope {
         Scope::Changed(change) => {
             match crate::changed::changed_since(&ctx.root, &ctx.path_env, &change.base) {
-                Ok(paths) => paths.into_iter().filter(|p| bootstrap_input(p)).collect(),
+                Ok(paths) => paths
+                    .into_iter()
+                    .filter(|p| bootstrap_input(p, &change.alone))
+                    .collect(),
                 Err(why) => {
                     report.cannot_run(why);
                     return;
                 }
             }
         }
-        _ => vec!["explicit selection (all bootstrap inputs)".to_owned()],
+        _ => vec![WHOLE_TREE.to_owned()],
     };
     if inputs.is_empty() {
-        report.pass("released-shim: no bootstrap inputs changed; no child build");
+        report.pass("released-shim: no executable bootstrap inputs changed; no child build");
         return;
     }
-    #[cfg(target_os = "macos")]
-    match mac::judge(&ctx.root, &ctx.env) {
-        Ok((judging, output)) if output.status.success() => {
-            report.raw(String::from_utf8_lossy(&output.stderr));
-            report.pass(format!(
-                "released-shim: {} built aterm-time; inputs: {}",
-                judging.who(),
-                inputs.join(", ")
-            ));
-        }
-        Ok((judging, output)) => {
-            report.raw(String::from_utf8_lossy(&output.stdout));
-            report.raw(String::from_utf8_lossy(&output.stderr));
-            report.fail(format!("released-shim: {} refuses candidate ({}); incompatible bootstrap inputs: {}; {}; land shim support first, release it, then adopt the configuration", judging.who(), output.status, inputs.join(", "), refusal(&output)));
-        }
-        Err(why) => report.cannot_run(format!("released-shim: {why}")),
+    let judged = judge(&ctx.root, &ctx.env, &inputs);
+    report.raw(judged.output);
+    match judged.verdict {
+        Verdict::Accepted => report.pass(judged.row),
+        Verdict::Refused => report.fail(judged.row),
+        Verdict::Undecided => report.cannot_run(judged.row),
+        Verdict::NotThisHost => report.skip(judged.row),
     }
-    #[cfg(not(target_os = "macos"))]
-    report.skip("released-shim: macOS installed-app bootstrap lane (run on a Mac)");
 }
+
+#[cfg(test)]
+#[path = "released_shim_tests.rs"]
+mod tests;
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -303,7 +389,9 @@ mod mac {
         pub(super) fn new(env: &EnvSnapshot, store: &Store, label: String) -> Result<Self, String> {
             let scratch = io(aterm_tempfile::tempdir())?;
             let home = io(scratch.path().canonicalize())?;
-            // Model the standard account cache parent without any managed cache or marker.
+            // Model the standard account cache parent without any managed cache or marker: a
+            // macOS HOME has ~/Library/Caches. Without it the installed 0.199.0 shim refuses
+            // its first build there (ATERM-KI-1112-154), which no real HOME ever meets.
             // This lane judges the installed shim's configuration support, independently of
             // whether an older helper can bootstrap missing account directories. The judgment
             // is one build, the first in its home, and its custody stays entirely in scratch.

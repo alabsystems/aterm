@@ -14,8 +14,6 @@ use aterm_types::needs::NeedWord;
 pub(crate) const POLL_EVERY: Duration = Duration::from_secs(60);
 /// The longest wait between reads that reach no peer ([`Quiet`]).
 pub(crate) const QUIET_MAX: Duration = Duration::from_secs(30 * 60);
-/// On menu open, a read younger than this is fresh enough.
-pub(crate) const MENU_FRESH: Duration = Duration::from_secs(15);
 /// A fleet need counts on the badge only from a read this young.
 pub(crate) const COUNT_FRESH: Duration = Duration::from_secs(300);
 /// One read's whole bound: the child's own deadline is 3 s a peer, so this is the kill, never a wait it is expected to reach.
@@ -33,16 +31,8 @@ pub(crate) struct FleetNeed {
     pub(crate) word: NeedWord,
     /// Who it is: the title a person gave it where the peer allows content, else its role, else its program.
     pub(crate) who: String,
-    /// "worker of s-1e91": the task's `from=` where it names a sid.
-    pub(crate) worker_of: Option<String>,
     /// How long ago the fact it stands on moved, as of the read.
     pub(crate) age_ms: Option<u64>,
-    /// The need's own words where the peer serves content ([`content_what`]): an ask's text, a box's kind, a wall's kind and reset; at any level, the words of a need the row says is the program's own report (`claim`).
-    pub(crate) what: Option<String>,
-    /// The need's words where the row says it is the program's own report (`needs_by=program`, [`crate::needs::claim_words_of_row`]): aterm's fixed words, no content of the peer's.
-    pub(crate) claim: Option<&'static str>,
-    /// The row says the need is a harness's `NEEDS YOU:` report its agent carries on past (`needs_by=harness`): Needs you lists it after the needs that stopped their agents ([`crate::status_item::NeedRow::carries_on`]).
-    pub(crate) carries_on: bool,
 }
 
 /// One session on a fleet peer that this Mac holds over the fleet.
@@ -74,25 +64,10 @@ pub(crate) struct FleetMac {
     pub(crate) dial: String,
     /// Its node id (its header's `node=`), when it sent one and proved it ([`Self::unproven`]'s is its claim, never kept).
     pub(crate) node: Option<String>,
-    /// Where Screen Sharing and ssh go: the peer's own `host=` (a proven peer's only), else the host its book name names.
-    pub(crate) host: Option<String>,
-    /// Its rows carry titles and words (`[fleet] allow = "content"`).
-    pub(crate) content: bool,
-    /// It lets this Mac drive it (its header's `drive=1`, the step-in).
-    pub(crate) drive: bool,
-    /// Its fleet access, the ceiling on what a driver may do there (its header's `access=`,
-    /// `aterm_types::fleet_access::FleetAccess::of_header`: a proven peer that sends none is an
-    /// aterm from before the lock, which enforces none). `None` where it was not read: this
-    /// Mac's copy, and a peer whose key is not proven, whose word it would be. Absent, never a
-    /// level.
-    pub(crate) access: Option<aterm_types::fleet_access::FleetAccess>,
     /// Its rows publish no `needs=`: an older aterm, listed and never counted.
     pub(crate) older: bool,
-    /// Answered without proving a node key this Mac binds (`"unproven":true`, [`BookFacts::unbound_issuer`]).
+    /// Answered without proving a node key this Mac binds (`"unproven":true`).
     pub(crate) unproven: bool,
-    /// The sessions its reply holds rows for; `None` on this Mac's copy, where no session count
-    /// leaves a Mac (its `now/activity` row counts agents, not sessions).
-    pub(crate) sessions: Option<usize>,
     /// What its agents are doing, by their own words ([`AgentWord::of`]): counted from its survey
     /// rows, or on this Mac's copy from its `now/activity` row ([`AgentTally::of_row`]). `None`
     /// where it was not read: an older aterm's rows, and on the copy a Mac that publishes no
@@ -111,9 +86,6 @@ pub(crate) struct FleetMac {
     pub(crate) sessions_more: usize,
     /// Rows its reply cap left out (`sessions=` past every session row sent, exited ones included: the header counts them too).
     pub(crate) left_out: usize,
-    /// Live instances the peer reports whose sessions this reply read (`instances_read=`, 1 where
-    /// a window answered alone).
-    pub(crate) instances_read: usize,
     /// Other live instances the peer reports, whose sessions this reply did not read.
     pub(crate) instances_unread: usize,
     /// Its needs.
@@ -608,18 +580,6 @@ impl FleetSnapshot {
         self.macs.iter().filter(|m| !m.carried).count()
     }
 
-    /// The agents it read on the Macs that answered it and count ([`FleetMac::counts`]); `None`
-    /// where no such Mac's activity was read (an older fleet; on this Mac's copy, no Mac's fresh
-    /// `now/activity` row).
-    pub(crate) fn agents(&self) -> Option<usize> {
-        self.macs
-            .iter()
-            .filter(|m| !m.carried && m.counts())
-            .filter_map(|m| m.activity)
-            .map(|tally| usize::from(tally.agents))
-            .reduce(|a, b| a + b)
-    }
-
     /// The first instant after `now_ms` (unix ms) at which the read, or one Mac's rows in it,
     /// starts or stops counting. A read ahead of a corrected clock starts at its timestamp.
     pub(crate) fn next_freshness_change(&self, now_ms: u64) -> Option<u64> {
@@ -666,20 +626,6 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// `name` when it can stand in a `vnc://` URL or an `ssh` line: letters, digits, `.`, `-` and `_`, starting with a letter or digit.
-pub(crate) fn host_word(name: &str) -> Option<String> {
-    let ok = !name.is_empty()
-        && name.len() <= 253
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-    ok.then(|| name.to_string())
-}
-
 /// THE NAME THE BOOK KNOWS A PEER BY, from its survey label.
 pub(crate) fn dial_of(label: &str) -> &str {
     label.split_once(" at ").map_or(label, |(name, _)| name)
@@ -711,53 +657,6 @@ pub(crate) fn short_name(dial: &str) -> String {
         .filter(|first| !first.is_empty())
         .unwrap_or(host)
         .to_string()
-}
-
-/// The `aterm` argv of a fleet row's read: `ctl survey --host <dial>`, and `--sid <sid>` for one session.
-#[cfg_attr(
-    all(not(target_os = "macos"), not(test)),
-    expect(dead_code, reason = "the menu-bar status item is macOS's")
-)]
-pub(crate) fn fleet_read_args(dial: &str, sid: Option<&str>) -> Option<Vec<String>> {
-    if dial.is_empty() || dial.starts_with('-') || dial.chars().any(char::is_whitespace) {
-        return None;
-    }
-    let mut args: Vec<String> = ["ctl", "survey", "--host", dial]
-        .map(str::to_string)
-        .to_vec();
-    if let Some(sid) = sid {
-        if !sid.starts_with("s-") || sid.chars().any(char::is_whitespace) {
-            return None;
-        }
-        args.extend(["--sid".to_string(), sid.to_string()]);
-    }
-    Some(args)
-}
-
-/// The argv after the program of a fleet need's Take Over (`on`) or Hand Back on the Mac the book knows as `dial`.
-#[cfg_attr(
-    all(not(target_os = "macos"), not(test)),
-    expect(dead_code, reason = "the menu-bar status item is macOS's")
-)]
-pub(crate) fn fleet_hold_args(dial: &str, sid: &str, on: bool) -> Option<Vec<String>> {
-    let plain = |word: &str| {
-        !word.is_empty() && !word.starts_with('-') && !word.chars().any(char::is_whitespace)
-    };
-    if !plain(dial) || !sid.starts_with("s-") || !plain(sid) {
-        return None;
-    }
-    Some(
-        [
-            "ctl",
-            "--host",
-            dial,
-            "hold",
-            sid,
-            if on { "on" } else { "off" },
-        ]
-        .map(str::to_string)
-        .to_vec(),
-    )
 }
 
 /// A member of a JSON object as a string, `None` for `-`, empty or absent.
@@ -810,20 +709,11 @@ fn mac_of(
         name: short_name(dial),
         dial: dial.to_string(),
         node: proven("node").map(str::to_ascii_lowercase),
-        host: proven("host")
-            .and_then(host_word)
-            .or_else(|| host_word(host_part(dial))),
-        content,
-        drive: proven("drive") == Some("1"),
-        access: (!unproven)
-            .then(|| aterm_types::fleet_access::FleetAccess::of_header(field(instance, "access"))),
         older,
         unproven,
-        sessions: Some(rows.len()),
         build: field(instance, "version").map(str::to_owned),
         // A node service answers for every window it reaches (`instances_read=`); a window that
         // answered alone read itself.
-        instances_read: count("instances_read"),
         instances_unread: count("instances").saturating_sub(count("instances_read")),
         ..FleetMac::default()
     };
@@ -899,58 +789,18 @@ fn mac_of(
             NeedWord::Frozen | NeedWord::Stopped if !agent => None,
             _ => Some("agent_ms"),
         };
-        let claim = (field(row, "needs_by") == Some("program"))
-            .then(|| crate::needs::claim_words_of_row(need, field(row, "agent")))
-            .flatten();
         mac.needs.push(FleetNeed {
             sid: sid.to_string(),
             word: need,
             who,
-            worker_of: field(row, "task_from")
-                .filter(|f| f.starts_with("s-"))
-                .map(crate::presence::short_sid),
             age_ms: age_key
                 .and_then(|key| field(row, key))
                 .filter(|ms| ms.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|ms| ms.parse().ok()),
-            what: claim
-                .map(str::to_string)
-                .or_else(|| content.then(|| content_what(need, row)).flatten()),
-            claim,
-            carries_on: field(row, "needs_by") == Some("harness"),
         });
     }
     mac.activity = (!older).then_some(tally);
     mac
-}
-
-/// A content peer's words for its row's need `word`, as a local row has
-/// them (§3: "titles and words appear only where that Mac's `[fleet]
-/// allow` is content"): an ask's own text — the row's attention excerpt is
-/// the entry the session is ranked by, the ask itself — a box's kind
-/// (`agent_detail`), a wall's kind and the reset it names.
-fn content_what(word: NeedWord, row: &aterm_json::Map) -> Option<String> {
-    use crate::needs::{HarnessAsk, ROW_WHAT_MAX, fold_clip, need_words};
-    match word {
-        NeedWord::Ask => field(row, "attention")
-            .map(|text| text.trim().trim_start_matches('\u{26a0}').trim_start())
-            .map(|text| {
-                need_words(text).map_or_else(
-                    || fold_clip(text, ROW_WHAT_MAX),
-                    |words| HarnessAsk::of(words).line(ROW_WHAT_MAX),
-                )
-            })
-            .filter(|what| !what.is_empty()),
-        NeedWord::Approval | NeedWord::Question => {
-            let detail = field(row, "agent_detail");
-            Some(crate::presence::prompt_band_word(detail))
-        }
-        NeedWord::Login | NeedWord::Memory | NeedWord::Wall => {
-            let kind = field(row, "agent")?.strip_prefix("wall:")?;
-            Some(crate::needs::wall_what(kind, field(row, "agent_detail")))
-        }
-        NeedWord::Frozen | NeedWord::Stopped | NeedWord::Stalled => None,
-    }
 }
 
 /// THE FLEET READ, PARSED.
@@ -1029,13 +879,6 @@ pub(crate) fn parse(
 pub(crate) struct BookFacts {
     /// It holds a fleet key: it is in a fleet.
     pub(crate) in_fleet: bool,
-    /// It minted the fleet's code (`aterm fleet init`). Joined peer rows no longer
-    /// establish this local fact after F17; it never overrides the watch preference.
-    pub(crate) minted: bool,
-    /// The issuer a member's book names, where it is all the book holds and no copy of that issuer's book was read.
-    pub(crate) issuer_label: Option<String>,
-    /// The issuer a member's book names with no key bound to it (it joined before node keys came, or its issuer proved none then).
-    pub(crate) unbound_issuer: Option<String>,
 }
 
 /// WHETHER THIS MAC IS IN A FLEET, the one answer every surface reads (the fleet glance's book here, the Agents rows' and Summarize's `summarize::in_fleet`).
@@ -1043,61 +886,10 @@ pub(crate) fn holds_fleet_key(state: &Path) -> bool {
     std::fs::symlink_metadata(state.join(aterm_net::fleet::KEY_FILE)).is_ok()
 }
 
-/// [`BookFacts`] of the state directory `state` (`fleet.key` and the book of peers).
+/// [`BookFacts`] of the state directory `state`: whether it holds `fleet.key`.
 pub(crate) fn read_book(state: &Path) -> BookFacts {
-    let in_fleet = holds_fleet_key(state);
-    if !in_fleet {
-        return BookFacts::default();
-    }
-    read_book_peers(state, in_fleet)
-}
-
-/// [`read_book`] off unix, where there is no book to read
-/// (`aterm_net::fleet_member` is unix-only): a fleet key says only that it is
-/// in a fleet — and no reader starts off macOS anyway
-/// (`App::fleet_glance_may_start`).
-#[cfg(not(unix))]
-fn read_book_peers(_state: &Path, in_fleet: bool) -> BookFacts {
     BookFacts {
-        in_fleet,
-        ..BookFacts::default()
-    }
-}
-
-/// [`read_book`]'s book: whether this Mac minted the fleet's code, or its
-/// book names only its issuer — and then, since the issuer's book (S11) makes a
-/// member's read whole, whether the last read got that book
-/// ([`aterm_net::fleet_member::holds_issuer_book`]): a member holding it
-/// knows the whole fleet, one without it (its issuer an older aterm that
-/// shares none, or no read yet) only its issuer — and whether its issuer's
-/// entry binds a key ([`BookFacts::unbound_issuer`]).
-#[cfg(unix)]
-fn read_book_peers(state: &Path, in_fleet: bool) -> BookFacts {
-    let book = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
-    let minted = std::fs::symlink_metadata(state.join(aterm_net::fleet_member::CODE_FILE))
-        .is_ok_and(|meta| meta.is_file());
-    let issuer_label = book
-        .iter()
-        .all(|p| p.via == aterm_net::fleet_member::Via::Issuer)
-        .then(|| book.first())
-        .flatten()
-        .filter(|first| {
-            !first
-                .node
-                .as_deref()
-                .is_some_and(|node| aterm_net::fleet_member::holds_issuer_book(state, node))
-        })
-        .map(|first| first.host.clone());
-    let unbound_issuer = book
-        .iter()
-        .find(|p| p.via == aterm_net::fleet_member::Via::Issuer)
-        .filter(|p| p.key.is_none())
-        .map(|p| p.host.clone());
-    BookFacts {
-        in_fleet,
-        minted,
-        issuer_label,
-        unbound_issuer,
+        in_fleet: holds_fleet_key(state),
     }
 }
 
@@ -1107,7 +899,6 @@ pub(crate) fn should_poll(
     watch: bool,
     last_ms: Option<u64>,
     now_ms: u64,
-    menu_opening: bool,
     every: Duration,
 ) -> bool {
     if !book.in_fleet {
@@ -1118,7 +909,7 @@ pub(crate) fn should_poll(
             .and_then(|at| now_ms.checked_sub(at))
             .is_none_or(|age| age >= millis(span))
     };
-    (menu_opening && older_than(MENU_FRESH)) || (watch && older_than(every))
+    watch && older_than(every)
 }
 
 /// THE READ'S BACKOFF WHILE AWAY (docs/DESIGN-fluid-swarm-2026-10-28.md F4): a read that reached
@@ -1199,15 +990,13 @@ pub(crate) fn answered_nodes(slot: &FleetSlot, now_ms: u64) -> Option<aterm_requ
     })
 }
 
-/// The shared slot the reader writes and the status item reads.
+/// The shared slot the reader writes and the App's surfaces read.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FleetSlot {
-    /// Moves with every snapshot written: a Fleet submenu click names it.
+    /// Moves with every snapshot written.
     pub(crate) generation: u16,
     /// The last good read.
     pub(crate) snapshot: Option<Arc<FleetSnapshot>>,
-    /// The read before it, and its generation: a click on a submenu painted from it still resolves.
-    pub(crate) previous: Option<(u16, Arc<FleetSnapshot>)>,
     /// Why the last read failed, when it did (cleared by a good one).
     pub(crate) error: Option<String>,
     /// A read is in flight.
@@ -1219,21 +1008,6 @@ pub(crate) struct FleetSlot {
 }
 
 impl FleetSlot {
-    /// The snapshot a click with `generation` was painted from.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
-    pub(crate) fn snapshot_at(&self, generation: u16) -> Option<&Arc<FleetSnapshot>> {
-        if self.generation == generation {
-            return self.snapshot.as_ref();
-        }
-        self.previous
-            .as_ref()
-            .filter(|(g, _)| *g == generation)
-            .map(|(_, s)| s)
-    }
-
     /// `chrome`'s `fleet=` word.
     pub(crate) fn word(&self) -> String {
         if !self.book.in_fleet {
@@ -1488,12 +1262,6 @@ pub(crate) fn snapshot_of(
             name,
             dial,
             node: Some(seat.principal.clone()),
-            host: host.and_then(host_word).or_else(|| {
-                presence
-                    .and_then(|row| row.addresses.iter().find(|at| at.is_ipv4()))
-                    .map(|at| at.ip().to_string())
-            }),
-            instances_read: 1,
             read_at_ms: now_ms,
             build,
             label,
@@ -1512,14 +1280,7 @@ pub(crate) fn snapshot_of(
                     Some(FleetNeed {
                         word: NeedWord::parse(need.word.as_str())?,
                         who: crate::presence::short_sid(&sid),
-                        worker_of: need
-                            .worker_of
-                            .as_ref()
-                            .map(|from| crate::presence::short_sid(&from.to_string())),
                         age_ms: age_ms(need.since),
-                        what: None,
-                        claim: None,
-                        carries_on: need.harness,
                         sid,
                     })
                 })
@@ -1677,18 +1438,6 @@ pub(crate) fn runner(
 /// What the reader thread is asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kick {
-    /// The status menu is opening: read if the last read is stale.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
-    MenuOpening,
-    /// The Fleet submenu's Refresh Now: read whatever the last read's age.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
-    Now,
     /// This Mac's network moved: the read's backoff ends ([`Quiet::moved`]), and a Mac that reads
     /// on its own reads now.
     Moved,
@@ -1697,10 +1446,6 @@ pub(crate) enum Kick {
 /// The kicks the reader holds at one look ([`reader_loop`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Asked {
-    /// A [`Kick::Now`].
-    now: bool,
-    /// A [`Kick::MenuOpening`].
-    menu: bool,
     /// A [`Kick::Moved`].
     moved: bool,
 }
@@ -1714,8 +1459,6 @@ impl Asked {
             .chain(std::iter::from_fn(|| rx.try_recv().ok()))
         {
             match kick {
-                Kick::Now => asked.now = true,
-                Kick::MenuOpening => asked.menu = true,
                 Kick::Moved => asked.moved = true,
             }
         }
@@ -1742,9 +1485,8 @@ pub(crate) struct ReaderSeams {
     pub(crate) moved: Option<crate::network_moved::Watch>,
     /// Whether aterm's own LAN traffic can go out now ([`crate::network_moved::lan_answers`]: on
     /// macOS the root LAN broker answers): a read dials the fleet's Macs, so none goes by itself
-    /// (the tick, a menu, a move) while it cannot. A person's Refresh Now still reads, and
-    /// its unanswered rows carry the broker's words. It is asked only for a read the tick would
-    /// make ([`should_poll`]), right before it.
+    /// (the tick, a move) while it cannot. It is asked only for a read the tick would make
+    /// ([`should_poll`]), right before it.
     pub(crate) lan: Box<dyn Fn() -> bool + Send>,
     /// Whether the automatic LAN lanes pace themselves now (`aterm_netplace::routes::paced`: away
     /// from the ALab LAN, on a hotspot, offline): a read then that reached nobody waits
@@ -1762,18 +1504,20 @@ thread_local! {
 pub(crate) struct FleetGlance {
     /// The shared slot.
     pub(crate) slot: Arc<Mutex<FleetSlot>>,
-    /// The reader's kicks.
+    /// The reader's kicks: held so the reader, which ends when every sender is gone, lives as
+    /// long as this handle; a test kicks through it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "held for the reader's lifetime")
+    )]
     kick: Sender<Kick>,
     /// `[fleet] watch`, which the App keeps current.
     watch: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FleetGlance {
-    /// Ask the reader for `kick` (a no-op once the thread is gone).
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
+    /// Ask the reader for `kick` (a no-op once the thread is gone), as the move watch does.
+    #[cfg(test)]
     pub(crate) fn kick(&self, kick: Kick) {
         let _ = self.kick.send(kick);
     }
@@ -1795,6 +1539,15 @@ impl FleetGlance {
             .as_ref()
             .filter(|snapshot| snapshot.fresh(now_ms))
             .and_then(|snapshot| snapshot.seats.clone())
+    }
+
+    /// Whether this Mac is in a fleet ([`read_book`]), as the slot last read it.
+    pub(crate) fn in_fleet(&self) -> bool {
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .book
+            .in_fleet
     }
 
     /// What moves when the slot does, read under its lock without copying it: the generation,
@@ -1858,7 +1611,7 @@ pub(crate) fn spawn(runner: Box<dyn FleetRunner>, mut seams: ReaderSeams) -> Opt
     })
 }
 
-/// The reader: look, read when [`should_poll`] (or a [`Kick::Now`]) says,
+/// The reader: look, read when [`should_poll`] says,
 /// at the wait [`Quiet`] keeps (a [`Kick::Moved`] starts it again and reads
 /// as if no read was made, and one that comes while a read runs does so once
 /// that read is over), write the slot ([`carry`]ing a silent Mac's last
@@ -1888,10 +1641,8 @@ fn reader_loop(
         let watch = !dials || seams.watch.load(std::sync::atomic::Ordering::Acquire);
         // The broker is asked last, only for a read this tick makes: a tick that reads nothing
         // dials nothing, and a read of this Mac's own copy dials no Mac.
-        let read = book.in_fleet
-            && (asked.now
-                || (should_poll(&book, watch, tried, now, asked.menu, quiet.every())
-                    && (!dials || (seams.lan)())));
+        let read =
+            should_poll(&book, watch, tried, now, quiet.every()) && (!dials || (seams.lan)());
         // A move of the network that came while a read ran: that read went out on the old one.
         let mut moved_since = false;
         let book_moved = {
@@ -1938,9 +1689,6 @@ fn reader_loop(
                         } else {
                             snapshot
                         };
-                        if let Some(old) = slot.snapshot.take() {
-                            slot.previous = Some((slot.generation, old));
-                        }
                         slot.generation = slot.generation.wrapping_add(1);
                         slot.snapshot = Some(Arc::new(snapshot));
                         slot.error = None;
@@ -1963,10 +1711,7 @@ fn reader_loop(
             Duration::from_millis(at.saturating_sub(now)).min(seams.tick)
         });
         asked = if moved_since {
-            Asked {
-                moved: true,
-                ..Asked::default()
-            }
+            Asked { moved: true }
         } else {
             match rx.recv_timeout(wait) {
                 Ok(kick) => Asked::with_queued(Some(kick), rx),
@@ -2055,7 +1800,7 @@ impl crate::App {
         !self.headless && cfg!(target_os = "macos") && self.fleet_glance.is_none()
     }
 
-    /// Start the reader with `runner` and `seams` where [`Self::fleet_glance_may_start`] allows, and hand its slot to the status item for the Fleet submenu.
+    /// Start the reader with `runner` and `seams` where [`Self::fleet_glance_may_start`] allows.
     pub(crate) fn start_fleet_glance_with(
         &mut self,
         runner: Box<dyn FleetRunner>,
@@ -2065,10 +1810,6 @@ impl crate::App {
             return;
         }
         self.fleet_glance = spawn(runner, seams);
-        #[cfg(target_os = "macos")]
-        if let (Some(handle), Some(fleet)) = (&self._status_item, &self.fleet_glance) {
-            crate::status_item::attach_fleet(handle, Arc::clone(&fleet.slot));
-        }
     }
 
     /// `[fleet] watch` moved (a config commit): the reader follows it.
@@ -2086,57 +1827,6 @@ impl crate::App {
             self.network_next_poll = None;
         }
         self.mark_status_dirty();
-    }
-
-    /// A fleet row's act on the Mac the book knows as `dial`, shown as `name` (and its session `sid`).
-    #[cfg(target_os = "macos")]
-    pub(crate) fn fleet_act(
-        &mut self,
-        action: crate::status_item::StatusAction,
-        dial: &str,
-        name: &str,
-        host: Option<&str>,
-        sid: Option<&str>,
-    ) {
-        use crate::platform::AppRt as _;
-        use crate::status_item::StatusAction;
-        match action {
-            StatusAction::PeerRead(_) | StatusAction::MacRead(_) => {
-                let Some(args) = fleet_read_args(dial, sid) else {
-                    aterm_log::info!("status item: no read for a fleet row with no name to dial");
-                    return;
-                };
-                let title =
-                    sid.map_or_else(|| name.to_string(), |sid| format!("{name} \u{b7} {sid}"));
-                self.run_status_read(crate::app_take_over::CliPlan::peer(args, title));
-            }
-            StatusAction::PeerScreen(_) | StatusAction::MacScreen(_) => {
-                if let Some(host) = host.and_then(host_word) {
-                    let _ = self.apprt.open_url(&format!("vnc://{host}"));
-                }
-            }
-            StatusAction::PeerSsh(_) | StatusAction::MacSsh(_) => {
-                if let Some(host) = host.and_then(host_word) {
-                    let _ = self.apprt.pasteboard_set(&format!("ssh {host}"));
-                }
-            }
-            StatusAction::PeerTakeOver(_) | StatusAction::PeerHandBack(_) => {
-                let on = matches!(action, StatusAction::PeerTakeOver(_));
-                let Some(args) = sid.and_then(|sid| fleet_hold_args(dial, sid, on)) else {
-                    aterm_log::info!(
-                        "status item: no step-in for a fleet row with no name to dial"
-                    );
-                    return;
-                };
-                let title = format!(
-                    "{} on {name} \u{b7} {}",
-                    if on { "Take Over" } else { "Hand Back" },
-                    sid.unwrap_or("")
-                );
-                self.run_status_read(crate::app_take_over::CliPlan::driven(args, title));
-            }
-            _ => {}
-        }
     }
 }
 

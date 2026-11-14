@@ -52,6 +52,12 @@ impl JournalOwner {
     pub(crate) const fn id(&self) -> JournalOwnerId {
         self.id
     }
+
+    /// Answers once this owner's custody worker has run every release and dropped its lease.
+    #[cfg(test)]
+    pub(crate) fn finished_for_test(&self) -> Arc<std::sync::Mutex<mpsc::Receiver<()>>> {
+        Arc::clone(&self.finished)
+    }
 }
 
 #[cfg(test)]

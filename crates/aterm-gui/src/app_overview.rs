@@ -11,19 +11,6 @@ use crate::overview::{
     ChipMark, Driver, Manages, OverviewAct, OverviewChip, OverviewGroup, OverviewState,
 };
 
-/// Where an entrance opens the Overview ([`App::open_overview_raised`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OverviewAt {
-    /// The card's first line (the status item's Overview…).
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(dead_code, reason = "only the macOS status item opens it here")
-    )]
-    Top,
-    /// A manager's manages line, by its local id, else its chip (its Team chip).
-    Manager(u64),
-}
-
 /// How often an open card's coarse ages are read again at paint time ([`App::overview_prepaint`]).
 pub(crate) const OVERVIEW_AGE_STEP: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -363,15 +350,15 @@ impl App {
         self.repaint_overview_pointer(wid, true);
     }
 
-    /// Open the Overview at `entrance`, raising the window.
+    /// Open the Overview at manager `session`'s manages line (its Team chip's entrance), by
+    /// its local id, raising the window.
     pub(crate) fn open_overview_raised(
         &mut self,
         wid: WindowId,
-        at: OverviewAt,
+        session: u64,
     ) -> Result<(), String> {
         self.open_overview_on(wid)?;
-        if let OverviewAt::Manager(session) = at
-            && let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
+        if let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
             && card.select_session(session)
         {
             self.repaint_overview_pointer(wid, true);

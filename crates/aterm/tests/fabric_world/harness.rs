@@ -137,7 +137,12 @@ pub fn own_image(dir: &Path, name: &str) -> PathBuf {
         .stdout(OwnedStdio::piped())
         .spawn()
         .unwrap_or_else(|error| panic!("run {name}: {error}"));
-    aterm_uds::deadline::prints(&mut proof, "own-image-ran", DEADLINE);
+    // The first execution proves fixture preparation; presence waits keep DEADLINE.
+    aterm_uds::deadline::prints(
+        &mut proof,
+        "own-image-ran",
+        aterm_uds::deadline::FIRST_EXEC_HANG,
+    );
     aterm_uds::deadline::kill_within(&mut proof, DEADLINE);
     path
 }

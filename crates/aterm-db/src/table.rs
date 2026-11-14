@@ -1689,6 +1689,18 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// The writers of the generations this session's home succeeds on this disk (a writer
+    /// succession's earlier seats), oldest first, as the generation observation the session keeps
+    /// proved them ([`crate::generation::Observation::succeeded`]); none for a home that succeeds
+    /// none. Nothing is observed again.
+    pub(crate) fn succeeded_writers(
+        &self,
+    ) -> impl Iterator<Item = &aterm_secrets::commons::binding::Binding> {
+        self.generation
+            .iter()
+            .flat_map(crate::generation::Observation::succeeded)
+    }
+
     /// Require, for one local read, that every predecessor of this session's home completed its
     /// succession ([`crate::generation::Observation::check_read`]). A home whose own writer
     /// recovery is pending still reads the records it holds. This grants no writer role and

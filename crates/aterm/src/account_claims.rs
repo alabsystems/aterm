@@ -142,7 +142,7 @@ impl Table for Commons {
             .map(denied_swarm_labels_from_roster)
             .unwrap_or_default();
         let mut machine_str = String::with_capacity(32);
-        let book = Book::of(
+        let mut book = Book::of(
             read.rows
                 .iter()
                 .filter_map(|(machine, body)| {
@@ -151,6 +151,12 @@ impl Table for Commons {
                     Row::from_value(&machine_str, body).ok()
                 })
                 .filter(|row| row.machine == me || !label_is_denied(&row.label, &denied)),
+        );
+        carry(
+            &mut book,
+            &me,
+            read.former.as_ref(),
+            secs(aterm_time::unix_millis().unwrap_or(0)),
         );
         Ok(Tabled {
             me,
@@ -178,21 +184,53 @@ impl Table for Commons {
     }
 }
 
-/// What `observation` says this Mac's Commons hears, where its discovery is active: a Mac that
-/// cannot look says nothing about who is gone.
+/// Put into `book`, as `me`'s own row at counter 0, the newest row this Mac's earlier writer seat
+/// signed (`former`, `aterm_db::accounts::claims::Read::former`), where `me`, the seat that now
+/// writes, has no row yet and that one is still live at `now` and claims something. Its claims
+/// are this Mac's uninterrupted use from before the writer succession: carried, each keeps its
+/// `since`, so a peer's claim made after it stays junior here and this Mac's sessions are not
+/// moved off an account they hold, and the first row the current seat writes keeps the `since`
+/// of each claim it still uses, its counter starting at 1 (`claims::claimed`), so every Mac
+/// ranks it as before. Like any own row a new seat finds, it grants its claims one bounded
+/// grace of use (`claims::SESSION_FRESH_S`) before a claim no session renews is given up.
+fn carry(book: &mut Book, me: &str, former: Option<&aterm_json::Value>, now: i64) {
+    if book.row(me).is_some() {
+        return;
+    }
+    let Some(row) = former.and_then(|body| Row::from_value(me, body).ok()) else {
+        return;
+    };
+    if row.until > now && !row.claims.is_empty() {
+        book.insert(Row { counter: 0, ..row });
+    }
+}
+
+/// What `observation` says this Mac's Commons hears, where its discovery is active and its
+/// observer is confirmed (`observer` is named): a Mac that cannot look says nothing about who is
+/// gone, and neither does an observer that is not taking this Mac's contacts. A publication names
+/// its observer only while that observer has confirmed this Mac's own identity and takes every
+/// authenticated contact (`aterm_db::network_state`): one that refused its retained history
+/// (another observer's or trust context's), could not open it, or has not confirmed this Mac yet
+/// names none, and contacts none of the peers it holds, so their last contacts stand still and
+/// every peer would read unheard, its leases lapsed. An observer whose checkpoint failed still
+/// names itself and takes every contact (its history is unavailable, not frozen), so its peers'
+/// last contacts stay current and it gives presence. With no presence a lease lives until its
+/// row's `until`, as on a Mac with no Commons.
 fn presence(observation: &NetworkObservation) -> Option<Presence> {
-    (observation.visibility == Visibility::Active).then(|| Presence {
-        at: secs(observation.observed_at_ms),
-        heard: observation
-            .peers
-            .iter()
-            .map(|peer| {
-                (
-                    hex::encode_lower(&peer.identity.machine_id),
-                    secs(peer.last_seen_ms),
-                )
-            })
-            .collect(),
+    (observation.visibility == Visibility::Active && observation.observer.is_some()).then(|| {
+        Presence {
+            at: secs(observation.observed_at_ms),
+            heard: observation
+                .peers
+                .iter()
+                .map(|peer| {
+                    (
+                        hex::encode_lower(&peer.identity.machine_id),
+                        secs(peer.last_seen_ms),
+                    )
+                })
+                .collect(),
+        }
     })
 }
 

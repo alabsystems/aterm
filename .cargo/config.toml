@@ -80,8 +80,18 @@ git-fetch-with-cli = true
 # crates/aterm/build.rs). Stock Rust builds these targets (STOCK EXCEPTION:
 # Trust has no Windows std), so the table reaches them; on a Windows host
 # building for itself it reaches build scripts and proc macros too.
+#
+# EVERY WINDOWS EXECUTABLE CARRIES ITS C RUNTIME. Linked against the DLL
+# runtime, aterm.exe imports VCRUNTIME140.dll, which Windows does not ship: on a
+# PC no Visual C++ Redistributable has visited, the release zip's aterm.exe,
+# aterm-gui.exe and get-aterm.ps1's aterm-bootstrap-verify.exe would not start
+# ("VCRUNTIME140.dll was not found"), and the zip carries no runtime of its own.
+# `+crt-static` links the static runtime (libcmt, libvcruntime, libucrt), so an
+# image needs nothing outside Windows; cc-built C code follows the same feature
+# (/MT). Dev, test and release builds link the same way, so what a test runs is
+# what ships.
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-Clink-arg=/MANIFEST:EMBED", "-Clink-arg=/MANIFESTUAC:level='asInvoker'"]
+rustflags = ["-Clink-arg=/MANIFEST:EMBED", "-Clink-arg=/MANIFESTUAC:level='asInvoker'", "-Ctarget-feature=+crt-static"]
 
 # STOCK EXCEPTION: Trust has no x86_64-pc-windows-gnu std, so the Windows cfg
 # check is `cargo +stable build --target x86_64-pc-windows-gnu`.

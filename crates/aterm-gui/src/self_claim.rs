@@ -200,17 +200,22 @@ pub(crate) fn typed_for(sid: &str) -> Option<self_claimed::Resume> {
 /// Read the proven claim's record now, while its identity is live
 /// ([`self_claimed::read_copy`]: looked at before and after the read), and
 /// keep it as aterm's copy.
-fn refresh(ctx: &crate::SessionCtx, proven: &Proven, revision: u64) -> bool {
+fn refresh(ctx: &crate::SessionCtx, proven: &Proven, placement: u64) -> bool {
     let typed = typed_for(ctx.self_id.as_str());
-    refresh_by(ctx, proven, revision, || {
+    refresh_by(ctx, proven, placement, || {
         self_claimed::read_copy(proven.pid, &proven.start, typed.as_ref())
     })
 }
 
+/// [`refresh`] with `read` for the record's read, begun at the claim's `placement`
+/// ([`crate::session_timeline::SessionMeta::claim_placements`]). It publishes only while that
+/// placement is still the latest and `proven`'s claim stands live: a read begun before any later
+/// placement, a renewal in place included, which keeps the revision, never publishes over the copy
+/// that placement's own read took (review of 2020f39c770, findings 3 and 5).
 fn refresh_by(
     ctx: &crate::SessionCtx,
     proven: &Proven,
-    revision: u64,
+    placement: u64,
     read: impl FnOnce() -> Option<Copy>,
 ) -> bool {
     let copy = read();
@@ -224,7 +229,7 @@ fn refresh_by(
         );
     }
     let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
-    if meta.supervisor_revision != revision
+    if meta.claim_placements != placement
         || meta
             .live_claim(crate::metrics::now_us())
             .and_then(|claim| claim.proven.as_ref())
@@ -253,13 +258,14 @@ fn refresh_by(
     true
 }
 
-/// Tab `sid`'s live proven claim, read under its meta guard (a clone; the
-/// guard let go before anything is read from disk).
+/// Tab `sid`'s live proven claim and the placement it stands at
+/// ([`crate::session_timeline::SessionMeta::claim_placements`]), read under its meta guard (a
+/// clone; the guard let go before anything is read from disk).
 fn standing(ctx: &crate::SessionCtx) -> Option<(Proven, u64)> {
     let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
     meta.live_claim(crate::metrics::now_us())
         .and_then(|claim| claim.proven.clone())
-        .map(|proven| (proven, meta.supervisor_revision))
+        .map(|proven| (proven, meta.claim_placements))
 }
 
 /// Whether `ctx`'s live proven claim matches `(pid, start)` and its live session record reports idle.
@@ -271,8 +277,8 @@ pub(crate) fn idle_now(ctx: &crate::SessionCtx, pid: u32, start: &str) -> bool {
 
 /// Re-read `ctx`'s proven claim session record on `meta-change` while its identity is live.
 pub(crate) fn meta_changed(ctx: &crate::SessionCtx) {
-    if let Some((proven, revision)) = standing(ctx) {
-        refresh(ctx, &proven, revision);
+    if let Some((proven, placement)) = standing(ctx) {
+        refresh(ctx, &proven, placement);
     }
 }
 
@@ -665,15 +671,16 @@ pub(crate) fn forget(sid: &str) {
         .remove(sid);
 }
 
-/// Refresh the record copy when a proven claim is granted on `ctx` and notify the host if it moved.
+/// Refresh the record copy when a proven claim is granted on `ctx` at `placement`
+/// ([`crate::session_timeline::Claimed::placement`]) and notify the host if it moved.
 pub(crate) fn claimed(
     ctx: &crate::SessionCtx,
     proven: &Proven,
-    revision: u64,
+    placement: u64,
     moved: bool,
     replaced: Option<&str>,
 ) {
-    if refresh(ctx, proven, revision) && (moved || replaced.is_some()) {
+    if refresh(ctx, proven, placement) && (moved || replaced.is_some()) {
         crate::harness_host::self_claimed(ctx.self_id.as_str(), replaced);
     }
 }

@@ -296,12 +296,7 @@ fn every_refusal_a_valid_config_gives() {
         &refused(&router, &RouteRequest::writer_read(repo(DEV)), A, P),
         RefusalCode::WriterAbsent,
         unauth,
-        &[
-            "fixture-dev",
-            "agh auth add dev",
-            "--owner fixture-dev",
-            "--tier dev",
-        ],
+        &["fixture-dev", "agh auth status"],
     );
     assert_refusal(
         &refused(&router, &RouteRequest::writer_read(repo(DEV)), u, P),

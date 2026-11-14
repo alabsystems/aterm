@@ -135,15 +135,6 @@ pub(crate) trait AppRt {
         false
     }
 
-    /// Put `text` on the system pasteboard (the status item's Copy "`ssh <host>`").
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
-    fn pasteboard_set(&self, text: &str) -> bool {
-        crate::control::pbcopy(text)
-    }
-
     /// Un-minimize and raise our own `window`.
     fn window_bring_to_front(&self, _window: &Window) -> bool {
         false

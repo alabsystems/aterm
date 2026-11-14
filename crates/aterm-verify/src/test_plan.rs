@@ -185,6 +185,19 @@ pub struct Plan {
     pub order: Vec<Planned>,
 }
 
+impl Plan {
+    /// This plan, every width, charge and peak as planned, dispatched within `share` cores
+    /// where that is more than the share it was planned on: more of its binaries run side by
+    /// side, and none runs wider.
+    #[must_use]
+    pub fn within(self, share: u32) -> Plan {
+        Plan {
+            share: self.share.max(share),
+            ..self
+        }
+    }
+}
+
 /// Plan binaries whose histories are `seen` (cargo's order) on a share of `share` cores, each
 /// binary's width at most `ceiling` (`--test-threads`, or the caller's `RUST_TEST_THREADS`), a
 /// binary with no history planned to hold `unseen_peak` bytes.

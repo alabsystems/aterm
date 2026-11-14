@@ -15,6 +15,7 @@ use crate::document_store::DocumentId;
 use crate::native_ui::{ActionId, LogicalRect, UiKey, UiTree};
 
 mod markdown_workspace;
+mod settings_delivery;
 pub(crate) use markdown_workspace::{
     MarkdownPane, MarkdownWorkspaceMode, MarkdownWorkspaceView, is_markdown_uri,
     resolve_markdown_link,
@@ -2438,6 +2439,7 @@ pub(crate) struct NativeRuntime {
     /// Process-global failure/recovery projection for the config and theme
     /// watcher.
     config_watch_status: crate::config_watcher::WatchStatusState,
+    settings_delivery: settings_delivery::Retained,
     next_operation: u64,
 }
 
@@ -2452,6 +2454,7 @@ impl Default for NativeRuntime {
             view_lifecycles: BTreeMap::new(),
             service_generations: BTreeMap::new(),
             config_watch_status: crate::config_watcher::WatchStatusState::default(),
+            settings_delivery: settings_delivery::Retained::default(),
             next_operation: 1,
         }
     }
@@ -2559,6 +2562,7 @@ impl NativeRuntime {
         match &mut state {
             AppViewState::Settings(settings) => {
                 settings.config_watch_status.clone_from(&watch_status);
+                self.settings_delivery.seed(settings);
             }
             AppViewState::Editor(editor) if matches!(app, NativeApp::Editor(app) if app.config_editor) =>
             {

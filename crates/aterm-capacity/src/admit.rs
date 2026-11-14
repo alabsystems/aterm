@@ -3302,6 +3302,13 @@ impl Claim {
     pub fn cohort_bound(&self, cohort: &crate::cohort::Cohort) -> bool {
         self.laid.cohort_bound(cohort)
     }
+
+    /// Observe only the original journal root, rather than any registered
+    /// subgroup. The retained owner separately checks its actual native child.
+    #[cfg(unix)]
+    pub(crate) fn original_root_bound(&self, cohort: &crate::cohort::Cohort) -> bool {
+        self.laid.original_root_bound(cohort)
+    }
 }
 
 /// What one look at the ledger found ([`Waiter::poll`]).

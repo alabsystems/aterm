@@ -63,7 +63,154 @@ fn settle_cancelled_video_export(export: &VideoExportState, bound: Duration) -> 
     false
 }
 
+/// What the quit's write of this run's desk left ([`App::write_quit_desk`]).
+#[derive(Default)]
+pub(crate) struct QuitDesk {
+    /// The quit had a layout to write (`settle_owed_layout_take_back_at_quit`'s
+    /// `quit_wrote_its_desk`), whether or not the write landed.
+    pub(crate) wrote: bool,
+    /// The layout the restore file holds for this run now: the one the quit wrote, where the
+    /// write published it (a write that failed only at its directory's sync published it too).
+    /// The next launch reads its task rows, so the result files they name outlive the quit
+    /// ([`App::settle_quit_desk_and_tasks`]).
+    pub(crate) published: Option<crate::restore::RestoreManifest>,
+}
+
 impl App {
+    /// Write this run's desk at the quit, where it keeps one and restores sessions: the layout
+    /// the last window's close captured, or the windows as they stand.
+    fn write_quit_desk(&mut self) -> QuitDesk {
+        if !(self.desk.kept() && self.config.restore_session_or_default()) {
+            return QuitDesk::default();
+        }
+        self.write_quit_desk_with(crate::restore::write_quit)
+    }
+
+    /// [`Self::write_quit_desk`] of a desk that is kept, the layout written by `write`.
+    pub(crate) fn write_quit_desk_with(
+        &mut self,
+        write: impl FnOnce(
+            &crate::restore::RestoreManifest,
+            Option<&str>,
+        ) -> Result<(), crate::restore::RestoreFault>,
+    ) -> QuitDesk {
+        let mut manifest = self
+            .quit_capture
+            .take()
+            .unwrap_or_else(|| self.capture_restore_manifest());
+        let keeps = self.desk.quit_keeps_agents(crate::system_quit::asked());
+        self.quit_agents(&mut manifest, keeps);
+        let run = self
+            .crash_journal
+            .run()
+            .map(crate::crash_journal::JournalId::stem);
+        if manifest.is_empty() {
+            return QuitDesk::default();
+        }
+        let published = match write(&manifest, run.as_deref()) {
+            Ok(()) => true,
+            Err(fault) => {
+                crate::logging::stderr_line!(
+                    "aterm-gui: could not persist the session layout: {fault}"
+                );
+                fault.published()
+            }
+        };
+        QuitDesk {
+            wrote: true,
+            published: published.then_some(manifest),
+        }
+    }
+
+    /// THE QUIT'S DESK, THEN ITS TASKS: `write` writes this run's desk ([`Self::write_quit_desk`]),
+    /// `between` does what the run's end does after that and before the tasks directory is
+    /// settled (the take settled, the journal retired, the PTYs hung up), and the tasks directory
+    /// is then settled against the layout the write left ([`Self::retire_tasks_at_quit`]). One
+    /// method holds the order, so the layout a quit keeps results for is always the one it wrote.
+    pub(crate) fn settle_quit_desk_and_tasks(
+        &mut self,
+        write: impl FnOnce(&mut Self) -> QuitDesk,
+        between: impl FnOnce(&mut Self, &QuitDesk),
+    ) {
+        let desk = write(self);
+        between(self, &desk);
+        self.retire_tasks_at_quit(desk.published.as_ref());
+    }
+
+    /// THE QUIT SETTLES THE TASKS DIRECTORY AGAINST THE LAYOUT IT LEFT (`published`, `None` where
+    /// it left none). The task files and results of every worker session this process still
+    /// holds, and of those the quit closed first, go, but the results the layout's task rows
+    /// name: the next launch seeds records that read them
+    /// (`task_launch::retire_task_files_at_quit`). A quit that came before a restore finished
+    /// also clears what the layout that restore took left. Where the quit published a layout,
+    /// that is what it left under the session IDs of the tabs it had placed, which `published`
+    /// names by their new IDs (`task_launch::RestoredTasks::sweep_at_quit`). Where it published
+    /// none, it is all of it but what this process's records keep
+    /// (`task_launch::RestoredTasks::sweep`): the run's end has settled the take, which removes
+    /// the taken layout, and retired this run's crash journal, so no file names those IDs again.
+    fn retire_tasks_at_quit(&mut self, published: Option<&crate::restore::RestoreManifest>) {
+        if !self.handoff_successor
+            && let Some(drain) = self.restore_drain.as_deref()
+        {
+            match published {
+                Some(written) => drain.tasks().sweep_at_quit(&self.store, written),
+                None => drain.tasks().sweep(&self.store),
+            }
+        }
+        let restored = published
+            .map(crate::task_launch::restored_results)
+            .unwrap_or_default();
+        let parked = self.pool.predecessors_sessions();
+        let closed = std::mem::take(&mut self.quit_closed_tasks);
+        crate::task_launch::retire_task_files_at_quit(&self.store, &parked, &closed, &restored);
+    }
+
+    /// What the run's end does once its desk is written (`quit_wrote_its_desk`, [`QuitDesk::wrote`])
+    /// and before it settles the tasks directory: the cold update lane's owed take-back settled,
+    /// the launch's take settled, this run's crash journal retired, the control socket and the
+    /// sessions' publications released (`root_sid` the launch's first session's), and every PTY
+    /// but those of `carried` hung up.
+    fn end_desk_and_sessions(
+        &mut self,
+        quit_wrote_its_desk: bool,
+        root_sid: aterm_session::SessionId,
+        carried: &[u64],
+    ) {
+        #[cfg(unix)]
+        self.settle_owed_layout_take_back_at_quit(quit_wrote_its_desk);
+        #[cfg(not(unix))]
+        let _ = quit_wrote_its_desk;
+        crate::restore::settle_take();
+        if let Err(error) = self.crash_journal.retire(std::time::Duration::from_secs(2)) {
+            crate::logging::stderr_line!("aterm-gui: crash journal not removed at quit: {error}");
+        }
+        if self.sock_bound.load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(plan) = &self.sock_plan
+        {
+            crate::owned_endpoint::release(plan);
+            let dir = crate::control_auth::dir_of_socket(&plan.sock_path);
+            let handles = {
+                self.store
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .snapshot()
+            };
+            let sessions =
+                std::iter::once(root_sid).chain(handles.into_iter().map(|h| h.sid.clone()));
+            crate::proxy::retire_own_sessions(&dir, &plan.sock_path, sessions);
+            let _ = crate::proxy::flush_publications(std::time::Duration::from_secs(1));
+        }
+        #[cfg(unix)]
+        {
+            self.pool.retire_at_quit(carried);
+            let _ = aterm_pty::wait_for_reaps(aterm_pty::REAP_GRACE_WAIT);
+        }
+        #[cfg(windows)]
+        aterm_pty::end_programs_outside_jobs();
+        #[cfg(not(unix))]
+        let _ = carried;
+    }
+
     /// The run's end, once ([`RunEnd`]): a second call, and a call on an App that never ran a
     /// loop, does nothing. The process exits after it (lib.rs, or AppKit).
     pub(crate) fn end_run(&mut self) {
@@ -121,60 +268,9 @@ impl App {
         let _ = crate::requests_host::flush_within(crate::requests_host::FLUSH_WAIT);
         self.session_log_journal
             .finish_at_quit(crate::session_log_journal::quit_budget());
-        let mut quit_wrote_its_desk = false;
-        if self.desk.kept() && self.config.restore_session_or_default() {
-            let mut manifest = self
-                .quit_capture
-                .take()
-                .unwrap_or_else(|| self.capture_restore_manifest());
-            let keeps = self.desk.quit_keeps_agents(crate::system_quit::asked());
-            self.quit_agents(&mut manifest, keeps);
-            let run = self
-                .crash_journal
-                .run()
-                .map(crate::crash_journal::JournalId::stem);
-            quit_wrote_its_desk = !manifest.is_empty();
-            if quit_wrote_its_desk
-                && let Err(e) = crate::restore::write_quit(&manifest, run.as_deref())
-            {
-                crate::logging::stderr_line!(
-                    "aterm-gui: could not persist the session layout: {e}"
-                );
-            }
-        }
-        #[cfg(unix)]
-        self.settle_owed_layout_take_back_at_quit(quit_wrote_its_desk);
-        #[cfg(not(unix))]
-        let _ = quit_wrote_its_desk;
-        crate::restore::settle_take();
-        if let Err(error) = self.crash_journal.retire(std::time::Duration::from_secs(2)) {
-            crate::logging::stderr_line!("aterm-gui: crash journal not removed at quit: {error}");
-        }
-        if self.sock_bound.load(std::sync::atomic::Ordering::SeqCst)
-            && let Some(plan) = &self.sock_plan
-        {
-            crate::owned_endpoint::release(plan);
-            let dir = crate::control_auth::dir_of_socket(&plan.sock_path);
-            let handles = {
-                self.store
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .snapshot()
-            };
-            let sessions =
-                std::iter::once(end.root_sid).chain(handles.into_iter().map(|h| h.sid.clone()));
-            crate::proxy::retire_own_sessions(&dir, &plan.sock_path, sessions);
-            let _ = crate::proxy::flush_publications(std::time::Duration::from_secs(1));
-        }
-        #[cfg(unix)]
-        {
-            self.pool.retire_at_quit(&carried);
-            let _ = aterm_pty::wait_for_reaps(aterm_pty::REAP_GRACE_WAIT);
-        }
-        #[cfg(windows)]
-        aterm_pty::end_programs_outside_jobs();
-        let parked = self.pool.predecessors_sessions();
-        crate::task_launch::retire_task_files_at_quit(&self.store, &parked);
+        self.settle_quit_desk_and_tasks(Self::write_quit_desk, |app, desk| {
+            app.end_desk_and_sessions(desk.wrote, end.root_sid, &carried);
+        });
         self.forget_retired_workers_at_quit();
         crate::crash_signal::remove_marker_on_clean_exit();
         let input_replies = crate::control::input_replies_of(&self.store);

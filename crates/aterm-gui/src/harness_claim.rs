@@ -117,7 +117,7 @@ pub(crate) fn image_in(layout: &atpkg::store::Layout, row: &Row, exe: &Path) -> 
 /// The development seam that makes this aterm answer as one predating contract 3:
 /// `ATERM_DEV_NO_CONTRACT3=1` in a debug or dev-seams build's environment
 /// ([`aterm_types::dev_seam`]; a shipped aterm reads no such variable). `lab harness-proof`'s
-/// negative control (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step 2) runs its instance under
+/// negative control (`docs/DESIGN-harness-repos-2026-10-24.md` §9) runs its instance under
 /// it, so a harness must pass through (§8.2) where no `contract=` is served.
 pub(crate) const NO_CONTRACT3_SEAM: &str = "ATERM_DEV_NO_CONTRACT3";
 

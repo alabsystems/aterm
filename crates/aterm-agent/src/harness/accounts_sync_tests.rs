@@ -7280,6 +7280,247 @@ fn its_arrival_meets_the_need(
         met.line
     );
 }
+
+/// An HTTP mailbox, which the sign-in reads directly
+/// ([`super::super::sign_in_ladder::Mailbox::Ready`]).
+#[cfg(unix)]
+const HTTP_MAILBOX: &str = "http_url = \"http://127.0.0.1:9/inbox\"\n";
+
+/// A webmail inbox with its password ([`super::super::sign_in_ladder::Mailbox::WebmailOnly`]).
+#[cfg(unix)]
+const WEBMAIL_MAILBOX: &str = "webmail_url = \"https://mail.example.test/inbox\"\n\
+                               user = \"m15@example.test\"\npassword = \"p\"\n";
+
+/// m15's `mailbox:m15-3` (measured 2026-11-13, aterm 0.199.0): two Claude Code rows signed in
+/// on this Mac, m15-3 and m15-4, each with a session on it and no sign-in due, sharing one
+/// mailbox (`mailbox`, the `~/.secrets` mailbox file; none, no file), which the lab was asked
+/// for (`asked`) for m15-3 alone while it needed a sign-in. The world and the ledger's paths,
+/// both rows checked to be no renewal candidate, so no ladder of either runs.
+#[cfg(unix)]
+fn signed_in_row_asked_for_its_mailbox(
+    mailbox: Option<&str>,
+    asked: bool,
+) -> (World, aterm_secrets::client::Paths) {
+    use aterm_secrets::need::{self, Purpose, Want};
+    let w = World::new();
+    let store = accounts::Store::at(&w.state);
+    fs::create_dir_all(&w.config).unwrap();
+    let mut roster = String::new();
+    for (label, sid) in [("m15-3", "s-3"), ("m15-4", "s-4")] {
+        let made = store.logins_dir().join(label);
+        let row = Row {
+            label: label.to_owned(),
+            class: Class::Preferred,
+            dir: Some(made.to_string_lossy().into_owned()),
+            email: Some(format!("{label}@example.test")),
+            ..Row::default()
+        };
+        roster.push_str(&accounts::row_text(&row).unwrap());
+        roster.push('\n');
+        fs::create_dir_all(&made).unwrap();
+        fs::write(made.join(".claude.json"), "{}").unwrap();
+        store
+            .transact_logins(UPKEEP_NOW - 120, &mut None, |state, _logins| {
+                Ok(accounts::note_session(
+                    state,
+                    sid,
+                    label,
+                    None,
+                    UPKEEP_NOW - 120,
+                ))
+            })
+            .unwrap();
+    }
+    fs::write(w.roster(), roster).unwrap();
+    if let Some(text) = mailbox {
+        let secrets = w.home.join(".secrets");
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(
+            secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+            text,
+        )
+        .unwrap();
+    }
+    let paths = aterm_secrets::client::Paths::for_home(&w.home);
+    let source = w.home.join("lab.vault");
+    aterm_secrets::client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1"))
+        .unwrap();
+    need::test_alab_policy(&paths);
+    if asked {
+        let raised = need::raise(
+            &paths,
+            Want::parse("mailbox:m15-3").unwrap(),
+            Purpose::HarnessSignIn,
+        )
+        .unwrap();
+        assert!(!raised.state.ended(), "{}", raised.line);
+    }
+    let candidates = read_renewal_candidates(
+        Cli::Claude,
+        &store,
+        (&w.home, &w.state),
+        &w.roster(),
+        UPKEEP_NOW,
+    )
+    .unwrap();
+    assert!(
+        candidates.tiered.iter().all(|(_, row)| upkeep_sign_in(
+            Cli::Claude,
+            (&candidates.records, &candidates.others),
+            row,
+            UPKEEP_NOW
+        )
+        .is_none()),
+        "m15-3 and m15-4 are signed in: no sign-in of either is due"
+    );
+    (w, paths)
+}
+
+#[cfg(unix)]
+std::thread_local! {
+    /// The labels of the rows whose mailbox [`counted_mailbox`] read on this thread, in order.
+    static MAILBOX_READS: std::cell::RefCell<Vec<String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// [`ladder_mailbox_files`], each read's row recorded in [`MAILBOX_READS`].
+#[cfg(unix)]
+fn counted_mailbox(
+    home: &Path,
+    store: &accounts::Store,
+    row: &Row,
+) -> (super::super::sign_in_ladder::Mailbox, Option<String>) {
+    MAILBOX_READS.with(|reads| reads.borrow_mut().push(row.label.clone()));
+    ladder_mailbox_files(home, store, row)
+}
+
+/// One upkeep's renewal step over `w`, on this thread: what it logged and the labels of the
+/// rows whose mailbox it read. It started no renewal.
+#[cfg(unix)]
+fn mailbox_need_pass(w: &World) -> (Vec<String>, Vec<String>) {
+    let wit = Witness::answering("");
+    let mut fx = wit.fx();
+    fx.mailbox = &counted_mailbox;
+    MAILBOX_READS.with(|reads| reads.borrow_mut().clear());
+    assert_eq!(
+        upkeep(
+            &w.home,
+            &w.state,
+            (&w.roster(), UPKEEP_NOW, UpkeepStep::Renew),
+            &fx
+        ),
+        UNCONFIGURED,
+        "no renewal progressed"
+    );
+    assert_eq!(wit.spawned(), 0, "no renewal started");
+    (wit.logged(), MAILBOX_READS.with(std::cell::RefCell::take))
+}
+
+/// `mailbox:m15-3` in `paths`' ledger.
+#[cfg(unix)]
+fn m15_3_need(paths: &aterm_secrets::client::Paths) -> aterm_secrets::need::Need {
+    let want = aterm_secrets::need::Want::parse("mailbox:m15-3").unwrap();
+    aterm_secrets::need::peek(paths)
+        .unwrap()
+        .into_iter()
+        .find(|need| need.want == want)
+        .expect("m15-3's mailbox need is on file")
+}
+
+/// A signed-in row's old ask for its mailbox ends at the upkeep's next pass once its mailbox
+/// holds, though no renewal of the row runs: an HTTP mailbox and a webmail inbox with its
+/// password. Only that row's mailbox is read: m15-4 beside it, asked for nothing, costs no read
+/// though the same mailbox holds for it. NEGATIVE CONTROL: with the upkeep's settle step off,
+/// as on main, where only the ladder of a row it renews met one, the need stays open (`local`
+/// here; m15-3's on m15, 2026-11-13, `awaiting-person`).
+#[cfg(unix)]
+#[test]
+fn a_signed_in_rows_mailbox_need_ends_once_its_mailbox_holds() {
+    use aterm_secrets::need::{Reason, State};
+    for mailbox in [HTTP_MAILBOX, WEBMAIL_MAILBOX] {
+        let (w, paths) = signed_in_row_asked_for_its_mailbox(Some(mailbox), true);
+        let (logged, reads) = mailbox_need_pass(&w);
+        let met = m15_3_need(&paths);
+        assert_eq!(met.state, State::Retired, "{mailbox}: {}", met.line);
+        assert_eq!(
+            met.retired.as_ref().map(|retired| retired.reason),
+            Some(Reason::NotNeeded),
+            "{mailbox}: {}",
+            met.line
+        );
+        assert_eq!(
+            met.line,
+            "not needed: harness.sign-in's check no longer lacks m15-3's mailbox password"
+        );
+        assert_eq!(
+            logged,
+            [format!("m15-3: its mailbox need: {}", met.line)],
+            "{mailbox}"
+        );
+        assert_eq!(
+            reads,
+            ["m15-3"],
+            "{mailbox}: one read, of the asked row's mailbox"
+        );
+    }
+}
+
+/// NEGATIVE CONTROL of [`a_signed_in_rows_mailbox_need_ends_once_its_mailbox_holds`]: where the
+/// row's mailbox does not hold, its need stands for its next renewal: no mailbox file, a webmail
+/// inbox with no password, and a `[[mailboxes]]` entry that receives another address alone.
+#[cfg(unix)]
+#[test]
+fn a_signed_in_rows_mailbox_need_stands_while_its_mailbox_does_not_hold() {
+    for mailbox in [
+        None,
+        Some("webmail_url = \"https://mail.example.test/inbox\"\nuser = \"m15@example.test\"\n"),
+        Some(
+            "[[mailboxes]]\nlogin = \"other@example.test\"\npassword = \"p\"\n\
+             webmail_url = \"https://mail.example.test/inbox\"\n\
+             receives = [\"other@example.test\"]\n",
+        ),
+    ] {
+        let (w, paths) = signed_in_row_asked_for_its_mailbox(mailbox, true);
+        let (logged, reads) = mailbox_need_pass(&w);
+        let stands = m15_3_need(&paths);
+        assert!(!stands.state.ended(), "{mailbox:?}: {}", stands.line);
+        assert_eq!(logged, Vec::<String>::new(), "{mailbox:?}");
+        assert_eq!(
+            reads,
+            ["m15-3"],
+            "{mailbox:?}: the asked row's mailbox is read while its need is open"
+        );
+    }
+}
+
+/// A row with no open need costs the upkeep no mailbox read: none raised, one met already, and
+/// m15-4 beside m15-3 while m15-3's need is open, though the same mailbox holds for both.
+#[cfg(unix)]
+#[test]
+fn a_row_with_no_open_mailbox_need_reads_no_mailbox() {
+    let (w, paths) = signed_in_row_asked_for_its_mailbox(Some(HTTP_MAILBOX), false);
+    assert_eq!(
+        mailbox_need_pass(&w),
+        (Vec::new(), Vec::new()),
+        "no need: no read"
+    );
+    assert!(aterm_secrets::need::peek(&paths).unwrap().is_empty());
+
+    let (w, paths) = signed_in_row_asked_for_its_mailbox(Some(HTTP_MAILBOX), true);
+    assert_eq!(
+        mailbox_need_pass(&w).1,
+        ["m15-3"],
+        "the open need's read alone, none of m15-4's"
+    );
+    assert!(m15_3_need(&paths).state.ended());
+    assert_eq!(
+        mailbox_need_pass(&w),
+        (Vec::new(), Vec::new()),
+        "a need met already: no read"
+    );
+}
+
 #[test]
 fn app_scope_cancellation_during_fetch_does_not_publish_the_fetched_roster() {
     for cancel_during_fetch in [false, true] {

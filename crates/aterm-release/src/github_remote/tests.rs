@@ -304,8 +304,13 @@ fn git(repo: &Path, args: &[&str]) -> String {
 /// Explicit local-bare fixture route in agh itself, never a production URL or
 /// credential fallback in the release adapter.
 pub(crate) fn local(repo: &Path, bare: &Path) -> Remote {
+    local_with_fx(repo, bare, Arc::new(agh::Fx::live()))
+}
+
+pub(crate) fn local_with_fx(repo: &Path, bare: &Path, effects: Arc<agh::Fx>) -> Remote {
     let slug = Slug::parse("fixture/app").unwrap();
     let client = GithubBuilder::new(Router::empty())
+        .fx(effects)
         .git_remote_for_tests("fixture/app", bare)
         .build();
     Remote::new(client, slug, repo).unwrap()

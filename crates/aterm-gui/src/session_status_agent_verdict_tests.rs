@@ -1270,7 +1270,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
         record.contains(
             " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
-             held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- goal=- task_state=- task_rev=0 \
+             held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- done_unseen=0 goal=- task_state=- task_rev=0 \
              log_seq=2 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
@@ -1313,7 +1313,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
         record.contains(
             " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
-             held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- goal=- task_state=- task_rev=0 \
+             held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- done_unseen=0 goal=- task_state=- task_rev=0 \
              log_seq=2 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
@@ -2279,12 +2279,12 @@ fn a_relaunch_and_upgrade_claim_leaves_the_boxes_to_the_person() {
     );
 }
 
-/// A prompt box raises one menu row per transition: the row names its tab and its command,
-/// the same box re-read keeps its row and its age, and a box the person is looking at or one in
+/// A prompt box raises one need per transition: the need names its tab and its command,
+/// the same box re-read keeps its need and its age, and a box the person is looking at or one in
 /// a headless app is listed all the same. The age is one a seamless update carried, so a re-read
 /// that started it again would show this second's, which no clock reading confuses with it.
 #[test]
-fn a_box_raises_one_menu_row_per_transition() {
+fn a_box_raises_one_need_per_transition() {
     let (mut app, sid) = app_with_stub();
     let now = i64::try_from(aterm_time::unix_secs().expect("the wall clock")).expect("i64");
     app.presence.need_ages.adopt(
@@ -2314,36 +2314,37 @@ fn a_box_raises_one_menu_row_per_transition() {
         sweep(&mut app, t);
         t += step;
     }
-    assert!(
-        app.status_glance().needs.is_empty(),
-        "a busy agent needs nobody"
-    );
+    assert!(app.local_needs().is_empty(), "a busy agent needs nobody");
 
     paint(&app, sid, &box_screen(1));
     sweep(&mut app, t);
     t += step;
-    let glance = app.status_glance();
+    let needs = app.local_needs();
+    assert_eq!(needs.len(), 1, "exactly one need: {needs:?}");
     assert_eq!(
-        glance.need_count(),
-        1,
-        "exactly one row: {:?}",
-        glance.needs
+        needs[0].session, sid,
+        "Next That Needs You goes to this tab"
     );
-    assert_eq!(
-        glance.local_need_sessions(),
-        vec![sid],
-        "a click on the row focuses this tab"
-    );
-    assert_eq!(glance.needs[0].label, "build", "the row names its tab");
+    assert_eq!(needs[0].label, "build", "the need names its tab");
+    let what = app
+        .pool
+        .get(sid)
+        .expect("pooled")
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .need()
+        .need
+        .as_ref()
+        .map(|need| need.what.clone())
+        .expect("the published need");
     assert!(
-        glance.needs[0]
-            .what
-            .contains("bash S=$PWD/tmp; for p in a b; do set -- $p; rm -rf"),
-        "the row names the command: {}",
-        glance.needs[0].what
+        what.contains("bash S=$PWD/tmp; for p in a b; do set -- $p; rm -rf"),
+        "the need names the command: {what}"
     );
-    let since = glance.needs[0].since_unix;
-    assert_eq!(since, Some(1_000), "the row has the age the update carried");
+    let since = needs[0].since;
+    assert_eq!(since, 1_000, "the need has the age the update carried");
     let rev = published(&app, sid).rev;
 
     paint(&app, sid, &box_screen(2));
@@ -2355,23 +2356,20 @@ fn a_box_raises_one_menu_row_per_transition() {
         "the same box is the same rev"
     );
     app.refresh_presence_session(sid);
-    let glance = app.status_glance();
-    assert_eq!(glance.need_count(), 1, "no second row: {:?}", glance.needs);
-    assert_eq!(
-        glance.needs[0].since_unix, since,
-        "the same box keeps its age"
-    );
+    let needs = app.local_needs();
+    assert_eq!(needs.len(), 1, "no second need: {needs:?}");
+    assert_eq!(needs[0].since, since, "the same box keeps its age");
 
     paint(&app, sid, &busy_screen(9));
     sweep(&mut app, t);
     t += step;
-    assert!(app.status_glance().needs.is_empty(), "row gone");
+    assert!(app.local_needs().is_empty(), "row gone");
     looking_at(&app, &[sid]);
     paint(&app, sid, &box_screen(3));
     sweep(&mut app, t);
     assert!(published(&app, sid).rev > rev, "a new transition");
     assert_eq!(
-        app.status_glance().need_count(),
+        app.local_needs().len(),
         1,
         "a box the person is looking at is listed too"
     );
@@ -2387,7 +2385,11 @@ fn a_box_raises_one_menu_row_per_transition() {
     sweep(&mut headless, t);
     assert_eq!(published(&headless, hsid).word, "prompt");
     assert_eq!(
-        headless.status_glance().local_need_sessions(),
+        headless
+            .local_needs()
+            .iter()
+            .map(|need| need.session)
+            .collect::<Vec<_>>(),
         vec![hsid],
         "a headless app lists it too"
     );
@@ -2430,11 +2432,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     paint(&app, sid, &box_screen(1));
     sweep(&mut app, t);
     assert_eq!(published(&app, sid).word, "prompt");
-    assert_eq!(
-        app.status_glance().need_count(),
-        0,
-        "NEGATIVE CONTROL: supervised"
-    );
+    assert_eq!(app.local_needs().len(), 0, "NEGATIVE CONTROL: supervised");
     let lapse =
         crate::metrics::instant_at_us(expiry_us).expect("in range") + Duration::from_millis(1);
     let deadline = app.presence_deadline(t).expect("armed");
@@ -2446,7 +2444,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     at(short);
     app.presence_tick(short);
     assert_eq!(
-        app.status_glance().need_count(),
+        app.local_needs().len(),
         0,
         "NEGATIVE CONTROL: not lapsed yet"
     );
@@ -2458,14 +2456,9 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
 
     at(lapse);
     app.presence_tick(lapse);
-    let glance = app.status_glance();
-    assert_eq!(
-        glance.need_count(),
-        1,
-        "the box needs you: {:?}",
-        glance.needs
-    );
-    assert_eq!(glance.local_need_sessions(), vec![sid]);
+    let needs = app.local_needs();
+    assert_eq!(needs.len(), 1, "the box needs you: {needs:?}");
+    assert_eq!(needs[0].session, sid);
     let lapses = || {
         ctx.timeline
             .lock()
@@ -2493,11 +2486,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     assert_eq!(lapses(), 1, "the lapse is recorded");
     app.presence_tick(lapse);
     assert_eq!(lapses(), 1, "and recorded once");
-    assert_eq!(
-        app.status_glance().need_count(),
-        1,
-        "the box still needs you"
-    );
+    assert_eq!(app.local_needs().len(), 1, "the box still needs you");
 }
 
 /// Grid resizes and the program's subsequent repaint do not advance `text_moves` or `verdict_moves`.

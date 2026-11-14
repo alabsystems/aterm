@@ -5,7 +5,8 @@
 //!
 //! A post or an owed receipt the bridge publishes again at its pinned sequence can meet an
 //! answer its read back cannot vouch for (`Bridge::publish_reserved`, `Unverifiable`): its
-//! words no longer match the attempt its pin names, or astream's dedup names an offset where
+//! words no longer match the attempt its pin names and no read by that attempt's identity can
+//! decide where it is (`Bridge::reworded_landing`), or astream's dedup names an offset where
 //! the read finds no record of the pin's faces, a record the pin, from a build before
 //! publication identities, cannot tell from another's, a record retention gave up since the
 //! answer, or a refusal below the face's oldest that a broker which does not tell fetches
@@ -32,9 +33,9 @@ pub(crate) const FIRST: Duration = Duration::from_secs(1);
 
 /// The longest hold: retention runs on minute ticks, so a sender waits at most about a tick
 /// past the cut that releases it, and a reservation no cut releases (its words no longer
-/// match its pin) costs its lane a retry a minute that reads nothing back and journals
-/// nothing before the local check refuses it (`Bridge::landed_at_its_pin`,
-/// `Bridge::publish_journaled_entry`).
+/// match its pin, and its pin names no identity or head to read its attempt back by, or it is
+/// a keyed re-post's) costs its lane a retry a minute that journals nothing before the local
+/// check refuses it (`Bridge::reworded_landing`, `Bridge::publish_journaled_entry`).
 pub(crate) const CEILING: Duration = Duration::from_secs(60);
 
 /// The part of a session's outbox whose order one reservation holds.

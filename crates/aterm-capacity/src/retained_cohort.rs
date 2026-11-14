@@ -287,6 +287,29 @@ impl RetainedCohort {
         })
     }
 
+    /// Recheck this reservation's actual original root without reaping it or
+    /// changing any launch, subgroup, scheduler or settlement state. A bound
+    /// subgroup cannot stand in for the root. An ended but unreaped original
+    /// remains checkable for its owner's retirement work.
+    ///
+    /// This borrows the original custody and exclusive child; no observation,
+    /// saved record, PID, deadline or environment supplies either capability.
+    /// Success establishes neither liveness nor capacity release.
+    ///
+    /// # Errors
+    /// Original leadership, memory/CPU custody or root birth changed, the
+    /// reservation is no longer bound, or the leader was reaped.
+    pub fn check_original_root(&self, fence: &Fence, root: &mut CohortChild) -> io::Result<()> {
+        self.observation(fence)?;
+        root.check_original_unreaped()?;
+        if !self.claim.original_root_bound(root.cohort()) {
+            return Err(refused(
+                "retained reservation requires its original bound root",
+            ));
+        }
+        Ok(())
+    }
+
     /// Original bundle width, not a count of free or reusable CPU credits.
     #[must_use]
     pub const fn cpu_units(&self) -> usize {

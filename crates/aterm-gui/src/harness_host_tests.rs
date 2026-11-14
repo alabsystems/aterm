@@ -32350,6 +32350,84 @@ fn a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp() {
     }
 }
 
+/// THE RESTART UNDER claude-code-alab, on a real PTY (`docs/DESIGN-harness-repos-2026-10-24.md`
+/// §8.1 item 10, §11 D53): while the tab's leader holds a proven contract 3 claim naming
+/// `relaunch`, the `restart` verb sends it nothing. It answers `OK restarting`, records
+/// `restart cause=asked` for the harness's subscribe connection, writes no act mark and leaves
+/// the program and its record as they were, with no host snapshot of that pid needed. CONTROL:
+/// under `scope=upgrade`, the claim its launch makes, the relaunch duty is still the built-in
+/// engine's, whose fences answer: it keeps no snapshot of the harness's pid, so the verb is
+/// refused and no event is recorded.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_real_restart_verb_sends_claude_code_alab_a_restart_event_and_no_signal() {
+    use aterm_agent::harness::contract::{Words, read};
+    let agent = RealAgent::spawn(false, 7311);
+    let pid = agent.pid;
+    let holder = format!("claude-code-alab@{pid}");
+    let state = aterm_tempfile::TempDir::new().expect("a state dir");
+    let claim = |scope: &str| {
+        let Words::Scoped(claim) = read(&holder, &["contract=3", scope]) else {
+            panic!("the roster admits claude-code-alab's {scope}");
+        };
+        crate::session_timeline::claim_supervisor_scoped(
+            &agent.ctx,
+            &holder,
+            Some(71),
+            crate::harness_claim::Scoped {
+                proven: crate::self_claim::Proven {
+                    pid: agent.upid(),
+                    start: agent.start.clone(),
+                },
+                claim,
+            },
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the proven claim");
+    };
+    let restart = || {
+        crate::harness_host::with_harness_state(state.path(), || {
+            crate::control::restart_verb(agent.master, "", &agent.ctx, aterm_slog::Actor::Ctl)
+        })
+    };
+    let events = || -> Vec<String> {
+        let g = agent.ctx.timeline.lock().unwrap();
+        g.view_copy(None, 0)
+            .rows()
+            .iter()
+            .filter(|row| row.kind == crate::restart_act::RESTART_EVENT)
+            .map(|row| AsRef::<str>::as_ref(&row.payload).to_string())
+            .collect()
+    };
+    claim("scope=upgrade");
+    assert_eq!(
+        restart(),
+        "ERR restart unavailable: not-the-hosts-agent\n",
+        "CONTROL: the relaunch duty is the built-in engine's"
+    );
+    assert!(events().is_empty(), "CONTROL: no event");
+    assert!(
+        restart_stamp::read(state.path(), &agent.sid).is_none(),
+        "CONTROL: nothing written"
+    );
+    claim("scope=relaunch,upgrade");
+    assert_eq!(restart(), format!("OK restarting pid {pid} cause=asked\n"));
+    assert_eq!(events(), ["cause=asked"]);
+    assert_eq!(agent.acts("restart"), 0, "no signal's act mark");
+    assert!(
+        agent.ended().is_none() && agent.record_left(),
+        "nothing sent: the harness restarts its own child"
+    );
+    assert_eq!(
+        restart(),
+        format!("OK restarting pid {pid} cause=asked\n"),
+        "a second ask joins the standing stamp and is delivered again"
+    );
+    assert_eq!(events(), ["cause=asked", "cause=asked"]);
+    assert!(agent.ended().is_none(), "still nothing sent");
+}
+
 /// The restart's fences, on a real PTY.
 #[cfg(target_os = "macos")]
 #[test]

@@ -1658,6 +1658,11 @@ pub struct Bridge {
     /// ([`Bridge::publish_reserved`]).
     #[cfg(test)]
     cut_after_the_answer: Option<Box<dyn FnMut(u64) + Send>>,
+    /// A test's late commit, landing once a retry whose words left its pin read its attempt
+    /// back and found none, before the retry is published, as an earlier connection's frame
+    /// the broker was still committing lands ([`Bridge::reworded_landing`]).
+    #[cfg(test)]
+    after_a_reworded_read: Option<Box<dyn FnMut() + Send>>,
     #[cfg(test)]
     moved_at_start: u64,
     /// The next reclaim's read of the lanes this node writes is refused with this code.
@@ -2145,6 +2150,8 @@ impl Bridge {
             attach_past_an_unwritten_drop: false,
             #[cfg(test)]
             cut_after_the_answer: None,
+            #[cfg(test)]
+            after_a_reworded_read: None,
             #[cfg(test)]
             moved_at_start: 0,
             #[cfg(test)]
@@ -3237,18 +3244,27 @@ impl Bridge {
         Ok((off, deduped))
     }
 
+    /// `body` published at `pin`'s sequence, a dedup answer taken only where its read back
+    /// vouches for it. Words that left the pin (`reconstructs`, critic item F21's case 1) are
+    /// refused unless `read_back` says the caller read the pin's attempt back by its identity
+    /// and found none ([`Bridge::reworded_landing`]): then they go on their own face at the
+    /// pin's sequence, and a dedup answer is vouched for by their identity or by the pin's, an
+    /// earlier attempt that landed past that read (one the broker was still committing).
     fn publish_reserved(
         &mut self,
         pin: &PublishPin,
         subject: &str,
         body: &[u8],
+        read_back: bool,
     ) -> io::Result<(u64, bool, Option<PublishIdentity>)> {
-        if !reconstructs(pin, body) {
+        let reworded = !reconstructs(pin, body);
+        if reworded && !read_back {
             return Err(self.unreconstructed(pin));
         }
         let attempt = pin
             .identity
             .clone()
+            .filter(|_| !reworded)
             .unwrap_or_else(|| publication_identity(subject, body));
         let (off, deduped) = self.publish_at(pin.seq, &attempt.subject, body)?;
         if !deduped {
@@ -3272,6 +3288,9 @@ impl Bridge {
         let mut candidates = vec![attempt];
         if let Some(original) = &pin.original {
             candidates.push(original.clone());
+        }
+        if let Some(pinned) = pin.identity.as_ref().filter(|_| reworded) {
+            candidates.push(pinned.clone());
         }
         let mut faces = BTreeSet::new();
         let mut exact_record = false;
@@ -3378,9 +3397,12 @@ impl Bridge {
     /// 1. ITS WORDS NO LONGER MATCH ITS PIN (`cannot reconstruct its pinned attempt`): the words
     ///    aterm lists for the post now, its `t=` aside, are not those of the attempt its pin
     ///    names (a reply's wire offset a mesh route reads again, an aterm that encodes the post
-    ///    otherwise since). Nothing is sent and the verdict is local: no retry and no cut changes
-    ///    it while the post and its pin stand, so it holds its sender until the post leaves
-    ///    aterm's outbox.
+    ///    otherwise since). The retry reads the attempt back by its pin's identity first
+    ///    ([`Bridge::reworded_landing`]), settling where it landed and publishing the current
+    ///    words at the pin's own sequence where the read finds none; only where no read can decide (no identity or head
+    ///    in the pin, a broker that does not tell fetches) is it refused, nothing sent, and its
+    ///    lane held, the reason saying why. A keyed re-post's pin keeps no head of its own
+    ///    attempt, so one whose words left it is held until the post leaves aterm's outbox.
     /// 2. A LEGACY PIN: it names no identity (a build before publication identities,
     ///    7a3d78d0f6), or a keyed re-post's names no winner's (v0.104.0 or older), and the read
     ///    finds no record of its words at the answered offset: nothing tells its own first copy
@@ -3420,11 +3442,21 @@ impl Bridge {
     /// [`Bridge::unverified_publication`]'s case 1: the words aterm lists for `pin`'s post or
     /// receipt now are not those its attempt published ([`reconstructs`]).
     fn unreconstructed(&mut self, pin: &PublishPin) -> io::Error {
+        let why = if pin.via_key {
+            "a keyed re-post's pin keeps no head to read its own attempt back from"
+        } else {
+            "its retry did not read its attempt back"
+        };
+        self.unreconstructed_because(pin, why)
+    }
+
+    /// [`Bridge::unreconstructed`], saying `why` no read decides where the pin's attempt is.
+    fn unreconstructed_because(&mut self, pin: &PublishPin, why: &str) -> io::Error {
         #[cfg(test)]
         self.fx
             .reservation_tap(crate::fx::ReservationTap::Unverifiable(1));
         self.unverified_publication(format!(
-            "reservation {} cannot reconstruct its pinned attempt; left queued",
+            "reservation {} cannot reconstruct its pinned attempt, and {why}; left queued",
             pin.seq
         ))
     }
@@ -5786,7 +5818,7 @@ impl Bridge {
             && self.inbox_commit_floor().is_none();
         let published = if commits {
             let pin = plain_pin(seq, &subject, &encoded);
-            self.publish_journaled_answering(&pin, &subject, &encoded, Some(off))
+            self.publish_journaled_answering(&pin, &subject, &encoded, Some(off), false)
                 .map(drop)
         } else {
             self.publish_own_at(seq, &subject, &encoded).map(drop)
@@ -5878,7 +5910,12 @@ impl Bridge {
         let subject = format!("{prefix}/ack");
         let re = self.wire_re(&prefix, r.off)?;
         let encoded = receipt_body(self.fx.wall_ms(), &r.sid, re, &r.verdict).encode();
-        let pinned = self.state.receipt_pin(&r.sid, r.rid)?;
+        #[cfg(test)]
+        self.state.receipt_heads_off(
+            self.fx
+                .mutant(crate::sim::world::Mutant::ReceiptPinKeepsNoHead),
+        );
+        let pinned = self.receipt_pin_now(&r.sid, r.rid)?;
         #[cfg(test)]
         let pinned = pinned.filter(|_| !self.fx.mutant(crate::sim::world::Mutant::FreshReceiptSeq));
         let retry = pinned.is_some();
@@ -5894,21 +5931,48 @@ impl Bridge {
                     owner: None,
                     at: Some(self.bus_high),
                 };
-                self.state.set_receipt_pin(&r.sid, r.rid, &pin)?;
+                let log = self.conn.as_ref().and_then(|conn| conn.seen_log_identity());
+                self.state.set_receipt_pin(&r.sid, r.rid, &pin, log)?;
                 pin
             }
         };
         // A retry at a pin an earlier attempt took, read back first: past a cut astream's
         // dedup no longer answers the pin with the record that attempt landed.
+        let mut read_back = false;
         if retry {
-            if let Some(off) = self.landed_at_its_pin(&pin, &subject, &encoded)? {
-                self.claim(off, pin.seq);
-                // The entry an earlier attempt left standing, its record held for this retry
-                // (`Bridge::awaiting_drain`): aterm's answer here ends it, as a post's read back
-                // does ([`Bridge::land_group`]).
-                let entry = self.awaiting_drain.get(&pin.seq).map(|&(_, ours)| ours);
-                self.receipt_landed(r, subject, pin, off, false, entry);
-                return Ok(());
+            match self.landed_at_its_pin(&pin, &subject, &encoded) {
+                Ok(Some((off, _))) => {
+                    self.claim(off, pin.seq);
+                    // The entry an earlier attempt left standing, its record held for this
+                    // retry (`Bridge::awaiting_drain`): aterm's answer here ends it, as a post's
+                    // read back does ([`Bridge::land_group`]).
+                    let entry = self.awaiting_drain.get(&pin.seq).map(|&(_, ours)| ours);
+                    self.receipt_landed(r, subject, pin, off, false, entry);
+                    return Ok(());
+                }
+                // Read back and found nowhere: words its pin's attempt never published go at the
+                // pin's own sequence ([`Bridge::reworded_landing`]).
+                Ok(None) => read_back = true,
+                // No read decides where its attempt is (case 1 of critic item F21): its
+                // session's receipts wait on a back-off, as at an unverifiable answer below.
+                Err(e) if unverifiable(&e) && self.conn.is_some() => {
+                    let now = self.fx.now();
+                    if !self
+                        .unverified
+                        .holds(&r.sid, crate::unverified_hold::Domain::Receipts, now)
+                    {
+                        let what = format!("the receipt for @{}", r.off);
+                        self.hold_unverifiable(
+                            &r.sid,
+                            crate::unverified_hold::Domain::Receipts,
+                            pin.seq,
+                            &what,
+                            &e,
+                        );
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
             }
         }
         // Past its lane's hold only to be retired where the replay read it back, never sent
@@ -5937,9 +6001,9 @@ impl Bridge {
         let published = match self.staged_refusal(&r.sid) {
             Some(refused) => Err(refused),
             None if at_the_ack => self
-                .publish_journaled(&pin, &subject, &encoded)
+                .publish_journaled_answering(&pin, &subject, &encoded, None, read_back)
                 .map(|(off, deduped, actual)| (off, deduped, actual, None)),
-            None => self.publish_journaled_entry(&pin, &subject, &encoded, None),
+            None => self.publish_journaled_entry(&pin, &subject, &encoded, None, read_back),
         };
         let (at, deduped, _, entry) = match published {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -6358,7 +6422,7 @@ impl Bridge {
         subject: &str,
         body: &[u8],
     ) -> io::Result<(u64, bool, Option<PublishIdentity>)> {
-        self.publish_journaled_answering(pin, subject, body, None)
+        self.publish_journaled_answering(pin, subject, body, None, false)
     }
 
     fn publish_journaled_answering(
@@ -6367,8 +6431,9 @@ impl Bridge {
         subject: &str,
         body: &[u8],
         answers: Option<u64>,
+        read_back: bool,
     ) -> io::Result<(u64, bool, Option<PublishIdentity>)> {
-        let published = self.publish_journaled_entry(pin, subject, body, answers);
+        let published = self.publish_journaled_entry(pin, subject, body, answers, read_back);
         let (off, deduped, actual, entry) = published?;
         if let Some(ours) = entry {
             self.settle_landed(pin.seq, off, ours);
@@ -6386,36 +6451,50 @@ impl Bridge {
         subject: &str,
         body: &[u8],
         answers: Option<u64>,
+        read_back: bool,
     ) -> io::Result<(u64, bool, Option<PublishIdentity>, Option<bool>)> {
+        let reworded =
+            answers.is_none() && pin.seq < astream_broker::ACK_SEQ_BASE && !reconstructs(pin, body);
+        // A reservation whose words no longer match its pin, which its retry did not read back
+        // by the pin's identity ([`Bridge::reworded_landing`]: a keyed re-post's), is refused
+        // before anything is journaled or sent (`publish_reserved`'s first check, critic item
+        // F21's case 1).
+        if reworded && !read_back {
+            return Err(self.unreconstructed(pin));
+        }
+        // Words that left the pin go on their own face; their entry keeps the pin, whose
+        // identity a dedup answer may still be (`Bridge::publish_reserved`), and its head, below
+        // which the replay need not read either back.
         let face = pin
             .identity
             .as_ref()
+            .filter(|_| !reworded)
             .map_or(subject, |identity| identity.subject.as_str())
             .to_string();
         let journaled = self.on_own_lane(&face);
         if journaled && self.conn.is_none() {
             return Err(broker_unreachable());
         }
-        // A reservation whose words no longer match its pin is refused before anything is
-        // journaled or sent (`publish_reserved`'s first check, critic item F21's case 1): a
-        // verdict no retry changes costs its held lane a local check at each.
-        if answers.is_none() && pin.seq < astream_broker::ACK_SEQ_BASE && !reconstructs(pin, body) {
-            return Err(self.unreconstructed(pin));
-        }
         if journaled {
+            let at = if reworded {
+                self.pin_head(pin)
+                    .map_or(self.bus_high, |head| head.min(self.bus_high))
+            } else {
+                self.bus_high
+            };
             self.state.set_in_flight(&InFlight {
                 pin: pin.clone(),
                 subject: face,
                 body: body.to_vec(),
                 log: self.conn.as_ref().and_then(|conn| conn.seen_log_identity()),
-                at: Some(self.bus_high),
+                at: Some(at),
             })?;
         }
         let published = match answers {
             Some(upto) => self
                 .publish_answer(pin.seq, subject, body, upto)
                 .map(|(off, deduped)| (off, deduped, None)),
-            None => self.publish_claimed(pin, subject, body),
+            None => self.publish_claimed(pin, subject, body, read_back),
         };
         match published {
             Ok((off, deduped, actual)) => {
@@ -6477,17 +6556,19 @@ impl Bridge {
         Ok((off, deduped))
     }
 
+    /// `body` published at `pin` ([`Bridge::publish_reserved`], whose `read_back` it passes).
     fn publish_claimed(
         &mut self,
         pin: &PublishPin,
         subject: &str,
         body: &[u8],
+        read_back: bool,
     ) -> io::Result<(u64, bool, Option<PublishIdentity>)> {
         if pin.seq >= astream_broker::ACK_SEQ_BASE {
             let (off, deduped) = self.publish_at(pin.seq, subject, body)?;
             return Ok((off, deduped, None));
         }
-        self.publish_reserved(pin, subject, body)
+        self.publish_reserved(pin, subject, body, read_back)
     }
 
     /// Whether a failed publish's record may yet be on the bus, so its in-flight entry stands
@@ -6650,27 +6731,32 @@ impl Bridge {
             // An older build's entry names no head, and one journaled on a log that keeps its id
             // and continues nothing, or whose lineage is unknown, is bound by nothing here: each
             // published again as before. One journaled on another log is read back from its start
-            // (`Bridge::read_back_from`).
+            // (`Bridge::read_back_from`). An entry in words its pin's attempt never published (a
+            // retry's that read that attempt back and found none, `Bridge::reworded_landing`) is
+            // read back by the pin's identity too, and published at the pin only once so read.
+            let mut wants = vec![publication_identity(&entry.subject, &entry.body)];
+            let reworded = !reconstructs(&entry.pin, &entry.body);
+            wants.extend(entry.pin.identity.clone().filter(|_| reworded));
+            let mut read = false;
             if let Some(from) = self
                 .read_back_from(entry.log, entry.at)
                 .filter(|_| read_back)
             {
-                match self.landed_since(&entry.subject, &entry.body, from, seq) {
-                    Ok(Some(off)) => {
+                match self.found_as_any(&wants, from, seq) {
+                    Ok((Some((off, landed)), _)) => {
                         stderr_line!(
                             "aterm-link: the in-flight record at sequence {seq} is on the bus \
                              at @{off}, read back; it is not published again"
                         );
                         self.claim(off, seq);
-                        let landed = publication_identity(&entry.subject, &entry.body);
                         if !self.land_key_winner(decoded.from.as_deref(), seq, &landed, off) {
                             return false;
                         }
-                        let ours = self.on_own_lane(&entry.subject);
+                        let ours = self.on_own_lane(&landed.subject);
                         self.land_replayed(seq, off, ours);
                         continue;
                     }
-                    Ok(None) => {}
+                    Ok((None, decided)) => read = decided,
                     Err(e) => {
                         stderr_line!(
                             "aterm-link: the in-flight record at sequence {seq} could not be \
@@ -6744,7 +6830,7 @@ impl Bridge {
             // burst, refused at every try) is judged as every other refusal is.
             let fx = self.fx.clone();
             let claimed = crate::rate_hold::waiting_out(
-                || self.publish_claimed(&entry.pin, &entry.subject, &entry.body),
+                || self.publish_claimed(&entry.pin, &entry.subject, &entry.body, read),
                 crate::rate_hold::REPLAY_WAIT_MAX,
                 |wait| fx.sleep(wait),
             );
@@ -6926,6 +7012,23 @@ impl Bridge {
         seq: u64,
     ) -> io::Result<Option<u64>> {
         let want = publication_identity(subject, body);
+        self.found_since(subject, std::slice::from_ref(&want), from, seq)
+            .map(|(found, _)| found.map(|(off, _)| off))
+    }
+
+    /// [`Bridge::landed_since`] for a record of any of the publication identities `wants` on
+    /// `subject`, whatever words the caller holds now: where it is and which it is, and
+    /// whether a `None` is the read's verdict: `false` where the read went on at a floor of
+    /// `subject`'s that its told read could not look below (a broker that does not tell
+    /// fetches, `Client::supports_told_fetch`), so retention may still hold such a record there
+    /// that the read did not see.
+    fn found_since(
+        &mut self,
+        subject: &str,
+        wants: &[PublishIdentity],
+        from: u64,
+        seq: u64,
+    ) -> io::Result<(Option<(u64, PublishIdentity)>, bool)> {
         #[cfg(test)]
         let tells = !self
             .fx
@@ -6949,6 +7052,7 @@ impl Bridge {
             .unwrap_or_default();
         let mut told: Option<(Conn, BusCloser)> = None;
         let mut cursor = from;
+        let mut decided = true;
         loop {
             let started = self.fx.now();
             let answer = match told.as_mut() {
@@ -6964,15 +7068,23 @@ impl Bridge {
                 told = Some(self.told_reader()?);
                 continue;
             }
-            if let Some((off, _, _)) = rows.iter().find(|(off, face, bytes)| {
-                face == subject
-                    && !others.contains(off)
-                    && publication_identity(face, bytes) == want
-            }) {
-                return Ok(Some(*off));
+            if floor.is_some()
+                && told
+                    .as_ref()
+                    .is_some_and(|(reader, _)| !reader.supports_told_fetch())
+            {
+                decided = false;
+            }
+            if let Some(found) = rows
+                .iter()
+                .filter(|(off, face, _)| face == subject && !others.contains(off))
+                .map(|(off, face, bytes)| (*off, publication_identity(face, bytes)))
+                .find(|(_, identity)| wants.contains(identity))
+            {
+                return Ok((Some(found), true));
             }
             if next >= head || next <= cursor {
-                return Ok(None);
+                return Ok((None, decided));
             }
             cursor = next;
         }
@@ -6983,20 +7095,27 @@ impl Bridge {
     /// settled its entry there, or an earlier retry published it), or else read back
     /// ([`Bridge::landed_since`]) from the head the pin was made at (`PublishPin::at`, which a
     /// move brings down to where the new log continues the old, and another log to its start:
-    /// `StateDir::publication_offset_resets`), or, for a pin whose file holds no head (a
-    /// receipt's), from that of its record in flight while it stands. `None` for none; for a
-    /// pin that names no head and has no record in flight on this log, which is published again
-    /// as before; and, with no read, for words the pin's attempt never published
-    /// (`reconstructs`), which no read finds its record by, and which the publish refuses before
-    /// it journals or sends anything (critic item F21's case 1). A keyed re-post's pin, whose
+    /// `StateDir::publication_offset_resets` for a post's, [`Bridge::receipt_pin_now`] for a
+    /// receipt's), or, for a pin that keeps no head (a receipt's before it kept one), from that
+    /// of its record in flight while it stands. `None` for none, and for a pin that names no
+    /// head and has no record in flight on this log, which is published again as before; with
+    /// the record's identity where the read took one other than the pin's. Words the pin's
+    /// attempt never published (`reconstructs`, critic item F21's case 1) are read back by the
+    /// pin's own identity and theirs instead ([`Bridge::reworded_landing`]): there `None` says
+    /// the read decided that neither is on the bus, and the caller publishes the current words
+    /// at the pin ([`Bridge::publish_reserved`]'s `read_back`). A keyed re-post's pin, whose
     /// winner may be another identity on another face, is read back by
     /// [`Bridge::keyed_repost_landed`], not here.
+    ///
+    /// # Errors
+    /// The read's; and, for words the pin's attempt never published, an [`Unverifiable`]
+    /// saying why no read can decide where that attempt is ([`Bridge::reworded_landing`]).
     fn landed_at_its_pin(
         &mut self,
         pin: &PublishPin,
         subject: &str,
         body: &[u8],
-    ) -> io::Result<Option<u64>> {
+    ) -> io::Result<Option<(u64, Option<PublishIdentity>)>> {
         #[cfg(test)]
         if self
             .fx
@@ -7013,13 +7132,31 @@ impl Bridge {
                 .find(|&(_, &seq)| seq == pin.seq)
                 .map(|(&off, _)| off)
         });
-        if known.is_some() {
-            return Ok(known);
+        if let Some(off) = known {
+            return Ok(Some((off, None)));
         }
+        let from = self.pin_head(pin);
         if !reconstructs(pin, body) {
-            return Ok(None);
+            return self
+                .reworded_landing(pin, subject, body, from)
+                .map(|found| found.map(|(off, identity)| (off, Some(identity))));
         }
-        let from = match pin.at {
+        let Some(from) = from else {
+            return Ok(None);
+        };
+        let face = pin
+            .identity
+            .as_ref()
+            .map_or(subject, |identity| identity.subject.as_str())
+            .to_string();
+        self.landed_since(&face, body, from, pin.seq)
+            .map(|found| found.map(|off| (off, None)))
+    }
+
+    /// Where a retry at `pin` reads its attempt back from ([`Bridge::landed_at_its_pin`]): the
+    /// pin's head, or that of its record in flight on this log while it stands.
+    fn pin_head(&self, pin: &PublishPin) -> Option<u64> {
+        match pin.at {
             Some(at) => Some(at),
             None => self
                 .state
@@ -7031,16 +7168,113 @@ impl Bridge {
                         .find_map(|(seq, entry)| (seq == pin.seq).then_some(entry))
                 })
                 .and_then(|entry| self.read_back_from(entry.log, entry.at)),
+        }
+    }
+
+    /// A record of any of `wants` read back from `from` ([`Bridge::found_since`]), on each of
+    /// their faces in turn: the first found, and whether a `None` is every read's verdict.
+    fn found_as_any(
+        &mut self,
+        wants: &[PublishIdentity],
+        from: u64,
+        seq: u64,
+    ) -> io::Result<(Option<(u64, PublishIdentity)>, bool)> {
+        let mut decided = true;
+        let mut faces: Vec<&str> = Vec::new();
+        for want in wants {
+            if faces.contains(&want.subject.as_str()) {
+                continue;
+            }
+            faces.push(&want.subject);
+            match self.found_since(&want.subject, wants, from, seq)? {
+                (Some(found), _) => return Ok((Some(found), true)),
+                (None, verdict) => decided &= verdict,
+            }
+        }
+        Ok((None, decided))
+    }
+
+    /// WHERE A RETRY WHOSE WORDS LEFT ITS PIN LANDED (critic item F21's case 1,
+    /// ATERM-KI-1111-7): aterm lists the post or receipt in words its pin's attempt did not
+    /// publish (a reply's `re=` a mesh route maps otherwise since, a newer build's encoding), so
+    /// no read of the current words alone finds that attempt. It is read back by the pin's own
+    /// publication identity, and by the current words' (`body` on `subject`, which an earlier
+    /// retry of these words published at the pin), from `from`, the pin's head
+    /// ([`Bridge::pin_head`]), TOLD what retention gave up ([`Bridge::found_as_any`]): where
+    /// either landed and which, which the caller settles the post or receipt at, or `None`
+    /// where the read decided that neither is on the bus. The caller then publishes the current
+    /// words AT THE PIN'S OWN SEQUENCE, a dedup answer vouched for by either identity
+    /// ([`Bridge::publish_reserved`]'s `read_back`): a first attempt the broker was still
+    /// committing when the read ran (an answer that timed out on a connection since dropped,
+    /// astream fencing no producer across connections) lands at that sequence too, so whichever
+    /// commits first is the one copy and the other is deduped onto it. The pin, the key's and
+    /// the in-flight entry keep that sequence, so nothing is rewritten before the post or
+    /// receipt lands. Past a cut that gave up the attempt the read finds none, and the words are
+    /// published again, as every retry past a cut is ([`Bridge::landed_since`] says the limit on
+    /// another node's lane). Before it, every such retry read nothing and was refused before it
+    /// was sent, its lane held on a back-off for as long as aterm listed it, whether its attempt
+    /// landed or not.
+    ///
+    /// # Errors
+    /// The read's; and an [`Unverifiable`] (case 1, its lane held) where no read can decide:
+    /// the pin names no identity to read by (a build before publication identities), or no
+    /// head to read from (a keyed re-post's, an older build's), or the read went on at a floor
+    /// a broker that does not tell fetches would not look below. NEGATIVE CONTROLS
+    /// (`Mutant::RewordedWithoutReadingBack`): no read, and the words are published at the pin;
+    /// (`Mutant::HoldAReworded`): no read, and the lane is held.
+    fn reworded_landing(
+        &mut self,
+        pin: &PublishPin,
+        subject: &str,
+        body: &[u8],
+        from: Option<u64>,
+    ) -> io::Result<Option<(u64, PublishIdentity)>> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::RewordedWithoutReadingBack)
+        {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if self.fx.mutant(crate::sim::world::Mutant::HoldAReworded) {
+            return Err(self.unreconstructed(pin));
+        }
+        let Some(identity) = pin.identity.clone() else {
+            return Err(self.unreconstructed_because(
+                pin,
+                "its pin names no identity to read its attempt back by",
+            ));
         };
         let Some(from) = from else {
-            return Ok(None);
+            return Err(self.unreconstructed_because(
+                pin,
+                "its pin keeps no head to read its attempt back from",
+            ));
         };
-        let face = pin
-            .identity
-            .as_ref()
-            .map_or(subject, |identity| identity.subject.as_str())
-            .to_string();
-        self.landed_since(&face, body, from, pin.seq)
+        let wants = [identity, publication_identity(subject, body)];
+        match self.found_as_any(&wants, from, pin.seq)? {
+            (Some((off, found)), _) => {
+                stderr_line!(
+                    "aterm-link: reservation {} no longer reconstructs its pinned attempt; read \
+                     back by its identity and its current words', it is on the bus at @{off}",
+                    pin.seq
+                );
+                Ok(Some((off, found)))
+            }
+            (None, true) => {
+                #[cfg(test)]
+                if let Some(late) = self.after_a_reworded_read.as_mut() {
+                    late();
+                }
+                Ok(None)
+            }
+            (None, false) => Err(self.unreconstructed_because(
+                pin,
+                "the broker does not tell fetches, so retention may still hold its attempt \
+                 below its face's oldest",
+            )),
+        }
     }
 
     /// WHERE A KEYED RE-POST'S KEY'S WINNER IS ON THE BUS, read back before the re-post is
@@ -10488,15 +10722,36 @@ impl Bridge {
                         }
                         return Ok(pin);
                     }
+                    // A KEY'S OWN POST WHOSE PIN THE JOURNAL LACKS (its key's pin written, its
+                    // own refused): it takes its key's sequence, but the bus's head now and the
+                    // current words, as a fresh pin does. An attempt is sent only once its
+                    // post's pin is on the journal, so one whose write never took sent none:
+                    // every attempt lands at or above this head, in words this pin names, where
+                    // a retry reads it back ([`Bridge::landed_at_its_pin`]). The key's file
+                    // keeps no head ([`PublishPin::render`]); with none no retry reads back, and
+                    // past a cut that carried its first attempt unread and dropped its dedup
+                    // key, the retry at the pin lands a second copy of its key (the lossy-log
+                    // keyed world's seed 590). NEGATIVE CONTROL
+                    // (`Mutant::OwnersPinFromItsKeyHeadless`). The key's words are those of a
+                    // drain that sent nothing; pinned in them, a retry whose words moved since
+                    // (a reply's `re=` a mesh route maps otherwise) would read back by words no
+                    // attempt published and miss an attempt in the words of a drain between.
+                    #[cfg(test)]
+                    let headless = self
+                        .fx
+                        .mutant(crate::sim::world::Mutant::OwnersPinFromItsKeyHeadless);
+                    #[cfg(not(test))]
+                    let headless = false;
+                    let head = (!headless).then_some(self.bus_high);
                     let pin = match keyed {
                         Some(keyed) if keyed.owner == Some(post.id) => PublishPin {
                             seq: keyed.seq,
                             via_key: false,
-                            identity: keyed.identity,
+                            identity: Some(publication_identity(&subject, &encoded)),
                             original: None,
                             original_off: None,
                             owner: Some(post.id),
-                            at: keyed.at,
+                            at: head,
                         },
                         Some(keyed) => PublishPin {
                             seq: keyed.seq,
@@ -10563,15 +10818,17 @@ impl Bridge {
                 // attach's replay may have landed it so (`Bridge::replay_in_flight`). A keyed
                 // re-post is read back by [`Bridge::keyed_repost_landed`]: at its own copy the
                 // replay read back, held or not, and otherwise, unheld, at its key's winner.
+                let mut read_back = false;
                 if staged.is_none() {
-                    let read_back = if pin.via_key {
+                    let found = if pin.via_key {
                         self.keyed_repost_landed(&pin, unsendable)
+                            .map(|found| found.map(|(off, winners)| (off, winners, None)))
                     } else {
                         self.landed_at_its_pin(&pin, &subject, &encoded)
-                            .map(|found| found.map(|off| (off, false)))
+                            .map(|found| found.map(|(off, identity)| (off, false, identity)))
                     };
-                    match read_back {
-                        Ok(Some((off, winners))) => {
+                    match found {
+                        Ok(Some((off, winners, identity))) => {
                             stderr_line!(
                                 "aterm-link: post {} of {} is on the bus at @{off}, read back; \
                                  it is not published again",
@@ -10579,12 +10836,14 @@ impl Bridge {
                                 post.sid
                             );
                             // The key's winner is its key's record, not this attempt's: a keyed
-                            // re-post claims nothing, as its dedup answer claims nothing.
+                            // re-post claims nothing, as its dedup answer claims nothing. A
+                            // reworded retry's read names the record it found, its pin's
+                            // attempt's or its current words'.
                             let (deduped, actual) = if winners {
                                 (true, pin.original.clone())
                             } else {
                                 self.claim(off, pin.seq);
-                                (false, pin.identity.clone())
+                                (false, identity.or_else(|| pin.identity.clone()))
                             };
                             self.settle_a_retry_answered_ahead(&post, off);
                             let sid = post.sid.clone();
@@ -10604,7 +10863,10 @@ impl Bridge {
                             });
                             return self.follow(&sid, next);
                         }
-                        Ok(None) => {}
+                        // Read back and found nowhere: words its pin's attempt never published
+                        // go at the pin's own sequence ([`Bridge::reworded_landing`]), sent
+                        // below unless it is held.
+                        Ok(None) => read_back = !pin.via_key,
                         Err(e) => {
                             let next = self.post_refused(&post, &subject, pin.seq, e);
                             return self.follow(&post.sid, next);
@@ -10618,7 +10880,7 @@ impl Bridge {
                 // outbox ([`Bridge::land_group`]).
                 let published = match staged {
                     Some(refused) => Err(refused),
-                    None => self.publish_journaled_entry(&pin, &subject, &encoded, None),
+                    None => self.publish_journaled_entry(&pin, &subject, &encoded, None, read_back),
                 };
                 let sid = post.sid.clone();
                 let next = match published {
@@ -10646,6 +10908,23 @@ impl Bridge {
             route => self.retire_at_the_door(&post, route.reason()),
         }
         true
+    }
+
+    /// Owed receipt `rid` of `sid`'s pin, with the head kept for it beside its pin file
+    /// (`StateDir::receipt_head`) read on the log the link reads, as an in-flight entry's is
+    /// ([`Bridge::read_back_from`]): as written on that log, brought down to where a log that
+    /// continues it forks, and to 0 on another log. None where the file names another pin or a
+    /// log the link cannot relate to its own (a build before the heads moves and re-pins past
+    /// the file without touching it).
+    fn receipt_pin_now(&self, sid: &str, rid: u64) -> io::Result<Option<PublishPin>> {
+        let Some(mut pin) = self.state.receipt_pin(sid, rid)? else {
+            return Ok(None);
+        };
+        pin.at = self
+            .state
+            .receipt_head(sid, rid, pin.seq)?
+            .and_then(|(log, at)| self.read_back_from(Some(log), Some(at)));
+        Ok(Some(pin))
     }
 
     /// Before a post's first pin is made, read the answer to every post of its sender in the

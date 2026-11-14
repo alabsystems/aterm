@@ -25,6 +25,8 @@ pub enum EventKind {
     ObservationUnavailable,
     MeasureDriver,
     CellPrerequisiteUnavailable,
+    /// What one cross-target cell's cargo calls took.
+    CellFinished,
     Disk,
     RunFinished,
     StageStarted,
@@ -43,6 +45,8 @@ pub enum EventKind {
     TestCaseFailed,
     TestBinaryFinished,
     TestDispatchWait,
+    /// What a test run's claim of cores asked and was granted, with the load as it was granted.
+    TestCoreGrant,
     TestCpuAccounted,
     TestPhaseStarted,
     TestPhaseEnded,

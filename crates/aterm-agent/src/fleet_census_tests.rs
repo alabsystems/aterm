@@ -130,6 +130,7 @@ fn sample_facts(
         home: None,
         home_free_mb: None,
         repos: None,
+        update: None,
     }
 }
 

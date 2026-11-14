@@ -115,7 +115,7 @@ impl World {
                  now=$(git -C \"$here\" rev-parse HEAD) || exit 12\n\
                  if [ \"$now\" != \"$captured\" ]; then\n\
                  code=$(git -C \"$here\" diff --name-only \"$captured\" \"$now\" | grep -v -x -e \
-                 mappings.json -e verification-log.jsonl | grep -v '^handoff/')\n\
+                 mappings.json -e verification-log.jsonl)\n\
                  [ -n \"$code\" ] && {{ echo \"FAIL: publication engine HEAD changed during stage \
                  (non-data-plane paths: $code); refusing to push\"; exit 1; }}\n\
                  fi\n\
@@ -972,15 +972,18 @@ fn the_export_refuses_a_rewritten_engine_origin_before_stage() {
     for divergent in [false, true] {
         let w = World::new();
         let base = w.origin_main();
-        peer_lands(&w, "handoff/first", "first record\n");
+        peer_lands(&w, "verification-log.jsonl", "{\"record\":\"first\"}\n");
         let mut real = w.real(false);
         real.engine_sync().unwrap();
         real.prepare_scanner_tools(&w.prover).unwrap();
         let held = git_in(&w.copy(), &["rev-parse", "HEAD"]);
         let rewritten = if divergent {
             git_in(&w.peer, &["checkout", "-q", "-b", "rewritten", &base]);
-            std::fs::create_dir_all(w.peer.join("handoff")).unwrap();
-            std::fs::write(w.peer.join("handoff/other"), "other record\n").unwrap();
+            std::fs::write(
+                w.peer.join("mappings.json"),
+                "{\"mappings\":{\"other\":{}}}\n",
+            )
+            .unwrap();
             git_in(&w.peer, &["add", "-A"]);
             git_in(&w.peer, &["commit", "-qm", "divergent record"]);
             git_in(&w.peer, &["rev-parse", "HEAD"])
@@ -1111,51 +1114,117 @@ fn peer_renames(w: &World, from: &str, to: &str) {
     git_in(&w.peer, &["push", "-q", "origin", "HEAD:main"]);
 }
 
-/// THE ENGINE'S CODE IS WHAT ITS OWN STAGE GUARD CALLS CODE (`bin/pub`'s `engine_code_drift`):
-/// records, the Rust port and the engine's prose are not; every other path is, a `*.md` under
-/// `bin/` included. NEGATIVE CONTROL: the release's rule before named only the records, so
-/// `docs/`, a top-level `*.md` and `crates/` were code.
+/// THE ENGINE'S CODE IS WHAT ITS OWN STAGE GUARD CALLS CODE, PATH FOR PATH (`bin/pub`'s
+/// `engine_code_drift`, and the paths of its `EngineCodeDriftTests`): its records, its prose and
+/// its lab tracker are not; every other path is, a `*.md` under `bin/`, a look-alike of `docs/`
+/// or `goals/`, a path under the deleted `handoff/` and one of the deleted Rust port included.
+/// A blank path is none.
 #[test]
 fn engine_code_is_what_the_engines_own_stage_guard_calls_code() {
     for path in [
         "mappings.json",
         "verification-log.jsonl",
-        "handoff/v1/x.toml",
-        "Cargo.toml",
-        "Cargo.lock",
-        "rust-toolchain.toml",
-        "crates/pubx/src/main.rs",
-        "docs/RUNBOOK.md",
+        "docs/RELEASE_READINESS.md",
+        "docs/sub/notes.md",
         "docs/measured/x.txt",
         "README.md",
         "AGENTS.md",
+        "TOOLS.md",
+        "KEYS.md",
+        "goals/GOALS.md",
+        "goals/data/packages.tsv",
+        "goals/tools/goals.py",
         "",
+        " ",
     ] {
         assert!(!engine_code(path), "{path} is not engine code");
     }
     for path in [
         "bin/pub",
+        "bin/pub_ring.py",
         "bin/pub_ledger.py",
-        "bin/NOTES.md",
+        "bin/notes.md",
+        "bin/goals.py",
+        "bin/crates/x",
         "registry/repos.toml",
         "registry/README.md",
+        "keys/release.pub",
         "keys/registry.toml",
+        "tools/check.sh",
+        "tests/test_pub_stage.py",
         "baseline/forbidden-content.txt",
         "pins.json",
-        "tests/test_pub.py",
         "README.txt",
+        "README.md.py",
+        "docsx/a.py",
+        "goalsx/a",
+        "crates.toml",
+        "Cargo.toml",
+        "handoff/v1/x.toml",
     ] {
         assert!(engine_code(path), "{path} is engine code");
     }
 }
 
+/// A LAB TRACKER COMMIT IS NOT ENGINE CODE (`bin/pub` f0aa02b, 2026-11-12): `goals/` holds the
+/// tracker's tables, `GOALS.md`, designs and the `goals/tools/*.py` that write them, tooling
+/// `bin/pub` never imports, runs or opens, and `goals.py` commits it to the engine every few
+/// minutes, so a release that counted it as code restaged for no change in what a stage runs.
+/// Only the directory passes. NEGATIVE CONTROL: with `goals/` not set aside in [`engine_code`],
+/// the tracker's paths are code.
+#[test]
+fn a_lab_tracker_commit_is_not_engine_code() {
+    for path in [
+        "goals/GOALS.md",
+        "goals/data/packages.tsv",
+        "goals/tools/goals.py",
+    ] {
+        assert!(!engine_code(path), "{path} is the lab tracker");
+    }
+    for path in ["bin/goals.py", "goalsx/a"] {
+        assert!(engine_code(path), "{path} only looks like the tracker");
+    }
+}
+
+/// THE RUST PORT THE ENGINE DELETED IS ENGINE CODE (publication 7e44954, 2026-11-12): the engine
+/// has no `crates/`, `Cargo.*` or `rust-toolchain.toml` now, and its stage guard sets none of
+/// them aside, so a path there is judged like any other. NEGATIVE CONTROL: with the port set
+/// aside in [`engine_code`] again, none of them is code.
+#[test]
+fn the_deleted_rust_port_is_engine_code() {
+    for path in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "crates/pubx/src/main.rs",
+    ] {
+        assert!(engine_code(path), "{path} is engine code");
+    }
+}
+
+/// A PATH UNDER THE DELETED `handoff/` IS NOT A RECORD (`bin/pub`'s
+/// `test_the_deleted_handoff_folder_is_not_data_plane`): the folder held hand-written notes
+/// until publication CU-13 deleted it (2026-11-13), and nothing writes there, so the release
+/// judges a path under it like any other path outside the records, the prose and the lab
+/// tracker: engine code. NEGATIVE CONTROL: with the `handoff/` prefix back in
+/// [`engine_data_plane`], both paths are records.
+#[test]
+fn a_path_under_the_deleted_handoff_folder_is_not_a_record() {
+    for path in ["handoff/aterm/0.149.0.toml", "handoff/README.md"] {
+        assert!(!engine_data_plane(path), "{path} is not a record");
+        assert!(engine_code(path), "{path} is engine code");
+    }
+}
+
 /// A RESUMED RELEASE RESTAGES ONLY WHEN THE ENGINE'S CODE MOVED: the engine's main took prose
-/// (`docs/`, a top-level `*.md`) and its Rust port since the release staged, as 101 of its 438
-/// commits in the week to 2026-11-07 did, and the engine that staged is still the one that
-/// promotes (`Same`). NEGATIVE CONTROL: the rule before (only records set aside) called that
-/// `Moved` and threw the stage away. A move of `bin/` is `Moved`, naming the path; so is a
-/// rename of engine code into `docs/`, which a diff with rename detection lists only at the path
-/// it took (NEGATIVE CONTROL: without `--no-renames`, `Same`).
+/// (`docs/`, a top-level `*.md`) and the lab tracker's commits (`goals/`, which `goals.py` pushes
+/// to the engine every few minutes) since the release staged, and the engine that staged is
+/// still the one that promotes (`Same`). NEGATIVE CONTROL: with `goals/` not set aside, the
+/// tracker's commits are `Moved` and throw the stage away. A move of the Rust port the engine
+/// deleted (`crates/`, `Cargo.toml`) is `Moved`, naming its paths and neither the prose nor the
+/// tracker (NEGATIVE CONTROL: with the port set aside, `Same`); so is a move of `bin/`, and a
+/// rename of engine code into `docs/`, which a diff with rename detection lists only at the
+/// path it took (NEGATIVE CONTROL: without `--no-renames`, `Same`).
 #[test]
 fn a_resume_restages_only_for_a_move_of_the_engines_code() {
     let w = World::new();
@@ -1164,22 +1233,34 @@ fn a_resume_restages_only_for_a_move_of_the_engines_code() {
     let staged = w.origin_main();
     peer_lands(&w, "docs/notes.md", "# notes\n");
     peer_lands(&w, "NOTES.md", "# top-level notes\n");
-    peer_lands(&w, "crates/pubx/src/main.rs", "fn main() {}\n");
-    peer_lands(&w, "Cargo.toml", "[workspace]\n");
+    peer_lands(&w, "goals/data/packages.tsv", "id\tstate\nCU-13\tdone\n");
+    peer_lands(&w, "goals/tools/goals.py", "# the tracker's writer\n");
     real.engine_sync().unwrap();
     assert_eq!(git_in(&w.copy(), &["rev-parse", "HEAD"]), w.origin_main());
     match Backend::engine_now(&mut real, &staged).unwrap() {
-        EngineNow::Same(note) => assert!(note.contains("records, Rust port or prose"), "{note}"),
-        other => panic!("only prose and the port moved: {other:?}"),
+        EngineNow::Same(note) => {
+            assert!(note.contains("records, prose or lab tracker"), "{note}");
+        }
+        other => panic!("only prose and the tracker moved: {other:?}"),
     }
 
-    peer_lands(&w, "bin/pub-tool", "# engine code\n");
+    peer_lands(&w, "crates/pubx/src/main.rs", "fn main() {}\n");
+    peer_lands(&w, "Cargo.toml", "[workspace]\n");
     real.engine_sync().unwrap();
     match Backend::engine_now(&mut real, &staged).unwrap() {
         EngineNow::Moved(why) => {
-            assert!(why.contains("bin/pub-tool"), "{why}");
+            assert!(why.contains("Cargo.toml, crates/pubx/src/main.rs"), "{why}");
             assert!(!why.contains("docs/notes.md"), "prose is not named: {why}");
+            assert!(!why.contains("goals/"), "the tracker is not named: {why}");
         }
+        other => panic!("the deleted port's paths are code: {other:?}"),
+    }
+
+    let staged = w.origin_main();
+    peer_lands(&w, "bin/pub-tool", "# engine code\n");
+    real.engine_sync().unwrap();
+    match Backend::engine_now(&mut real, &staged).unwrap() {
+        EngineNow::Moved(why) => assert!(why.contains("bin/pub-tool"), "{why}"),
         other => panic!("engine code moved: {other:?}"),
     }
 
@@ -1193,19 +1274,22 @@ fn a_resume_restages_only_for_a_move_of_the_engines_code() {
 }
 
 /// A COMMIT THE RELEASE'S ENGINE HOLDS THAT RENAMES ENGINE CODE INTO ITS RECORDS IS KEPT, NOT
-/// DELIVERED: the sync lists both paths of a rename, so `bin/pub-tool` moved to `handoff/` is
-/// refused as code and the origin is untouched. NEGATIVE CONTROL: a listing with rename
-/// detection names only `handoff/pub-tool`, a record, and the sync pushed the commit that
+/// DELIVERED: the sync lists both paths of a rename, so `bin/pub-tool` moved to
+/// `mappings.json`, a record path the origin's main had dropped (a rename needs a path the base
+/// lacks), is refused as code and the origin is untouched. NEGATIVE CONTROL: a listing with
+/// rename detection names only `mappings.json`, a record, and the sync pushed the commit that
 /// deleted engine code from the origin's main.
 #[test]
 fn a_held_rename_of_engine_code_into_the_records_is_never_delivered() {
     let w = World::new();
     peer_lands(&w, "bin/pub-tool", "# engine code\n");
+    git_in(&w.peer, &["rm", "-q", "mappings.json"]);
+    git_in(&w.peer, &["commit", "-q", "-m", "drop the ledger"]);
+    git_in(&w.peer, &["push", "-q", "origin", "HEAD:main"]);
     let real = w.real(false);
     real.engine_sync().unwrap();
     let copy = w.copy();
-    std::fs::create_dir_all(copy.join("handoff")).unwrap();
-    git_in(&copy, &["mv", "bin/pub-tool", "handoff/pub-tool"]);
+    git_in(&copy, &["mv", "bin/pub-tool", "mappings.json"]);
     git_in(&copy, &["commit", "-q", "-m", "chore(audit): not a record"]);
     let held = git_in(&copy, &["rev-parse", "HEAD"]);
     let origin_was = w.origin_main();

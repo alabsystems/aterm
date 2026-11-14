@@ -9,7 +9,7 @@
 
 use super::registry::{
     ACCOUNT, ACCOUNT_OBS, ADDRESS, COLLECTIONS, MACHINE, MACHINE_FACTS, MAILBOX, MAILBOX_OBS,
-    PREFERENCE,
+    PREFERENCE, bound_machine, held_machines,
 };
 use crate::typed::{
     Kind,
@@ -33,7 +33,10 @@ pub struct Finding {
 /// The rules over the Macs' own rows (design §4.7): each is a finding and nothing merges. Two live
 /// enrollments bind one machine; two live enrollments state one hardware hint, a clone or a
 /// machine identifier VMs share; a row binds a machine the registry does not have; and a Mac's
-/// facts differ from the owner's statement on its machine row, where the facts win in views. A
+/// facts differ from the owner's statement on the machine row it is, where the facts win in views.
+/// A row binds both the machine its `mac` names and the one its own `merged_into` moved it to
+/// ([`held_machines`]), so a Mac merged or folded onto a machine another enrollment binds shares
+/// that machine with it. A
 /// row whose chain of `predecessor`s reaches another of its group is that Mac's later enrollment
 /// (a writer succession, whose earlier uuid stays seated), so a group is shared only where it
 /// has more than one enrollment that succeeded no other of it, or two rows on its chains that
@@ -47,28 +50,31 @@ pub fn facts(read: &OwnedRead, live: &BTreeSet<String>, machines: &Projection) -
     let mut by_hint = BTreeMap::<&str, Vec<&str>>::new();
     for (uuid, row) in read.rows.iter().filter(|(uuid, _)| live.contains(*uuid)) {
         let text = |column: &str| row.value.get(column).and_then(Value::as_str);
-        if let Some(mac) = text("mac") {
+        let held = held_machines(&row.value);
+        if held.iter().any(|mac| !machines.rows.contains_key(*mac)) {
+            found.push(Finding {
+                kind: "facts-machine-unknown",
+                collection: MACHINE_FACTS.name,
+                pks: vec![uuid.clone()],
+            });
+        }
+        for mac in held {
             by_machine.entry(mac).or_default().push(uuid.as_str());
-            match machines.rows.get(mac) {
-                None => found.push(Finding {
-                    kind: "facts-machine-unknown",
+        }
+        if let Some(mac) = bound_machine(&row.value)
+            && let Some(machine) = machines.rows.get(mac)
+        {
+            let differs = ["chip", "ram_gb", "disk_gb"].into_iter().any(|column| {
+                machine
+                    .get(column)
+                    .is_some_and(|stated| row.value.get(column).is_some_and(|fact| fact != stated))
+            });
+            if differs {
+                found.push(Finding {
+                    kind: "facts-differ",
                     collection: MACHINE_FACTS.name,
-                    pks: vec![uuid.clone()],
-                }),
-                Some(machine) => {
-                    let differs = ["chip", "ram_gb", "disk_gb"].into_iter().any(|column| {
-                        machine.get(column).is_some_and(|stated| {
-                            row.value.get(column).is_some_and(|fact| fact != stated)
-                        })
-                    });
-                    if differs {
-                        found.push(Finding {
-                            kind: "facts-differ",
-                            collection: MACHINE_FACTS.name,
-                            pks: vec![uuid.clone(), mac.to_owned()],
-                        });
-                    }
-                }
+                    pks: vec![uuid.clone(), mac.to_owned()],
+                });
             }
         }
         if let Some(hint) = text("hw_hint") {

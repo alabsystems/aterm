@@ -561,7 +561,7 @@ impl Local {
     /// marked so.
     #[must_use]
     pub fn automatically_admits(&self, from: IpAddr) -> bool {
-        self.automatic_lan && self.home.is_some_and(|home| home.holds(from))
+        self.automatic_lan && self.home.as_ref().is_some_and(|home| home.holds(from))
     }
 
     /// Whether the vault's signed swarm roster names `request`'s recipient as a member here, so

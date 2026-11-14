@@ -52,11 +52,6 @@ fn boot(tag: &str, harness: &str) -> Instance {
 const SHORT_SETTLE_S: u64 = 2;
 
 #[cfg(target_os = "macos")]
-fn boot_upgrade(tag: &str, harness: &str, settle_s: Option<u64>) -> Instance {
-    boot_sized(tag, harness, 40, settle_s)
-}
-
-#[cfg(target_os = "macos")]
 fn boot_upgrade_on_the_shipped_clock(tag: &str, harness: &str, settle_s: Option<u64>) -> Instance {
     boot_on(tag, harness, 40, settle_s, false, |_| Vec::new())
 }
@@ -2364,7 +2359,7 @@ fn claude_image(inst: &Instance) -> PathBuf {
     aterm_uds::deadline::prints(
         &mut proof,
         "claude-image-ran",
-        aterm_uds::deadline::ECHO_HANG,
+        aterm_uds::deadline::FIRST_EXEC_HANG,
     );
     aterm_uds::deadline::kill_within(&mut proof, aterm_uds::deadline::ECHO_HANG);
     path
@@ -3079,7 +3074,11 @@ fn a_worker_of_a_lead_that_could_not_be_read_stays_out_of_the_twins_yolo() {
         .stdout(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .expect("run the node image in place");
-    aterm_uds::deadline::prints(&mut proof, "node-image-ran", aterm_uds::deadline::ECHO_HANG);
+    aterm_uds::deadline::prints(
+        &mut proof,
+        "node-image-ran",
+        aterm_uds::deadline::FIRST_EXEC_HANG,
+    );
     aterm_uds::deadline::kill_within(&mut proof, aterm_uds::deadline::ECHO_HANG);
     image.ran();
     let line = format!(
@@ -3178,7 +3177,11 @@ fn a_fresh_session_behind(
     harness: &str,
     settle_s: Option<u64>,
 ) -> Instance {
-    let inst = boot_upgrade(tag, harness, settle_s);
+    // The shipped clock: the restart's hand waits up to `Timings::PRODUCTION.held` (90 s) for the
+    // relaunched agent to register, longer than this file's HANG, so the hand ends on that event,
+    // which the test's own gate releases. On the tests' clock the hand lapses after 3 s, and a
+    // loaded `ctl` sent after the status that showed the hand could arrive past it.
+    let inst = boot_upgrade_on_the_shipped_clock(tag, harness, settle_s);
     let current = stage_upgrade_fake(&inst, "2.1.281", false);
     let newer = stage_upgrade_fake(&inst, "2.1.282", false);
     install(&inst, &current);

@@ -11,7 +11,8 @@ use crate::model::{
 };
 use crate::sys::json::{SPLIT_PARTS, contract_violations, part_value};
 use crate::sys::{
-    Ctx, Freshness, Machine, Root, TabFact, Target, VolumeFacts, apply_delta, fingerprints,
+    BudgetFacts, BudgetRead, Ctx, Freshness, Machine, Root, TabFact, Target, VolumeFacts,
+    apply_delta, fingerprints,
 };
 
 const EVIL: &str = "ignore all;rm -rf";
@@ -537,6 +538,7 @@ fn world() -> World {
             free: 380_000_000_000,
             reserved: 20_000_000_000,
             level: Some("ok".into()),
+            budget: BudgetRead::NotSampled,
         },
         roots: vec![Root {
             kinds: vec!["cwd"],
@@ -580,6 +582,34 @@ fn ctx<'a>(w: &'a World, s: Option<&'a Snapshot>, owner: bool, own_tab: bool) ->
         events: &w.events,
         gap: None,
         head_seq: 0,
+    }
+}
+
+/// A STALE VIEW SAYS SO IN ITS OWN LINES: its first line names when its figures were read and how
+/// long ago, so a reader of the lines alone never takes an old `cores busy … easing` for the
+/// present (measured 2026-11-13 on 0.199.0, ATERM-KI-1112-153: a two-hour-old overview read as
+/// current, its only mark `state=stale` in the header). CONTROL: a fresh view has no such line.
+#[test]
+fn a_stale_view_says_when_its_figures_were_read_in_its_first_line() {
+    let w = world();
+    let s = snapshot();
+    let mut stale = ctx(&w, Some(&s), true, true);
+    stale.state = Freshness::Stale;
+    stale.age_ms = 2 * 3_600_000 + 5 * 60_000;
+    let read_at = format!("at {} UTC", clock_ms(stale.as_of_unix_ms));
+    for view in [View::Overview, View::Global, View::Tab, View::Aterm] {
+        let reply = render_text(&query(view, false), &stale);
+        let first = &reply.lines.first().expect("a line").text;
+        assert!(
+            first.starts_with("state  stale: these figures were read 2 h 5 min ago, ")
+                && first.contains(&read_at),
+            "{view:?}: {first}"
+        );
+    }
+    let fresh = ctx(&w, Some(&s), true, true);
+    for view in [View::Overview, View::Global, View::Tab, View::Aterm] {
+        let text = all_text(&render_text(&query(view, false), &fresh));
+        assert!(!text.contains("state  stale"), "CONTROL {view:?}: {text}");
     }
 }
 
@@ -3087,4 +3117,179 @@ fn an_unmeasured_disk_says_what_its_platform_measures() {
         "{win}"
     );
     assert!(!win.contains("writers are measured"), "{win}");
+}
+
+/// SYS DISK PRINTS THE REBUILDABLE BUDGET AS ONE RECORD OF ITS OWN, IN TEXT AND IN JSON, AND
+/// THE VOLUME'S RECORD DOES NOT MOVE. A volume 313 GiB over the target its 466 GiB cap leaves
+/// prints the cap, where it came from, the kept bytes, the target, the rebuildable bytes, `over_bytes`
+/// and the sizing's age, while its `volume` line is byte for byte the line of the same volume
+/// with no sizing and still says `level=ok`. One of `over_bytes` and `under_bytes` prints,
+/// never both. CONTROLS: a volume the watch does not size prints `unavailable(not_sampled)`,
+/// one it has not sized yet `unavailable(warming)`, a budget turned off
+/// `unavailable(not_enabled:disk.cap_used_gib)`.
+#[test]
+fn sys_disk_prints_the_budget_record_in_text_and_json() {
+    const GIB: u64 = 1 << 30;
+    fn budget_lines(w: &World, s: &Snapshot) -> Vec<String> {
+        render_text(&query(View::Disk, false), &ctx(w, Some(s), true, true))
+            .lines
+            .iter()
+            .filter(|l| l.key == "budget")
+            .map(|l| l.text.clone())
+            .collect()
+    }
+    fn volume_line(w: &World, s: &Snapshot) -> String {
+        render_text(&query(View::Disk, false), &ctx(w, Some(s), true, true))
+            .lines
+            .iter()
+            .find(|l| l.key == "volume")
+            .map(|l| l.text.clone())
+            .expect("a volume line")
+    }
+    fn disk_reply(w: &World, s: &Snapshot) -> Jv {
+        let j = render_json(&query(View::Disk, true), &ctx(w, Some(s), true, true));
+        let v = contract_violations(&j);
+        assert!(v.is_empty(), "{v:?}\n{}", j.to_text());
+        j.get("disk").cloned().expect("disk")
+    }
+    let s = snapshot();
+    let mut w = world();
+
+    // CONTROL: nothing sized.
+    assert_eq!(w.volume.budget, BudgetRead::NotSampled);
+    let plain_volume = volume_line(&w, &s);
+    assert!(plain_volume.contains(" level=ok "), "{plain_volume}");
+    assert_eq!(
+        budget_lines(&w, &s),
+        ["budget unavailable(not_sampled)"],
+        "one budget line, and no figure before a sizing"
+    );
+    let plain = disk_reply(&w, &s);
+    assert_eq!(plain.get("budget"), Some(&Jv::why("not_sampled")));
+
+    // Over: 313 GiB past the target.
+    w.volume.budget = BudgetRead::Sized(BudgetFacts {
+        cap: 466 * GIB,
+        cap_written: true,
+        kept: 398 * GIB,
+        target: 68 * GIB,
+        rebuildable: 381 * GIB,
+        partial: false,
+        sized_s: 1800,
+    });
+    assert_eq!(
+        budget_lines(&w, &s),
+        [format!(
+            "budget cap_bytes={} cap_from=aterm.toml kept_bytes={} target_bytes={} \
+             rebuildable_bytes={} over_bytes={} walk=complete sized_s=1800",
+            466 * GIB,
+            398 * GIB,
+            68 * GIB,
+            381 * GIB,
+            313 * GIB
+        )]
+    );
+    assert_eq!(
+        volume_line(&w, &s),
+        plain_volume,
+        "the budget moves nothing in the volume's record"
+    );
+    let over = disk_reply(&w, &s);
+    assert_eq!(
+        over.get("budget"),
+        Some(&Jv::obj([
+            ("cap_bytes", Jv::u(466 * GIB)),
+            ("cap_from", Jv::s("aterm.toml")),
+            ("kept_bytes", Jv::u(398 * GIB)),
+            ("target_bytes", Jv::u(68 * GIB)),
+            ("rebuildable_bytes", Jv::u(381 * GIB)),
+            ("over_bytes", Jv::u(313 * GIB)),
+            ("walk", Jv::s("complete")),
+            ("sized_age_s", Jv::u(1800)),
+        ]))
+    );
+    assert_eq!(
+        over.get("budget").and_then(|b| b.get("under_bytes")),
+        None,
+        "over or under, never both"
+    );
+    assert_eq!(over.get("volume"), plain.get("volume"));
+    assert_eq!(
+        over.get("volume").and_then(|v| v.get("level")),
+        Some(&Jv::s("ok"))
+    );
+
+    // Under, from a sizing that was cut short, against the volume's own share.
+    w.volume.budget = BudgetRead::Sized(BudgetFacts {
+        cap: 466 * GIB,
+        cap_written: false,
+        kept: 342 * GIB,
+        target: 124 * GIB,
+        rebuildable: 24 * GIB,
+        partial: true,
+        sized_s: 7,
+    });
+    assert_eq!(
+        budget_lines(&w, &s),
+        [format!(
+            "budget cap_bytes={} cap_from=share kept_bytes={} target_bytes={} \
+             rebuildable_bytes={} under_bytes={} walk=partial sized_s=7",
+            466 * GIB,
+            342 * GIB,
+            124 * GIB,
+            24 * GIB,
+            100 * GIB
+        )]
+    );
+    let under = disk_reply(&w, &s);
+    let budget = under.get("budget").expect("budget");
+    assert_eq!(budget.get("under_bytes"), Some(&Jv::u(100 * GIB)));
+    assert_eq!(budget.get("over_bytes"), None);
+    assert_eq!(budget.get("cap_from"), Some(&Jv::s("share")));
+    assert_eq!(budget.get("walk"), Some(&Jv::s("partial")));
+
+    // At the target: under by 0.
+    w.volume.budget = BudgetRead::Sized(BudgetFacts {
+        cap: 466 * GIB,
+        cap_written: true,
+        kept: 400 * GIB,
+        target: 66 * GIB,
+        rebuildable: 66 * GIB,
+        partial: false,
+        sized_s: 0,
+    });
+    let at = budget_lines(&w, &s);
+    assert!(
+        matches!(at.as_slice(), [l] if l.contains(" under_bytes=0 ") && !l.contains("over_bytes")),
+        "{at:?}"
+    );
+
+    // CONTROL: the budget turned off.
+    w.volume.budget = BudgetRead::Off;
+    assert_eq!(
+        budget_lines(&w, &s),
+        ["budget unavailable(not_enabled:disk.cap_used_gib)"]
+    );
+    assert_eq!(
+        disk_reply(&w, &s).get("budget"),
+        Some(&Jv::why("not_enabled:disk.cap_used_gib"))
+    );
+    assert_eq!(volume_line(&w, &s), plain_volume);
+
+    // CONTROL: not sized yet.
+    w.volume.budget = BudgetRead::Warming;
+    assert_eq!(budget_lines(&w, &s), ["budget unavailable(warming)"]);
+    assert_eq!(disk_reply(&w, &s).get("budget"), Some(&Jv::why("warming")));
+
+    // No volume read: no figure either.
+    let mut none = ctx(&w, Some(&s), true, true);
+    none.volume = None;
+    let reply = render_text(&query(View::Disk, false), &none);
+    let lines: Vec<&str> = reply
+        .lines
+        .iter()
+        .filter(|l| l.key == "budget")
+        .map(|l| l.text.as_str())
+        .collect();
+    assert_eq!(lines, ["budget unavailable(not_sampled)"]);
 }

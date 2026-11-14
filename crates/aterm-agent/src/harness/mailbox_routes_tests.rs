@@ -234,6 +234,82 @@ webmail_url = "https://mail.example.test/inbox"
     );
 }
 
+/// AN ADDRESS NO ROUTE NAMES IS READ ONLY AT ITS LOGIN'S OWN PROVIDER: with a top-level `user`
+/// of one provider, a password and no URL, an address of another provider discovers the
+/// login's server and inbox, never the address's (measured on m15, 2026-11-13: a Gmail row
+/// with no route, beside a Proton top-level login, was given `imap.gmail.com` with the Proton
+/// login and password). A top-level login with no domain discovers nothing. CONTROLS: with no
+/// top-level `user` the address is its own login and discovers its own provider; a top-level
+/// URL is kept. NEGATIVE CONTROL: discovering by the address's domain again fails this.
+#[test]
+fn an_unrouted_address_is_read_only_at_its_logins_own_provider() {
+    let other_provider = config("user = \"box@fastmail.com\"\npassword = \"default-pw\"\n");
+    for (target, imap, webmail) in [
+        (
+            "alice@gmail.com",
+            Some("imaps://imap.fastmail.com:993/INBOX"),
+            Some("https://app.fastmail.com/mail/Inbox"),
+        ),
+        (
+            "alice@outlook.com",
+            Some("imaps://imap.fastmail.com:993/INBOX"),
+            Some("https://app.fastmail.com/mail/Inbox"),
+        ),
+    ] {
+        assert_eq!(
+            other_provider.effective_imap_url(Some(target)).as_deref(),
+            imap,
+            "{target}: the top-level login's server, not the address's"
+        );
+        assert_eq!(
+            other_provider
+                .effective_webmail_url(Some(target))
+                .as_deref(),
+            webmail,
+            "{target}: the top-level login's inbox, not the address's"
+        );
+        assert_eq!(
+            other_provider.webmail_user_for(Some(target)).as_deref(),
+            Some("box@fastmail.com"),
+            "{target}: the login offered there is the top-level one"
+        );
+    }
+
+    let no_domain = config("user = \"box\"\npassword = \"default-pw\"\n");
+    assert_eq!(no_domain.effective_imap_url(Some("alice@gmail.com")), None);
+    assert_eq!(
+        no_domain.effective_webmail_url(Some("alice@outlook.com")),
+        None
+    );
+
+    let own_login = config("password = \"app-pw\"\n");
+    assert_eq!(
+        own_login
+            .effective_imap_url(Some("alice@gmail.com"))
+            .as_deref(),
+        Some("imaps://imap.gmail.com:993/INBOX"),
+        "CONTROL: the address is its own login"
+    );
+    assert_eq!(
+        own_login
+            .effective_webmail_url(Some("alice@outlook.com"))
+            .as_deref(),
+        Some("https://outlook.live.com/mail/0/inbox"),
+        "CONTROL: the address is its own login"
+    );
+    let named_url = config(
+        "user = \"box@fastmail.com\"\npassword = \"default-pw\"\n\
+         imap_url = \"imaps://mail.example.test:993/INBOX\"\n",
+    );
+    assert_eq!(
+        named_url
+            .effective_imap_url(Some("alice@gmail.com"))
+            .as_deref(),
+        Some("imaps://mail.example.test:993/INBOX"),
+        "CONTROL: a top-level URL is kept"
+    );
+}
+
 /// AN EMPTY OR MISSING PASSWORD IS NEVER TRIED: an entry with `password = ""` (or none) makes no
 /// connection at all, keeps the top-level mailbox off its addresses, and is reported as
 /// `mailbox ab…@… has no password yet`, never as a failed sign-in; a top-level IMAP mailbox

@@ -81,7 +81,7 @@ fn bare(who: &User) -> Fake {
 /// [`bare`], with the vault's token.
 fn fake(who: &User) -> Fake {
     let sys = bare(who);
-    let path = Path::new(&who.home).join(TOKEN_FILE);
+    let path = token_file(Path::new(&who.home));
     sys.file(path.to_str().unwrap(), DEV.as_bytes())
         .stat_of(path.to_str().unwrap(), stat(who, DEV.len()));
     sys

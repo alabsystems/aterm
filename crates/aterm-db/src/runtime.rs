@@ -275,6 +275,10 @@ struct Network {
     /// Every transport open fails with [`OPEN_FAILS`] (tests).
     #[cfg(test)]
     open_fails: bool,
+    /// The shared files' materializer of a runtime on this network, and its cadence (tests):
+    /// none unless a test asks, so this crate's runtime labs write no shared file.
+    #[cfg(test)]
+    files: Option<crate::alab::upkeep::Cadence>,
     /// Each wait the owner took after a try that did not serve, in order (tests; [`Self::retry`]).
     #[cfg(test)]
     retries: Option<Arc<Mutex<Vec<Duration>>>>,
@@ -309,6 +313,8 @@ impl Network {
             stand_in: None,
             #[cfg(test)]
             open_fails: false,
+            #[cfg(test)]
+            files: None,
             #[cfg(test)]
             retries: None,
             #[cfg(test)]
@@ -1056,15 +1062,36 @@ impl Runtime {
         let bus = network.bus.clone();
         // A background owner yields to a window only before the one-mesh transport.
         let yields = background && !network.mesh;
+        #[cfg(test)]
+        let files = network.files;
+        #[cfg(not(test))]
+        let files = Some(crate::alab::upkeep::Cadence::LIVE);
         let task = thread::Builder::new()
             .name("commons-owner".into())
             .spawn(move || {
                 // Declared first, so dropped last: after the observer, whose drop writes what
                 // is pending and closes its history.
                 let _ending = ending;
+                // The shared files' materializer lives as long as this owner, whatever each
+                // try at serving comes to: `[commons]` off, no membership and an unfinished
+                // succession are states a reader needs recorded, and in none of them does
+                // this thread serve. It rests while another process owns Commons.
+                let elsewhere = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let _files = files.and_then(|cadence| {
+                    crate::alab::upkeep::Materializer::start(
+                        paths.clone(),
+                        config.clone(),
+                        cadence,
+                        elsewhere.clone(),
+                    )
+                });
                 let mut window_claim = None;
                 let mut previous = None;
                 let mut report = |status: Status| {
+                    elsewhere.store(
+                        status == Status::Waiting,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if previous.as_ref() != Some(&status) {
                         observe(status.clone());
                         previous = Some(status);
@@ -1495,7 +1522,11 @@ fn serve_selected(
         return Ok(());
     }
     // Observation failures never gate independently authorized data repair.
-    let _ = history.local(machine_identity(request.binding()), bootstrap.trust());
+    let mut confirmation = Confirmation::first(
+        history,
+        (paths, request.binding(), bootstrap.trust()),
+        crate::admission::deadline(),
+    );
     let candidates = network.addresses()?;
     network.may_use(&candidates)?;
     let mut transport = network
@@ -1517,7 +1548,8 @@ fn serve_selected(
         ClockStore::open(&bootstrap)
     };
     // The lab journal's flusher, on a thread of its own; an enrolling owner has no writer to
-    // publish anything with.
+    // publish anything with. (The shared files' materializer is the owner thread's, not this
+    // serving loop's: it passes in the states this function never reaches.)
     let mut lab = (!pending).then(|| crate::alab::upkeep::Upkeep::new(Instant::now()));
     let mut refresh = Instant::now() + Duration::from_secs(30);
     // While it serves, each append this process makes to a table of this custody rings the owner,
@@ -1561,6 +1593,7 @@ fn serve_selected(
                     if !enabled(config).map_err(refusal("configuration"))? {
                         return Err(Status::Disabled);
                     }
+                    confirmation.again(history, now);
                     match commons::observe_until_settled(paths, now + Duration::from_millis(200))
                         .map_err(refusal("vault observation"))?
                     {
@@ -2007,6 +2040,106 @@ fn machine_identity(binding: &aterm_secrets::commons::binding::Binding) -> Machi
         machine_id: *binding.machine(),
         incarnation: *binding.incarnation(),
         label: None,
+    }
+}
+
+/// How long a serving session waits after its confirmation of its own identity as its network
+/// history's observer was refused before it tries again ([`Confirmation::again`]).
+const RECONFIRM: Duration = Duration::from_secs(15);
+
+/// The most a confirmation tried again within a serving session waits on the home's lineage
+/// ([`Confirmation::again`]): the serving loop's polled round waits on it, so a vault writer that
+/// holds the state lock for long holds repair back at most this long each [`RECONFIRM`].
+const RECONFIRM_PASS: Duration = Duration::from_secs(2);
+
+/// A serving session's confirmation of this owner's own identity as its network history's
+/// observer ([`Observer::local`]): tried as the session starts ([`Self::first`]), and, while it
+/// is refused, again at a polled round once [`RECONFIRM`] has passed ([`Self::again`]). A refusal
+/// can come of a passing failure: the lineage that proves a writer successor's earlier seats
+/// ([`succeeded_machines`]) can meet a vault writer that holds the state lock (its reads wait for
+/// one only until their deadline, its denial check not at all), and a session can begin while
+/// the subscriber still applies the vault version that restarted it. Tried once, such a refusal
+/// lasted the whole session (until the vault next changed, a refresh came or the owner stopped),
+/// the history unavailable and every contact dropped, so this Mac heard none of its peers. A
+/// confirmation that succeeded is not tried again; one refused for a trust context or a missing
+/// journal is tried again at no cost, as only another machine's history reads the lineage.
+struct Confirmation<'a> {
+    paths: &'a Paths,
+    binding: &'a aterm_secrets::commons::binding::Binding,
+    trust: aterm_secrets::commons::journal::Trust,
+    confirmed: bool,
+    next: Instant,
+}
+
+impl<'a> Confirmation<'a> {
+    /// Confirm `binding` (this owner's, under `paths`, in the `trust` context) as `history`'s
+    /// observer, its lineage read by `deadline` at most.
+    fn first(
+        history: &mut Observer,
+        (paths, binding, trust): (
+            &'a Paths,
+            &'a aterm_secrets::commons::binding::Binding,
+            aterm_secrets::commons::journal::Trust,
+        ),
+        deadline: Instant,
+    ) -> Self {
+        let mut confirmation = Self {
+            paths,
+            binding,
+            trust,
+            confirmed: false,
+            next: Instant::now(),
+        };
+        confirmation.confirm(history, Instant::now(), deadline);
+        confirmation
+    }
+
+    /// Confirm again at `now` where the last confirmation was refused and [`RECONFIRM`] has
+    /// passed since, the lineage read within [`RECONFIRM_PASS`].
+    fn again(&mut self, history: &mut Observer, now: Instant) {
+        if !self.confirmed && now >= self.next {
+            self.confirm(history, now, now + RECONFIRM_PASS);
+        }
+    }
+
+    fn confirm(&mut self, history: &mut Observer, now: Instant, deadline: Instant) {
+        self.confirmed = history
+            .local(machine_identity(self.binding), self.trust, || {
+                succeeded_machines(self.paths, self.binding, deadline)
+            })
+            .is_ok();
+        self.next = now + RECONFIRM;
+    }
+}
+
+/// The Commons machines of the writer generations `selected`'s home succeeds on this disk,
+/// oldest first, as its authenticated lineage proves them from the home it began at
+/// ([`crate::generation::lineage_until`] of [`crate::generation::predecessors`]' last), where
+/// that lineage ends at `current`, this owner's own binding (a newer succession may have
+/// completed since `selected` was named): the machines whose network history this owner's
+/// observer takes up ([`Observer::local`]). None for a home that succeeds none, which reads no
+/// lineage, and none while the lineage cannot be proved (a vault writer holding the state lock
+/// included) or ends at another binding, so such a history stays refused until a later
+/// confirmation proves it ([`Confirmation`]).
+fn succeeded_machines(
+    selected: &Paths,
+    current: &aterm_secrets::commons::binding::Binding,
+    deadline: Instant,
+) -> Vec<[u8; 16]> {
+    let Some(original) = crate::generation::predecessors(selected)
+        .ok()
+        .and_then(|mut predecessors| predecessors.pop())
+    else {
+        return Vec::new();
+    };
+    let Ok(lineage) = crate::generation::lineage_until(&original, deadline) else {
+        return Vec::new();
+    };
+    match lineage.split_last() {
+        Some((own, earlier)) if own == current => {
+            earlier.iter().map(|binding| *binding.machine()).collect()
+        }
+        _ => Vec::new(),
     }
 }
 

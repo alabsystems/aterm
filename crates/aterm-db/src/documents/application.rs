@@ -495,6 +495,8 @@ pub(crate) fn peek_declaration(
 /// custody. This creates no application table, catalog or declaration.
 pub(crate) fn observed_bootstrap(paths: &Paths) -> Result<Option<Box<Bootstrap>>> {
     use aterm_secrets::commons::{Unavailable, bootstrap::Availability};
+    #[cfg(test)]
+    crate::file::seam::custody();
     match Bootstrap::observe(paths).map_err(crate::table::failure)? {
         Availability::Available(bootstrap) => Ok(Some(bootstrap)),
         Availability::Unavailable(

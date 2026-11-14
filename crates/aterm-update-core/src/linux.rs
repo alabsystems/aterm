@@ -127,47 +127,20 @@ pub(crate) fn artifact<'a>(
     sha256: Option<&'a str>,
     size: Option<u64>,
 ) -> Result<Option<LinuxArtifact<'a>>, String> {
-    let (name, sha256, size) = match (name, sha256, size) {
-        (None, None, None) => return Ok(None),
-        (Some(name), Some(sha256), Some(size)) => (name, sha256, size),
-        _ => {
-            return Err(format!(
-                "incomplete Linux {} artifact: name, sha256, and size must appear together",
-                target.arch()
-            ));
-        }
+    let rule = crate::manifest::AssetRule {
+        platform: "Linux",
+        arch: target.arch(),
+        canonical: target.asset_name(version),
+        max: LINUX_BINARY_MAX_BYTES,
     };
-    if !matches!(
-        crate::tag::parse_release_tag(&format!("v{version}")),
-        Ok(crate::tag::TagKind::Candidate(_))
-    ) {
-        return Err("Linux artifact requires a canonical three-component release version".into());
-    }
-    if name != target.asset_name(version) {
-        return Err(format!(
-            "Linux {} artifact must be named {}",
-            target.arch(),
-            target.asset_name(version)
-        ));
-    }
-    if !aterm_codec::hex::is_lower(sha256, 64) {
-        return Err(format!(
-            "Linux {} sha256 is not lowercase SHA-256",
-            target.arch()
-        ));
-    }
-    if !(64..=LINUX_BINARY_MAX_BYTES).contains(&size) {
-        return Err(format!(
-            "Linux {} size {size} is outside 64..={LINUX_BINARY_MAX_BYTES}",
-            target.arch()
-        ));
-    }
-    Ok(Some(LinuxArtifact {
-        target,
-        name,
-        sha256,
-        size,
-    }))
+    Ok(rule
+        .claim(version, name, sha256, size)?
+        .map(|(name, sha256, size)| LinuxArtifact {
+            target,
+            name,
+            sha256,
+            size,
+        }))
 }
 
 #[cfg(test)]

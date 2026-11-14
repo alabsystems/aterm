@@ -104,7 +104,7 @@ impl Backend for Fake {
     }
 
     fn unmoved(&self, _network: &str) -> Option<Option<HomeNet>> {
-        *self.unmoved.lock_or_recover()
+        self.unmoved.lock_or_recover().clone()
     }
 
     fn now(&self) -> Instant {

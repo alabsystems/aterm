@@ -248,12 +248,12 @@ pub enum ToolsInstall {
     /// itself once the mode is off. Install… stays, for a person who turned it off.
     LowData,
     /// This account is none of the Mac's administrators, whom alone macOS lets install them: the
-    /// row says so, with no Install… that would only say it again, and no menu line, since
+    /// row says so, with no Install… that would only say it again, and no signal line, since
     /// nothing here changes it.
     NotAdmin,
     /// aterm's own ask for setup's Mac password comes by itself (its tab is due, waits on a quiet
     /// keyboard or another macOS step, or tries again on the account's record's schedule): the
-    /// row waits, calmly, with no menu line, and Install… stays for a person who wants it now.
+    /// row waits, calmly, with no signal line, and Install… stays for a person who wants it now.
     Coming,
 }
 
@@ -323,7 +323,7 @@ pub(crate) struct Failure {
     pub(crate) restore: bool,
     pub(crate) whole_restore: bool,
     /// A Check's result: a read, whose remedy is pressing Check again, so the page's note alone
-    /// says it (§3.6), never the headline, the menu line or the tab's attention.
+    /// says it (§3.6), never the headline, the signal line or the tab's attention.
     pub(crate) check: bool,
     /// What kind of failure it is (§3.6): one naming a row whose reading needs a person is that
     /// person's, which the row and the headline say as needing you, never as a failure or a
@@ -532,7 +532,7 @@ impl SetupStatus {
 
     /// The steps the last run could not finish (a stage error, a join the
     /// vault refused, a change that did not land), each with the row it
-    /// names, if one: failures, which the menu line and the tab's attention
+    /// names, if one: failures, which the signal line and the tab's attention
     /// say as they say a row that failed (§3.6), besides the page's notes,
     /// once nothing tries them again by itself (the run's retries, or a vault try on its own
     /// pause, [`Failure::retried`]) and no row they name needs a person
@@ -648,7 +648,7 @@ impl SetupStatus {
     /// results said alike (a stage's rows, all failed) are one note naming
     /// each row; then one calm line naming every setting that is back as
     /// saved but loads only at the next login (`login`). That line is no
-    /// failure: [`Self::failed_steps`], the menu line and the tab's attention
+    /// failure: [`Self::failed_steps`], the signal line and the tab's attention
     /// leave it out.
     fn notes(&self, plan: &Plan) -> Vec<String> {
         let mut notes = Vec::new();
@@ -1074,7 +1074,7 @@ pub(crate) const JOURNAL_NOTE: &str = "Every change went ahead; aterm could not 
 const NOTED: &str = "noted";
 
 /// The exceptions digest's entry for changes aterm made to this Mac and could not log (§3.6):
-/// a fact for later, never an alert, the menu line or the tab's attention. `detail` is
+/// a fact for later, never an alert, the signal line or the tab's attention. `detail` is
 /// `aterm doctor`'s line naming each change and why, which the log keeps.
 #[must_use]
 pub fn journal_refused_entry(detail: &str) -> aterm_messages::exceptions::Entry {
@@ -1100,7 +1100,7 @@ pub fn note_journal_refused(detail: &str) {
 }
 
 /// The exceptions digest's entry for a launch's setup that has not started for ten minutes,
-/// trying a step again by itself (§3.5): a fact for later, never an alert, the menu line or the
+/// trying a step again by itself (§3.5): a fact for later, never an alert, the signal line or the
 /// tab's attention, which the page's calm line ([`STARTUP_RETRY_NOTE`]) leaves dark. `detail`
 /// is why the step failed last, which the log keeps.
 #[must_use]
@@ -1488,7 +1488,7 @@ pub(crate) const EVERYTHING_LEFT_AS_IS: &str = "Everything is left as is";
 
 /// The headline while the first launch's offer waits for the page's own answer, which it gives
 /// on its first tick (design revision 4: no review, no countdown, no confirmation, and no wait for
-/// a person), or once a busy page is free: the only signal it gives; no diamond, no menu line.
+/// a person), or once a busy page is free: the only signal it gives; no diamond, no signal line.
 pub(crate) const STARTING_HEADLINE: &str = "Starting this Mac's setup";
 
 /// The headline while a newer aterm's setup is in force ([`SetupStatus::newer`]): calm, and the
@@ -1556,7 +1556,7 @@ pub const STARTUP_RETRY_NOTE: &str =
     "aterm could not start setup just now; it tries again by itself.";
 
 /// A calm line about setup as a whole, in `words` that are whole sentences in the page's own
-/// terms: no failure, so no failure headline, menu line or tab attention (§3.6).
+/// terms: no failure, so no failure headline, signal line or tab attention (§3.6).
 #[must_use]
 pub fn calm_setup_row(words: &str) -> SetupStatusRow {
     SetupStatusRow {
@@ -2594,7 +2594,7 @@ pub(crate) enum ToolsWait {
 impl ToolsWait {
     /// Whether the wait needs nobody here: one that runs or ends by itself (an install, a queued
     /// press, Low Data Mode, aterm's own ask on its way), or one no press here changes (an
-    /// account that may not install them). Calm: no menu line.
+    /// account that may not install them). Calm: no signal line.
     pub(crate) const fn calm(self) -> bool {
         matches!(
             self,
@@ -2814,7 +2814,7 @@ impl Headline {
     /// [`Self::waiting`] for `waiting`, where a step aterm parked (init-on-by-default design
     /// §6.5) offers Check again alone: its rows say why in the stage's words, the worker begins
     /// it again by itself once its pause is over, and a press of Check again lifts the park at
-    /// once. Nothing signals: no diamond, no menu line.
+    /// once. Nothing signals: no diamond, no signal line.
     fn waiting_on(status: &SetupStatus, waiting: &[Subject]) -> Self {
         let parked = waiting
             .iter()
@@ -5784,7 +5784,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         "failed" => {
             // The run's GitHub repositories step, which could not reach GitHub on its last try,
             // once no worker goes on with the run: aterm no longer tries it by itself, and Set up now
-            // does, so the headline, the row, the menu line and the diamond say it failed. The
+            // does, so the headline, the row, the signal line and the diamond say it failed. The
             // worker's page says it under its row in the reason the step decided
             // (`init_observe::failure_note`; the log keeps GitHub's words), which the row keeps
             // as its note, so the page's note names Set up now alone; the row reads the clones

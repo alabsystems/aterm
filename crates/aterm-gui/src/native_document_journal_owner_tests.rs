@@ -359,7 +359,7 @@ fn a_reseat_that_finds_its_own_image_joins_its_owner_set() {
     let path = store.initialize(decision, &disk, &disk).unwrap().path;
     let other = root.host();
     let other_id = other.owner_id().unwrap();
-    drop(other);
+    finish_host(other);
     write_mark(
         &path,
         &sys::open_regular(&path).unwrap(),

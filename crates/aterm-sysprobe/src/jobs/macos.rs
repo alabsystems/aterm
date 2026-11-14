@@ -892,6 +892,11 @@ fn close_all(fds: &[c_int]) {
 
 fn own_pipe() -> Option<[c_int; 2]> {
     let mut fds = [0 as c_int; 2];
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "aterm-uds depends on this crate, so its kept-out pipe is out of reach; neither \
+                  self-check waits on an end's EOF or EPIPE (L7 wakes its reader with a byte)"
+    )]
     // SAFETY: `fds` is two writable descriptors' room.
     let made = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if made != 0 {

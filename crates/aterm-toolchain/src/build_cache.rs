@@ -1329,41 +1329,56 @@ pub enum BuildDir {
     TrustEnv(String),
 }
 
-/// The explicit outputs and manifest a managed build already chose. This is observation only:
+/// A final target chosen by a completely resolved producing command. A workspace default
+/// requires the registrar's canonical owner; an unresolved command produces no choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalTarget {
+    Explicit(PathBuf),
+    WorkspaceDefault,
+}
+
+/// The outputs and manifest readings a managed build selected. This is observation only:
 /// creating or owning a directory belongs to the package manager, never to this resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplicitCache {
-    pub target: PathBuf,
+pub struct SelectedOutputs {
+    pub target: FinalTarget,
     /// All supported initial manifest readings; custody requires owner agreement.
     pub manifests: Vec<PathBuf>,
     /// A separately selected intermediate directory; both outputs require custody.
     pub intermediates: Option<PathBuf>,
 }
 
-/// Resolve an explicit target without moving a build or calling Cargo metadata, from the line
+/// Resolve selected outputs without moving a build or calling Cargo metadata, from the line
 /// Targo runs ([`targo_reading`], `alias` saying what user alias takes a verb's name). A query,
 /// `clean` (at the verb: `test clean` runs the tests named so), a line whose alias cannot be
 /// told, an external command, a verb that builds nothing, unverified-lane refusals and
 /// unresolved output configs grant no creation.
 #[must_use]
-pub fn explicit_cache(
+pub fn selected_outputs(
     args: &[String],
     tool: Tool,
     m: &Machine<'_>,
     alias: &dyn Fn(&str) -> UserAlias,
-) -> Option<ExplicitCache> {
+) -> Option<SelectedOutputs> {
     let (line, target, intermediates) = cache_line(args, tool, m, alias)?;
     let cwd = m.cwd?;
     let target = if line.trust || tool == Tool::Cargo {
         target.or_else(|| configured_target(cwd, tool, m))
     } else {
         target
-    }?;
-    if target.as_os_str().is_empty() {
-        return None;
-    }
-    Some(ExplicitCache {
-        target: absolute(target, cwd)?,
+    };
+    let target = match target {
+        Some(path) if !path.as_os_str().is_empty() => FinalTarget::Explicit(absolute(path, cwd)?),
+        // cache_line completed native configuration discovery. This None therefore means
+        // no final override, not an unknown graph. A separately selected intermediate is
+        // the only new choice: ordinary automatic placement retains its existing path.
+        None if !line.trust && tool != Tool::Cargo && intermediates.is_some() => {
+            FinalTarget::WorkspaceDefault
+        }
+        _ => return None,
+    };
+    Some(SelectedOutputs {
+        target,
         manifests: cache_manifests(&line, tool, m)?,
         intermediates,
     })

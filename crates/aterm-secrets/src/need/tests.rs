@@ -147,6 +147,7 @@ fn need_of(s: &ModelState) -> Option<Need> {
         record: None,
         line: String::new(),
         seq: Some(SEQ),
+        exposed: Vec::new(),
     })
 }
 
@@ -327,6 +328,7 @@ fn the_catalog_answers_what_no_mac_can_give_and_names_every_want_once() {
     for word in [
         "site-deployer-key",
         "notary",
+        "developer-id:m22",
         "mailbox:m29",
         "mailbox:m29-2",
         "gh:dev",
@@ -346,6 +348,8 @@ fn the_catalog_answers_what_no_mac_can_give_and_names_every_want_once() {
         "mailbox:",
         "mailbox:M29",
         "gh:other",
+        "developer-id:",
+        "developer-id:../m22",
         "entry:~/.secrets/x",
         "secret",
         "login:m29",
@@ -356,6 +360,22 @@ fn the_catalog_answers_what_no_mac_can_give_and_names_every_want_once() {
     assert_eq!(Want::Login("claude/m29".into()).class(), Class::PerMac);
     assert_eq!(Want::SiteDeployerKey.class(), Class::Copyable);
     assert_eq!(Want::Mailbox("m29".into()).class(), Class::VaultOnly);
+    let devid = Want::DeveloperId("m22".into());
+    assert_eq!(devid.class(), Class::VaultOnly);
+    assert!(devid.posted() && devid.if_absent());
+    assert_eq!(
+        devid.entries(),
+        [
+            "~/.aterm/apple/devid-m22.cer",
+            "~/.aterm/apple/devid-m22.key"
+        ]
+    );
+    assert!(
+        devid
+            .entries()
+            .iter()
+            .all(|name| crate::entry_class::signing_material(name))
+    );
     assert_eq!(Want::CommonsControl.class(), Class::AdminAct);
     assert!(!Want::Entry("notary".into()).posted());
     assert!(!Want::PaperMaster.posted() && !Want::CommonsControl.posted());
@@ -1296,5 +1316,53 @@ fn the_policy_is_the_configured_vaults_and_no_vault_refuses_nothing_yet() {
     assert!(
         !policy_for(None).allows(&Want::PaperMaster),
         "the catalog still decides first"
+    );
+}
+
+/// A stolen Mac's rotation is never posted and never answered by a copy: it stays on this Mac,
+/// waiting on its own `set`, while the vault holds the entry and this Mac may post. An
+/// `entry:<name>` that another purpose raises is answered from the envelope at once.
+///
+/// NEGATIVE CONTROL: the same want under a purpose that asks the lab flushes, and the same
+/// entry by hand retires `not-needed`.
+#[test]
+fn a_stolen_macs_rotation_stays_on_this_mac_and_is_never_posted() {
+    let mut facts = facts_of(&model_state(&[("kind", 3), ("commons", 1), ("auth", 1)]));
+    if let Some(sight) = facts.sight.as_mut() {
+        sight.held.insert("gh_access_token".to_owned());
+        sight.held.insert("m29_password".to_owned());
+    }
+    let entry = Want::Entry("gh_access_token".into());
+    let filed = settle(
+        &fresh([21; 16], entry.clone(), Purpose::StolenRotation, &facts),
+        &facts,
+    );
+    assert_eq!((filed.state, filed.wait), (State::Local, Wait::Requester));
+    assert!(filed.line.contains("gh_access_token"), "{}", filed.line);
+    let mailbox = fresh(
+        [22; 16],
+        Want::Mailbox("m29".into()),
+        Purpose::StolenRotation,
+        &facts,
+    );
+    assert_eq!(settle(&mailbox, &facts).state, State::Local);
+    assert!(act(&mailbox, &facts, &Act::Flush).is_none());
+
+    let asks = fresh(
+        [23; 16],
+        Want::Mailbox("m29".into()),
+        Purpose::ByHand,
+        &facts,
+    );
+    assert_eq!(
+        act(&asks, &facts, &Act::Flush).map(|need| need.state),
+        Some(State::Open)
+    );
+    let by_hand = settle(&fresh([24; 16], entry, Purpose::ByHand, &facts), &facts);
+    assert_eq!(by_hand.state, State::Retired, "{}", by_hand.line);
+    assert!(!Purpose::StolenRotation.asks_the_lab());
+    assert_eq!(
+        Purpose::parse("revoke.stolen"),
+        Some(Purpose::StolenRotation)
     );
 }

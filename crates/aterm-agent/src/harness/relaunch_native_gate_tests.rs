@@ -1451,6 +1451,68 @@ fn a_held_replay_leaves_the_exit_lanes_record_as_it_stood() {
     );
 }
 
+/// The exit lane meets a kept prepare its host answers `closed`. The record replayed is the
+/// earlier move's, kept whole while its operation was unresolved: the replay drops the operation
+/// and keeps its watch, and the lane waits with that record otherwise as it stood. It plans no
+/// start on the earlier move's cause and line; the next pass settles the watch on this exit's own
+/// record, which carries it.
+#[test]
+fn a_closed_replay_waits_and_plans_no_start_on_the_earlier_moves_record() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = options(world.path());
+    let mut st = lapsable_crash(true);
+    st.stop("stale-exit", now_s());
+    save(&opts, SESSION, &st);
+    let before = load(&opts, SESSION).expect("the kept record");
+    let mut exited = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+        .spawn()
+        .unwrap();
+    let pid = exited.id();
+    exited.wait().unwrap();
+    let (mut snap, mut plan) = exit_input(world.path(), &st);
+    snap.pid = pid;
+    plan.line = "a new crash plan's own line".into();
+    plan.command = Some(PlannedCommand {
+        dialect: Dialect::Zsh,
+        heal: None,
+        cwd: None,
+        target: std::env::current_exe().unwrap(),
+        argv: Vec::new(),
+        env: Vec::new(),
+        unset: None,
+        account_intent: None,
+    });
+    let (client, worker) = endpoint_with(|line| {
+        if line.contains(" lease acquire ") || line.contains(" lease release ") {
+            "ERR busy\n".into()
+        } else if line.contains(" native-act prepare ") {
+            super::super::native_act::closed_reply(&"ab".repeat(16)).unwrap()
+        } else {
+            panic!("a closed prepare dispatches nothing else: {line}")
+        }
+    });
+    let result = launch_after_exit(
+        &opts,
+        &snap,
+        ExitCause::HostEnded,
+        true,
+        report(),
+        st,
+        plan,
+        client,
+    );
+    assert_eq!(result.step, super::super::native_restart::WAIT_CLOSED);
+    assert_eq!(prepares(&worker.join().unwrap()), 1);
+    let after = load(&opts, SESSION).expect("the record after the exit lane");
+    assert!(after.native_closed.is_some(), "the watch is kept");
+    assert!(after.native.is_none() && after.native_prepare.is_empty());
+    assert!(!after.in_flight(), "{:?}", after.phase);
+    assert_eq!(
+        (&after.phase, after.pid, &after.line, &after.cause),
+        (&before.phase, before.pid, &before.line, &before.cause)
+    );
+}
+
 /// The checked relaunch's carry of its own kept prepare: a later host's `lapsed` stops the record
 /// where it stands. The operation may have signalled the agent, so nothing is restored, and no
 /// producer authorization is asked for.
@@ -2233,5 +2295,117 @@ fn a_cold_line_past_the_twin_commands_the_build_it_types() {
             .unwrap();
         assert_eq!(forward.program, build.to_str().unwrap(), "resume={resume}");
         assert_eq!(forward.legacy_line().as_deref(), Some(plan.line.as_str()));
+    }
+}
+
+/// A later host epoch answers no query of the record's binding, only a replay of its saved
+/// prepare, which says the restart closed uncommitted: the lane then never waits on native
+/// recovery but on the closed restart's watch, which adopts the relaunch it observes in the tab
+/// the shell gave up, holds while the shell still has the tab, and ends the lane once the shell
+/// is back with nothing running. None of it commits, reconciles or signals.
+#[test]
+fn a_restart_closed_in_a_later_host_epoch_settles_by_its_watch_never_by_recovery() {
+    use super::super::native_restart::closed_tests::{Watched, shell_start};
+    use super::super::native_restart::{FAILED_CLOSED, WAIT_CLOSED};
+    const RELAUNCHED: u32 = 4242;
+    let shell = std::process::id();
+    for (case, holds_tab, parented, step) in [
+        ("adopts", Some(false), true, "done:fresh"),
+        ("holds", Some(true), true, WAIT_CLOSED),
+        ("clears", Some(true), false, FAILED_CLOSED),
+    ] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let mut opts = options(world.path());
+        opts.timings.held = Duration::ZERO;
+        let mut st = state(true);
+        st.phase = upgrade::Phase::Relaunched { at_s: now_s() };
+        st.cause = CAUSE_FRESH.into();
+        st.native = Some(super::super::native_act::Binding {
+            id: "ab".repeat(16),
+            capability: "cd".repeat(32),
+        });
+        retain_bound_preparation(&mut st);
+        let prepare = super::super::native_restart::retained_prepare(&st).unwrap();
+        // The relaunch registered a fresh conversation in the record's agent home.
+        let sessions = opts.home.join(".claude/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{RELAUNCHED}.json")),
+            format!(
+                "{{\"pid\":{RELAUNCHED},\"sessionId\":\"{}\",\"cwd\":\"/\",\"version\":\"2.1.0\",\
+                 \"status\":\"idle\",\"statusUpdatedAt\":0,\"procStart\":\"\",\
+                 \"kind\":\"interactive\",\"entrypoint\":\"cli\"}}",
+                super::super::native_restart::closed_tests::CONVERSATION
+            ),
+        )
+        .unwrap();
+        let k = Watched {
+            parents: if parented {
+                vec![(RELAUNCHED, shell)]
+            } else {
+                Vec::new()
+            },
+            children: Some(if parented {
+                vec![RELAUNCHED]
+            } else {
+                Vec::new()
+            }),
+            holds_tab,
+            shell_start: Some(shell_start(&prepare)),
+            ..Watched::default()
+        };
+        let (mut client, worker) = endpoint_with(move |line| {
+            if line.contains(" native-act query ") {
+                // A later host epoch issued no binding: the query names nothing it holds.
+                "ERR unavailable\n".into()
+            } else if line.contains(" native-act prepare ") {
+                super::super::native_act::closed_reply(&"ab".repeat(16)).unwrap()
+            } else if line.contains(" await agent ") {
+                "OK agent idle\n".into()
+            } else if line.contains(" lease acquire ") || line.contains(" lease release ") {
+                "ERR busy\n".into()
+            } else {
+                "ERR unexpected fixture action\n".into()
+            }
+        });
+        let got = await_new(&opts, report(), &mut st, &mut client, SESSION, &k);
+        assert_eq!(got.step, step, "{case}");
+        assert_ne!(got.step, "wait:native-recovery", "{case}");
+        assert!(
+            st.native.is_none() && st.native_prepare.is_empty(),
+            "{case}"
+        );
+        assert_eq!(st.native_closed.is_some(), case == "holds", "{case}");
+        match case {
+            "adopts" => {
+                assert_eq!(got.pid, RELAUNCHED);
+                assert_eq!(st.phase, upgrade::Phase::Done);
+            }
+            "holds" => assert!(matches!(st.phase, upgrade::Phase::Relaunched { .. })),
+            _ => assert!(
+                matches!(st.phase, upgrade::Phase::Failed(_)),
+                "{:?}",
+                st.phase
+            ),
+        }
+        let saved = load(&opts, SESSION).expect("the record is saved");
+        assert_eq!(saved.native_closed, st.native_closed, "{case}");
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert_eq!(
+            seen.iter()
+                .filter(|line| line.contains(" native-act prepare "))
+                .count(),
+            1,
+            "{case}: one replay of the saved prepare"
+        );
+        for verb in ["commit", "reconcile", "recover", "signal", "rollback"] {
+            assert!(
+                !seen
+                    .iter()
+                    .any(|line| line.contains(&format!(" native-act {verb}"))),
+                "{case}: {verb} in {seen:?}"
+            );
+        }
     }
 }

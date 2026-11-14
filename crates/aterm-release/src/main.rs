@@ -101,6 +101,7 @@ mod trust_lock;
 
 mod trust_oblig;
 mod verify;
+mod windows_pin;
 
 fn main() -> std::process::ExitCode {
     if let Err(error) = agh::git::HelperHost::Subcommand.record() {

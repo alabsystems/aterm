@@ -415,11 +415,12 @@ pub(crate) enum NativeTabInstallError {
     DuplicateTab,
 }
 
-/// THE INSTANT A TASK'S END WAS TOLD AT, unix ms, for the menu bar's Done for you row
+/// THE INSTANT A TASK'S END WAS TOLD AT, unix ms, as `status end=` says it
 /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4.3, item 1): `told`, the time the timeline
 /// holds for the end's face (the face, or the one held across the host's "unknown" between loop
 /// runs; `SessionTimeline::task_face_at`), else the end's own minute (`Stamp::unix_ms`); `0` where
-/// neither is known.
+/// neither is known. Read by `status`'s end fields, which development builds print.
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn end_wall_ms(end: crate::harness_glass::EndGlass, told: Option<i64>) -> u64 {
     told.or_else(|| end.at.and_then(crate::harness_glass::Stamp::unix_ms))
         .and_then(|ms| u64::try_from(ms).ok())
@@ -2821,36 +2822,13 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// One registry handle as the status item sees it (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3): the tab's label as every Agents surface names it ([`Self::tab_label_of_session`]: the Overview, the tab menu and the long-hold entry name it the same), the session's PUBLISHED verdict ([`Self::publish_need`]), its agent word, its task record and what the person's hold refused.
+    /// One registry handle as the need-age keeper reads it ([`crate::status_item::NeedAges`]): the tab's label as every Agents surface names it ([`Self::tab_label_of_session`]), the session's PUBLISHED verdict ([`Self::publish_need`]), its agent word and its task record.
     pub(crate) fn status_session_row(
         &self,
         h: &crate::session_store::SessionHandle,
     ) -> crate::status_item::SessionRow {
-        let glass_end = self
-            .harness_glass
-            .get(&h.local_id)
-            .and_then(crate::harness_glass::SessionGlass::end);
-        let landed = self.chip_face_landed(h.local_id);
-        let hold = self.shown_hold(h.local_id);
-        let stop = self.shown_stop(h.local_id);
-        let held_tip = hold
-            .as_ref()
-            .and_then(|hold| hold.words(None, crate::harness_glass::HoldForm::Tip, None, stop));
-        let stop_tip = stop.map(|stop| stop.words(crate::harness_glass::HoldForm::Tip));
-        let landing_tip = match (stop_tip, held_tip) {
-            (Some(stop), Some(held)) => {
-                Some(format!("{stop}{}{held}", crate::native_ui::FACT_SEPARATOR))
-            }
-            (stop, held) => stop.or(held),
-        };
-        let need_alone = hold.as_ref().is_some_and(|hold| hold.hold.need_alone());
-        let (verdict, agent, program, task, told, receipt) = {
+        let (verdict, agent, program, task) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            // What aterm checked at the landing (§14.9, slice 9c), beside a landed face only.
-            let receipt = tl
-                .task_face()
-                .filter(|(face, _)| *face == aterm_agent::harness::acts::TaskFace::Landed)
-                .and_then(|_| tl.land_receipt().cloned());
             (
                 tl.need().clone(),
                 tl.agent().word,
@@ -2862,30 +2840,19 @@ impl App {
                 tl.task().map(|t| crate::status_item::TaskRow {
                     state: t.state,
                     why: t.why,
-                    finished: t.finished,
                     from: t.from.clone(),
                     entered: t.entered,
                     since_unix_ms: t.since_unix_ms,
                     result_bytes: t.result_bytes,
-                    result_path: t.result_path.clone(),
                     seen: false,
-                    own_report: crate::task_record::reports_its_own_end(t.trusted_cwd.as_deref()),
                 }),
-                glass_end.and_then(|end| tl.task_face_at(end.face.task_face())),
-                receipt,
             )
         };
         let task = task.map(|mut t| {
             t.seen = self.done_seen.get(&h.local_id) == Some(&t.entered);
             t
         });
-        let end = glass_end.map(|end| crate::status_item::EndRow {
-            serial: end.serial,
-            since_unix_ms: end_wall_ms(end, told),
-            seen: !end.unseen(),
-        });
         crate::status_item::SessionRow {
-            id: h.local_id,
             sid: h.sid.as_str().to_string(),
             title: self.tab_label_of_session(h.local_id),
             need: verdict.need,
@@ -2895,17 +2862,6 @@ impl App {
             agent,
             program,
             task,
-            need_since: self.presence.need_ages.need_since(h.local_id),
-            held_since: self.presence.need_ages.held_since(h.local_id),
-            person_refusals: h.ctx.fabric.person_refusals(),
-            held_by_host: h.ctx.fabric.holds().remote().map(|r| r.host.clone()),
-            end,
-            landed,
-            landing: hold.is_some(),
-            landing_tip,
-            receipt,
-            need_alone,
-            place: None,
         }
     }
 
@@ -2917,33 +2873,7 @@ impl App {
                 == crate::claude_lights::ChipFace::Landed
     }
 
-    fn place_alike_rows(&self, rows: &mut [crate::status_item::SessionRow]) {
-        let shared: Vec<usize> = (0..rows.len())
-            .filter(|&i| {
-                rows.iter()
-                    .enumerate()
-                    .any(|(j, other)| j != i && other.title == rows[i].title)
-            })
-            .collect();
-        if shared.is_empty() {
-            return;
-        }
-        for &i in &shared {
-            rows[i].place = Some(self.session_place(&rows[i].sid));
-        }
-        let named: Vec<String> = shared.iter().map(|&i| rows[i].named()).collect();
-        for (k, &i) in shared.iter().enumerate() {
-            if named
-                .iter()
-                .enumerate()
-                .any(|(l, other)| l != k && *other == named[k])
-            {
-                rows[i].place = Some(self.pane_place(&rows[i].sid).0);
-            }
-        }
-    }
-
-    /// Fold one session's PUBLISHED need into the need ages ([`crate::status_item::NeedAges`], §9 S4: the ages are fed by the need): remember since when its need and hold stand (the glance's ages), and dirty the menu-bar item where what it shows of the session moved.
+    /// Fold one session's PUBLISHED need into the need ages ([`crate::status_item::NeedAges`], §9 S4: the ages are fed by the need): remember since when its need and hold stand, and tell `await needs` where what the session shows moved.
     pub(crate) fn age_session_need(&mut self, session: u64) {
         let handle = self
             .store
@@ -3125,68 +3055,54 @@ impl App {
             .collect()
     }
 
-    /// THE STATUS GLANCE (§3): the REGISTRY snapshot → one [`crate::status_item::SessionRow`] per live session ([`Self::status_session_row`], leaf locks only) → the pure [`crate::status_item::Glance::build`], with the last sibling scan, the fleet read, the API outage's start and the digest's entries.
+    /// THE STATUS GLANCE: this Mac's name, whether it is in a fleet, the network it is on, the
+    /// lock's face, and the fleet traffic as the background reader last added it up
+    /// ([`Self::fleet_traffic`]). It copies what is already in memory: no file, no child
+    /// process and no network.
     pub(crate) fn status_glance(&self) -> crate::status_item::Glance {
         let started = std::time::Instant::now();
-        let glance = self.status_glance_built();
+        let glance = self.status_glance_built(aterm_time::unix_millis().unwrap_or(0));
         crate::metrics::note_status_glance(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
         glance
     }
 
-    fn status_glance_built(&self) -> crate::status_item::Glance {
-        let handles = self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .snapshot();
-        let mut rows: Vec<crate::status_item::SessionRow> = handles
-            .iter()
-            .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
-            .map(|h| self.status_session_row(h))
-            .collect();
-        self.place_alike_rows(&mut rows);
-        let api_since = self.api_outage.values().min().copied();
-        let fleet = self
+    fn status_glance_built(&self, now_ms: u64) -> crate::status_item::Glance {
+        let traffic = self.fleet_traffic();
+        let summary = traffic.and_then(crate::fleet_traffic::FleetTraffic::summary);
+        let seen_ms = traffic.map_or(0, crate::fleet_traffic::FleetTraffic::seen_ms);
+        let in_fleet = self
             .fleet_glance
             .as_ref()
-            .map(crate::fleet_glance::FleetGlance::copy);
-        let mut glance = crate::status_item::Glance::build(
-            &rows,
-            &self.siblings,
-            fleet.as_ref(),
-            aterm_time::unix_millis().unwrap_or(0),
-            api_since,
-        );
-        glance.exceptions = self
-            .messages
-            .digest()
-            .entries
-            .into_iter()
-            .map(|entry| (entry.id.raw(), entry.title))
-            .collect();
-        glance.system_state = self.system_state_menu_line();
-        glance.network = crate::net_place::menu_line();
-        glance.access = self.lock_face.on_disk();
-        glance.access_shown = self.lock_face.shown();
-        glance.access_flash = self.lock_face.flash(std::time::Instant::now());
-        #[cfg(target_os = "macos")]
-        {
-            glance.machine = self
+            .is_some_and(crate::fleet_glance::FleetGlance::in_fleet);
+        crate::status_item::Glance {
+            #[cfg(target_os = "macos")]
+            machine: self
                 .machine_view
                 .as_ref()
-                .map(crate::machine_title::machine_menu_bar_title);
+                .map(crate::machine_title::machine_menu_bar_title),
+            #[cfg(not(target_os = "macos"))]
+            machine: None,
+            in_fleet,
+            network: crate::net_place::identity_words(),
+            access: self.lock_face.on_disk(),
+            access_shown: self.lock_face.shown(),
+            access_flash: self.lock_face.flash(std::time::Instant::now()),
+            blocked: in_fleet
+                && crate::status_item::blocked_unseen(summary.as_ref(), seen_ms, now_ms),
+            traffic: summary,
         }
-        glance
     }
 
-    /// The menu-bar item owes a rebuild.
+    /// What reads the sessions owes a rebuild at the next turn of the loop: the menu-bar item,
+    /// the Overview, the Agents menu, and the look at the front tab's done
+    /// ([`Self::refresh_status_item`]).
     pub(crate) const fn mark_status_dirty(&mut self) {
         self.status_dirty = true;
     }
 
-    /// Whether the menu-bar item owes a rebuild ([`Self::mark_status_dirty`]), taking the debt.
+    /// Whether a rebuild is owed ([`Self::mark_status_dirty`]), taking the debt.
     pub(crate) fn take_status_rebuild(&mut self) -> bool {
         std::mem::take(&mut self.status_dirty)
     }
@@ -3203,26 +3119,12 @@ impl App {
             return;
         }
         self.status_fingerprint = Some(fp);
-        let glance = self.status_drawn_next(glance);
         if let Some(handle) = &self._status_item {
             crate::status_item::update(handle, glance);
         }
     }
 
-    fn status_drawn_next(
-        &mut self,
-        mut glance: crate::status_item::Glance,
-    ) -> crate::status_item::Glance {
-        self.status_gen = self.status_gen.wrapping_add(1);
-        glance.generation = self.status_gen;
-        self.status_drawn.push(glance.clone());
-        while self.status_drawn.len() > 2 {
-            self.status_drawn.remove(0);
-        }
-        glance
-    }
-
-    /// Install the menu-bar status item with the first glance (the first OS window's attach; never headless) and seed its sibling rows with a background scan so the first open has them.
+    /// Install the menu-bar status item with the first glance (the first OS window's attach; never headless), and start the readers it and the Overview stand on: the sibling scan and the fleet glance.
     pub(crate) fn install_status_item(
         &mut self,
         proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
@@ -3230,7 +3132,6 @@ impl App {
         self.reread_fleet_access();
         let glance = self.status_glance();
         let fp = glance.fingerprint();
-        let glance = self.status_drawn_next(glance);
         self._status_item = self.apprt.install_status_item(proxy, &glance);
         if self._status_item.is_some() {
             self.status_fingerprint = Some(fp);
@@ -3241,8 +3142,9 @@ impl App {
 
     /// Read this Mac's stored fleet access again (`crate::control::fleet_access_stated`): at
     /// the item's install, on the change notification `aterm fleet access`, a leave, a join and
-    /// another window's lock post (`Wake::FleetAccessChanged`), as the menu opens, before a
-    /// click rotates it, before a pending raise is written and as `aterm ctl chrome` prints it.
+    /// another window's lock post (`Wake::FleetAccessChanged`), before a click rotates it,
+    /// before a pending raise is written and as `aterm ctl chrome` prints it. The menu's open
+    /// reads nothing: it shows the level the last of these left in force.
     /// A level this App did not write replaces the one in force, and a pending raise is dropped
     /// where the state it was asked over moved ([`crate::status_item::LockFace::seen`]); the
     /// change is journalled, and a drop below Read and Write that has rested lifts the remote
@@ -3351,8 +3253,8 @@ impl App {
         self.lock_face_moved();
     }
 
-    /// A level picked in the Fleet Access submenu (`StatusAction::SetFleetAccess`): written at
-    /// once, and no raise is pending any more.
+    /// A level picked in the menu (`StatusAction::SetFleetAccess`): written at once, and no
+    /// raise is pending any more.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn pick_fleet_access(&mut self, level: aterm_types::fleet_access::FleetAccess) {
         self.reread_fleet_access();
@@ -3395,33 +3297,7 @@ impl App {
             .min()
     }
 
-    /// The drawn glance a click's `pick` was painted from — the one the menu's last open was painted from ([`Self::note_status_painted`]), else one of the last two handed over — or `None`.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
-    pub(crate) fn status_pick(
-        &self,
-        pick: crate::status_item::Pick,
-    ) -> Option<&crate::status_item::Glance> {
-        self.status_painted
-            .iter()
-            .chain(self.status_drawn.iter().rev())
-            .find(|g| g.generation == pick.generation)
-    }
-
-    /// The status menu opened painted from `painted` (`None`: no paint ran, and the menu still shows the last one): keep it until the next open.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
-    pub(crate) fn note_status_painted(&mut self, painted: Option<crate::status_item::Glance>) {
-        if let Some(glance) = painted {
-            self.status_painted = Some(glance);
-        }
-    }
-
-    /// The owner went to session `session` from the menu bar or a notice.
+    /// The owner went to session `session` from a notice.
     pub(crate) fn note_session_done_seen(&mut self, session: u64) {
         self.see_session_end(session);
         let done = self
@@ -3452,35 +3328,25 @@ impl App {
             .retain(|session, _| pool.get(*session).is_some());
     }
 
-    /// The menu-bar item's mark as `aterm ctl chrome`'s `statusitem` line ([`Self::status_item_line_of`]) of a glance built now.
-    #[cfg(test)]
-    pub(crate) fn status_item_chrome_line(&self) -> String {
-        self.status_item_line_of(&self.status_glance())
-    }
-
-    /// The menu-bar item as `aterm ctl chrome` prints it (§3).
+    /// The menu-bar item as `aterm ctl chrome` prints it: its `statusitem` line
+    /// ([`Self::status_item_line_of`]), then the menu a right click opens, one `statusmenu`
+    /// line per row (`status_item::menu_lines`).
     pub(crate) fn status_item_chrome_lines(&self) -> Vec<String> {
-        self.status_item_chrome_lines_at(
-            aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0)),
-        )
+        self.status_item_chrome_lines_at(aterm_time::unix_millis().unwrap_or(0))
     }
 
     #[cfg_attr(
         all(not(target_os = "macos"), not(test)),
         expect(unused_variables, reason = "the menu-bar status item is macOS's")
     )]
-    fn status_item_chrome_lines_at(&self, now_unix: i64) -> Vec<String> {
+    fn status_item_chrome_lines_at(&self, now_ms: u64) -> Vec<String> {
         let glance = self.status_glance();
         let mark = self.status_item_line_of(&glance);
         #[cfg(any(target_os = "macos", test))]
         {
-            let fleet = self.fleet_glance.as_ref().map_or_else(Vec::new, |fleet| {
-                crate::status_item::compose_fleet_menu(&fleet.copy(), now_unix)
-            });
             std::iter::once(mark)
                 .chain(crate::status_item::menu_lines(
-                    &crate::status_item::compose_status_menu(&glance, now_unix),
-                    &fleet,
+                    &crate::status_item::compose_status_menu(&glance, now_ms),
                 ))
                 .collect()
         }
@@ -3490,66 +3356,30 @@ impl App {
         }
     }
 
+    /// `statusitem title=❯ fleet=<word> access=<level> shown=<level> blocked=<yes|no>`: the
+    /// title, the fleet read's word (`off` out of a fleet), the level in force, the level the
+    /// lock shows, and whether the lock wears the blocked mark.
     fn status_item_line_of(&self, glance: &crate::status_item::Glance) -> String {
         let fleet = self
             .fleet_glance
             .as_ref()
             .map_or_else(|| "off".to_string(), |f| f.copy().word());
         format!(
-            "statusitem title={} needs={} stuck={} exceptions={} done={} fleet={fleet} access={} \
-             shown={}",
+            "statusitem title={} fleet={fleet} access={} shown={} blocked={}",
             glance.button_title(),
-            glance.need_count(),
-            glance.stuck_count(),
-            glance.exceptions.len(),
-            glance.done.len(),
             glance.access.word(),
             glance.access_shown.word(),
+            if glance.blocked { "yes" } else { "no" },
         )
     }
 
-    #[cfg(any(target_os = "macos", test))]
-    fn hand_back_all(&mut self) {
+    /// Hand Back All (Agents ▸ Hand Back All): lift every person hold.
+    pub(crate) fn hand_back_all(&mut self) {
         let held: Vec<u64> = self.person_holds().iter().map(|h| h.session).collect();
         for session in held {
             if let Err(why) = self.hand_back_session(session) {
-                aterm_log::info!("status item: Hand Back All: {session}: {why}");
+                aterm_log::info!("Hand Back All: {session}: {why}");
             }
-        }
-    }
-
-    /// Read Result: a finished worker's result as a Markdown document tab on the front window, raised ([`Self::raise_window`]), which marks its done seen, and the captured supervised agent's task end with it ([`Self::see_session_end`]).
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn read_status_result(&mut self, result: &crate::status_item::ResultRef) {
-        let Some(wid) = self
-            .frontmost_window
-            .or_else(|| self.windows.keys().next().copied())
-        else {
-            return;
-        };
-        let opened = crate::native_document_host::path_to_file_uri(&result.path)
-            .map_err(|e| e.to_string())
-            .and_then(|uri| {
-                self.request_document_tab_in_window(wid, crate::native_app::AppKind::Markdown, &uri)
-            });
-        if let Err(e) = opened {
-            // The row's label can be the program's own title (DESIGN §3.6): the log names the
-            // session.
-            aterm_log::info!(
-                "status item: session {}'s result did not open: {e}",
-                result.session
-            );
-            return;
-        }
-        self.raise_window(wid);
-        self.mark_done_seen(result.session, result.entered);
-        if result.end_serial.is_some_and(|serial| {
-            self.harness_glass
-                .get(&result.session)
-                .and_then(crate::harness_glass::SessionGlass::end)
-                .is_some_and(|end| end.serial == serial)
-        }) {
-            self.see_session_end(result.session);
         }
     }
 
@@ -3563,28 +3393,48 @@ impl App {
         }
     }
 
-    /// The status menu is opening (`Wake::StatusMenuOpening`) painted from `painted`, which its clicks resolve against until the next open ([`Self::note_status_painted`]).
-    #[cfg(target_os = "macos")]
-    pub(crate) fn on_status_menu_opening(&mut self, painted: Option<crate::status_item::Glance>) {
-        self.note_status_painted(painted);
-        // Opening the menu cancels a raise that has not taken effect, and reads the level
-        // again, so the next open's checkmark is the file's.
+    /// THE STATUS MENU IS OPENING (`Wake::StatusMenuOpening`, sent after the menu was painted
+    /// from the glance it already held). A raise that has not taken effect is cancelled. The
+    /// open reads no file: the level in force is the one the change notification last brought
+    /// (`Wake::FleetAccessChanged`, [`Self::reread_fleet_access`]). The person has now seen
+    /// what the painted menu showed this Mac's lock refusing (`seen_blocked_ms`, the latest
+    /// such refusal in it; `None` where it showed none), so the bar's blocked mark clears for
+    /// that much and no more: a refusal that arrived after the paint keeps the mark
+    /// ([`crate::fleet_traffic::FleetTraffic::menu_opened`]: the reader keeps it on disk, this
+    /// thread writes nothing).
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn on_status_menu_opening(&mut self, seen_blocked_ms: Option<u64>) {
         let before = self.lock_face;
         self.lock_face.menu_opened();
-        self.reread_fleet_access();
         if self.lock_face != before {
             self.lock_face_moved();
         }
+        #[cfg(target_os = "macos")]
         self.notice_center.adopt_clicks();
-        if let Some(proxy) = self.proxy.clone() {
-            crate::sibling_scan::request_scan(proxy);
+        if let (Some(traffic), Some(at_ms)) = (self.fleet_traffic(), seen_blocked_ms) {
+            traffic.menu_opened(at_ms);
         }
-        if let Some(fleet) = &self.fleet_glance {
-            fleet.kick(crate::fleet_glance::Kick::MenuOpening);
+        self.mark_status_dirty();
+    }
+
+    /// A DEVELOPMENT BUILD'S STAND-IN FOR THE PERSON OPENS THE MENU (`aterm ctl person menubar
+    /// open`): what a right click's open does here ([`Self::on_status_menu_opening`]) with the
+    /// menu composed from the glance as it stands, and no menu on the screen.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn person_menubar_open(&mut self) -> Result<String, String> {
+        #[cfg(not(any(target_os = "macos", test)))]
+        {
+            Err("no menu-bar item off macOS".to_string())
+        }
+        #[cfg(any(target_os = "macos", test))]
+        {
+            let seen = self.status_glance().blocked_shown_ms();
+            self.on_status_menu_opening(seen);
+            Ok("opened the menu".to_string())
         }
     }
 
-    /// A DEVELOPMENT BUILD'S STAND-IN FOR THE PERSON CLICKS THE MENU-BAR ROW AT `at` (`aterm ctl person menubar press <at>`, `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2): the menu composed as `chrome` composes it ([`Self::status_item_chrome_lines`]), from a glance stamped with the next generation and kept as the one the menu was painted from ([`Self::note_status_painted`], what a menu's open keeps).
+    /// A DEVELOPMENT BUILD'S STAND-IN FOR THE PERSON CLICKS THE MENU ROW AT `at` (`aterm ctl person menubar press <at>`): the menu composed as `chrome` composes it ([`Self::status_item_chrome_lines`]), and the row's action posted as its click posts it.
     #[cfg(any(test, debug_assertions))]
     #[cfg_attr(
         not(target_os = "macos"),
@@ -3602,33 +3452,21 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             use crate::status_item::{StatusAction, StatusRow};
-            let now_unix = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
-            let mut glance = self.status_glance();
-            self.status_gen = self.status_gen.wrapping_add(1);
-            glance.generation = self.status_gen;
-            let fleet = self.fleet_glance.as_ref().map_or_else(Vec::new, |fleet| {
-                crate::status_item::compose_fleet_menu(&fleet.copy(), now_unix)
-            });
-            let rows = crate::status_item::compose_status_menu(&glance, now_unix);
-            let (label, action) = match crate::status_item::row_at(&rows, &fleet, at) {
+            let glance = self.status_glance();
+            let rows = crate::status_item::compose_status_menu(
+                &glance,
+                aterm_time::unix_millis().unwrap_or(0),
+            );
+            let (label, action) = match crate::status_item::row_at(&rows, at) {
                 None => return Err(format!("no row at {at}")),
-                Some(StatusRow::Action {
-                    label,
-                    enabled: false,
-                    ..
-                }) => return Err(format!("disabled {label:?}")),
                 Some(StatusRow::Action { label, action, .. }) => (label.clone(), *action),
-                Some(
-                    StatusRow::Info(_)
-                    | StatusRow::Separator
-                    | StatusRow::Submenu { .. }
-                    | StatusRow::FleetSubmenu { .. },
-                ) => return Err("not an action".to_string()),
+                Some(StatusRow::Info { .. } | StatusRow::Separator) => {
+                    return Err("not an action".to_string());
+                }
             };
             let Some(action) = StatusAction::from_tag(action.tag()) else {
                 return Err("not an action".to_string());
             };
-            self.note_status_painted(Some(glance));
             if !post(crate::Wake::StatusAction { action }) {
                 return Err("event loop gone".to_string());
             }
@@ -3671,121 +3509,19 @@ impl App {
     pub(crate) fn dispatch_status_action(&mut self, action: crate::status_item::StatusAction) {
         use crate::status_item::StatusAction;
         match action {
-            StatusAction::Overview => {
-                let opened = self
-                    .frontmost_window
-                    .ok_or_else(|| "no front window to open the overview on".to_string())
-                    .and_then(|wid| {
-                        self.open_overview_raised(wid, crate::app_overview::OverviewAt::Top)
-                    });
-                if let Err(e) = opened {
-                    aterm_log::info!("overview: {e}");
-                }
-            }
-            StatusAction::ReadThisMac => {
-                self.run_status_read(crate::app_take_over::CliPlan::new(
-                    crate::app_take_over::CliVerb::ReadThisMac,
-                ));
-            }
-            StatusAction::HandBackAll => self.hand_back_all(),
             StatusAction::RotateFleetAccess { repeated } => {
                 self.rotate_fleet_access(std::time::Instant::now(), repeated);
             }
             StatusAction::SetFleetAccess(level) => self.pick_fleet_access(level),
-            StatusAction::DismissExceptions => {
-                let _ = self.dismiss_exceptions();
-            }
-            StatusAction::ShowException(id) => {
-                if !self.show_status_exception(id) {
-                    aterm_log::info!("status item: couldn't open message {id}");
-                }
-            }
-            StatusAction::Go(pick) => {
-                let session = self
-                    .status_pick(pick)
-                    .and_then(|g| g.go.get(usize::from(pick.index)).copied());
-                if let Some(session) = session {
-                    self.go_to_session(session);
-                }
-            }
-            StatusAction::ReadResult(pick) => {
-                let result = self
-                    .status_pick(pick)
-                    .and_then(|g| g.reads.get(usize::from(pick.index)).cloned());
-                if let Some(result) = result {
-                    self.read_status_result(&result);
-                }
-            }
-            StatusAction::RaiseSibling(pick) => {
-                let sibling = self
-                    .status_pick(pick)
-                    .and_then(|g| g.raises.get(usize::from(pick.index)).cloned());
-                if let (Some(sibling), Some(proxy)) = (sibling, self.proxy.clone()) {
-                    crate::sibling_scan::raise_sibling(
-                        proxy,
-                        sibling.pid,
-                        sibling.sock,
-                        sibling.sid,
-                    );
-                }
-            }
-            StatusAction::ReadFleet => {
+            StatusAction::AllActivity => {
                 self.run_status_read(crate::app_take_over::CliPlan::new(
-                    crate::app_take_over::CliVerb::ReadFleet,
+                    crate::app_take_over::CliVerb::FleetActivity,
                 ));
-            }
-            StatusAction::ReadFleetNow => {
-                if let Some(fleet) = &self.fleet_glance {
-                    fleet.kick(crate::fleet_glance::Kick::Now);
-                }
-            }
-            StatusAction::OpenSystemState => {
-                let _ = self.open_system_state_from_status_item();
-            }
-            StatusAction::PeerRead(pick)
-            | StatusAction::PeerScreen(pick)
-            | StatusAction::PeerSsh(pick)
-            | StatusAction::PeerTakeOver(pick)
-            | StatusAction::PeerHandBack(pick) => {
-                let peer = self
-                    .status_pick(pick)
-                    .and_then(|g| g.peers.get(usize::from(pick.index)).cloned());
-                if let Some(peer) = peer {
-                    self.fleet_act(
-                        action,
-                        &peer.dial,
-                        &peer.name,
-                        peer.host.as_deref(),
-                        Some(&peer.sid),
-                    );
-                }
-            }
-            StatusAction::MacRead(pick)
-            | StatusAction::MacScreen(pick)
-            | StatusAction::MacSsh(pick) => {
-                let mac = self.fleet_glance.as_ref().and_then(|f| {
-                    f.copy()
-                        .snapshot_at(pick.generation)
-                        .and_then(|s| s.macs.get(usize::from(pick.index)).cloned())
-                });
-                if let Some(mac) = mac {
-                    self.fleet_act(action, &mac.dial, &mac.name, mac.host.as_deref(), None);
-                }
             }
         }
     }
 
-    /// A "To look at" line: Settings ▸ Messages at that entry, in the front window (else the first), and that window raised.
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn show_status_exception(&mut self, id: u64) -> bool {
-        let Some(wid) = self.open_messages_entry_anywhere(id) else {
-            return false;
-        };
-        self.raise_window(wid);
-        true
-    }
-
-    /// TAKE ME THERE: the ❯ menu's Go, and a click on a notice about `session` (`Wake::NoticeClicked`: aterm's own macOS notice, a Windows balloon, a Linux notification through `Self::notice_clicked`).
+    /// TAKE ME THERE: a click on a notice about `session` (`Wake::NoticeClicked`: aterm's own macOS notice, a Windows balloon, a Linux notification through `Self::notice_clicked`).
     #[cfg_attr(
         all(
             not(target_os = "macos"),
@@ -6761,6 +6497,15 @@ impl App {
                 .tree_spent()
         });
         let tasked = task_end.is_some();
+        // The results its record named under other session IDs, which its ID does not name
+        // (`SessionTimeline::carried_results`).
+        let carried_results = closing.as_ref().map_or_else(Vec::new, |ctx| {
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .carried_results()
+                .to_vec()
+        });
         // A worker whose tab closes tells its manager while it is still on this Mac's roster.
         if tasked && let Some(ctx) = closing.as_ref() {
             let _ = self.mail_worker_close(ctx);
@@ -6841,20 +6586,53 @@ impl App {
             crate::self_claim::forget_read(stable.as_str());
             self.end_occupancy_lines_of(stable.as_str());
             if tasked {
-                // A worker aterm closed keeps its results while its retired row stands.
-                let kept = self
-                    .store
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .retired_workers()
-                    .by_sid(&stable)
-                    .is_some();
-                crate::task_launch::retire_task_file(&stable, kept);
+                self.retire_closed_task_files(&stable, carried_results);
             }
             crate::proxy::unpublish_session(&stable);
             crate::connections::sweep_session_closed_in(&self.connections, &stable, &self.store);
             self.overview_refresh_all();
         }
+    }
+}
+
+impl App {
+    /// What the close of worker session `stable`, out of the store now, removes from the tasks
+    /// directory, `carried_results` the results its record named under other session IDs:
+    ///
+    /// - Nothing in a seamless update's candidate before its Commit (`incoming_handoff_pending`,
+    ///   which the Commit lifts). A worker session it closes then is one it adopted (a window
+    ///   that could not attach, `Self::retire_unattached_restored_window`), the handoff is
+    ///   withheld, and the predecessor resumes with a record that names these files, as
+    ///   [`Self::forget_retired_workers_at_quit`] leaves a retired row's. The pool's own test,
+    ///   `Session::predecessor_owns`, cannot be asked here: the view's detach has dropped the
+    ///   session from the pool.
+    /// - Nothing yet where a quit has taken its layout (`Self::quit_capture`, the last window
+    ///   closing): the layout's task row names this tab's result, so the session is noted
+    ///   (`task_launch::QuitClosed`) and the run's end removes its files but those the layout it
+    ///   writes names (`Self::retire_tasks_at_quit`).
+    /// - Otherwise its task file and `carried_results`, but a file another record names, and its
+    ///   own results unless a retired row answers for them (a worker aterm closed keeps them while
+    ///   that row stands).
+    fn retire_closed_task_files(
+        &mut self,
+        stable: &aterm_session::SessionId,
+        carried_results: Vec<std::path::PathBuf>,
+    ) {
+        if self.incoming_handoff_pending {
+            return;
+        }
+        if self.quit_capture.is_some() {
+            self.quit_closed_tasks.note(stable.clone(), carried_results);
+            return;
+        }
+        let kept = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .retired_workers()
+            .by_sid(stable)
+            .is_some();
+        crate::task_launch::retire_task_file(&self.store, stable, &carried_results, kept);
     }
 }
 
@@ -6907,5 +6685,5 @@ mod pane_close_render_seam_tests;
 mod shell_start_exit_tests;
 
 #[cfg(test)]
-#[path = "status_end_tests.rs"]
-mod status_end_tests;
+#[path = "app_tabs_end_seen_tests.rs"]
+mod end_seen_tests;

@@ -103,8 +103,11 @@ lane_holds! {
     /// again, so the hold lasts as long as the item's section does. A harness native mutation's
     /// section ends once it can start nothing more, though its processes run on
     /// (`native_act::starts_nothing_more`): a signalled restart past its deadline, an own-image
-    /// move whose actor is gone. A restart that granted its child Execute, and an own-image move
-    /// whose actor lives on, hold until they finish or their processes exit.
+    /// move whose actor is gone. An own-image move also closes Unknown at its deadline before
+    /// releasing the section, fencing late recovery and completion without claiming rollback.
+    /// A restart that granted its child Execute holds until it finishes, its processes exit or its
+    /// close (the deadline plus the completion grace) seals it `closed`
+    /// (`native_act::close_at_close`).
     BoundaryItem => "boundary-item",
     /// A launch's Mac setup offer has a person's draft in it (a group pressed, a vault address or
     /// password typed), which the successor could not carry. It is the person's own and holds only

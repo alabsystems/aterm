@@ -543,6 +543,9 @@ impl FxAtlasSide {
 
     /// The resident arts written after write `after`, in write order.
     pub(crate) fn written_after(&self, after: u64) -> Vec<(&Arc<FxArt>, [u16; 4])> {
+        if self.seq <= after {
+            return Vec::new();
+        }
         let mut out: Vec<(u64, &Arc<FxArt>, [u16; 4])> = self
             .resident
             .values()

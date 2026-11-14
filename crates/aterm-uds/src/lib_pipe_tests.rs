@@ -80,6 +80,10 @@ fn a_forked_child_holds(read: std::io::PipeReader, write: std::io::PipeWriter) -
 /// reader sees no EOF after the writer drops.
 #[test]
 fn a_forked_child_holds_no_end_of_a_kept_out_pipe() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the negative control: a bare pipe, whose ends a forked child holds"
+    )]
     let (read, write) = std::io::pipe().expect("a bare pipe");
     assert!(
         a_forked_child_holds(read, write),

@@ -435,9 +435,11 @@ pub fn with_append_sink<T>(sink: impl Fn(&Appended<'_>) + 'static, run: impl FnO
 }
 
 /// Hand `record`, an append to a store whose claim lives in `claim_dir`, to that custody's
-/// listeners ([`listen`]), then to this thread's sink or the process's.
+/// listeners ([`listen`]), then to this thread's sink or the process's. A store grew, too: the
+/// Commons owner's next upkeep tick materializes the shared files.
 fn appended(record: &Appended<'_>, claim_dir: &Path) {
     listeners::tell(record, claim_dir);
+    crate::file::grew();
     #[cfg(any(test, debug_assertions))]
     if let Some(sink) = THREAD_SINK.with(|slot| slot.borrow().clone()) {
         sink(record);
@@ -3302,6 +3304,20 @@ impl Store {
             .iter()
             .filter(move |(id, _)| !excluded.contains(*id))
             .map(|(id, _)| id)
+    }
+
+    /// Replication-eligible wires in request order, under the same fresh-open
+    /// check as `replication_inventory_unchecked`. Compute its exclusion closure
+    /// once for the batch; physical holdings remain unchanged when a wire is withheld.
+    pub(crate) fn replication_wires_unchecked(&self, ids: &[Digest]) -> Vec<Vec<u8>> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let excluded = self.quarantine_closure();
+        ids.iter()
+            .filter(|id| !excluded.contains(*id))
+            .filter_map(|id| self.wire_unchecked(id).map(ToOwned::to_owned))
+            .collect()
     }
     /// IDs withheld from replication by unavailable membership, quarantine and their causal closure. As with
     /// `inventory_unchecked`, the caller stands on the store's check in its admitted session.

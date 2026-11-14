@@ -821,20 +821,6 @@ fn a_details_press_marks_the_row_seen_and_folds_a_held_one() {
 }
 
 #[test]
-fn a_menu_line_opens_messages_at_its_entry() {
-    let mut app = App::headless_for_test();
-    let wid = *app.windows.keys().next().expect("a window");
-    app.frontmost_window = None;
-    let first = app.post_message(warn("first"));
-    let second = app.post_message(warn("second"));
-    assert!(app.open_messages_entry(wid, Some(first)));
-    assert_eq!(app.open_messages_entry_anywhere(second.raw()), Some(wid));
-    let view = settings_view(&app, wid).expect("Settings in the first window");
-    assert_eq!(view.route, SettingsRoute::Messages);
-    assert_eq!(view.messages_selected, Some(second.raw()));
-}
-
-#[test]
 fn the_projection_reads_the_hosts_facts() {
     let mut app = App::headless_for_test();
     let open_log = |app: &mut App, path: String| {

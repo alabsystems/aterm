@@ -3,7 +3,7 @@
 
 //! Derived TLA+: one authored model, two faithful backends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A value in the model's (bounded-integer / boolean) semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +415,25 @@ pub struct Model {
 }
 
 impl Model {
+    /// Reject names that would alias another declaration in the emitted module.
+    pub(crate) fn assert_valid_names(&self) {
+        let mut declared = BTreeSet::from(["vars", "Init", "Next", "Spec"]);
+        for name in self
+            .consts
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(self.vars.iter().map(|var| var.name))
+            .chain(self.fn_vars.iter().map(|var| var.name))
+            .chain(self.actions.iter().map(|action| action.name))
+            .chain(self.invariants.iter().map(|law| law.name))
+        {
+            assert!(
+                declared.insert(name),
+                "duplicate or reserved TLA+ declaration `{name}`"
+            );
+        }
+    }
+
     /// All state-variable names, scalar then function-valued (the order used in
     /// `VARIABLES`, `vars`, and `UNCHANGED`).
     #[cfg_attr(trust_verify, trust::skip)]
@@ -435,6 +454,9 @@ impl Model {
     }
 
     /// Generate the complete TLA+ module text (the embedded, `ty`-checkable spec) with the model's concrete `Init` (variables start at their declared values).
+    ///
+    /// # Panics
+    /// Panics if declarations reuse a name or collide with a generated operator.
     pub fn to_tla(&self) -> String {
         let const_names: Vec<String> = self.consts.iter().map(|(n, _)| (*n).to_string()).collect();
         let mut init_parts: Vec<String> = self
@@ -450,6 +472,9 @@ impl Model {
     }
 
     /// The module with an open `Init` (`Init == TRUE`), for strict per-transition conformance (Tier 1).
+    ///
+    /// # Panics
+    /// Panics if declarations reuse a name or collide with a generated operator.
     pub fn transition_spec(&self) -> String {
         let const_names: Vec<String> = self.consts.iter().map(|(n, _)| (*n).to_string()).collect();
         self.render(&const_names, "TRUE")
@@ -459,6 +484,7 @@ impl Model {
     /// concrete and open-`Init` forms.
     #[cfg_attr(trust_verify, trust::skip)]
     fn render(&self, const_names: &[String], init_line: &str) -> String {
+        self.assert_valid_names();
         let vars = self.all_var_names();
         let mut s = String::new();
         s.push_str(&format!("---- MODULE {} ----\n", self.name));
@@ -512,12 +538,19 @@ impl Model {
     }
 
     /// Generate the `.cfg`: constant bindings, the specification, and every invariant.
+    ///
+    /// # Panics
+    /// Panics if declarations reuse a name or collide with a generated operator.
     pub fn to_cfg(&self) -> String {
         self.to_cfg_with(&[])
     }
 
     /// Like [`to_cfg`](Self::to_cfg) with constant `overrides`, e.g. `Buggy = 1` to check that an invariant is non-trivial (the buggy variant must yield a counterexample).
+    ///
+    /// # Panics
+    /// Panics if declarations reuse a name or collide with a generated operator.
     pub fn to_cfg_with(&self, overrides: &[(&'static str, i64)]) -> String {
+        self.assert_valid_names();
         let mut s = String::new();
         for (n, default) in &self.consts {
             let val = overrides
@@ -543,8 +576,11 @@ impl Model {
     }
 
     /// Config for [`transition_spec`](Self::transition_spec).
+    /// # Panics
+    /// If declaration names collide or use a generated definition's reserved name.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn transition_cfg(&self, overrides: &[(&'static str, i64)]) -> String {
+        self.assert_valid_names();
         let mut s = String::new();
         for (n, default) in &self.consts {
             let val = overrides
@@ -559,8 +595,12 @@ impl Model {
     }
 
     /// The initial concrete state (variable -> value).
+    /// Validate declaration names before map collection can hide duplicates.
+    /// # Panics
+    /// If declaration names collide or use a generated definition's reserved name.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn init_state(&self) -> BTreeMap<&'static str, i64> {
+        self.assert_valid_names();
         self.vars.iter().map(|v| (v.name, v.init)).collect()
     }
 
@@ -617,7 +657,12 @@ impl Model {
             })
             .collect();
         let mut acc: Vec<BTreeMap<&'static str, i64>> = vec![state.clone()];
-        for (var, vals) in choices {
+        for (index, (var, vals)) in choices.into_iter().enumerate() {
+            if act.updates[..index].iter().any(|u| u.var == var) {
+                // Primed updates are simultaneous constraints on one next-state value.
+                acc.retain(|state| vals.contains(&state[var]));
+                continue;
+            }
             // Deterministic update (the common case): write the one candidate in place instead
             // of cloning the accumulator (-20% on a full-registry BMC sweep). Order is kept, so
             // `fire`'s canonical successor is unchanged.

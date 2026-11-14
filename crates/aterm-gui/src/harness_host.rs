@@ -26699,9 +26699,160 @@ static DISK_RUNS: DiskRuns = DiskRuns::new();
 #[cfg(target_os = "macos")]
 static DISK_CACHE_CHECK: Mutex<cache_maintenance::Schedule> =
     Mutex::new(cache_maintenance::Schedule::new());
+/// When the look's worktree step runs next in this window ([`disk_worktree_look`]).
+#[cfg(target_os = "macos")]
+static DISK_WORKTREES: Mutex<aterm_agent::harness::disk::worktree::Schedule> =
+    Mutex::new(aterm_agent::harness::disk::worktree::Schedule::new());
 const DISK_SHORT_LOOKS: u32 = 2;
 static DISK_NOTES_SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 static DISK_PRIVATE_SAID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// When the last sizing of the rebuildable budget began, unix seconds, as this process last
+/// knew it: from the record every process shares (`aterm_agent::harness::disk::budget::Record`)
+/// at its first look and at each claim, and set when it starts a sizing, so a look neither
+/// starts one within the hour nor reads the record each minute.
+static DISK_BUDGET_BEGAN: Mutex<Option<i64>> = Mutex::new(None);
+/// Whether this process read the record of the last sizing yet ([`disk_budget_record`]).
+static DISK_BUDGET_READ: AtomicBool = AtomicBool::new(false);
+/// Whether a sizing runs on its thread now ([`disk_budget_look`]): one at a time.
+static DISK_BUDGET_SIZING: AtomicBool = AtomicBool::new(false);
+
+/// At this process's first look of the disk watch, the record of the last sizing in the
+/// harness state directory `state`: when it began, and its figures, which `sys disk` prints
+/// with their true age before this process sizes anything.
+fn disk_budget_record(state: &Path) {
+    if DISK_BUDGET_READ.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let record = aterm_agent::harness::disk::budget::Record::load(state);
+    *DISK_BUDGET_BEGAN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = record.began_unix;
+    if let Some(last) = record.last {
+        crate::disk_board::publish(|b| b.budget_sized(last));
+    }
+}
+
+/// Start a sizing of the rebuildable budget for `sys disk`'s `budget` record, where one is due
+/// (`aterm_agent::harness::disk::budget::due`) and none runs, on a thread of its own: the look
+/// that starts it returns at once, and later looks and every demand's wait go on while it
+/// walks. [`disk_look_pass`] calls it from a look that
+/// `aterm_agent::harness::disk::budget::admitted` admits.
+fn disk_budget_look(
+    cap: aterm_agent::harness::disk::Cap,
+    state: &Path,
+    cwds: &[std::path::PathBuf],
+    agents: &[u32],
+    home: &Path,
+    table: &aterm_sysprobe::volumes::Table,
+    now: i64,
+) {
+    use aterm_agent::harness::disk::budget;
+    {
+        let mut began = DISK_BUDGET_BEGAN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !budget::due(*began, now) || DISK_BUDGET_SIZING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Before the walk: one that fails or is cut short is not begun again within the hour.
+        *began = Some(now);
+    }
+    let (state, home, table) = (state.to_path_buf(), home.to_path_buf(), table.clone());
+    let (cwds, agents) = (cwds.to_vec(), agents.to_vec());
+    let spawned = std::thread::Builder::new()
+        .name(format!("{THREAD_PREFIX}disk-budget"))
+        .spawn(move || {
+            let _quiet = aterm_sysprobe::quiet_errors();
+            let _ = caught(
+                "the rebuildable budget's sizing",
+                "the next is due within the hour",
+                || disk_budget_size(cap, &state, &cwds, &agents, &home, &table, now),
+            );
+            DISK_BUDGET_SIZING.store(false, Ordering::SeqCst);
+        });
+    if let Err(e) = spawned {
+        DISK_BUDGET_SIZING.store(false, Ordering::SeqCst);
+        aterm_log::warn!(
+            "harness disk watch: the rebuildable budget's sizing could not start: {e}"
+        );
+    }
+}
+
+/// One sizing ([`disk_budget_look`]'s thread): claim it in the record every process shares
+/// (where another process began one within the hour, take that record's figures instead), then
+/// every build directory a search finds on the home volume and every registered build cache,
+/// all within one wall (`aterm_agent::harness::cli::disk_rebuildable`), against the volume's
+/// used bytes read once the walk is done; kept in the record and published as one sizing. It
+/// removes and journals nothing, takes no build's lock, raises nothing and moves no level.
+fn disk_budget_size(
+    cap: aterm_agent::harness::disk::Cap,
+    state: &Path,
+    cwds: &[std::path::PathBuf],
+    agents: &[u32],
+    home: &Path,
+    table: &aterm_sysprobe::volumes::Table,
+    now: i64,
+) {
+    use aterm_agent::harness::disk::{self, budget};
+    match budget::claim(state, now) {
+        Ok(budget::Claim::Claimed(_)) => {}
+        Ok(budget::Claim::NotDue(record)) => {
+            *DISK_BUDGET_BEGAN
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = record.began_unix;
+            if let Some(last) = record.last {
+                crate::disk_board::publish(|b| b.budget_sized(last));
+            }
+            return;
+        }
+        Err(e) => {
+            aterm_log::warn!("harness disk watch: the rebuildable budget was not sized: {e}");
+            return;
+        }
+    }
+    let began = Instant::now();
+    let deadline = began + budget::WALL;
+    let roots = disk_roots(
+        cwds,
+        agents,
+        home,
+        disk::discover::running_claude_census(Some(home)),
+    );
+    let sized = aterm_agent::harness::cli::disk_rebuildable(home, &roots, Some(table), deadline);
+    let Ok(reading) = disk::volume_of(home, table) else {
+        return;
+    };
+    let sizing = budget::Sizing {
+        volume: reading.key.spelled(),
+        total: reading.total,
+        used: reading.total.saturating_sub(reading.free),
+        sized,
+        sized_unix: crate::disk_board::unix_now().unwrap_or(now),
+    };
+    if let Err(e) = budget::keep(state, now, sizing.clone()) {
+        aterm_log::warn!("harness disk watch: the rebuildable budget's record was not kept: {e}");
+    }
+    if let Some(budget) = cap.budget(sizing.total, sizing.used, sized.bytes) {
+        aterm_log::info!(
+            "harness disk watch: rebuildable budget sized in {} s: {}{} rebuildable, {} kept, \
+             cap {} ({}), target {}, {} {}",
+            began.elapsed().as_secs(),
+            if sized.partial { "at least " } else { "" },
+            disk::human_bytes(budget.rebuildable),
+            disk::human_bytes(budget.kept),
+            disk::human_bytes(budget.cap),
+            if budget.cap_written {
+                "disk.cap_used_gib"
+            } else {
+                "the volume's share"
+            },
+            disk::human_bytes(budget.target),
+            disk::human_bytes(budget.over().max(budget.under())),
+            if budget.over() > 0 { "over" } else { "under" },
+        );
+    }
+    crate::disk_board::publish(|b| b.budget_sized(sizing));
+}
 
 /// The log line for a look below the warning line, or with an agent's demand waiting, in a
 /// process that is not the owner's disk watch (`private`, from [`disk_private`]): the level and
@@ -26766,6 +26917,85 @@ fn disk_reclaimed(looked: &mut disk_ask::Looked, bytes: u64) {
                 .unwrap_or(0),
             bytes,
         });
+}
+
+/// The look's worktree step (`aterm_agent::harness::cli::disk_worktree_step`), hourly at most,
+/// under the pass lock, which another host's pass may hold (then it runs at a later look): a
+/// merged, clean worktree no session uses goes, with its merged branch. What it freed is this
+/// look's; what went is one log line.
+#[cfg(target_os = "macos")]
+fn disk_worktree_look(
+    home: &Path,
+    state: &Path,
+    now: i64,
+    config: aterm_agent::harness::disk::Config,
+    table: &aterm_sysprobe::volumes::Table,
+    looked: &mut disk_ask::Looked,
+) {
+    use aterm_agent::harness::disk::{reserve, worktree};
+    let mut schedule = DISK_WORKTREES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if config.auto_free_gib == 0 || !schedule.due(Instant::now()) {
+        return;
+    }
+    let lock_path = reserve::pass_lock_for(home);
+    let lock = match reserve::take_pass(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return,
+        Err(e) => {
+            aterm_log::warn!(
+                "harness disk watch: the pass lock {} could not be taken ({e}); the worktree \
+                 step is deferred",
+                lock_path.display()
+            );
+            return;
+        }
+    };
+    let cwds: Vec<PathBuf> = DISK_ALL_CWDS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|(_, cwd)| cwd.clone())
+        .collect();
+    let unknown = disk_cwd_unknown(
+        &DISK_CWD_UNKNOWN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+    );
+    let open = worktree::open_sessions(home);
+    let transcripts = home.join(".claude").join("projects");
+    let look = aterm_agent::harness::cli::WorktreeLook {
+        state,
+        home,
+        now,
+        transcripts: Some(&transcripts),
+        session_cwds: &cwds,
+        session_cwd_unknown: unknown.as_deref(),
+        open: &open,
+        table: Some(table),
+    };
+    let done = aterm_agent::harness::cli::disk_worktree_step(&look, config, &mut schedule, &|| {
+        lock.validate_for(&lock_path).is_ok()
+    });
+    drop(lock);
+    disk_reclaimed(looked, done.freed());
+    if !done.removed.is_empty() {
+        aterm_log::info!(
+            "harness disk watch: removed {} merged worktree(s) ({}), {} back",
+            done.removed.len(),
+            done.removed
+                .iter()
+                .map(|r| r.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            atpkg::cost::human_bytes(done.freed())
+        );
+    }
+    if let Some(why) = &done.unfinished {
+        aterm_log::info!("harness disk watch: the worktree step stopped short: {why}");
+    }
 }
 
 /// The look's pass ([`disk_look`]): what it read for the ask goes in `looked`.
@@ -26835,6 +27065,9 @@ fn disk_look_pass(
     let private = disk_private(&home);
     looked.thresholds = Some(thresholds);
     looked.private = private.is_some();
+    if private.is_none() {
+        disk_budget_record(&state);
+    }
     disk_publish_look(
         &table,
         stats.as_ref().map(|r| crate::disk_board::VolumeRow {
@@ -26914,6 +27147,16 @@ fn disk_look_pass(
     let line = disk_private_line(private, config.below_warn(free), demand.is_some(), level);
     if let Some(line) = disk_private_said(&DISK_PRIVATE_SAID, line) {
         aterm_log::info!("{line}");
+    }
+    // The worktree step runs in the owner's own window only, on a look that runs no pressure
+    // pass: here when nothing presses, and below on a pressed look with no pass due; never
+    // ahead of a pass or an agent's waiting demand.
+    #[cfg(target_os = "macos")]
+    {
+        let pressed = config.below_warn(free) || projected.is_some();
+        if private.is_none() && demand.is_none() && !pressed {
+            disk_worktree_look(&home, &state, now, config, &table, looked);
+        }
     }
     if !DISK_RUNS.admit(
         (config.below_warn(free) || demand.is_some() || projected.is_some())
@@ -26999,6 +27242,23 @@ fn disk_look_pass(
             note,
         );
         disk_episode_after(board, level, 0, &[]);
+        if aterm_agent::harness::disk::budget::admitted(
+            level,
+            private.is_none(),
+            demand.is_some(),
+            projected.is_some(),
+            config.cap_used_gib,
+        ) {
+            disk_budget_look(
+                config.cap_used_gib,
+                &state,
+                cwds,
+                agents,
+                &home,
+                &table,
+                now,
+            );
+        }
         return;
     }
     let started = Instant::now();
@@ -27021,6 +27281,8 @@ fn disk_look_pass(
             room.unwrap_or(0),
         );
     if !due {
+        #[cfg(target_os = "macos")]
+        disk_worktree_look(&home, &state, now, config, &table, looked);
         // Back above the floor with no pass due: the run of short passes
         // ends, and with it the owner's low-disk line.
         if reading.at_or_above_floor(free)
@@ -27480,7 +27742,9 @@ fn disk_look_pass(
     }
 }
 
-/// The board's rows of one look (`crate::disk_board`).
+/// The board's rows of one look (`crate::disk_board`), and what the look read for the
+/// rebuildable budget: the cap as its `reading` has it, and the home volume where this process
+/// is the account's own watch, the one that sizes it (`crate::disk_board::Board::budget_look`).
 fn disk_publish_look(
     table: &aterm_sysprobe::volumes::Table,
     home: Option<crate::disk_board::VolumeRow>,
@@ -27489,6 +27753,10 @@ fn disk_publish_look(
     state: &Path,
     now: i64,
 ) {
+    let sized_on = home
+        .as_ref()
+        .filter(|r| r.reclaimed_here)
+        .map(|r| r.reading.key.spelled());
     let (mut rows, map) = disk_look_rows(table, home, sessions, reading, state, now);
     crate::disk_board::publish(|b| {
         for old in std::mem::take(&mut b.volumes) {
@@ -27502,6 +27770,7 @@ fn disk_publish_look(
         b.table = table.clone();
         b.volumes = rows;
         b.sessions = map;
+        b.budget_look(reading.config.cap_used_gib, sized_on);
     });
 }
 

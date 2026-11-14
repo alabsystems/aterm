@@ -585,7 +585,7 @@ impl App {
             .unwrap_or_else(|p| p.into_inner())
             .retired_workers_mut()
             .drop_all();
-        crate::retired_workers::forget_results(&retired);
+        crate::retired_workers::forget_results(&self.store, &retired);
     }
 
     /// Clear Finished: window `wid`'s Finished rows leave its page, what they left kept as

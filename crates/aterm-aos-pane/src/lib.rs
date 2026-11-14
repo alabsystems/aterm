@@ -1407,3 +1407,6 @@ impl fmt::Display for PaneCounts {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod model_conformance_tests;

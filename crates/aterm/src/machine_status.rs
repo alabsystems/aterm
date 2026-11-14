@@ -1395,7 +1395,7 @@ fn read_areas() -> Vec<Area> {
         let home = aterm_types::dirs::home_dir();
         bounded(move || {
             home.is_some_and(|home| {
-                std::fs::symlink_metadata(home.join(agh::identity::vault::DEV_TOKEN_FILE))
+                std::fs::symlink_metadata(agh::identity::vault::Slot::Dev.path(&home))
                     .is_ok_and(|meta| meta.is_file())
             })
         })

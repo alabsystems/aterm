@@ -210,6 +210,22 @@ fn developer_dir_with(
     is_file(&dir.join("usr/bin/notarytool")).then_some(dir)
 }
 
+/// Whether notarytool's `history` answer `stderr` says the keychain profile itself is no use:
+/// absent, or refused by Apple for its credential or its team (HTTP 401 or 403, the 403 of a
+/// lapsed developer agreement included). Such a profile is replaced from the vault's entry, so a
+/// credential the owner updated there reaches a Mac that holds an older one. Any other failure
+/// (no network, Apple unavailable, a timeout) leaves the profile as it is.
+fn profile_unusable(stderr: &str) -> bool {
+    [
+        "No Keychain password item found",
+        "HTTP status code: 401",
+        "HTTP status code: 403",
+        "Invalid credentials",
+    ]
+    .iter()
+    .any(|said| stderr.contains(said))
+}
+
 /// The notarytool runs of a live round, and its read of xcrun's developer directory
 /// ([`developer_dir_with`]). A test build has none of them ([`LIVE_HISTORY`], [`LIVE_STORE`],
 /// [`LIVE_DEVELOPER_DIR`]), so no test, nor a mutant of one, ever reaches xcrun.
@@ -246,12 +262,11 @@ mod live {
         if output.status.success() {
             return Ok(true);
         }
-        let detail = String::from_utf8_lossy(&output.stderr);
-        if detail.contains("No Keychain password item found") {
+        if profile_unusable(&String::from_utf8_lossy(&output.stderr)) {
             return Ok(false);
         }
         Err(Error::new(
-            "notarytool history did not authenticate; the existing profile was left unchanged",
+            "notarytool history did not complete; the existing profile was left unchanged",
         ))
     }
 

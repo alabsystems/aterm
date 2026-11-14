@@ -404,8 +404,18 @@ fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// The images of `dist` that are aliases of `aterm.exe`: every `.exe` but the
-/// front door itself, the windowed image and the console host.
+/// The images `build.ps1` lays into a folder that are no alias of `aterm.exe`, lower case:
+/// the front door itself, the windowed image, the console host, and get-aterm.ps1's
+/// signature checker (`aterm_winship::handoff::VERIFIER_MEMBER`).
+pub const OWN_IMAGES: [&str; 4] = [
+    "aterm.exe",
+    "aterm-gui.exe",
+    "openconsole.exe",
+    "aterm-bootstrap-verify.exe",
+];
+
+/// The images of `dist` that are aliases of `aterm.exe`: every `.exe` but
+/// [`OWN_IMAGES`], so an image nothing names is judged as an alias and refused.
 ///
 /// # Errors
 /// The folder could not be listed.
@@ -416,8 +426,7 @@ pub fn aliases(dist: &Path) -> Result<Vec<PathBuf>, String> {
         .filter(|p| {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
             p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe"))
-                && !["aterm.exe", "aterm-gui.exe", "openconsole.exe"]
-                    .contains(&name.to_ascii_lowercase().as_str())
+                && !OWN_IMAGES.contains(&name.to_ascii_lowercase().as_str())
         })
         .collect();
     found.sort();

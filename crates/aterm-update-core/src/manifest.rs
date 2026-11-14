@@ -67,6 +67,31 @@ pub struct Manifest {
     /// The install.sh interface those verifiers speak (`aterm_bootstrap_verify::pin::INTERFACE`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux_verifier_interface: Option<u32>,
+    /// The native Windows portable zip (`aterm-<version>-windows-x86_64.zip`,
+    /// [`crate::windows::WindowsTarget`]): its asset name, SHA-256 and size, which appear
+    /// together or not at all ([`Self::windows_artifact`]). Optional keys in schema 1: a reader
+    /// that predates them skips them, as every appcast reader skips a key it does not name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_x86_64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_x86_64_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_x86_64_size: Option<u64>,
+    /// The Windows bootstrap verifier published beside the Windows zip
+    /// (`aterm-bootstrap-verify-<version>-windows-<arch>.exe`): its asset name, SHA-256 and
+    /// size, and the get-aterm.ps1 interface it speaks
+    /// (`aterm_bootstrap_verify::pin::WINDOWS_INTERFACE`), signed with the rest of the manifest
+    /// so get-aterm.ps1's verifier pin is bound to the release signer (`ship pin-verifier
+    /// --windows --from-release`), as the `linux_verifier_*` fields bind install.sh's. No client
+    /// reads them, and a reader that predates them skips them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_verifier_x86_64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_verifier_x86_64_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_verifier_x86_64_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_verifier_interface: Option<u32>,
     /// The Intel batteries-included DMG's asset name, e.g. `"aterm-0.47.0-x86_64.dmg"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dmg_x86_64: Option<String>,
@@ -117,6 +142,53 @@ impl Manifest {
         crate::linux::artifact(target, &self.version, name, digest, size)
     }
 
+    /// Select a Windows portable zip only when all its signed identity fields agree.
+    pub fn windows_artifact(
+        &self,
+        target: crate::windows::WindowsTarget,
+    ) -> Result<Option<crate::windows::WindowsArtifact<'_>>, String> {
+        let (name, digest, size) = match target {
+            crate::windows::WindowsTarget::X86_64 => (
+                self.windows_x86_64.as_deref(),
+                self.windows_x86_64_sha256.as_deref(),
+                self.windows_x86_64_size,
+            ),
+        };
+        crate::windows::artifact(target, &self.version, name, digest, size)
+    }
+
+    /// Write `artifact` into its target's Windows fields: the release cutter's one way to sign a
+    /// portable zip into the appcast. An entry [`Self::windows_artifact`] would not read back
+    /// (another version's or target's name, a digest that is not lowercase SHA-256, a size
+    /// outside `64..=WINDOWS_ZIP_MAX_BYTES`) is refused and changes nothing.
+    pub fn set_windows_artifact(
+        &mut self,
+        artifact: &crate::windows::WindowsArtifact<'_>,
+    ) -> Result<(), String> {
+        crate::windows::artifact(
+            artifact.target,
+            &self.version,
+            Some(artifact.name),
+            Some(artifact.sha256),
+            Some(artifact.size),
+        )?;
+        let fields = (
+            Some(artifact.name.to_string()),
+            Some(artifact.sha256.to_string()),
+            Some(artifact.size),
+        );
+        match artifact.target {
+            crate::windows::WindowsTarget::X86_64 => {
+                (
+                    self.windows_x86_64,
+                    self.windows_x86_64_sha256,
+                    self.windows_x86_64_size,
+                ) = fields;
+            }
+        }
+        Ok(())
+    }
+
     /// Parse a manifest from TOML text, rejecting a schema this build is too old to understand.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -143,6 +215,9 @@ impl Manifest {
         }
         self.linux_artifact(crate::linux::LinuxTarget::X86_64)?;
         self.linux_artifact(crate::linux::LinuxTarget::Aarch64)?;
+        for target in crate::windows::WindowsTarget::ALL {
+            self.windows_artifact(target)?;
+        }
         Ok(())
     }
 
@@ -177,6 +252,68 @@ impl Manifest {
             out.push_str("'''\n");
         }
         Ok(out)
+    }
+}
+
+/// How one native target's asset is read from its three signed fields (name, SHA-256, size):
+/// the words a refusal names it by, its canonical name for the manifest's version, and the
+/// largest size a client downloads.
+pub(crate) struct AssetRule {
+    pub(crate) platform: &'static str,
+    pub(crate) arch: &'static str,
+    pub(crate) canonical: String,
+    pub(crate) max: u64,
+}
+
+impl AssetRule {
+    /// `None` when all three fields are absent; the three when all are present, `version` is a
+    /// canonical three-component release version, the name is the canonical one, the digest is
+    /// lowercase SHA-256 and the size is in `64..=max`; a refusal otherwise.
+    pub(crate) fn claim<'a>(
+        &self,
+        version: &str,
+        name: Option<&'a str>,
+        sha256: Option<&'a str>,
+        size: Option<u64>,
+    ) -> Result<Option<(&'a str, &'a str, u64)>, String> {
+        let Self {
+            platform,
+            arch,
+            canonical,
+            max,
+        } = self;
+        let (name, sha256, size) = match (name, sha256, size) {
+            (None, None, None) => return Ok(None),
+            (Some(name), Some(sha256), Some(size)) => (name, sha256, size),
+            _ => {
+                return Err(format!(
+                    "incomplete {platform} {arch} artifact: name, sha256, and size must appear \
+                     together"
+                ));
+            }
+        };
+        if !matches!(
+            crate::tag::parse_release_tag(&format!("v{version}")),
+            Ok(crate::tag::TagKind::Candidate(_))
+        ) {
+            return Err(format!(
+                "{platform} artifact requires a canonical three-component release version"
+            ));
+        }
+        if name != canonical {
+            return Err(format!(
+                "{platform} {arch} artifact must be named {canonical}"
+            ));
+        }
+        if !aterm_codec::hex::is_lower(sha256, 64) {
+            return Err(format!("{platform} {arch} sha256 is not lowercase SHA-256"));
+        }
+        if !(64..=*max).contains(&size) {
+            return Err(format!(
+                "{platform} {arch} size {size} is outside 64..={max}"
+            ));
+        }
+        Ok(Some((name, sha256, size)))
     }
 }
 

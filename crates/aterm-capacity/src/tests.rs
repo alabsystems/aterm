@@ -5387,6 +5387,63 @@ fn the_floor_is_the_watchs_own() {
     assert_eq!(written("not toml [").knobs, floor::Knobs::default());
 }
 
+/// THE REBUILDABLE BUDGET IS THE CAP LESS THE KEPT BYTES, NEVER BELOW ZERO. A 926 GiB volume
+/// with 779 GiB used, 381 GiB of it rebuildable, under a 466 GiB cap keeps 398 GiB, so the
+/// target is 68 GiB and the rebuildable part is 313 GiB over it (m18 stood 313 GiB over the
+/// owner's "at most 500GB used", 466 GiB, on 2026-11-12, with no reading that said so:
+/// `docs/OWNER_RULINGS.md`, 2026-11-05, Disk use). The cap is the written figure
+/// only where it is below 80% of the volume, the kept bytes alone can exceed the cap (target
+/// 0, every rebuildable byte over), and a sizing above the used bytes leaves nothing kept.
+/// CONTROL: one GiB of room under the cap gives a one GiB target, so zero is not a constant.
+#[test]
+fn the_rebuildable_budget_is_the_cap_less_the_kept_bytes_and_never_below_zero() {
+    let of = |cap: Option<u64>, total: u64, used: u64, rebuildable: u64| {
+        floor::budget(cap, total * GIB, used * GIB, rebuildable * GIB)
+    };
+
+    // (a) the cap less the kept bytes, over and under.
+    let over = of(Some(466), 926, 779, 381);
+    assert_eq!(
+        over,
+        floor::Budget {
+            cap: 466 * GIB,
+            cap_written: true,
+            kept: 398 * GIB,
+            target: 68 * GIB,
+            rebuildable: 381 * GIB,
+        }
+    );
+    assert_eq!((over.over(), over.under()), (313 * GIB, 0));
+    let under = of(Some(466), 926, 366, 24);
+    assert_eq!((under.kept, under.target), (342 * GIB, 124 * GIB));
+    assert_eq!((under.over(), under.under()), (0, 100 * GIB));
+
+    // (b) a written cap above 80% of the volume is held to the share, and is not the written one.
+    let held = of(Some(900), 1000, 500, 100);
+    assert_eq!((held.cap, held.cap_written), (800 * GIB, false));
+    assert_eq!(held.target, 400 * GIB);
+
+    // (c) unwritten: 80% of the volume.
+    let unwritten = of(None, 1000, 500, 100);
+    assert_eq!((unwritten.cap, unwritten.cap_written), (800 * GIB, false));
+    assert_eq!(unwritten, held);
+
+    // (d) the kept bytes alone are over the cap: nothing is left for rebuildable bytes.
+    let full = of(Some(466), 926, 700, 100);
+    assert_eq!((full.kept, full.target), (600 * GIB, 0));
+    assert_eq!((full.over(), full.under()), (100 * GIB, 0));
+
+    // (e) a sizing above the used bytes (shared storage counted twice) keeps nothing.
+    let shared = of(Some(466), 926, 100, 150);
+    assert_eq!((shared.kept, shared.target), (0, 466 * GIB));
+    assert_eq!((shared.over(), shared.under()), (0, 316 * GIB));
+
+    // (f) CONTROL: one GiB under the cap is a one GiB target.
+    let edge = of(Some(466), 926, 500, 35);
+    assert_eq!((edge.kept, edge.target), (465 * GIB, GIB));
+    assert_eq!((edge.over(), edge.under()), (34 * GIB, 0));
+}
+
 /// The 233.8 GiB request on m118 combined a 46.8 GiB measured claim with a 187 GiB
 /// cleanup floor. That floor is spare room for builds, not additional bytes this run writes.
 /// The old expression is the negative control; an explicit owner floor still applies.

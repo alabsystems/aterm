@@ -136,6 +136,7 @@ pub(in crate::native_act) fn stage(
         env,
         intent: Arc::clone(&original.intent),
         record: original.record.clone(),
+        source: original.source.clone(),
         continuation: Some(proof),
         fresh_snapshot: Some(fresh_snapshot),
     };

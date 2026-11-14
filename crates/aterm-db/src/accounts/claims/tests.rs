@@ -396,6 +396,79 @@ fn a_row_at_another_macs_key_is_inert() {
     }
 }
 
+/// After a Commons writer succession this Mac's earlier seat stays a member, and the last row it
+/// signed stays in the day table it went into until it lapses. To this Mac that row is its own
+/// past, never another Mac's claim: its read leaves it out of the members' rows, so the harness
+/// never records this Mac's own home accounts as held by the earlier seat's machine, and the
+/// current seat's first row starts at 1 and stands. The read gives that row apart
+/// (`Read::former`), so the claims this Mac still uses keep their `since` in the current seat's
+/// first row (the harness's `a_writer_successor_keeps_the_seniority_of_the_claims_it_still_uses`).
+/// A peer's row is read as before, and is never the former one.
+///
+/// Negative controls: with the read keeping every member's latest row, the earlier seat's row
+/// came back beside the peer's (`left: Some(1)`, `right: None`: `the earlier seat's row read as
+/// another Mac's`). With no former row given (2026-11-13), the earlier seat's claims were lost to
+/// this Mac (`the earlier seat's row is given apart`, `left: None`).
+#[test]
+#[cfg(unix)]
+fn a_writer_successor_reads_no_row_of_its_earlier_seat() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
+    let now = at(D, 600);
+    let caps = Caps::default();
+    let machine = |n: usize| *lab.bootstrap(n).request().unwrap().binding().machine();
+    let (earlier, peer) = (machine(0), machine(2));
+    let used = json!({"counter": 1, "until": now + DAY, "claims": [
+        {"pool": "claude", "email": "a@example.test", "kind": "lease", "since": now - 600}
+    ]});
+    write_at(&lab.paths[0], &used, now, caps).unwrap();
+    write_at(&lab.paths[2], &row(1, now), now, caps).unwrap();
+    let day = CLAIMS.scope(lab.bootstrap(0).trust(), D).unwrap().digest();
+    repair_commons_among_first(&lab, 1, &[0, 2], &[now; 3], day);
+    let before = read_at(&lab.paths[0], now, caps).unwrap();
+    assert_eq!(
+        (counter(&before, &earlier), counter(&before, &peer)),
+        (Some(1), Some(1)),
+        "PRECONDITION: the earlier seat's row and a peer's"
+    );
+    assert_eq!(
+        before.former, None,
+        "PRECONDITION: a home that succeeds none"
+    );
+    let next = crate::generation::test_complete_successor(
+        lab._home.path(),
+        &lab.paths[0],
+        &lab.paths[1],
+        &lab.paths[0].home.join("config.toml"),
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    let current = *Bootstrap::required(&next)
+        .unwrap()
+        .request()
+        .unwrap()
+        .binding()
+        .machine();
+    let read = read_at(&lab.paths[0], now, caps).unwrap();
+    assert_eq!(read.me, current);
+    assert_eq!(
+        counter(&read, &earlier),
+        None,
+        "the earlier seat's row read as another Mac's"
+    );
+    assert_eq!(counter(&read, &peer), Some(1), "a peer's row is read");
+    assert_eq!(
+        read.former.as_ref(),
+        Some(&used),
+        "the earlier seat's row is given apart"
+    );
+    write_at(&lab.paths[0], &row(1, now), now, caps).unwrap();
+    let read = read_at(&lab.paths[0], now, caps).unwrap();
+    assert_eq!(counter(&read, &current), Some(1));
+    assert_eq!(counter(&read, &earlier), None);
+    assert_eq!(read.rows.len(), 2);
+    assert_eq!(read.former.as_ref(), Some(&used));
+}
+
 /// A claim record has one wire spelling: the same command with a space after its opening brace
 /// parses, and is refused.
 /// NEGATIVE CONTROL: a decoder without its canonical check (e1083090a5) takes the respelled

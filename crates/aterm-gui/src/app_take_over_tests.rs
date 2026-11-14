@@ -7,145 +7,19 @@ use crate::palette::PaletteState;
 use crate::session_timeline::MetaField;
 use std::sync::Arc;
 
-#[cfg(unix)]
+/// A read's child is cut at the read cap; a bus install ends by itself.
 #[test]
-#[ignore = "owned native child exercised by the hold-action parent"]
-fn native_hold_action_child() {
-    use std::io::Write as _;
-    let args: Vec<String> = std::env::args().collect();
-    let Some(gate) = args.iter().find_map(|arg| arg.strip_prefix("hold-gate=")) else {
-        return;
-    };
-    let port: u16 = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix("hold-port="))
-        .unwrap()
-        .parse()
-        .unwrap();
-    println!("owned hold action started");
-    let mut proof = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    proof.write_all(b"ready\n").unwrap();
-    let _writer = aterm_update_core::FileLock::acquire(Path::new(gate)).unwrap();
-    println!("owned hold action completed");
-    eprintln!("owned hold action diagnostic");
-    if let Some(code) = args.iter().find_map(|arg| arg.strip_prefix("hold-exit=")) {
-        std::process::exit(code.parse().unwrap());
+fn a_read_is_capped_and_a_bus_command_is_not() {
+    for verb in [
+        CliVerb::ReadThisMac,
+        CliVerb::ReadFleet,
+        CliVerb::FleetPeers,
+        CliVerb::FleetActivity,
+    ] {
+        assert_eq!(verb.cap(), Some(crate::bounded_child::READ_CAP), "{verb:?}");
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn a_required_fleet_hold_action_waits_for_its_native_command() {
-    use std::cell::RefCell;
-    use std::io::Read as _;
-
-    assert_eq!(
-        CliVerb::ReadThisMac.cap(),
-        Some(crate::bounded_child::READ_CAP)
-    );
-    assert_eq!(
-        CliVerb::ReadFleet.cap(),
-        Some(crate::bounded_child::READ_CAP)
-    );
-    assert_eq!(
-        CliVerb::FleetPeers.cap(),
-        Some(crate::bounded_child::READ_CAP)
-    );
-    assert_eq!(
-        CliVerb::ReadPeer.cap(),
-        Some(crate::bounded_child::READ_CAP)
-    );
     for verb in [CliVerb::BusStatus, CliVerb::BusOn, CliVerb::BusOff] {
-        assert_eq!(verb.cap(), None);
-    }
-    let root = aterm_tempfile::tempdir().unwrap();
-    let gate = root.path().join("hold.lock");
-    let child = std::env::current_exe().unwrap();
-    for (age, exit) in [(31, 0), (61, 0), (0, 0), (31, 7)] {
-        let held = RefCell::new(Some(aterm_update_core::FileLock::acquire(&gate).unwrap()));
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let proof = RefCell::new(None);
-        let mut released = false;
-        let args = vec![
-            "--ignored".into(),
-            "--exact".into(),
-            "app_take_over::tests::native_hold_action_child".into(),
-            "--nocapture".into(),
-            format!("hold-gate={}", gate.display()),
-            format!("hold-port={port}"),
-            format!("hold-exit={exit}"),
-        ];
-        let got = crate::bounded_child::run_bounded_observing(
-            &child,
-            &args,
-            CliVerb::DrivePeer.cap(),
-            || {
-                let (mut connected, _) = aterm_uds::accept(
-                    &listener,
-                    aterm_uds::AcceptWait::Until(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
-                    aterm_uds::AcceptedMode::Blocking,
-                )
-                .expect("owned child reached its writer");
-                // The sanctioned accept makes the stream blocking explicitly, so the read
-                // timeout below waits through the child's planted connect-to-write delay.
-                connected
-                    .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-                    .unwrap();
-                let mut ready = [0; 6];
-                connected.read_exact(&mut ready).unwrap();
-                assert_eq!(&ready, b"ready\n");
-                *proof.borrow_mut() = Some(connected);
-                Instant::now() - Duration::from_secs(age)
-            },
-            || {
-                if !released {
-                    assert_eq!(
-                        aterm_update_core::FileLock::acquire_within(&gate, Duration::ZERO)
-                            .err()
-                            .unwrap()
-                            .kind(),
-                        std::io::ErrorKind::TimedOut,
-                    );
-                    drop(held.borrow_mut().take());
-                    released = true;
-                }
-            },
-        );
-        if age == 61 {
-            assert!(
-                got.is_err(),
-                "the actual expired child is killed and reaped"
-            );
-            assert!(!released, "an expired allowance cannot release custody");
-            assert!(held.borrow().is_some());
-            assert_eq!(
-                aterm_update_core::FileLock::acquire_within(&gate, Duration::ZERO)
-                    .err()
-                    .unwrap()
-                    .kind(),
-                std::io::ErrorKind::TimedOut,
-            );
-        } else {
-            let got = got.expect("the requested command retains its completion allowance");
-            assert!(released);
-            assert_eq!(got.code, Some(exit));
-            assert!(
-                got.stdout.contains("owned hold action completed"),
-                "{got:?}"
-            );
-            assert!(
-                got.stderr.contains("owned hold action diagnostic"),
-                "{got:?}"
-            );
-        }
-        assert_eq!(
-            proof.borrow_mut().as_mut().unwrap().read(&mut [0]).unwrap(),
-            0,
-            "the actual child ended before its owned scratch is removed"
-        );
-        drop(held.into_inner());
-        drop(aterm_update_core::FileLock::acquire_within(&gate, Duration::ZERO).unwrap());
+        assert_eq!(verb.cap(), None, "{verb:?}");
     }
 }
 
@@ -1370,7 +1244,7 @@ fn the_cli_rows_compose_their_argv_and_run_nothing_headless() {
             CliVerb::BusStatus | CliVerb::BusOn | CliVerb::BusOff => {
                 assert_eq!(first, Some("fabric"));
             }
-            CliVerb::ReadPeer | CliVerb::DrivePeer => unreachable!("not a row's verb"),
+            CliVerb::FleetActivity => assert_eq!(plan.argv, ["fleet", "activity"]),
         }
         assert_eq!(
             verb.confirmation().is_some(),
@@ -1383,17 +1257,9 @@ fn the_cli_rows_compose_their_argv_and_run_nothing_headless() {
 
 #[test]
 fn the_cli_tab_fences_its_output() {
-    let plan = CliPlan::peer(
-        ["ctl", "survey", "--host", "mac-17"]
-            .map(String::from)
-            .to_vec(),
-        "mac-17".to_string(),
-    );
+    let plan = CliPlan::new(CliVerb::FleetActivity);
     let text = cli_markdown(&plan, &Ok(Some(1)), "a ``` b\n", "");
-    assert!(
-        text.starts_with("# aterm ctl survey --host mac-17\n"),
-        "{text}"
-    );
+    assert!(text.starts_with("# aterm fleet activity\n"), "{text}");
     assert!(text.contains("````text\na ``` b\n````"), "{text}");
     assert_eq!(text.matches("````text").count(), 1);
     assert_eq!(
@@ -1406,29 +1272,7 @@ fn the_cli_tab_fences_its_output() {
 }
 
 #[test]
-fn a_take_over_on_another_mac_says_how_to_hand_it_back() {
-    let plan = |way: &str| {
-        CliPlan::driven(
-            ["ctl", "--host", "mac-17.local", "hold", "s-ab12", way]
-                .map(String::from)
-                .to_vec(),
-            "Take Over on mac-17 \u{b7} s-ab12".to_string(),
-        )
-    };
-    let took = cli_markdown(&plan("on"), &Ok(Some(0)), "OK hold=1\n", "");
-    assert!(
-        took.contains("aterm ctl --host mac-17.local hold s-ab12 off"),
-        "{took}"
-    );
-    assert!(took.contains("@s-ab12 send"), "{took}");
-    let refused = cli_markdown(&plan("on"), &Ok(Some(1)), "", "ERR denied\n");
-    assert!(!refused.contains("hold s-ab12 off"), "{refused}");
-    let back = cli_markdown(&plan("off"), &Ok(Some(0)), "OK hold=0\n", "");
-    assert!(!back.contains("hold s-ab12 off`"), "{back}");
-}
-
-#[test]
-fn the_menu_bars_reads_raise_their_window_and_nothing_else_does() {
+fn the_menu_bars_read_raises_its_window_and_an_agents_rows_does_not() {
     use crate::native_app::AppKind;
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-status-read-raise")
@@ -1464,28 +1308,6 @@ fn the_menu_bars_reads_raise_their_window_and_nothing_else_does() {
     let mut read = CliPlan::new(CliVerb::ReadThisMac).raised();
     read.out = file("read.md");
     app.complete_cli_tab(ended(read));
-    assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
-
-    let result = |path| crate::status_item::ResultRef {
-        session: 0,
-        entered: 7,
-        end_serial: None,
-        path,
-        label: "lint".to_string(),
-    };
-    app.read_status_result(&result(dir.path().join("missing.md")));
-    assert_eq!(crate::app_tabs::take_raised_windows(), Vec::new());
-    assert_eq!(app.done_seen.get(&0), None, "nothing opened: not seen");
-    app.read_status_result(&result(file("result.md")));
-    assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
-    assert_eq!(app.done_seen.get(&0), Some(&7));
-
-    let entry = app.post_message(aterm_messages::Message::new(
-        aterm_messages::tags::CONFIG,
-        aterm_messages::Severity::Warn,
-        "to look at",
-    ));
-    assert!(app.show_status_exception(entry.raw()));
     assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
 }
 
@@ -1586,12 +1408,10 @@ fn next_need_starts_where_the_status_items_needs_start() {
         first < second,
         "control: the session order picks the earlier tab"
     );
-    let listed = app.status_glance().local_need_sessions();
-    assert_eq!(listed, vec![second, first], "❯ lists the older first");
     assert_eq!(app.next_need(), Ok(()));
-    assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(listed[0]));
+    assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(second));
     assert_eq!(app.next_need(), Ok(()));
-    assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(listed[1]));
+    assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(first));
 }
 
 /// STOPPED WORK FIRST (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): an hour-old
@@ -1651,12 +1471,6 @@ fn next_need_starts_at_a_stopped_need_before_an_older_report() {
     assert!(
         stop(first).map(|n| n.since) < stop(second).map(|n| n.since),
         "control: the report is the older"
-    );
-    let listed = app.status_glance().local_need_sessions();
-    assert_eq!(
-        listed,
-        vec![second, first],
-        "❯ lists the stopped box before the older report"
     );
     assert_eq!(app.next_need(), Ok(()));
     assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(second));

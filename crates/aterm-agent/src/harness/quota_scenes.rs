@@ -179,6 +179,7 @@ impl Fx {
             credits: self.credits,
             now: self.now,
             offset: self.offset,
+            signing_in: None,
         }
     }
 

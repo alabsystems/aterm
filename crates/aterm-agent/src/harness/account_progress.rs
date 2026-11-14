@@ -313,6 +313,7 @@ pub fn enrich_inventory_with_identity(
             let action = match task.action {
                 accounts::SignInAction::Browser => "browser sign-in needed",
                 accounts::SignInAction::Login => "CLI sign-in needed",
+                accounts::SignInAction::Renew => "sign-in at this Mac's terminal needed",
             };
             progress.details.push(format!("{label}: {action}"));
             progress

@@ -1403,6 +1403,7 @@ fn update_status() -> aterm_update::UpdateStatus {
         failing_checks_kind: String::new(),
         channel_unreadable: false,
         hold: None,
+        start_failure: None,
         last: None,
         offered: Some(100),
         behind: false,
@@ -1471,6 +1472,172 @@ fn the_update_line_claims_up_to_date_only_over_a_completed_check() {
     }
 }
 
+/// ONE DECISION (ATERM-KI-1111-23): the line `aterm update status` prints and the standing a
+/// fleet survey says of this copy come from one decision (`UpdateStatus::arm`), so they never
+/// disagree: over a status for every arm, on a Mac and on Linux, each line carries its standing's
+/// words (held ⇔ "is held for", current ⇔ "is up to date", refused ⇔ "install was refused",
+/// installed ⇔ "is installed", …), and no other standing's.
+/// NEGATIVE CONTROL: an `arm` that answers current for a staged build fails "downloaded ⇔ is
+/// downloaded".
+#[test]
+fn the_update_line_and_the_fleets_standing_are_one_decision() {
+    use aterm_types::update_standing::UpdateStanding;
+    let checked = aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
+    let now = checked + 600;
+    let linux = |staged: Option<u64>, phase: Option<&str>| aterm_update::LinuxUpdateStatus {
+        installed_build: 101,
+        installed_version: "0.92.0".into(),
+        staged_build: staged,
+        staged_version: staged.map(|_| "0.93.0".into()),
+        staged_commit: None,
+        trial_phase: phase.map(str::to_owned),
+        trial_starts: 0,
+        trial_healthy: false,
+    };
+    let refusing = aterm_update::ApplyLaneReport {
+        last_refusal: "the Mac setup offer is still open".into(),
+        ..Default::default()
+    };
+    let tried = aterm_update::ApplyLaneReport {
+        last_failure_target_build: 101,
+        failures_for_target: 2,
+        ..Default::default()
+    };
+    let with = |edit: &dyn Fn(&mut aterm_update::UpdateStatus)| {
+        let mut st = update_status();
+        edit(&mut st);
+        st
+    };
+    let staged = |st: &mut aterm_update::UpdateStatus| {
+        st.staged_build = Some(101);
+        st.staged_version = Some("0.92.0".into());
+    };
+    let corpus: Vec<(
+        aterm_update::UpdateStatus,
+        Option<&aterm_update::ApplyLaneReport>,
+    )> = vec![
+        (with(&|st| st.enabled = false), None),
+        (with(&|st| st.linux = Some(linux(Some(102), None))), None),
+        (
+            with(&|st| st.linux = Some(linux(None, Some("Installed")))),
+            None,
+        ),
+        (with(&|st| st.installable = false), None),
+        (
+            with(&|st| {
+                staged(st);
+                st.hold = Some(held_view(now, now, false));
+            }),
+            None,
+        ),
+        (
+            with(&|st| {
+                staged(st);
+                st.start_failure = Some(start_failed_view(now, now));
+            }),
+            Some(&refusing),
+        ),
+        (with(&|st| staged(st)), Some(&refusing)),
+        (with(&|st| staged(st)), Some(&tried)),
+        (with(&|st| staged(st)), None),
+        (with(&|st| st.channel_unreadable = true), None),
+        (
+            with(&|st| {
+                st.failing_persistent = true;
+                st.failing_checks_kind = "manifest".into();
+                st.outcome = "reinstall aterm from the current release".into();
+            }),
+            None,
+        ),
+        (
+            with(&|st| {
+                st.failing_persistent = true;
+                st.failing_kind = "network".into();
+            }),
+            None,
+        ),
+        (
+            with(&|st| {
+                st.failing_checks = 1;
+                st.failing_checks_kind = "network".into();
+            }),
+            None,
+        ),
+        (
+            with(&|st| st.hold = Some(held_view(now - 6000, now, false))),
+            None,
+        ),
+        (
+            with(&|st| {
+                st.behind = true;
+                st.offered = Some(101);
+            }),
+            None,
+        ),
+        (with(&|_| {}), None),
+        (with(&|st| st.updated_at = String::new()), None),
+    ];
+    let says = |standing: UpdateStanding| -> &'static [&'static str] {
+        match standing {
+            UpdateStanding::Off => &["doesn\u{2019}t update itself"],
+            UpdateStanding::Installed => &["is installed"],
+            UpdateStanding::Downloaded => &["is downloaded"],
+            UpdateStanding::Cannot => &["can\u{2019}t update itself"],
+            UpdateStanding::Held => &["is held for"],
+            UpdateStanding::Refused => &["install was refused"],
+            UpdateStanding::NotInstalling => &["didn\u{2019}t install ("],
+            UpdateStanding::Unreadable => &["can\u{2019}t check for updates"],
+            UpdateStanding::TooOld => &["is too old"],
+            UpdateStanding::Failing => &["keep failing"],
+            UpdateStanding::CheckFailed => &["the last check didn\u{2019}t finish"],
+            UpdateStanding::Retrying => &["again"],
+            UpdateStanding::Behind => &["a newer release is out"],
+            UpdateStanding::Current => &["is up to date"],
+            UpdateStanding::Unchecked => &["hasn\u{2019}t checked"],
+            UpdateStanding::Unread => &[],
+        }
+    };
+    let mut seen = Vec::new();
+    for (st, lane) in &corpus {
+        let standing = st.standing(100, *lane);
+        let line = update_summary(
+            "0.91.0",
+            100,
+            st,
+            *lane,
+            now,
+            true,
+            true,
+            &DevCopy::No,
+            "hint",
+        )
+        .0;
+        seen.push(standing);
+        for other in UpdateStanding::ALL {
+            for words in says(other) {
+                // A refused or failed install is a download too.
+                let shared = *words == "is downloaded"
+                    && matches!(
+                        standing,
+                        UpdateStanding::Refused | UpdateStanding::NotInstalling
+                    );
+                assert_eq!(
+                    line.contains(words),
+                    other == standing || shared,
+                    "{standing:?} \u{21d4} {words}: {line}"
+                );
+            }
+        }
+    }
+    for standing in UpdateStanding::ALL {
+        assert_eq!(
+            seen.contains(&standing),
+            standing != UpdateStanding::Unread,
+            "{standing:?} has a status in the sweep"
+        );
+    }
+}
+
 /// A hold on build 101 (0.92.0) after it did not start cleanly, at its second try, set at `at`
 /// and lapsing an hour and a half later (live as of `now` when `now` is before that).
 fn held_view(at: i64, now: i64, peer_lifted: bool) -> aterm_update::HoldView {
@@ -1486,6 +1653,65 @@ fn held_view(at: i64, now: i64, peer_lifted: bool) -> aterm_update::HoldView {
         live: u64::try_from(now).unwrap() < until,
         peer_lifted,
     }
+}
+
+/// Build 101's (0.92.0) staged bytes, which a window running 100 saw fail to start at `at`: the
+/// first try, lapsing four hours later (live as of `now` when `now` is before that).
+fn start_failed_view(at: i64, now: i64) -> aterm_update::HoldView {
+    let until = u64::try_from(at).unwrap() + 4 * 3600;
+    aterm_update::HoldView {
+        build: 101,
+        version: "0.92.0".into(),
+        cause: aterm_update_core::update_record::Cause::StartFailed,
+        witness: aterm_update_core::update_record::Witness::Window,
+        why: "stalled (unlaunched)".into(),
+        tries: 1,
+        until,
+        live: u64::try_from(now).unwrap() < until,
+        peer_lifted: false,
+    }
+}
+
+/// A STAGED BUILD A WINDOW SAW FAIL TO START IS NAMED: while the window-start failure of the
+/// staged bytes holds, no start without a window installs them, and `aterm update status` says
+/// so over the download and its refusal: the build, how long more, why, which try and the verb
+/// that ends it, with how the window saw it fail on stderr. Once it lapses, the download's own
+/// line is said again.
+/// NEGATIVE CONTROL: saying the start-failure arm by `held_update_line`, as a hold of its own,
+/// fails `held over its download and its refusal`.
+#[test]
+fn the_update_line_names_a_staged_build_a_window_saw_fail_to_start() {
+    let checked = aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
+    let now = checked + 600;
+    let refusing = aterm_update::ApplyLaneReport {
+        last_refusal: "the Mac setup offer is still open".into(),
+        ..Default::default()
+    };
+    let mut st = update_status();
+    st.staged_build = Some(101);
+    st.staged_version = Some("0.92.0".into());
+    st.start_failure = Some(start_failed_view(now - 600, now));
+    let (line, trouble) = update_summary(
+        "0.91.0",
+        100,
+        &st,
+        Some(&refusing),
+        now,
+        true,
+        true,
+        &DevCopy::No,
+        "",
+    );
+    assert_eq!(
+        line,
+        "aterm 0.91.0 \u{b7} 0.92.0 is held for 4 h more from every start with no window (a \
+         window here saw it fail to start, try 1) \u{b7} `aterm update retry` ends that now",
+        "held over its download and its refusal"
+    );
+    assert_eq!(trouble.as_deref(), Some("stalled (unlaunched)"));
+    st.start_failure = Some(start_failed_view(now - 4 * 3600, now));
+    let line = update_summary("0.91.0", 100, &st, None, now, true, true, &DevCopy::No, "").0;
+    assert!(line.contains("0.92.0 is downloaded"), "{line}");
 }
 
 /// The headline never says "up to date" while a newer build is held or offered, on every

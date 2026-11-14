@@ -1059,20 +1059,27 @@ fn fleet_keys_are_set_and_removed_in_place() {
     assert_eq!(without_fleet("theme = \"Nord\"\n"), Ok(None));
 }
 
-/// What a [`Listener`]'s survey answer says of the instance that answered it: its aterm version
-/// and its `window=` word (`None`: none, as an older aterm's answer says).
+/// What a [`Listener`]'s survey answer says of the instance that answered it: its aterm version,
+/// its `window=` word (`None`: none, as an older aterm's answer says) and its updater's `update*=`
+/// words (`None`: none, as an aterm older than them says).
 #[derive(Clone, Copy)]
 struct Said {
     version: &'static str,
     window: Option<bool>,
+    update: Option<&'static str>,
 }
+
+/// When every [`Listener`]'s answer says it answered (its `at_ms=`), on the answering Mac's clock:
+/// weeks before any run of these tests, as a peer's clock may be off this Mac's.
+const ANSWERED_AT_MS: u64 = 1_793_130_000_000;
 
 impl Said {
     /// What every listener's answer says unless it was made [`Listener::answering`]: its issuer's
-    /// own version, and no `window=` word.
+    /// own version, no `window=` word and no `update*=` words.
     const OLDER: Self = Self {
         version: "0.95.0",
         window: None,
+        update: None,
     };
 }
 
@@ -1227,7 +1234,8 @@ impl Listener {
                                     .push(String::from_utf8_lossy(&query).into_owned());
                                 let reply = format!(
                                     "OK {}\ninstance pid=1 host=127.0.0.1 version={} \
-                                     sessions={} level=facts cut=0 at_ms=1 node={}{}\n{}",
+                                     sessions={} level=facts cut=0 at_ms={ANSWERED_AT_MS} \
+                                     node={}{}{}\n{}",
                                     rows.len() + 1,
                                     said.version,
                                     rows.len(),
@@ -1236,6 +1244,7 @@ impl Listener {
                                         " window={}",
                                         u8::from(w)
                                     )),
+                                    said.update.map_or_else(String::new, |u| format!(" {u}")),
                                     rows.iter()
                                         .map(|row| format!("{row}\n"))
                                         .collect::<String>()
@@ -1307,6 +1316,7 @@ fn a_survey_of_a_host_alone_dials_it_at_the_default_port() {
         host: Some("127.0.0.1"),
         within: HANG,
         holder: None,
+        by: None,
     };
     let read = survey_fleet_in(&world.places, &ask).unwrap_or_else(|why| panic!("{why}"));
     let at = format!("127.0.0.1:{}", member::default_port());
@@ -1376,12 +1386,21 @@ fn a_host_read_naming_a_holder_sends_the_holder_request() {
         boot: "7bd6dc21fbac480eabe228c34320639d".into(),
         start: 9,
     };
-    for (asked, expected) in [
+    // A survey a session asked for names it to the peer; one aterm makes of its own names none.
+    let session = "s-0123456789abcdef0123";
+    for (asked, by, expected) in [
         (
             Some(&holder),
+            None,
             "survey holder=4242.7bd6dc21fbac480eabe228c34320639d.9",
         ),
-        (None, "survey"),
+        (None, None, "survey"),
+        (None, Some(session), "survey by=s-0123456789abcdef0123"),
+        (
+            Some(&holder),
+            Some(session),
+            "survey holder=4242.7bd6dc21fbac480eabe228c34320639d.9 by=s-0123456789abcdef0123",
+        ),
     ] {
         serving.queries.lock().unwrap().clear();
         let read = survey_fleet_in(
@@ -1390,6 +1409,7 @@ fn a_host_read_naming_a_holder_sends_the_holder_request() {
                 host: Some(&node),
                 within: HANG,
                 holder: asked,
+                by,
             },
         )
         .unwrap();
@@ -1665,6 +1685,7 @@ fn peers_shows_a_nodes_version_and_its_windows_apart() {
             Said {
                 version: "0.94.0",
                 window,
+                update: None,
             },
         );
         let member = World::new("versions-member");
@@ -1720,6 +1741,126 @@ fn peers_shows_a_nodes_version_and_its_windows_apart() {
             Some("-"),
             "an unreached peer's window is unknown ({window:?}):\n{theirs}"
         );
+    }
+}
+
+/// PEERS UPDATE COLUMN (ATERM-KI-1111-23): from another Mac, why a Mac holds its update was
+/// unknown, since only a tab on that Mac read its updater. So `peers` shows where each answering
+/// peer's updater stands, as its own answer says it: its standing word under UPDATE, and for
+/// every standing a reader cannot pass by (not `current`, or automatic checks off) one `Updater
+/// of <head>:` line after the table with the build it names, how long it holds, why, which try
+/// and when it last checked, told on the clock the peer answered on (its `at_ms=`), not this
+/// Mac's. An older aterm's answer, an unreached peer and a word outside the grammar read `-`,
+/// with no line; a `current` answer reads `current`, with no line.
+/// NEGATIVE CONTROL: an UPDATE column that drops the answer's standing (`-` for every row) fails
+/// "held is the peer's"; an `updater_words` that says nothing fails "its updater line follows the
+/// table"; one that tells the hold on this Mac's clock, weeks after the peer's, fails "on the
+/// peer's clock".
+#[test]
+fn peers_shows_each_peers_updater_from_its_answer() {
+    // Ten minutes after the peer's check and three hours before its hold lapses, on its clock.
+    const HELD: &str = "update=held update_at=1793129400 update_to=0.199.0 \
+                        update_until=1793140800 update_why=crash-loop update_tries=2 \
+                        update_checks=on";
+    for (update, shown, line) in [
+        (Some(HELD), "held", Some("0.199.0 is held for ")),
+        (Some("update=current update_checks=on"), "current", None),
+        (
+            Some("update=current update_checks=off"),
+            "current",
+            Some("up to date \u{b7} automatic checks off."),
+        ),
+        (Some("update=%1B%5B2J"), "-", None),
+        (None, "-", None),
+    ] {
+        let (issuer, code, _serving) = issuing_answering(
+            "updater-issuer",
+            Said {
+                version: "0.199.0",
+                window: Some(true),
+                update,
+            },
+        );
+        let member = World::new("updater-member");
+        let opts = Opts {
+            port: Some(closed_port()),
+            host: Some("127.0.0.1".to_owned()),
+            ..Opts::default()
+        };
+        ok(join(&member.places, &opts, &code));
+        let head = short(&member::node_id(&issuer.places.state).unwrap()).to_owned();
+        let listed = ok(list_peers(&member.places, HANG));
+        let header: Vec<&str> = listed
+            .lines()
+            .find(|line| line.trim_start().starts_with("NODE "))
+            .unwrap_or_else(|| panic!("a header:\n{listed}"))
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            header.iter().position(|word| *word == "UPDATE"),
+            Some(8),
+            "UPDATE follows WINDOW VERSION ({update:?}):\n{listed}"
+        );
+        let row: Vec<&str> = listed
+            .lines()
+            .find(|line| line.trim_start().starts_with(&head))
+            .unwrap_or_else(|| panic!("the issuer's row:\n{listed}"))
+            .split_whitespace()
+            .collect();
+        assert!(
+            row.iter().any(|word| word.starts_with("ok,")),
+            "the issuer answered ({update:?}):\n{listed}"
+        );
+        assert_eq!(
+            (row.get(4).copied(), row.get(5).copied()),
+            (Some("0.95.0"), Some("0.199.0")),
+            "the versions keep their columns ({update:?}):\n{listed}"
+        );
+        assert_eq!(
+            row.get(6).copied(),
+            Some(shown),
+            "held is the peer's ({update:?}):\n{listed}"
+        );
+        let lines: Vec<&str> = listed
+            .lines()
+            .filter(|line| line.starts_with("Updater of "))
+            .collect();
+        match line {
+            Some(said) => {
+                assert_eq!(lines.len(), 1, "one updater line ({update:?}):\n{listed}");
+                let prefix = format!("Updater of {head}: ");
+                assert!(
+                    lines[0].starts_with(&prefix) && lines[0].contains(said),
+                    "its updater line follows the table ({update:?}):\n{listed}"
+                );
+            }
+            None => assert!(lines.is_empty(), "no updater line ({update:?}):\n{listed}"),
+        }
+        if update == Some(HELD) {
+            assert!(
+                lines[0].ends_with(
+                    "0.199.0 is held for 3 h more (crash-loop, try 2) \u{b7} checked 10 min ago."
+                ),
+                "on the peer's clock: why, which try and when it checked:\n{listed}"
+            );
+            // A peer not reached has no answer to say its updater by.
+            let theirs = ok(list_peers(&issuer.places, HANG));
+            let row: Vec<&str> = theirs
+                .lines()
+                .find(|line| {
+                    line.trim_start()
+                        .starts_with(short(&member::node_id(&member.places.state).unwrap()))
+                })
+                .unwrap_or_else(|| panic!("the member's row:\n{theirs}"))
+                .split_whitespace()
+                .collect();
+            assert_eq!(
+                row.get(6).copied(),
+                Some("-"),
+                "an unreached peer's updater is unknown:\n{theirs}"
+            );
+            assert!(!theirs.contains("Updater of "), "{theirs}");
+        }
     }
 }
 
@@ -4147,6 +4288,7 @@ fn a_members_peers_reads_its_issuers_book_and_keeps_a_copy() {
         host: None,
         within: HANG,
         holder: None,
+        by: None,
     };
     let read = survey_fleet_in(&member.places, &whole).unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(read.peers.len(), 2, "{:?}", read.peers);
@@ -4271,6 +4413,7 @@ fn a_proven_mac_that_names_this_one_in_its_survey_is_refused_not_hidden() {
         host: None,
         within: HANG,
         holder: None,
+        by: None,
     };
     let only = || {
         let mut read =
@@ -4409,6 +4552,7 @@ fn an_issuer_whose_book_lists_no_peer_says_so_and_not_that_none_joined() {
         host: None,
         within: HANG,
         holder: None,
+        by: None,
     };
     let book = "this machine's book lists no peer: a member is recorded when it runs `aterm fleet \
                 join`, and `aterm fleet peers add <host>` names one by hand";
@@ -4463,6 +4607,7 @@ fn a_members_rm_of_its_issuer_gives_a_members_remedy() {
         host: None,
         within: HANG,
         holder: None,
+        by: None,
     };
     let alone = survey_fleet_in(&member.places, &fleet).unwrap();
     assert!(
@@ -4555,6 +4700,7 @@ fn a_word_naming_the_issuer_and_a_copied_member_is_refused_by_every_verb_alike()
             host: Some("127.0.0.1"),
             within: 2 * HANG,
             holder: None,
+            by: None,
         };
         let surveyed = survey_fleet_in(&member.places, &ask).map(|read| read.peers.len());
         assert_eq!(surveyed.map_err(|refused| refused.why), Err(named.clone()));
@@ -4606,6 +4752,7 @@ fn a_word_naming_the_issuer_and_an_entry_by_hand_elsewhere_takes_out_neither() {
                 host: Some("127.0.0.1"),
                 within: 2 * HANG,
                 holder: None,
+                by: None,
             };
             let surveyed = survey_fleet_in(&member.places, &ask).map(|read| read.peers.len());
             assert_eq!(
@@ -4657,6 +4804,7 @@ fn a_word_naming_the_issuer_gets_one_answer_from_every_verb_from_an_old_copy_or_
             host: Some("127.0.0.1"),
             within: 2 * HANG,
             holder: None,
+            by: None,
         };
         before();
         let removed = peers(&member.places, &args(&["rm", "127.0.0.1"]));
@@ -6217,6 +6365,7 @@ fn a_member_reaches_a_member_that_joined_after_its_last_read() {
                 host: Some(&later),
                 within: 2 * HANG,
                 holder: None,
+                by: None,
             },
         )
     })
@@ -6249,6 +6398,7 @@ fn a_survey_reads_its_issuers_book_again_within_its_own_deadline() {
             host: Some(&elsewhere),
             within: Duration::ZERO,
             holder: None,
+            by: None,
         },
     )
     .unwrap_or_else(|why| panic!("{why}"));
@@ -6334,6 +6484,7 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
                 host: Some(word),
                 within,
                 holder: None,
+                by: None,
             },
         )
         .unwrap_or_else(|why| panic!("{why}"))
@@ -6418,6 +6569,7 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
                     host: Some(word),
                     within: 2 * HANG,
                     holder: None,
+                    by: None,
                 },
             )
         })
@@ -6529,6 +6681,7 @@ fn an_issuer_that_answers_with_no_book_is_told_once() {
                 host: Some(&elsewhere),
                 within: 2 * HANG,
                 holder: None,
+                by: None,
             },
         )
     })
@@ -6684,6 +6837,7 @@ fn a_place_no_read_takes_as_a_peer_is_refused_at_its_add_and_skipped_when_booked
         host: None,
         within: HANG,
         holder: None,
+        by: None,
     };
     let read = survey_fleet_in(&issuer.places, &whole).unwrap_or_else(|why| panic!("{why}"));
     let labels: Vec<&str> = read.peers.iter().map(|peer| peer.label.as_str()).collect();
@@ -6838,6 +6992,7 @@ fn peers_beside_a_key_it_cannot_use_refuses_saying_how_it_reads_again() {
         host: None,
         within: HANG,
         holder: None,
+        by: None,
     };
     let unread = survey_fleet_in(&member.places, &whole).expect_err("no key it can use");
     assert!(unread.why.contains("remove that link"), "{unread}");
@@ -7248,6 +7403,7 @@ fn a_head_of_this_machines_id_another_peer_shares_is_ambiguous_to_every_verb() {
                 host: Some(word),
                 within: HANG,
                 holder: None,
+                by: None,
             },
         )
         .expect_err("refused");
@@ -7320,6 +7476,7 @@ fn a_head_of_this_machines_id_no_book_here_settles_is_refused_alike_while_the_is
             host: Some(word),
             within: HANG,
             holder: None,
+            by: None,
         },
     )
     .expect_err("refused");
@@ -7440,6 +7597,7 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
                 host: Some(word),
                 within: HANG,
                 holder: None,
+                by: None,
             },
         )
         .expect_err("its own node");
@@ -9146,6 +9304,7 @@ fn a_members_drive_grant_follows_its_issuers_book() {
         host: None,
         within: HANG,
         holder: None,
+        by: None,
     };
 
     bind(Some(key));
@@ -9450,6 +9609,7 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
             host: Some(word),
             within: Duration::from_millis(100),
             holder: None,
+            by: None,
         };
         let read =
             survey_fleet_in(&member.places, &ask).unwrap_or_else(|why| panic!("{word}: {why}"));
@@ -9481,6 +9641,7 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
         host: Some("lab-mini"),
         within: Duration::from_millis(100),
         holder: None,
+        by: None,
     };
     assert_eq!(
         survey_fleet_in(&member.places, &ask)

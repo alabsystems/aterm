@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use super::{
-    CARRYING_ON, Chain, DEFENSE_HEAD, NEED, NEED_A, NEED_B, NEED_C, Opening, Scenario, Seen, Tab,
+    CARRYING_ON, Chain, DEFENSE_HEAD, NEED_A, NEED_B, NEED_C, Opening, Scenario, Seen, Tab,
     Verdict, at, attention_text, needs_up, on, reading, reading_on, word,
 };
 use crate::door::Door;
@@ -65,7 +65,7 @@ const IDLE_TRIES: usize = 3;
 /// The front tab's capture: one file, overwritten (a bare name is confined to the instance's images directory).
 const FRONT_IMAGE: &str = "forever-front.png";
 
-/// The hang detector of a look's or a press's effect (a wait for something that must happen).
+/// The hang detector of a look's effect (a wait for something that must happen).
 const STEP_WAIT: Duration = Duration::from_secs(60);
 
 /// Recorded window surface observations for a single tab ([`Window::note`]).
@@ -73,8 +73,8 @@ const STEP_WAIT: Duration = Duration::from_secs(60);
 pub struct Window {
     /// Whether window surfaces were read (`false` under `--no-surfaces`).
     pub read: bool,
-    /// When each glance was noted ([`Window::note`]): its `chrome` read answered, so the chip,
-    /// strip and menu were read then, whether or not any of them changed.
+    /// When each glance was noted ([`Window::note`]): its `chrome` read answered, so the chip
+    /// and strip were read then, whether or not either changed.
     pub glances: Vec<i64>,
     /// Tab label across surfaces (the chain's name).
     pub label: String,
@@ -88,8 +88,6 @@ pub struct Window {
     pub hover: Vec<(i64, String)>,
     /// Timestamps of all tooltip reads, including unchanged values.
     pub hover_reads: Vec<i64>,
-    /// Observed `statusmenu` rows naming this tab (`<section>|<label>`).
-    pub menu: Vec<(i64, String)>,
     /// Observed Settings ▸ Harness rows (`head=…`, `state=…`, `today=…`).
     pub page: Vec<(i64, String)>,
     /// Timestamps of all Harness-page reads.
@@ -114,20 +112,12 @@ pub struct Window {
     /// What that `chrome` read answered where it failed: no line stands in [`Self::opening`] for
     /// it, and the title before the first prompt goes unjudged ([`title_words`] fails).
     pub opening_failed: Option<String>,
-    /// Its row one level into its manager's submenu ([`worker_of`]): `-` where none names it.
-    pub worker: Vec<(i64, String)>,
-    /// Its Done for you row's tip ([`done_tip_of`], slice 9c: what aterm checked at its
-    /// landing): `-` where no such row names it or the row has none.
-    pub done_tip: Vec<(i64, String)>,
     /// A same-reply chain's looks in front past its hold ([`held::look_step`]): each its
     /// `autopilot` line, title and all (`-` where its label was not in the strip).
     pub held: Vec<(i64, String)>,
     /// What a screen reader is handed at each of those looks, one per [`Self::held`] entry at its
     /// time: `sid`'s Autopilot chip node ([`ax_of`]).
     pub held_ax: Vec<(i64, String)>,
-    /// `cruise-n`'s stand-in ask beside its N4 report ([`stopped::ask_step`]): what Needs you
-    /// showed of the two ([`stopped::Read::line`]).
-    pub stopped: Option<(i64, String)>,
 }
 
 impl Window {
@@ -143,14 +133,11 @@ impl Window {
                 (chip, title.unwrap_or_else(|| "?".into()))
             },
         );
-        let worker = worker_of(&g.sub, &label);
-        let done_tip = done_tip_of(&g.menu, &label);
         let tab = g.strip.iter().find(|s| s.label == label);
         let strip = tab.map_or_else(|| "-".to_string(), StripTab::words);
         let hover = tab
             .and_then(StripTab::driven)
             .unwrap_or_else(|| "-".to_string());
-        let menu = menu_of(&g.menu, &label);
         let page = page_of(&g.page, &label).unwrap_or_else(|| "-".into());
         let hover_read = g.hover_read && tab.is_some();
         if hover_read {
@@ -164,11 +151,8 @@ impl Window {
             ("chip", &mut self.chip, chip),
             ("strip", &mut self.strip, strip),
             ("hover", &mut self.hover, hover),
-            ("menu", &mut self.menu, menu),
             ("page", &mut self.page, page),
             ("title", &mut self.title, title),
-            ("worker", &mut self.worker, worker),
-            ("done_tip", &mut self.done_tip, done_tip),
         ] {
             if (what == "hover" && !hover_read) || (what == "page" && !g.page_read) {
                 continue;
@@ -200,9 +184,6 @@ pub struct Desk {
     pub chains_window: String,
     /// Session ID of the chains window's front tab.
     pub front_sid: String,
-    /// Observed This Mac menu rows (`This Mac — …`, or `m8 Heron — …` once the title is read;
-    /// [`here_counts`]).
-    pub here: Vec<(i64, String)>,
     /// Observed `Sessions: …` page rows.
     pub sessions: Vec<(i64, String)>,
     /// Observed today summary lines under STATUS ([`today_of`]).
@@ -218,11 +199,6 @@ pub struct Desk {
 impl Desk {
     /// Appends changed desk observations from `g`, returning each change.
     pub fn note(&mut self, g: &Glance) -> Vec<(&'static str, String)> {
-        let here = g
-            .menu
-            .iter()
-            .find(|r| r.section == "here")
-            .map_or_else(|| "-".to_string(), |r| r.label.clone());
         let sessions = g
             .page
             .iter()
@@ -232,7 +208,6 @@ impl Desk {
         let every = every_of(&g.page).unwrap_or_else(|| "-".into());
         let mut said = Vec::new();
         for (what, list, v) in [
-            ("here", &mut self.here, here),
             ("sessions", &mut self.sessions, sessions),
             ("today", &mut self.today, today),
             ("every", &mut self.every, every),
@@ -276,9 +251,6 @@ pub struct Glance {
     pub t: i64,
     pub chrome: String,
     pub strip: Vec<StripTab>,
-    pub menu: Vec<MenuRow>,
-    /// The rows one level into each submenu ([`sub_rows`]).
-    pub sub: Vec<SubRow>,
     /// Parsed `text key=… label=…` rows from the Harness page.
     pub page: Vec<(String, String)>,
     /// Whether `chrome` included a complete tooltip table.
@@ -309,8 +281,6 @@ impl Glance {
             t,
             chrome: chrome.to_string(),
             strip,
-            menu: menu_rows(chrome),
-            sub: sub_rows(chrome),
             page,
             hover_read,
             page_read,
@@ -363,17 +333,6 @@ impl StripTab {
                 .map(str::to_string)
         })
     }
-}
-
-/// Parsed `statusmenu` row with its section header, label, enabled flag, and tip.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MenuRow {
-    pub section: String,
-    pub label: String,
-    pub at: String,
-    pub indent: u8,
-    /// Its hover (`tip="…"`), where it has one.
-    pub tip: Option<String>,
 }
 
 /// Extracts and unescapes a `key="…"` value from `line`.
@@ -546,237 +505,6 @@ pub fn team_unmarked(shown: &str) -> &str {
         .rsplit_once(" \u{21c9}")
         .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         .map_or(title, |(t, _)| t)
-}
-
-/// The section an Info row heads, by its words.
-fn section_of(label: &str) -> Option<&'static str> {
-    if here_counts(label).is_some() {
-        return Some("here");
-    }
-    [
-        ("Needs you (", "needs"),
-        ("Done for you (", "done"),
-        ("To look at (", "look"),
-    ]
-    .into_iter()
-    .find(|(head, _)| label.starts_with(head))
-    .map(|(_, s)| s)
-}
-
-/// This Mac's counts: what its row carries after ` — `, the row being led by `This Mac` or, once
-/// the title's reader has read it, by this machine's title (`m8 Heron`, `m0 Maize`: `m`, digits,
-/// then the nickname; `docs/DESIGN-machine-names-2026-11-04.md` §5.5).
-#[must_use]
-pub fn here_counts(label: &str) -> Option<&str> {
-    let (lead, counts) = label.split_once(" \u{2014} ")?;
-    let titled = lead.strip_prefix('m').is_some_and(|rest| {
-        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        digits > 0 && rest.as_bytes().get(digits).is_none_or(|b| *b == b' ')
-    });
-    (lead == "This Mac" || titled).then_some(counts)
-}
-
-/// Parses `statusmenu` rows from `chrome` under their section headers.
-#[must_use]
-pub fn menu_rows(chrome: &str) -> Vec<MenuRow> {
-    let mut section = "-";
-    let mut out = Vec::new();
-    for line in chrome.lines() {
-        let Some(rest) = line.strip_prefix("statusmenu ") else {
-            continue;
-        };
-        if rest.starts_with("---") {
-            section = "-";
-            continue;
-        }
-        let Some(body) = rest.strip_prefix('"') else {
-            continue;
-        };
-        let (label, tail) = unquote(body);
-        if word(tail, "enabled").as_deref() == Some("no")
-            && let Some(head) = section_of(&label)
-        {
-            section = head;
-        }
-        out.push(MenuRow {
-            section: section.to_string(),
-            label,
-            at: word(tail, "at").unwrap_or_default(),
-            indent: word(tail, "indent")
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0),
-            tip: quoted(tail, "tip"),
-        });
-    }
-    out
-}
-
-/// The tip of the Done for you row naming the tab labelled `tab` (slice 9c), `-` where no such
-/// row or no tip.
-#[must_use]
-pub fn done_tip_of(menu: &[MenuRow], tab: &str) -> String {
-    menu.iter()
-        .find(|r| r.section == "done" && r.indent == 0 && row_names(&r.label, tab))
-        .and_then(|r| r.tip.clone())
-        .unwrap_or_else(|| "-".into())
-}
-
-/// Whether menu row `row` names the tab labelled `tab`.
-#[must_use]
-pub fn row_names(row: &str, tab: &str) -> bool {
-    let mut cs = row.chars();
-    cs.next();
-    cs.as_str()
-        .strip_prefix(' ')
-        .and_then(|r| r.strip_prefix(tab))
-        .is_some_and(|r| r.starts_with(" \u{2014} ") || r.starts_with(" (worker of "))
-}
-
-/// Whether a menu row is its section's header (`Needs you (2)`).
-fn is_head(r: &MenuRow) -> bool {
-    section_of(&r.label) == Some(r.section.as_str())
-}
-
-/// Formats all menu rows in `menu` naming `tab` for [`Window::menu`].
-#[must_use]
-pub fn menu_of(menu: &[MenuRow], tab: &str) -> String {
-    let named: Vec<(&MenuRow, &[MenuRow])> = menu
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.indent == 0 && row_names(&r.label, tab))
-        .map(|(i, r)| {
-            let under = &menu[i + 1..];
-            let n = under.iter().take_while(|u| u.indent > 0).count();
-            (r, &under[..n])
-        })
-        .collect();
-    let mut lines = Vec::new();
-    let mut sections: Vec<&str> = named.iter().map(|(r, _)| r.section.as_str()).collect();
-    sections.dedup();
-    for section in sections
-        .into_iter()
-        .filter(|s| matches!(*s, "needs" | "done"))
-    {
-        let Some(head) = menu.iter().find(|r| r.section == section && is_head(r)) else {
-            continue;
-        };
-        let rows = menu
-            .iter()
-            .filter(|r| {
-                r.section == section && r.indent == 0 && !is_head(r) && !r.label.starts_with("and ")
-            })
-            .count();
-        lines.push(format!(
-            "{section}-head|{} rows={rows}",
-            masked(&head.label)
-        ));
-    }
-    for (r, under) in named {
-        lines.push(format!("{}|{}", r.section, masked(&r.label)));
-        lines.extend(
-            under
-                .iter()
-                .map(|u| format!("{}|{} indent={}", u.section, masked(&u.label), u.indent)),
-        );
-    }
-    lines.join("\n")
-}
-
-/// One row one level into a submenu of `chrome`'s `statusmenu` lines (printed with two spaces
-/// before it, which [`menu_rows`] passes over): the submenu's own row, its words and its tip.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SubRow {
-    pub parent: String,
-    pub label: String,
-    pub tip: Option<String>,
-}
-
-/// Parses the rows one level into each submenu of `chrome`'s `statusmenu` lines.
-#[must_use]
-pub fn sub_rows(chrome: &str) -> Vec<SubRow> {
-    let mut parent: Option<String> = None;
-    let mut out = Vec::new();
-    for line in chrome.lines() {
-        let Some(rest) = line.strip_prefix("statusmenu ") else {
-            continue;
-        };
-        if let Some(body) = rest.strip_prefix('"') {
-            let (label, tail) = unquote(body);
-            parent = tail
-                .split_whitespace()
-                .any(|w| w == "submenu")
-                .then_some(label);
-            continue;
-        }
-        if rest.starts_with("---") {
-            parent = None;
-            continue;
-        }
-        let (Some(body), Some(p)) = (rest.strip_prefix("  \""), &parent) else {
-            continue;
-        };
-        let (label, tail) = unquote(body);
-        out.push(SubRow {
-            parent: p.clone(),
-            label,
-            tip: quoted(tail, "tip"),
-        });
-    }
-    out
-}
-
-/// Whether submenu row `parent` is a manager's (`<label> — <n> worker(s): …`, `manager_line`).
-fn is_manager(parent: &str) -> bool {
-    parent
-        .split_once(" \u{2014} ")
-        .and_then(|(_, r)| r.split_once(' '))
-        .is_some_and(|(n, w)| {
-            n.parse::<usize>().is_ok() && (w.starts_with("worker: ") || w.starts_with("workers: "))
-        })
-}
-
-/// Formats tab `tab`'s row one level into its manager's submenu for [`Window::worker`]
-/// (`mgr|<the manager's row>`, `row|<its row>`, then `tip|<its tip>` where it has one), ages
-/// masked; `-` where no manager's submenu names it.
-#[must_use]
-pub fn worker_of(rows: &[SubRow], tab: &str) -> String {
-    let Some(r) = rows
-        .iter()
-        .find(|r| is_manager(&r.parent) && row_names(&r.label, tab))
-    else {
-        return "-".into();
-    };
-    let mut out = vec![
-        format!("mgr|{}", masked(&r.parent)),
-        format!("row|{}", masked(&r.label)),
-    ];
-    if let Some(tip) = &r.tip {
-        out.push(format!("tip|{tip}"));
-    }
-    out.join("\n")
-}
-
-/// A [`Window::worker`] entry's `field|` line.
-fn worker_field<'a>(entry: &'a str, field: &str) -> Option<&'a str> {
-    entry
-        .lines()
-        .find_map(|l| l.strip_prefix(field)?.strip_prefix('|'))
-}
-
-/// Replaces relative age tokens (`6s`, `3m`, `2h`, `1d`) in `s` with `#`.
-#[must_use]
-pub fn masked(s: &str) -> String {
-    s.split(' ')
-        .map(|w| {
-            let n = w.trim_end_matches(['s', 'm', 'h', 'd']);
-            if !n.is_empty() && n.len() + 1 == w.len() && n.bytes().all(|b| b.is_ascii_digit()) {
-                "#"
-            } else {
-                w
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Parses `(key, label)` pairs from `inspect app/v1 view <id> text` output.
@@ -1022,13 +750,6 @@ pub(crate) fn states(strip: &str) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// The menu rows of a [`Window::menu`] entry in `section`.
-pub(crate) fn rows_in<'a>(menu: &'a str, section: &str) -> Vec<&'a str> {
-    menu.lines()
-        .filter_map(|l| l.strip_prefix(section)?.strip_prefix('|'))
-        .collect()
-}
-
 /// A [`Window::page`] entry's `field=` line.
 pub(super) fn page_field<'a>(page: &'a str, field: &str) -> Option<&'a str> {
     page.lines()
@@ -1196,8 +917,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::First(&[Chain::LandA, Chain::LandJ, Chain::LandK, Chain::LandListed]),
-        name: "never a Done for you row or a •, never a need row where none is scripted",
-        judge: never_a_row,
+        name: "never a •, never a need (status needs=-) where none is scripted",
+        judge: never_a_mark,
     },
     Want {
         under: Under::Scenario(Scenario::L1),
@@ -1261,8 +982,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::L3),
-        name: "its row under Needs you (N) in the worker's words, N its rows; its tab's attention state",
-        judge: l3_row,
+        name: "its tab's attention state while its need stands",
+        judge: l3_attention,
     },
     Want {
         under: Under::Scenario(Scenario::L5),
@@ -1271,8 +992,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::L5),
-        name: "under the floor: no •, no Done for you row",
-        judge: never_a_row,
+        name: "under the floor: no •",
+        judge: never_a_mark,
     },
     Want {
         under: Under::Scenario(Scenario::L5),
@@ -1286,13 +1007,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::L7),
-        name: "its Done for you row ✓ … — landed; This Mac counts every landed tab",
-        judge: l7_rows,
-    },
-    Want {
-        under: Under::Scenario(Scenario::L7),
-        name: "This Mac counts every held Land tab as landing, less those whose need it counts",
-        judge: l7_here,
+        name: "its tab's • once landed",
+        judge: l7_dot,
     },
     Want {
         under: Under::Scenario(Scenario::L7),
@@ -1320,11 +1036,6 @@ pub const WANTS: &[Want] = &[
         judge: |s, c| hold::legs(s, c, hold::DEFENSE),
     },
     Want {
-        under: Under::Scenario(Scenario::L15),
-        name: "its row under its manager: ● … — working before land@v1, ● … — landing while it holds, its tip the hold's",
-        judge: hold::worker_row,
-    },
-    Want {
         under: Under::Scenario(Scenario::L16),
         name: "status end=<t> end_seen=0 once landed",
         judge: end_stands,
@@ -1336,7 +1047,7 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::L16),
-        name: "its • and its Done for you row; after person look and tab: end_seen=1, both gone",
+        name: "its •; after person look and tab: end_seen=1, the • gone",
         judge: l16_look,
     },
     Want {
@@ -1351,8 +1062,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::L17),
-        name: "its • and its Done for you row; after the press: in front, end_seen=1, the row gone",
-        judge: l17_press,
+        name: "its •; its end still unseen behind the tab a look saw (end_seen=0)",
+        judge: l17_still,
     },
     Want {
         under: Under::Scenario(Scenario::N1),
@@ -1361,13 +1072,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::N1),
-        name: "drawn= equal to face=, the menu's need with no count (its other on a row of its own), the page's need (+1 more)",
+        name: "drawn= equal to face=, the page's need (+1 more)",
         judge: |s, c| n_window(s, c, 0),
-    },
-    Want {
-        under: Under::Scenario(Scenario::N1),
-        name: "(b) on a row one level in under its row (indent=1)",
-        judge: |s, c| n_further(s, c, 0),
     },
     Want {
         under: Under::Scenario(Scenario::N2),
@@ -1376,13 +1082,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::N2),
-        name: "drawn= equal to face=, no need row, no need on the page",
+        name: "drawn= equal to face=, no need on the page",
         judge: |s, c| n_window(s, c, 1),
-    },
-    Want {
-        under: Under::Scenario(Scenario::N2),
-        name: "no row one level in",
-        judge: |s, c| n_further(s, c, 1),
     },
     Want {
         under: Under::Scenario(Scenario::N3),
@@ -1391,13 +1092,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::N3),
-        name: "drawn= equal to face=, the menu's and the page's need alone",
+        name: "drawn= equal to face=, the page's need alone",
         judge: |s, c| n_window(s, c, 2),
-    },
-    Want {
-        under: Under::Scenario(Scenario::N3),
-        name: "no row one level in: its one need",
-        judge: |s, c| n_further(s, c, 2),
     },
     Want {
         under: Under::Scenario(Scenario::N4),
@@ -1406,18 +1102,8 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::N4),
-        name: "drawn= equal to face=, the menu's need with no count (its other on a row of its own), the page's need (+1 more)",
+        name: "drawn= equal to face=, the page's need (+1 more)",
         judge: |s, c| n_window(s, c, 3),
-    },
-    Want {
-        under: Under::Scenario(Scenario::N4),
-        name: "(c), never (b), on a row one level in under its row (indent=1)",
-        judge: |s, c| n_further(s, c, 3),
-    },
-    Want {
-        under: Under::Scenario(Scenario::N4),
-        name: stopped::WANT,
-        judge: stopped::first,
     },
     Want {
         under: Under::Scenario(Scenario::O1),
@@ -1601,30 +1287,23 @@ fn never_ended(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     Verdict::Pass(format!("end=- at all {read} status read(s)"))
 }
 
-/// Never a row (every chain but L16's and L17's, and L5 under the floor).
-fn never_a_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
+/// Never a mark (every chain but L16's and L17's, and L5 under the floor): no `•` on its tab
+/// where it has no task record, and no need published (`status needs=`) where none is scripted.
+fn never_a_mark(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let w = &seen.window;
     let mut bad = Vec::new();
-    if !cx.chain.tasked() {
-        if let Some((t, m)) = w.menu.iter().find(|(_, m)| !rows_in(m, "done").is_empty()) {
-            bad.push(format!(
-                "+{} a Done for you row: {}",
-                at(cx.t0, *t),
-                rows_in(m, "done").join(" / ")
-            ));
-        }
-        if let Some((t, s)) = w.strip.iter().find(|(_, s)| states(s).contains(&"done")) {
-            bad.push(format!("+{} its tab's • ({s})", at(cx.t0, *t)));
-        }
+    if !cx.chain.tasked()
+        && let Some((t, s)) = w.strip.iter().find(|(_, s)| states(s).contains(&"done"))
+    {
+        bad.push(format!("+{} its tab's • ({s})", at(cx.t0, *t)));
     }
     if !NEEDING.contains(&cx.chain)
-        && let Some((t, m)) = w.menu.iter().find(|(_, m)| !rows_in(m, "needs").is_empty())
+        && let Some((t, n)) = seen
+            .status
+            .iter()
+            .find_map(|(t, s)| word(s, "needs").filter(|n| n != "-").map(|n| (*t, n)))
     {
-        bad.push(format!(
-            "+{} a need row: {}",
-            at(cx.t0, *t),
-            rows_in(m, "needs").join(" / ")
-        ));
+        bad.push(format!("+{} a need: status needs={n}", at(cx.t0, t)));
     }
     let strips = w.strip.iter().filter(|(_, s)| s != "-").count();
     if bad.is_empty() && strips == 0 {
@@ -1634,10 +1313,10 @@ fn never_a_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         ));
     }
     let said = format!(
-        "{} menu read(s), {strips} strip read(s){}",
-        w.menu.len(),
+        "{} status read(s), {strips} strip read(s){}",
+        seen.status.len(),
         if cx.chain.tasked() {
-            " (its task record's row and • are L7's)"
+            " (its task record's • is L7's)"
         } else {
             ""
         }
@@ -1731,91 +1410,21 @@ fn l3_count(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     }
 }
 
-/// A [`Window::menu`] entry's `<section>-head|` line.
-fn head_of(menu: &str, section: &str) -> Option<(Option<usize>, usize)> {
-    let head = menu
-        .lines()
-        .find_map(|l| l.strip_prefix(section)?.strip_prefix("-head|"))?;
-    let rows = word(head, "rows")?.parse().ok()?;
-    let n = head
-        .split_once(" (")
-        .and_then(|(_, r)| r.split_once(')'))
-        .and_then(|(n, _)| n.parse().ok());
-    Some((n, rows))
-}
-
-/// L3: its row under `Needs you (N)` in the worker's words (`◇ land-a — rotate the deploy key · #`, never `<program> needs you:`), the header's `N` the rows the menu lists under it (every tab's need, so 1 or more), and `attention` among its tab's states, while its need stood.
-fn l3_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
+/// L3: `attention` among its tab's states while its need stood.
+fn l3_attention(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((from, until)) = need_span(seen, cx.t0) else {
         return Verdict::Unobserved("no NEEDS line (L3's records)".into());
     };
-    let w = &seen.window;
-    let want = format!(" {} \u{2014} {NEED} \u{b7} #", w.label);
-    let menus = standing(&w.menu, from, until);
-    let found = menus.iter().find_map(|(t, m)| {
-        rows_in(m, "needs")
-            .into_iter()
-            .find(|r| r.contains(&want))
-            .map(|r| (*t, r, m.as_str()))
-    });
-    let row = found.map(|(t, r, _)| (t, r));
-    let strips = standing(&w.strip, from, until);
-    let attention = strips
+    let strips = standing(&seen.window.strip, from, until);
+    match strips
         .iter()
-        .find(|(_, s)| states(s).contains(&"attention"));
-    let mut bad = Vec::new();
-    if let Some((t, _, m)) = found {
-        match head_of(m, "needs") {
-            Some((Some(n), rows)) if n >= 1 && n == rows => {}
-            Some((n, rows)) => bad.push(format!(
-                "+{} its header counts {}, the menu lists {rows} row(s) under it",
-                at(cx.t0, t),
-                n.map_or_else(|| "nothing".to_string(), |n| n.to_string())
-            )),
-            None => bad.push(format!(
-                "+{} no Needs you (N) header over its row",
-                at(cx.t0, t)
-            )),
-        }
-    }
-    match row {
-        Some((_, r)) if r.contains("needs you:") => {
-            bad.push(format!("its row reads the entry's words: {r}"));
-        }
-        Some(_) => {}
-        None => bad.push(format!(
-            "no Needs you row \"…{want}\" while it stood ({} menu read(s): {:?})",
-            menus.len(),
-            menus
-                .iter()
-                .map(|(_, m)| one_line(m, 120))
-                .collect::<Vec<_>>()
-        )),
-    }
-    if attention.is_none() {
-        bad.push(format!(
+        .find(|(_, s)| states(s).contains(&"attention"))
+    {
+        Some((t, s)) => Verdict::Pass(format!("strip +{} {s}", at(cx.t0, *t))),
+        None => Verdict::Fail(format!(
             "no attention among its tab's states while it stood ({:?})",
             strips.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>()
-        ));
-    }
-    let said = format!(
-        "row {}; header {}; strip {}",
-        row.map_or_else(
-            || "-".to_string(),
-            |(t, r)| format!("+{} {r}", at(cx.t0, t))
-        ),
-        found
-            .and_then(|(_, _, m)| m.lines().find_map(|l| l.strip_prefix("needs-head|")))
-            .unwrap_or("-"),
-        attention.map_or_else(
-            || "-".to_string(),
-            |(t, s)| format!("+{} {s}", at(cx.t0, *t))
-        )
-    );
-    if bad.is_empty() {
-        Verdict::Pass(said)
-    } else {
-        Verdict::Fail(format!("{said}: {}", bad.join("; ")))
+        )),
     }
 }
 
@@ -1936,115 +1545,12 @@ fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 pub(crate) const L5_UNSPOKEN: &str =
     "the landed chip's description was not drawn (its tail not judged)";
 
-/// L7: the worker's row under Done for you, `✓ land-e — landed #`, after its landing.
-fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
-    let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
-        return Verdict::Unobserved("no landing (L7's records)".into());
-    };
-    let w = &seen.window;
-    let want = format!("\u{2713} {} \u{2014} landed", w.label);
-    let row = standing(&w.menu, *d, i64::MAX)
-        .into_iter()
-        .flat_map(|(t, m)| rows_in(m, "done").into_iter().map(move |r| (*t, r)))
-        .find(|(_, r)| r.starts_with(&want));
-    let mut bad = Vec::new();
-    if row.is_none() {
-        bad.push(format!(
-            "no Done for you row \"{want} …\" after the landing"
-        ));
+/// L7: the worker's `•` on its tab after its landing.
+fn l7_dot(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
+    match end_dot(seen, cx) {
+        Ok(said) => Verdict::Pass(said),
+        Err(v) => v,
     }
-    let rest = w.rest.as_deref();
-    let here = rest.and_then(|r| quoted(r, "here"));
-    let tabs: Option<usize> = rest.and_then(|r| word(r, "landed_tabs")?.parse().ok());
-    let counted = here.as_deref().and_then(here_counts).and_then(|h| {
-        h.split(" \u{b7} ")
-            .find_map(|p| p.strip_suffix(" landed"))
-            .and_then(|n| n.parse::<usize>().ok())
-    });
-    let mut unread = Vec::new();
-    match (counted, tabs, rest.and_then(totals_short)) {
-        (_, None, _) => unread.push(UNREST.to_string()),
-        (_, _, Some(Verdict::Fail(why))) => bad.push(why),
-        (_, _, Some(v)) => unread.push(v.why().to_string()),
-        (Some(n), Some(k), None) if n == k && k > 0 => {}
-        (n, Some(k), None) => bad.push(format!(
-            "This Mac reads {} landed, {k} tab(s) said task=landed: {}",
-            n.map_or_else(|| "no".to_string(), |n| n.to_string()),
-            here.as_deref().unwrap_or("-")
-        )),
-    }
-    let said = format!(
-        "row {}; at rest {}",
-        row.map_or_else(
-            || "-".to_string(),
-            |(t, r)| format!("+{} {r}", at(cx.t0, t))
-        ),
-        rest.unwrap_or("-")
-    );
-    told(said, &bad, &unread)
-}
-
-/// Whether a Land tab's `status` says its hold stands: `land_nudges=` a count, where `-` is no
-/// hold (the line's `land_fields`) — Land's instruction typed, the tab not landed. `None` where
-/// the line has no `land_nudges=` at all: a hold this read cannot see either way.
-#[must_use]
-pub fn held_at_rest(status: &str) -> Option<bool> {
-    word(status, "land_nudges").map(|n| n != "-")
-}
-
-/// L7 widened (§14.6): at rest, This Mac counts every Land tab that holds as `landing`, less
-/// those whose need it counts first (`need you`): `held_landing` less `held_needs` of the rest
-/// read, exactly, and a build whose This Mac calls a held tab `resting` fails. It never passes on
-/// `-` (§14.0 limit 7): UNOBSERVED where an open Land tab's `status` names no hold either way
-/// (`held_unread`), where no Land tab holds at rest, and where This Mac counts a wait, which
-/// counts first and which no `status` attributes to a tab; a FAIL where END's `status` read of a
-/// tab failed, which no total counts ([`totals_short`]).
-fn l7_here(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
-    let Some(rest) = seen.window.rest.as_deref() else {
-        return Verdict::Unobserved(UNREST.into());
-    };
-    let n = |key: &str| word(rest, key).and_then(|v| v.parse::<usize>().ok());
-    let (Some(held), Some(needs), Some(unread)) =
-        (n("held_landing"), n("held_needs"), n("held_unread"))
-    else {
-        return Verdict::Unobserved(format!("the rest read lacks its counts: {rest}"));
-    };
-    if let Some(v) = totals_short(rest) {
-        return v;
-    }
-    let Some((here, counts)) = quoted(rest, "here").and_then(|here| {
-        let counts = here_counts(&here)?.to_string();
-        Some((here, counts))
-    }) else {
-        return Verdict::Unobserved("the menu's This Mac row was never read at rest".into());
-    };
-    if unread > 0 {
-        return Verdict::Unobserved(format!(
-            "{unread} open Land tab(s) whose status names no land_nudges=, so no hold of theirs was read; This Mac \"{here}\""
-        ));
-    }
-    if held == 0 {
-        return Verdict::Unobserved(format!(
-            "no Land tab held at rest, so nothing for This Mac to count landing; This Mac \"{here}\""
-        ));
-    }
-    let waits = count_in(&counts, "waiting");
-    if waits > 0 {
-        return Verdict::Unobserved(format!(
-            "This Mac counts {waits} waiting, which count before landing and which no status names by tab; This Mac \"{here}\""
-        ));
-    }
-    let want = held.saturating_sub(needs);
-    let landing = count_in(&counts, "landing");
-    let said = format!(
-        "This Mac \"{here}\"; {held} Land tab(s) held at rest, {needs} of them with a need it counts first"
-    );
-    let bad = if landing == want {
-        Vec::new()
-    } else {
-        vec![format!("{landing} landing, not {want}")]
-    };
-    told(said, &bad, &[])
 }
 
 /// What one title read says of its chain's mode ([`title_says`]).
@@ -2633,7 +2139,7 @@ fn l7_forced(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
 /// Why a want of the window at rest is unread: END never read it.
 const UNREST: &str = "the window never read at rest (END not reached, or its idle window moved)";
 
-/// Where the rest read's tab totals (`landed_tabs`, `landing_tabs`, `held_*`) leave a tab out: a
+/// Where the rest read's tab totals (`landed_tabs`, `landing_tabs`) leave a tab out: a
 /// FAIL naming each tab whose `status` read END failed and what it answered (the line's
 /// `status_failed=`, `-` where every read answered); UNOBSERVED where the line lacks the key.
 /// `None` where every tab is counted.
@@ -2731,8 +2237,8 @@ fn end_stands(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     }
 }
 
-/// Its `•` and its Done for you row (`✓ <label> — landed #`) once landed, before the end's look.
-fn end_marks(seen: &Seen, cx: &Ctx<'_>) -> Result<String, Verdict> {
+/// Its `•` once landed, before the end's look.
+fn end_dot(seen: &Seen, cx: &Ctx<'_>) -> Result<String, Verdict> {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Err(Verdict::Unobserved("no landing (its records)".into()));
     };
@@ -2745,36 +2251,15 @@ fn end_marks(seen: &Seen, cx: &Ctx<'_>) -> Result<String, Verdict> {
             at(cx.t0, *t)
         )));
     }
-    let want = format!("\u{2713} {} \u{2014} landed", w.label);
-    let dot = standing(&w.strip, *d, i64::MAX)
+    match standing(&w.strip, *d, i64::MAX)
         .into_iter()
-        .find(|(_, s)| states(s).contains(&"done"));
-    let row = standing(&w.menu, *d, i64::MAX)
-        .into_iter()
-        .flat_map(|(t, m)| rows_in(m, "done").into_iter().map(move |r| (*t, r)))
-        .find(|(_, r)| r.starts_with(&want));
-    let said = format!(
-        "• {}; row {}",
-        dot.map_or_else(
-            || "-".to_string(),
-            |(t, s)| format!("+{} {s}", at(cx.t0, *t))
-        ),
-        row.map_or_else(
-            || "-".to_string(),
-            |(t, r)| format!("+{} {r}", at(cx.t0, t))
-        )
-    );
-    if dot.is_none() || row.is_none() {
-        return Err(Verdict::Fail(format!(
-            "{said}: landed past the floor, yet no {} once landed",
-            match (dot.is_none(), row.is_none()) {
-                (true, true) => "• and no Done for you row",
-                (true, false) => "•",
-                _ => "Done for you row",
-            }
-        )));
+        .find(|(_, s)| states(s).contains(&"done"))
+    {
+        Some((t, s)) => Ok(format!("• +{} {s}", at(cx.t0, *t))),
+        None => Err(Verdict::Fail(
+            "• -: landed past the floor, yet no • once landed".into(),
+        )),
     }
-    Ok(said)
 }
 
 /// A [`Window::looked`] line of `step`.
@@ -2784,8 +2269,8 @@ fn step<'a>(w: &'a Window, name: &str) -> Option<&'a (i64, String)> {
         .find(|(_, l)| word(l, "step").as_deref() == Some(name))
 }
 
-/// Its `step=<name>` line of END left its end standing, unseen with its `•` and its Done for you
-/// row (`end_seen=0 … done_row=yes`, `done` among its states where it is behind).
+/// Its `step=<name>` line of END left its end standing, unseen with its `•` (`end_seen=0`,
+/// `done` among its states where it is behind).
 fn left_it(w: &Window, cx: &Ctx<'_>, name: &str, why: &str) -> Result<String, Verdict> {
     let Some((t, l)) = step(w, name) else {
         return Err(Verdict::Unobserved(format!(
@@ -2794,20 +2279,19 @@ fn left_it(w: &Window, cx: &Ctx<'_>, name: &str, why: &str) -> Result<String, Ve
     };
     let behind = word(l, "selected").as_deref() == Some("0");
     let stands = word(l, "end_seen").as_deref() == Some("0")
-        && word(l, "done_row").as_deref() == Some("yes")
         && (!behind || word(l, "states").is_some_and(|s| s.split(',').any(|x| x == "done")));
     if !stands {
         return Err(Verdict::Fail(format!(
-            "+{} {why}, yet: {l} (wanted end_seen=0, its • and its row)",
+            "+{} {why}, yet: {l} (wanted end_seen=0 and its •)",
             at(cx.t0, *t)
         )));
     }
     Ok(format!("{name} +{} {l}", at(cx.t0, *t)))
 }
 
-/// L16: its `•` and its row once landed.
+/// L16: its `•` once landed, gone with the look that sees its end.
 fn l16_look(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
-    let marks = match end_marks(seen, cx) {
+    let marks = match end_dot(seen, cx) {
         Ok(s) => s,
         Err(v) => return v,
     };
@@ -2828,25 +2312,22 @@ fn l16_look(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let said = format!("{}; look +{} {l}", before.join("; "), at(cx.t0, *t));
     let gone = word(l, "end_seen").as_deref() == Some("1")
         && word(l, "selected").as_deref() == Some("1")
-        && !word(l, "states").is_some_and(|s| s.split(',').any(|x| x == "done"))
-        && word(l, "done_row").as_deref() == Some("no");
+        && !word(l, "states").is_some_and(|s| s.split(',').any(|x| x == "done"));
     if gone {
         Verdict::Pass(said)
     } else {
-        Verdict::Fail(format!(
-            "{said}: wanted selected=1 end_seen=1, no •, no row"
-        ))
+        Verdict::Fail(format!("{said}: wanted selected=1 end_seen=1, no •"))
     }
 }
 
-/// L17: its `•` and its row once landed.
-fn l17_press(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
-    let marks = match end_marks(seen, cx) {
+/// L17: its `•` once landed, and its end still unseen behind the tab a look saw.
+fn l17_still(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
+    let marks = match end_dot(seen, cx) {
         Ok(s) => s,
         Err(v) => return v,
     };
     let w = &seen.window;
-    let mut before = vec![marks];
+    let mut said = vec![marks];
     for (name, why) in [
         ("sweep", "brought forward with no look"),
         ("look-on", "behind the tab the look began on"),
@@ -2856,25 +2337,11 @@ fn l17_press(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         ),
     ] {
         match left_it(w, cx, name, why) {
-            Ok(s) => before.push(s),
+            Ok(s) => said.push(s),
             Err(v) => return v,
         }
     }
-    let Some((t, l)) = step(w, "press") else {
-        return Verdict::Unobserved(format!("{}; END's press never ran", before.join("; ")));
-    };
-    let said = format!("{}; press +{} {l}", before.join("; "), at(cx.t0, *t));
-    let ok = word(l, "pressed").as_deref() == Some("OK")
-        && word(l, "selected").as_deref() == Some("1")
-        && word(l, "end_seen").as_deref() == Some("1")
-        && word(l, "done_row").as_deref() == Some("no");
-    if ok {
-        Verdict::Pass(said)
-    } else {
-        Verdict::Fail(format!(
-            "{said}: wanted pressed=OK selected=1 end_seen=1 done_row=no"
-        ))
-    }
+    Verdict::Pass(said.join("; "))
 }
 
 /// N1–N4: the words each step's reply's yield is told by (its last row, which `EVENT idle` quotes: its last need, or the defense) and the count `status` wants of its needs.
@@ -3033,7 +2500,7 @@ fn n_status(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     }
 }
 
-/// N1–N4 on the window: every chip line standing in the span drawn as its face (the front tab), and, settled, its need row naming the first need with no count (every other need has a row of its own one level in, [`n_further`]), and its page state naming the first need with the others' count (` (+1 more)`), the need alone, or none.
+/// N1–N4 on the window: every chip line standing in the span drawn as its face (the front tab), and, settled, its page state naming the first need with the others' count (` (+1 more)`), the need alone, or none.
 fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let (from, until) = match n_span(seen, cx.t0, k) {
         Ok(s) => s,
@@ -3065,21 +2532,6 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
         bad.push("no chip line in its span".into());
     }
     let more = N_STEPS[k].1.saturating_sub(1);
-    let want_row = match N_STEPS[k].1 {
-        0 => None,
-        _ => Some(format!(" {} \u{2014} {NEED_A} \u{b7} #", w.label)),
-    };
-    let menu = settled(&w.menu, until).map_or("", |(_, m)| m.as_str());
-    let rows = rows_in(menu, "needs");
-    match &want_row {
-        Some(want) if !rows.iter().any(|r| r.contains(want.as_str())) => {
-            bad.push(format!("no need row \"…{want}\" settled ({rows:?})"));
-        }
-        None if !rows.is_empty() => {
-            bad.push(format!("a need row stands with none named: {rows:?}"))
-        }
-        _ => {}
-    }
     let page = settled(&w.page, until).map_or("-", |(_, p)| p.as_str());
     let state = page_field(page, "state").unwrap_or("");
     let mut unread = Vec::new();
@@ -3104,7 +2556,7 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
         _ => {}
     }
     let said = format!(
-        "{} chip line(s) standing, the last {}; rows {rows:?}; state \"{state}\"",
+        "{} chip line(s) standing, the last {}; state \"{state}\"",
         chips.len(),
         chips
             .last()
@@ -3114,8 +2566,8 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 }
 
 /// UNOBSERVED where no window read fell in N`k+1`'s span (`(from, until)`): no glance
-/// ([`Window::glances`]) between its reply and its next act. The menu and page the span settles
-/// on are then a read from before its reply or none, which say nothing of the step (Muse Code's
+/// ([`Window::glances`]) between its reply and its next act. The page the span settles
+/// on is then a read from before its reply or none, which say nothing of the step (Muse Code's
 /// N1, 2026-11-05: the watch's first read of cruise-n came at +129.3 s, after its first need's
 /// 2 min back-off had closed the span, and the judges failed it on rows nobody read). A glance
 /// that changed nothing counts: it read the rows that stood from before the reply again, inside
@@ -3130,36 +2582,6 @@ fn n_unglanced(w: &Window, t0: i64, k: usize, (from, until): (i64, i64)) -> Opti
             at(t0, until)
         ))
     })
-}
-
-/// N1–N4's further needs, each on a row of its own one level in under the tab's row (`indent=1`).
-const N_OTHERS: [&[&str]; 4] = [&[NEED_B], &[], &[], &[NEED_C]];
-
-/// N1–N4's rows one level in.
-fn n_further(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
-    let (from, until) = match n_span(seen, cx.t0, k) {
-        Ok(s) => s,
-        Err(v) => return v,
-    };
-    if let Some(v) = n_unglanced(&seen.window, cx.t0, k, (from, until)) {
-        return v;
-    }
-    let menu = settled(&seen.window.menu, until);
-    let under: Vec<&str> = menu
-        .map(|(_, m)| rows_in(m, "needs"))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|r| r.strip_suffix(" indent=1"))
-        .collect();
-    let said = format!(
-        "settled {}: rows one level in {under:?}",
-        menu.map_or_else(|| "-".to_string(), |(t, _)| format!("+{}", at(cx.t0, *t)))
-    );
-    if under == N_OTHERS[k] {
-        Verdict::Pass(said)
-    } else {
-        Verdict::Fail(format!("{said}: wanted {:?}", N_OTHERS[k]))
-    }
 }
 
 /// Why a want of a chain's page row is unread.
@@ -3826,18 +3248,13 @@ pub(super) fn open_worker(door: &Door<'_>, tab: &mut Tab, back: Option<&str>, fr
 }
 
 /// What one tab's end step read.
-fn step_line(door: &Door<'_>, tab: &Tab, name: &str, pressed: Option<&str>) -> String {
+fn step_line(door: &Door<'_>, tab: &Tab, name: &str) -> String {
     let s = on(door, &tab.sid, &["status"]);
     let g = Glance::of(now_ms(), &door.out(&["chrome"]), "");
     let label = &tab.seen.window.label;
     let strip = g.strip.iter().find(|t| t.label == *label);
-    let want = format!("\u{2713} {label} \u{2014} ");
-    let row = g
-        .menu
-        .iter()
-        .any(|r| r.section == "done" && r.label.starts_with(&want));
     format!(
-        "step={name} end={} end_seen={} selected={} states={} done_row={}{}",
+        "step={name} end={} end_seen={} selected={} states={}",
         word(&s, "end").unwrap_or_else(|| "?".into()),
         word(&s, "end_seen").unwrap_or_else(|| "?".into()),
         strip.map_or("-", |t| if t.selected { "1" } else { "0" }),
@@ -3848,9 +3265,7 @@ fn step_line(door: &Door<'_>, tab: &Tab, name: &str, pressed: Option<&str>) -> S
             } else {
                 t.states.join(",")
             }
-        ),
-        if row { "yes" } else { "no" },
-        pressed.map_or_else(String::new, |p| format!(" pressed={p}"))
+        )
     )
 }
 
@@ -4220,7 +3635,7 @@ fn q(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Runs the end-of-run idle measurement, front sweep, look, and menu press sequence.
+/// Runs the end-of-run idle measurement, front sweep and look sequence.
 ///
 /// # Errors
 ///
@@ -4266,14 +3681,7 @@ pub(super) fn end_steps(
     }
     let at_rest = idle.moved.is_empty();
     desk.idle = Some(idle);
-    let g = Glance::of(now_ms(), &door.out(&["chrome"]), "");
-    let here = g
-        .menu
-        .iter()
-        .find(|r| r.section == "here")
-        .map_or_else(String::new, |r| r.label.clone());
     let (mut landed_tabs, mut landing_tabs) = (0, 0);
-    let (mut held_landing, mut held_needs, mut held_unread) = (0, 0, 0);
     let mut unread_status = Vec::new();
     for t in tabs.iter() {
         // A tab whose read failed is in no total: the rest line's `status_failed=` names it.
@@ -4290,19 +3698,7 @@ pub(super) fn end_steps(
         match word(&s, "task").as_deref() {
             Some("landed") => landed_tabs += 1,
             Some("theirs") => {}
-            _ => {
-                landing_tabs += 1;
-                match held_at_rest(&s) {
-                    Some(true) => {
-                        held_landing += 1;
-                        if word(&s, "needs").is_some_and(|n| n != "-") {
-                            held_needs += 1;
-                        }
-                    }
-                    Some(false) => {}
-                    None => held_unread += 1,
-                }
-            }
+            _ => landing_tabs += 1,
         }
     }
     let day = local_day(now_ms());
@@ -4349,8 +3745,7 @@ pub(super) fn end_steps(
     };
     let (forced_row, forced_line) = forced.map_or((None, None), |(row, line)| (Some(row), line));
     let rest = format!(
-        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} held_landing={held_landing} held_needs={held_needs} held_unread={held_unread} landings={landings} today={} every={} did={} forced={forced_today} forced_row={} forced_line={} status_failed={}",
-        q(&here),
+        "landed_tabs={landed_tabs} landing_tabs={landing_tabs} landings={landings} today={} every={} did={} forced={forced_today} forced_row={} forced_line={} status_failed={}",
         q(today.as_deref().unwrap_or("-")),
         q(every.as_deref().unwrap_or("-")),
         q(did.as_deref().unwrap_or("-")),
@@ -4368,7 +3763,7 @@ pub(super) fn end_steps(
             tab.seen.window.rest = Some(rest.clone());
         }
     } else {
-        // Its idle window moved, so a tab's act can fall between the menu's read and the tabs'
+        // Its idle window moved, so a tab's act can fall between the page's read and the tabs'
         // statuses, whose totals L7 holds equal: no tab keeps it.
         say(desk, format!("not at rest {rest}"));
     }
@@ -4396,7 +3791,7 @@ pub(super) fn end_steps(
         }
     }
     for tab in tabs.iter_mut().filter(|t| ENDING.contains(&t.chain)) {
-        let l = step_line(door, tab, "sweep", None);
+        let l = step_line(door, tab, "sweep");
         say(desk, format!("{}: {l}", tab.chain.name()));
         tab.seen.window.looked.push((now_ms(), l));
     }
@@ -4407,15 +3802,14 @@ pub(super) fn end_steps(
     else {
         say(
             desk,
-            "no front tab without an end to begin the look on: the look and the press not run"
-                .into(),
+            "no front tab without an end to begin the look on: the look not run".into(),
         );
         return Ok(());
     };
     let Some(i) = index_of(door, &front) else {
         say(
             desk,
-            format!("{front}: not in the front window's strip; the look and the press not run"),
+            format!("{front}: not in the front window's strip; the look not run"),
         );
         return Ok(());
     };
@@ -4428,7 +3822,7 @@ pub(super) fn end_steps(
         format!("person look {chains_window}: {}", looked.trim()),
     );
     for tab in tabs.iter_mut().filter(|t| ENDING.contains(&t.chain)) {
-        let l = step_line(door, tab, "look-on", None);
+        let l = step_line(door, tab, "look-on");
         say(desk, format!("{}: {l}", tab.chain.name()));
         tab.seen.window.looked.push((now_ms(), l));
     }
@@ -4440,53 +3834,14 @@ pub(super) fn end_steps(
             let _ = wait_until(STEP_WAIT, || {
                 word(&on(door, &tab.sid, &["status"]), "end_seen").as_deref() == Some("1")
             });
-            let l = step_line(door, tab, "look", None);
+            let l = step_line(door, tab, "look");
             say(desk, format!("{label}: {l}"));
             tab.seen.window.looked.push((now_ms(), l));
         }
     }
     if let Some(tab) = tabs.iter_mut().find(|t| t.chain == Chain::LandK) {
-        let l = step_line(door, tab, "still", None);
+        let l = step_line(door, tab, "still");
         say(desk, format!("{}: {l}", tab.chain.name()));
-        tab.seen.window.looked.push((now_ms(), l));
-    }
-    if let Some(tab) = tabs.iter_mut().find(|t| t.chain == Chain::LandK) {
-        let label = tab.seen.window.label.clone();
-        let want = format!("\u{2713} {label} \u{2014} ");
-        let row = menu_rows(&door.out(&["chrome"]))
-            .into_iter()
-            .find(|r| r.section == "done" && r.label.starts_with(&want));
-        let pressed = match &row {
-            Some(r) => {
-                let out = door.ctl(&["person", "menubar", "press", &r.at])?;
-                say(
-                    desk,
-                    format!(
-                        "person menubar press {} (\"{}\"): {}{}",
-                        r.at,
-                        r.label,
-                        out.stdout.trim(),
-                        out.stderr.trim()
-                    ),
-                );
-                if out.stdout.starts_with("OK pressed") {
-                    "OK"
-                } else {
-                    "ERR"
-                }
-            }
-            None => {
-                say(desk, format!("{label}: no Done for you row to press"));
-                "no-row"
-            }
-        };
-        if pressed == "OK" {
-            let _ = wait_until(STEP_WAIT, || {
-                word(&on(door, &tab.sid, &["status"]), "end_seen").as_deref() == Some("1")
-            });
-        }
-        let l = step_line(door, tab, "press", Some(pressed));
-        say(desk, format!("{label}: {l}"));
         tab.seen.window.looked.push((now_ms(), l));
     }
     let off = door.out(&["person", "look", "off"]);
@@ -4503,9 +3858,6 @@ pub mod hold;
 
 #[path = "forever_held.rs"]
 pub mod held;
-
-#[path = "forever_stopped.rs"]
-pub mod stopped;
 
 #[cfg(test)]
 #[path = "forever_surfaces_tests.rs"]

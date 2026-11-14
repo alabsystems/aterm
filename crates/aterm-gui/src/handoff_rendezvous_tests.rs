@@ -1466,6 +1466,18 @@ fn open_pty() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
 
+/// Large transfers run with the same descriptor setup as an actual
+/// successor, in their own process so parallel fixtures cannot exhaust its
+/// table. The surrounding test owner retains and waits for this exact child.
+fn enter_claim_process_for_test() -> bool {
+    if !crate::test_alone::alone() {
+        return false;
+    }
+    crate::descriptor_limit::raise_descriptor_limit_for_claim()
+        .expect("the successor descriptor-limit setup is permitted");
+    true
+}
+
 fn pipes_for_test(count: usize) -> (Vec<std::io::PipeReader>, Vec<std::io::PipeWriter>) {
     (0..count).map(|_| aterm_uds::pipe().expect("pipe")).unzip()
 }
@@ -1615,6 +1627,9 @@ fn a_successor_raises_its_descriptor_limit_before_claiming() {
 
 #[test]
 fn a_grant_past_its_deadline_says_the_successor_dialed_and_sends_nothing() {
+    if !enter_claim_process_for_test() {
+        return;
+    }
     for (sessions, chunks) in [(3_usize, false), (100, true)] {
         let rendezvous = bind_for_test();
         let (_reads, writes) = pipes_for_test(sessions);
@@ -1671,6 +1686,9 @@ fn a_grant_past_its_deadline_says_the_successor_dialed_and_sends_nothing() {
 
 #[test]
 fn a_grant_of_100_sessions_crosses_in_chunks() {
+    if !enter_claim_process_for_test() {
+        return;
+    }
     let rendezvous = bind_for_test();
     let (reads, writes) = pipes_for_test(100);
     let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
@@ -1746,6 +1764,9 @@ fn a_grant_of_100_sessions_crosses_in_chunks() {
 
 #[test]
 fn an_atrz1c_claim_never_receives_a_chunked_grant() {
+    if !enter_claim_process_for_test() {
+        return;
+    }
     use std::io::Read as _;
 
     let rendezvous = bind_for_test();
@@ -1929,6 +1950,9 @@ fn stub_grant(
 
 #[test]
 fn a_short_chunk_is_refused_and_closes_every_fd() {
+    if !enter_claim_process_for_test() {
+        return;
+    }
     for (what, second) in [
         ("a short second chunk", Some(30usize)),
         ("no second chunk", None),

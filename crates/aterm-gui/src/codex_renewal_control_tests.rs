@@ -108,6 +108,7 @@ fn seal(ctx: &Arc<crate::SessionCtx>) -> Seal {
         env: Env::from_process().unwrap(),
         intent: Arc::new(IntentFence::new(ctx)),
         record: None,
+        source: None,
         continuation: None,
         fresh_snapshot: None,
     }
@@ -363,6 +364,188 @@ fn codex_renewal_consumed_reply_repairs_the_barrier_and_rejects_a_stale_receipt(
         "ERR codex-renewal record unavailable\n"
     );
     assert_eq!(renewal::read_receipt(&env, &newer.id), Some(newer));
+}
+
+/// A rotation that ended because its successor never attached took the pool's canary onto its
+/// destination; its service gives that back only under the host's closure of its last budget,
+/// never on the receipt alone. With no retained closure it keeps its service and retries.
+#[test]
+fn codex_rotation_ended_unattached_keeps_its_service_until_the_host_proves_closure() {
+    // Its last budget's launcher may have attached, and the root ends unattached all the same.
+    for (session, attached) in [(8898, false), (8899, true)] {
+        ended_unattached_keeps_its_service(session, attached);
+    }
+}
+
+fn ended_unattached_keeps_its_service(session: u64, attached: bool) {
+    let handle = crate::session_store::test_handle_on(session, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    install(&ctx, 71, &[Scope::Relaunch]);
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let mut seed = seal(&ctx);
+    seed.env.home = Some(directory.path().join("home"));
+    seed.env.state = directory.path().join("state");
+    seed.env.config = Some(directory.path().join("aterm.toml"));
+    seed.receipt.intent.purpose = renewal::Purpose::WeeklyQuota;
+    seed.receipt.destination = Some(renewal::Identity::from_native("target", "user"));
+    seed.receipt.phase = Phase::Committing;
+    seed.receipt.launch_attempted = true;
+    seed.receipt.current_attempt = Some(renewal::AttemptRef {
+        id: "cd".repeat(16),
+        generation: service::MAX_CONTINUATIONS,
+    });
+    seed.receipt.native_prepare =
+        aterm_agent::harness::native_act::Request::prepare(seed.prepare.clone())
+            .encode()
+            .unwrap();
+    if attached {
+        let NativePlan::Restart { shell, .. } = &seed.prepare.plan else {
+            unreachable!("a restart recipe");
+        };
+        seed.receipt.candidate = Some(renewal::Candidate::of(shell, true));
+    }
+    let id = seed.receipt.id.clone();
+    let env = seed.env.clone();
+    renewal::with_receipt_writer(&env, |writer| {
+        renewal::write_receipt(&env, &seed.receipt)?;
+        writer.cancel(
+            &seed.receipt,
+            renewal::CancellationKind::SuccessorNeverAttached,
+            0,
+            0,
+        )
+    })
+    .unwrap()
+    .unwrap();
+    ctx.fenced_writes
+        .native
+        .lock()
+        .unwrap()
+        .renewal_services
+        .insert(id.clone(), Arc::new(Service::new(seed)));
+    assert!(!service::observe_terminal(&ctx, &id));
+    assert!(
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .renewal_services
+            .contains_key(&id)
+    );
+}
+
+/// A root that ended with no successor hands its session back on the login it was on, and the
+/// agent that relaunch starts (a new pid, the same conversation, its record still bound to the
+/// receipt it inherited) asks about that receipt. It is told the receipt retired, so it unbinds
+/// and asks afresh, for a login renewal and a rotation alike; were it told it is the wrong
+/// process, it would keep the point and ask again until a person typed. A process on the other
+/// login, on another conversation, or whose record no longer names the receipt is still refused.
+#[test]
+fn codex_renewal_ended_root_answers_the_agent_handed_back_on_its_login() {
+    for (session, purpose) in [
+        (8903, renewal::Purpose::Login),
+        (8904, renewal::Purpose::WeeklyQuota),
+    ] {
+        ended_root_answers_its_lineage(session, purpose);
+    }
+}
+
+fn ended_root_answers_its_lineage(session: u64, purpose: renewal::Purpose) {
+    let handle = crate::session_store::test_handle_on(session, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    install(&ctx, 71, &[Scope::Relaunch]);
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let mut seed = seal(&ctx);
+    seed.env.home = Some(directory.path().join("home"));
+    seed.env.state = directory.path().join("state");
+    seed.env.config = Some(directory.path().join("aterm.toml"));
+    seed.receipt.intent.purpose = purpose;
+    if purpose == renewal::Purpose::WeeklyQuota {
+        seed.receipt.destination = Some(renewal::Identity::from_native("target", "user"));
+    }
+    seed.receipt.phase = Phase::Committing;
+    seed.receipt.launch_attempted = true;
+    seed.receipt.current_attempt = Some(renewal::AttemptRef {
+        id: "cd".repeat(16),
+        generation: service::MAX_CONTINUATIONS,
+    });
+    seed.receipt.native_prepare =
+        aterm_agent::harness::native_act::Request::prepare(seed.prepare.clone())
+            .encode()
+            .unwrap();
+    let id = seed.receipt.id.clone();
+    let env = seed.env.clone();
+    renewal::with_receipt_writer(&env, |writer| {
+        renewal::write_receipt(&env, &seed.receipt)?;
+        writer.cancel(
+            &seed.receipt,
+            renewal::CancellationKind::SuccessorNeverAttached,
+            0,
+            0,
+        )
+    })
+    .unwrap()
+    .unwrap();
+    let ended = renewal::read_receipt(&env, &id).unwrap();
+    assert_eq!(ended.phase, Phase::Retired);
+    assert!(ended.revoked && ended.successor_pid.is_none());
+    // The relaunched agent: this test process, which is not the source the Signal ended.
+    let pid = std::process::id();
+    let proof = crate::self_claim::Proven {
+        pid,
+        start: aterm_agent::harness::restart_stamp::kernel_start(pid).unwrap(),
+    };
+    let home = directory.path().join("home/.codex");
+    let copy = |thread: &str, auth: &str| self_claimed::Copy {
+        lifetime: None,
+        pid,
+        start: proof.start.clone(),
+        home: home.clone(),
+        seen: self_claimed::Seen::Never,
+        resume: Ok(self_claimed::Resume {
+            argv: vec!["/fixture/codex-alab".into(), "resume".into(), thread.into()],
+            session: thread.into(),
+            codex_home: Some(home.to_string_lossy().into_owned()),
+            codex_auth_path: Some(auth.into()),
+            cwd: None,
+        }),
+    };
+    let bound = |receipt: &str| match purpose {
+        renewal::Purpose::Login => aterm_json::json!({"owed": {"renewal": {"receipt": receipt}}}),
+        renewal::Purpose::WeeklyQuota => {
+            aterm_json::json!({"owed": {"rotation": {"receipt": receipt}}})
+        }
+    };
+    let ask = |copy: &self_claimed::Copy, record: &aterm_json::Value| {
+        status(
+            &ctx,
+            &env,
+            &proof,
+            copy,
+            record,
+            &id,
+            renewal::Request::Status(id.clone()),
+        )
+    };
+    let thread = ended.intent.thread.clone();
+    let lineage = copy(&thread, "/old/auth.json");
+    let reply = ask(&lineage, &bound(&id));
+    assert!(
+        reply.starts_with("OK codex-") && reply.contains(" state=retired "),
+        "{purpose:?}: {reply}"
+    );
+    // `serve_rotation` renames the rotation lane's prefix; `status` answers in this one.
+    let wrong = "ERR codex-renewal wrong process\n";
+    for (copy, record) in [
+        (copy(&thread, "/new/auth.json"), bound(&id)),
+        (
+            copy("019a4b54-5fa9-7123-8123-123456789abc", "/old/auth.json"),
+            bound(&id),
+        ),
+        (lineage.clone(), bound(&"ef".repeat(16))),
+    ] {
+        assert_eq!(ask(&copy, &record), wrong, "{purpose:?}: {copy:?} {record}");
+    }
 }
 
 #[test]

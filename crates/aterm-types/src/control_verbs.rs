@@ -1485,14 +1485,17 @@ pub const VERBS: &[VerbSpec] = &[
          subject= requests= not_allowed= answer_age_ms= window_s=<s> probe= probe_age_ms= \
          grant=<granted|not_granted|unknown> list=<on|off|absent|unknown> list_probe= \
          program_check=<n|-> program_check_oldest_ms=<ms|-> program_check_stranded=<n|->`; \
+         `accessibility grant=<granted|not_granted|unknown> \
+         probe=<read|refused_disabled|refused_no_exe|refused_out_of_bundle|unsupported_platform>`; \
          `observer fda= responsible= log= taskport=`; `access_card \
-         state=<quiet|asked|opened|granted|declined> asked_at= opened_at= verified_at= renew_at= \
-         needs=`; `remediate fda= files= debugger= devtools=`; then a `note <pct>` when `anchor=` \
-         is `displaced` or `deleted`, and the closing `note <pct>`. `--json` is `OK 1` and one \
-         object of the same facts, nested (`identity`, `folders`, `census`, `sessions`, \
-         `containment`, `warmup`, `debugger`, `devtools`, `access_card`, `observers`, \
-         `remediate`), with `grant_unverifiable` for a `displaced` or `deleted` anchor and only \
-         the closing `note`. Free text is pct-encoded and `-` is unset; an in-flight probe reads \
+         state=<quiet|asked|opened|granted|declined> asked_at= \
+         opened_at= verified_at= renew_at= needs=`; `remediate fda= files= debugger= devtools= \
+         accessibility=`; then a `note <pct>` when `anchor=` is `displaced` or `deleted`, and the \
+         closing `note <pct>`. `--json` is `OK 1` and one object of the same facts, nested \
+         (`identity`, `folders`, `census`, `sessions`, `containment`, `warmup`, `debugger`, \
+         `devtools`, `accessibility`, `access_card`, `observers`, `remediate`), with \
+         `grant_unverifiable` for a `displaced` or `deleted` anchor and only the closing \
+         `note`. Free text is pct-encoded and `-` is unset; an in-flight probe reads \
          `full_disk_access=unknown probe=pending`. A folder stays `unknown` until the warm-up \
          asks macOS for it (`asking`, then `allowed`, `denied` or `error`) or a measured grant \
          covers it (`covered-by-fda`; `source=none|warmup|fda|warmup,fda`); \
@@ -1508,7 +1511,11 @@ pub const VERBS: &[VerbSpec] = &[
          no reading); `program_check_stranded=` counts those held since before the syspolicyd \
          running now started, whose check went to one no longer running, instance-wide (`sys \
          jobs` names each; `-` while one may be stranded and nothing read tells, as `status` \
-         says). Only a person changes these, at the places `remediate` names: \
+         says). `accessibility`: `grant=` is aterm's own Accessibility grant, asked of macOS for \
+         each request with no prompt (`probe=read`), `unknown` when nothing was read \
+         (`refused_disabled` headless or with `[privacy] enabled` or `check` off; \
+         `refused_out_of_bundle` outside a `.app`, where macOS would answer for the program that \
+         started aterm). Only a person changes these, at the places `remediate` names: \
          `settings:<pane>` is a System Settings pane, `aterm-settings:<page>` a page of aterm's \
          Settings (the debugger's is Settings ▸ Security); `devtools hand-over` opens the \
          Developer Tools pane and `await consent [kind=debugger]` waits for a change. Setup's \
@@ -1997,7 +2004,7 @@ pub const VERBS: &[VerbSpec] = &[
          <= 90 chars; quiet for 24 h after a dismissal, a Details read or an answer; \
          `OK message=<id>`). `notice later <key> [tag=<tag>] [url=<https-url>] <title> -- \
          <reason> -- <step>[ -- \
-         <detail>]` files a non-urgent exception in the menu-bar item and Settings ▸ Messages \
+         <detail>]` files a non-urgent exception in Settings ▸ Messages \
          (`OK later=<id> how=<new|restated|duplicate|quiet>`; up to 4 wire entries, filed after \
          14 d; `url=` adds an Open in browser button). `notice settle <key> <id> <revision>` \
          resolves that open digest entry only while its key and confirmation (`id` and `rev` from \
@@ -2330,13 +2337,17 @@ pub const VERBS: &[VerbSpec] = &[
          whatever any window shows, and per window `a11y window=<id> autopilot|account \
          sid=<sid> role=<role> label=\"<words>\" description=\"<words>\"|description=-` \
          lines: each Autopilot and Account chip's node as the window's accessibility tree is \
-         built for a screen reader). Then `statusitem title=❯ needs=<n> stuck=<n> exceptions=<n> \
-         done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>> access=<read|write|full> \
-         shown=<read|write|full>` (this Mac's fleet access in force, and the level its lock \
-         shows: a raise not yet in effect) and, on macOS, the `❯` menu's \
-         `statusmenu \"<label>\" enabled=<yes|no> [checked=<yes|no>] [tip=\"<text>\"] [indent=<n>] \
-         [submenu]` lines (`statusmenu ---` for a separator; debug builds add `at=<i>[.<j>…]` for \
-         `person menubar press`).",
+         built for a screen reader). Then `statusitem title=❯ \
+         fleet=<off|unread|reading|failed|as_of:<unix ms>> access=<read|write|full> \
+         shown=<read|write|full> blocked=<yes|no>` (this Mac's fleet access in force, the level \
+         its lock shows: a raise not yet in effect, and whether the lock wears the blocked mark: \
+         this Mac's lock refused another Mac's request no opened menu has shown) and, on \
+         macOS, the `❯` menu's rows: `statusmenu \"<text>\" enabled=no [blocked=yes]` for a grey \
+         line (`blocked=yes` where it wears the blocked mark), `statusmenu \"<label>\" enabled=yes \
+         checked=<yes|no> [tip=\"<text>\"]` for a row that can be clicked and `statusmenu ---` for \
+         a separator (debug builds add `at=<i>` for `person menubar press`). Last, while a \
+         System State step waits for a person or failed, `systemstate \"<label>\" \
+         [note=\"<text>\"]`.",
     ),
     v(
         "controls",
@@ -3203,7 +3214,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "observe this Codex session's account pool",
-        "Authenticated Codex only. `snapshot schema=<1|2> request=<32 lowercase hex>`: versioned cached account metadata, without credentials or assignment authority. Schema 2 also says what `restart account=` may ask for this session: the row aterm judges it to run on from the login its launch carried (`assignment.account_id`), the pool's choice, pin and rotation (`pool`), the rows a move would not be refused on record (`eligible`), and whether that restart would be carried now (`capabilities.select`, and `.auto` for `account-auto`). The relaunch still proves the row.",
+        "Authenticated Codex only. `snapshot schema=<1|2|3> request=<32 lowercase hex>`: versioned cached account metadata, without credentials or assignment authority. Schema 2 also says what `restart account=` may ask for this session: the row aterm judges it to run on from the login its launch carried (`assignment.account_id`), the pool's choice, pin and rotation (`pool`), the rows a move would not be refused on record (`eligible`), and whether that restart would be carried now (`capabilities.select`, and `.auto` for `account-auto`). The relaunch still proves the row. Schema 3 is schema 2 with each row's `signed_out_reason`: the closed word of the settled refusal on record of the refresh token a signed-out row's login holds (`refresh_token_expired`, ...), else null; an observation that grants nothing. Schemas 1 and 2 are unchanged.",
     ).input(Input::NONE),
     v(
         "codex-auth",
@@ -3339,16 +3350,21 @@ pub const VERBS: &[VerbSpec] = &[
          its line lands. The move is that session's alone: no pin, active row or rotation is \
          written, and nobody is signed in. Replies `OK restarting pid <n> \
          cause=<stall|asked>[ discarded=<bytes>]`, ending ` account=<label>` or ` account-auto` \
-         where one was asked, `OK restart gone pid <n>`, or `ERR restart \
+         where one was asked, `OK restart gone pid <n>` (the leader left its tab before anything \
+         was sent, also where the act had come to refuse after writing its stamp), or `ERR restart \
          unavailable: \
          <not-the-hosts-agent|not-relaunchable|not-supervised|driver-lease|driver-turn|halted|start-unread|no-state|exit-owner-not-ready>` \
          and after those, for an account, in order: `account-unread` (the pool was judged for \
          another process than the one now leading the tab), `account-unmanaged`, \
          `account-not-resumable`, `account-recovery-pending`, the pool's word \
          `<account-unmanaged|account-off|account-unknown|account-no-choice|account-current|account-same|account-not-enrolled|account-signed-out|account-held|account-limited|account-identity|account-unread>`, \
-         then `account-restart-pending` \
+         then `account-restart-pending`, then `account-busy` (the session was not at its own \
+         rest: its record, read last, was not idle with an empty draft, or could not be read \
+         within 1 s, or unread input or a person's gesture reached it after the ask arrived; a \
+         plain restart is never refused so; a hand that comes while the record is read answers \
+         its own word above) \
          (or `ERR not-stalled`, `ERR bad restart argument: <word>`, `ERR restart failed: <what>`). \
-         A refused account writes and sends nothing. \
+         A refused account sends nothing and leaves no stamp. \
          `OK restarting` acknowledges acceptance; verify the new live process and its version \
          after resuming. Earlier typing does not hold an accepted restart's resume line; new \
          input, a draft, a hold or another driver's hand still does. \
@@ -3532,16 +3548,18 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         OwnerOnly,
-        "person look <window>|off | menubar press <at>|click: the person, stood in for (debug \
+        "person look <window>|off | menubar open|press <at>|click: the person's stand-in (debug \
          builds)",
         "— debug-only stand-in for the human at the window; requires `ATERM_DEBUG_PERSON_INVOKE=1` \
          at launch (`ERR denied: …` or `ERR person needs a debug build` otherwise). `person look \
          <window>|off` (`window=` from `ls`) marks a headless window as looked at for `status \
-         end_seen=`, the tab `•` dot and Done for you (`OK person look window=<n>` / `OK person \
-         look off`; `ERR no window <n>`, `ERR a window looks for itself`). `person menubar press \
-         <at>` clicks the `statusmenu` row at path `at=<i>[.<j>…]` from `chrome` (`OK pressed \
-         \"<label>\"`, or `ERR no row at <at>`, `ERR not an action`, `ERR disabled \"<label>\"`, \
-         `ERR no menu-bar item off macOS`). `person menubar click` left-clicks the menu-bar lock: \
+         end_seen=` and the tab `•` dot (`OK person look window=<n>` / `OK person look off`; \
+         `ERR no window <n>`, `ERR a window looks for itself`). `person menubar open` opens the \
+         `❯` menu as a right click does, with no menu on the screen: the blocked mark clears \
+         (`OK opened the menu`). `person menubar press <at>` clicks the `statusmenu` row at \
+         `at=<i>` from `chrome` (`OK pressed \"<label>\"`, or `ERR no row at <at>`, `ERR not an \
+         action`; each `ERR no menu-bar item off macOS`). `person menubar click` left-clicks the \
+         menu-bar lock: \
          this Mac's fleet access one step on, a lower level at once and a raise after its \
          2-second settle (`OK clicked the lock at <word>: <word> next`; `chrome` prints \
          `access=` and `shown=`).",

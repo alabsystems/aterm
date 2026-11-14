@@ -123,6 +123,30 @@ fn a_stray_byte_in_the_file_hides_no_setting() {
     assert!(matches!(read_config_text(&path), Ok(None)));
 }
 
+/// A LINK TO A FOLDER IS NO FILE EITHER (Windows): a junction at the config's name, which the
+/// open follows to a folder Windows will not open for reading, reads as no text, as the folder
+/// itself does. A look at the link rather than its target would call it an error.
+#[cfg(windows)]
+#[test]
+fn a_junction_to_a_folder_at_the_config_s_name_has_no_text() {
+    let dir = crate::test_scratch_dir("upd-settings-junction");
+    let target = dir.path().join("folder");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("aterm.toml");
+    // `mklink` refuses the verbatim spelling (`\\?\C:\…`), so the plain one is passed.
+    let plain = |path: &Path| {
+        let text = path.to_str().expect("test paths are UTF-8");
+        text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()
+    };
+    let made = aterm_uds::spawnfd::command("cmd")
+        .args(["/C", "mklink", "/J", &plain(&link), &plain(&target)])
+        .output()
+        .expect("cmd runs");
+    assert!(made.status.success(), "mklink /J: {made:?}");
+    assert!(matches!(read_config_text(&target), Ok(None)));
+    assert!(matches!(read_config_text(&link), Ok(None)));
+}
+
 /// A SOCKET AT THE NAME IS NO FILE: its open fails with an error a volume that went away also
 /// gives, and reading that as a fault that can pass would hold every update for as long as it
 /// stood there.

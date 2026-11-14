@@ -8821,6 +8821,11 @@ fn upkeep_claude(
     if step.syncs() {
         heal_default_login_in_upkeep(home, state_dir, roster_path, now, fx);
     }
+    // Before any renewal and whatever it starts: a row needs no renewal for its mailbox's
+    // arrival to end the lab's ask for it.
+    if step.renews() {
+        settle_mailbox_needs(home, state_dir, roster_path, now, fx);
+    }
     // A saved explicit choice is independent of automatic fleet-source admission.
     let pending = step
         .renews()
@@ -13325,6 +13330,11 @@ struct MachineReads {
     var: fn(&str) -> Option<std::ffi::OsString>,
     /// Whether a browser outside the home counts.
     system_browsers: bool,
+    /// Whether this machine has a desk aterm's sign-in window can open on: macOS.
+    desk: bool,
+    /// Whether another Mac's fleet drive typed into the session this process runs in
+    /// ([`super::cli::AccountsHost::driven_over_the_fleet`]).
+    driven: fn() -> bool,
 }
 
 impl Default for MachineReads {
@@ -13332,16 +13342,24 @@ impl Default for MachineReads {
         Self {
             var: |_| None,
             system_browsers: false,
+            desk: false,
+            driven: || false,
         }
     }
 }
 
 impl MachineReads {
-    /// The process's environment and every installed browser.
+    /// The process's environment, every installed browser, this machine's desk and what its
+    /// aterm instances say of this process's session, asked once.
     fn live() -> Self {
         Self {
             var: |name| std::env::var_os(name),
             system_browsers: true,
+            desk: cfg!(target_os = "macos"),
+            driven: || {
+                static DRIVEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *DRIVEN.get_or_init(super::fleet_session::an_instance_says_another_mac_drives)
+            },
         }
     }
 
@@ -15346,6 +15364,28 @@ pub(super) fn has_configured_mailbox_for_row_with(
             })
 }
 
+/// Whether aterm's sign-in window reads the login code of the row `label` (`target_email`) by
+/// itself: the answer the window's own desk gives
+/// ([`super::headless_oauth::MailboxConfig::window_reads`]), over the same configuration, read
+/// on this Mac alone. A mailbox only a headless browser reads (webmail) and the fleet's mail
+/// relay are none, though [`has_configured_mailbox_for_row_with`] counts both: a sign-in
+/// nobody is watching opens the window only where this holds. The environment is read through
+/// `var` alone.
+pub(super) fn window_reads_mailbox_for_row_with(
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<&Path>,
+    store: &accounts::Store,
+    label: Option<&str>,
+    target_email: Option<&str>,
+) -> bool {
+    super::headless_oauth::discover_mailbox_config_with_env(home, Some(&store.dir), var)
+        .is_some_and(|mut cfg| {
+            cfg.read_on_this_mac_alone();
+            cfg.alias_label_to_email(label, target_email);
+            cfg.window_reads(target_email)
+        })
+}
+
 /// [`latest_mailbox_mtime_with`] reading no environment, as a test's guard reads it.
 #[cfg(test)]
 fn latest_mailbox_mtime(
@@ -16262,6 +16302,60 @@ fn complete_staging_renewal(
         &|_| {},
     )
     .published()
+}
+
+/// WHETHER THE UPKEEP'S SIGN-IN OF A ROW OPENS ATERM'S OWN WINDOW: only this Mac's own
+/// upkeep, at its own desk (`reads`: macOS, no SSH connection, no mark of another machine's
+/// request and no session another Mac's drive typed into,
+/// [`super::cli::opens_sign_in_window_by`]), for a row in no shared custody
+/// (`shared_custody`: its sign-in is another holder's to give), and whose login code the
+/// window reads by itself (`window_reads_mailbox`,
+/// [`window_reads_mailbox_for_row_with`]): nobody is there to type one. The mailbox is read
+/// last, and only where everything else allows the window.
+fn upkeep_opens_window(
+    reads: MachineReads,
+    shared_custody: bool,
+    window_reads_mailbox: &dyn Fn() -> bool,
+) -> bool {
+    !shared_custody
+        && super::cli::opens_sign_in_window_by(reads.desk, &reads.var, &reads.driven)
+        && window_reads_mailbox()
+}
+
+/// What opens the page of a sign-in the upkeep starts for a row with a mailbox or a proven
+/// headless profile: aterm's own window where this run may open it (`window`,
+/// [`upkeep_opens_window`]), else nothing a person sees, the opener signing in headlessly or
+/// not at all.
+fn upkeep_browser(window: bool, opener: PathBuf) -> super::cli::RenewBrowser {
+    if window {
+        super::cli::RenewBrowser::Window { opener }
+    } else {
+        super::cli::RenewBrowser::Remote {
+            opener: Some(opener),
+        }
+    }
+}
+
+/// The log's line for the token step after `label`'s sign-in in aterm's window: that the token
+/// was made, or what the token verb `refused`, on one line and with each address in it written
+/// `<address>` (the verb names the account to a person; the log names the row).
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the token step after a sign-in writes it, and that step is Unix's"
+    )
+)]
+fn token_step_line(label: &str, refused: &str) -> String {
+    let refused = refused.trim();
+    format!(
+        "{label}: token: {}",
+        if refused.is_empty() {
+            "made in the sign-in window".to_owned()
+        } else {
+            super::open_url::without_addresses(&super::one_line(refused, 300))
+        }
+    )
 }
 
 fn select_auto_renew_browser(
@@ -18314,9 +18408,10 @@ fn ladder_route_with_clock(
     ladder_route_in_context(home, store, (row, None), now, renew_guard, ctx, clock)
 }
 
-/// Whether a page's stop still holds `raw`'s background sign-in: its current workflow's last pass
-/// ended at that page under [`PERSON_BACKOFF`] ago, with no signed-in browser window on record
-/// since. A real change of address could change that page's answer sooner too, but nothing here
+/// Whether a stop still holds `raw`'s background sign-in: its current workflow's last pass
+/// ended `blocked` ([`accounts::AttemptOutcome::Blocked`]: a page's check in the headless page
+/// or in aterm's sign-in window, a window a person closed, another account's consent) under
+/// [`PERSON_BACKOFF`] ago, with no signed-in `accounts browser` window on record since. A real change of address could change that page's answer sooner too, but nothing here
 /// can tell one from the rest of what counts as a move ([`super::sign_in_ladder::Ladder::moved`]).
 /// This holds across what the ladder's own wait does not: a restart forgets that wait, and a file
 /// changing in `~/.secrets` ends it as a new input, though a check judges neither.
@@ -18586,6 +18681,66 @@ fn mailbox_need(home: &Path, label: &str, met: bool) -> Option<String> {
     {
         let _ = (home, label, met);
         None
+    }
+}
+
+/// THE LAB'S ASK FOR A ROW'S MAILBOX, ENDED ONCE THE MAILBOX HOLDS, whatever signed the row in:
+/// each Claude Code roster row with a `mailbox:<label>` need of the sign-in's that has not ended
+/// has its mailbox read through the ladder's own reader ([`UpkeepEffects::mailbox`]), and where
+/// that mailbox holds ([`super::sign_in_ladder::Mailbox::holds`]) the need is met
+/// ([`mailbox_need`]) and its line logged, as the ladder does. The ladder reads a row only while
+/// it renews it, so without this a row signed in again another way would keep a person asked
+/// for a password nothing lacks. Claude Code's ladder raises these needs under its rows' labels
+/// (a person may file one by hand under the sign-in's purpose too), so only its roster is read.
+/// A pass with no such need reads the need ledger once and nothing else; a row's mailbox is read
+/// only while its need is open, and a row whose mailbox does not hold keeps its need for its
+/// next renewal. Off unix, where no ledger is kept, it does nothing.
+fn settle_mailbox_needs(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) {
+    #[cfg(unix)]
+    {
+        use aterm_secrets::need::{self, Purpose, Want};
+        let Ok(needs) = need::peek(&aterm_secrets::client::Paths::for_home(home)) else {
+            return;
+        };
+        let open: BTreeSet<String> = needs
+            .into_iter()
+            .filter(|need| need.purpose == Purpose::HarnessSignIn && !need.state.ended())
+            .filter_map(|need| match need.want {
+                Want::Mailbox(label) => Some(label),
+                _ => None,
+            })
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let store = accounts::Store::at(state_dir);
+        let Ok(roster) = store.read_roster(Some(roster_path), now) else {
+            return;
+        };
+        for row in roster.rows.iter().filter(|row| open.contains(&row.label)) {
+            if fx
+                .scope
+                .as_ref()
+                .is_some_and(super::account_work::Scope::cancelled)
+            {
+                return;
+            }
+            if (fx.mailbox)(home, &store, row).0.holds()
+                && let Some(line) = mailbox_need(home, &row.label, true)
+            {
+                (fx.log)(&format!("{}: its mailbox need: {line}", row.label));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (home, state_dir, roster_path, now, fx);
     }
 }
 
@@ -18995,6 +19150,30 @@ fn spawn_row_renewal(
             return RenewalDispatch::Held;
         }
     }
+    // This Mac's own upkeep signs a row in in aterm's own window where the window reads the
+    // row's login code by itself; a run for another Mac, one over SSH, and a row whose
+    // mailbox only a headless browser or the fleet's relay reads open none, and keep the
+    // headless route.
+    let opens_window = has_mailbox
+        && upkeep_opens_window(reads, shared_authority.is_some(), &|| {
+            window_reads_mailbox_for_row_with(
+                &reads.var,
+                Some(home),
+                &store,
+                Some(&next_label),
+                Some(&next_email),
+            )
+        });
+    // A row whose last sign-in ended where only a person can go on (the consent page's human
+    // check, Cloudflare's) is left to that person: the upkeep opens no window for it again,
+    // however long ago that was. A person's own renewal, or their pin request, opens it.
+    if opens_window
+        && pin_request.is_none()
+        && accounts::current_sign_in_task(&raw_workflow, logins)
+            .is_some_and(|task| task.action == accounts::SignInAction::Renew)
+    {
+        return RenewalDispatch::Held;
+    }
     // The machine's one sign-in at a time, taken before anything is admitted: while another
     // sign-in (a vendor's renewal, `accounts browser`'s window, another process's) holds it this
     // renewal is Held, so a pin request stays pending for a later upkeep, with no cooldown
@@ -19161,16 +19340,6 @@ fn spawn_row_renewal(
                         return Renewal::Failed;
                     }
                 };
-                if met
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(super::open_url::Met::is_service_unavailable)
-                {
-                    completion.defer();
-                    deferred.set(true);
-                    let _ = fs::remove_dir_all(&staging);
-                    return Renewal::Deferred;
-                }
                 if ran.code != Some(0) || !accounts::login_made(&staging) {
                     let _ = fs::remove_dir_all(&staging);
                     exited.set(ran.code);
@@ -19284,7 +19453,7 @@ fn spawn_row_renewal(
                     if result
                         .observation
                         .as_ref()
-                        .is_some_and(|observation| observation.service_deferred())
+                        .is_some_and(|observation| observation.deferred())
                     {
                         completion.defer();
                         deferred.set(true);
@@ -19394,6 +19563,9 @@ fn spawn_row_renewal(
                     cause.borrow().as_deref(),
                 )
             };
+            // Whether this run's sign-in was made in aterm's own window, whose store is then the
+            // account's and makes its token.
+            let in_window = std::cell::Cell::new(false);
             let ran = (|| -> Result<Renewal, String> {
                 store
                     .check_signin_state(now)
@@ -19416,9 +19588,10 @@ fn spawn_row_renewal(
                     })
                 };
                 let browser = if has_mailbox || has_headless_profile {
-                    super::cli::RenewBrowser::Remote {
-                        opener: Some(opener.map_err(|error| error.to_string())?),
-                    }
+                    // The window where this run opens it ([`upkeep_opens_window`]), decided
+                    // before the run started; a scripted run is handed the same choice.
+                    in_window.set(opens_window);
+                    upkeep_browser(opens_window, opener.map_err(|error| error.to_string())?)
                 } else {
                     let Some(b) = non_headless_fallback.clone() else {
                         return Err(opener.err().map_or_else(
@@ -19529,7 +19702,7 @@ fn spawn_row_renewal(
                             .ladder
                             .page_stopped(&next_label, Instant::now() + PERSON_BACKOFF);
                         wait = PERSON_BACKOFF;
-                        sooner = "when a person signs its browser in";
+                        sooner = "when a person signs it in at this Mac";
                     }
                     guard.ladder_owners.insert(
                         next_label.clone(),
@@ -19559,6 +19732,40 @@ fn spawn_row_renewal(
                 }
                 let _ =
                     store.complete_requested_pin_at(&roster_owned, &file_roster, request, now_done);
+            }
+            // A row signed in in aterm's window gets its year-long token in the same store, by
+            // itself (the token design's §4.6), last of all: the renewal is complete, its
+            // requested pin is answered and its sign-in lock is released first, so nothing
+            // that waits on this sign-in waits on a token's window too. What the token verb
+            // refuses is logged with no address in it, and the sign-in stands either way. A
+            // scripted run signed nothing in, so no window's store holds a session to make a
+            // token in.
+            #[cfg(unix)]
+            if renewed && in_window.get() && run_seam.is_none() {
+                drop(_signin);
+                let env = quiet_env(
+                    &home_owned,
+                    &state_owned,
+                    &config_beside(&roster_owned),
+                    now_done,
+                );
+                let host = super::cli::LiveAccounts::background(scope.clone());
+                let (mut said, mut refused) = (Vec::new(), Vec::new());
+                if super::accounts_tokens::after_sign_in(
+                    &env,
+                    &host,
+                    &next_label,
+                    &mut said,
+                    &mut refused,
+                )
+                .is_some()
+                    && let Some((_, _, _, log)) = &unattended
+                {
+                    log(&token_step_line(
+                        &next_label,
+                        &String::from_utf8_lossy(&refused),
+                    ));
+                }
             }
         },
         spawn_renewal,

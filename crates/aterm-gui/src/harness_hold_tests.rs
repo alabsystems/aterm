@@ -645,7 +645,7 @@ fn the_hover_follows_the_hold_and_the_face() {
 }
 
 #[test]
-fn a_nudge_the_hover_does_not_say_still_rebuilds_the_glance() {
+fn a_nudge_the_hover_does_not_say_still_owes_the_agents_surfaces_a_rebuild() {
     let (mut app, sid, _host) = desk("land");
     tell_hold(&mut app, &sid, Some(held()));
     let _ = app.take_status_rebuild();
@@ -662,15 +662,7 @@ fn a_nudge_the_hover_does_not_say_still_rebuilds_the_glance() {
         0,
         "no strip stamped"
     );
-    assert!(app.take_status_rebuild(), "the glance owes a rebuild");
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
-    assert!(
-        app.status_session_row(&handle)
-            .landing_tip
-            .is_some_and(|tip| tip.ends_with(" \u{b7} 4 nudges")),
-        "{:?}",
-        app.status_session_row(&handle).landing_tip
-    );
+    assert!(app.take_status_rebuild(), "the Overview owes a rebuild");
     assert!(!app.take_status_rebuild(), "and only once");
 }
 
@@ -683,13 +675,10 @@ fn a_hold_is_shown_only_while_the_word_is_land() {
         land_fields(&app),
         ["needs,repo,open", "3", &SINCE_S.to_string()]
     );
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
-    assert!(app.status_session_row(&handle).landing);
     meta(&mut app, "set autopilot cruise");
     assert_eq!(app.shown_hold(0), None, "hidden under Cruise");
     assert_eq!(driven(&app).as_deref(), Some("driven by aterm (cruise)"));
     assert_eq!(land_fields(&app), ["-", "-", "-"]);
-    assert!(!app.status_session_row(&handle).landing);
     meta(&mut app, "set autopilot land");
     assert!(app.shown_hold(0).is_some(), "the glass kept it");
     assert_eq!(driven(&app).as_deref(), Some(WHY));
@@ -811,86 +800,6 @@ fn status_prints_land_fields_only_where_claimed_here() {
 }
 
 #[test]
-fn a_worker_reads_landing_only_after_its_instruction() {
-    use crate::status_item::{Glance, SessionRow, TaskRow, compose_status_menu, menu_lines};
-    use crate::task_record::TaskState;
-    const NOW: i64 = 1_800_000_000;
-    let worker = |id: u64, label: &str, landing: bool| SessionRow {
-        id,
-        sid: format!("s-{id:020}"),
-        title: label.to_string(),
-        agent: "busy",
-        task: Some(TaskRow {
-            state: TaskState::Working,
-            why: None,
-            from: "s-manager".to_string(),
-            entered: 7,
-            since_unix_ms: u64::try_from(NOW - 4 * 60).expect("positive") * 1000,
-            result_bytes: 0,
-            result_path: None,
-            seen: false,
-            finished: false,
-            own_report: false,
-        }),
-        landing,
-        landing_tip: landing.then(|| "not landed yet: 2 unpushed commits \u{b7} 3 nudges".into()),
-        ..SessionRow::default()
-    };
-    let manager = SessionRow {
-        id: 1,
-        sid: "s-manager".to_string(),
-        title: "lab-sweep".to_string(),
-        agent: "busy",
-        ..SessionRow::default()
-    };
-    let rows = [manager, worker(2, "bench", true), worker(3, "lint", false)];
-    let glance = Glance::build(
-        &rows,
-        &[],
-        None,
-        u64::try_from(NOW).expect("positive") * 1000,
-        None,
-    );
-    let lines = menu_lines(&compose_status_menu(&glance, NOW), &[]);
-    let line = |words: &str| {
-        let found: Vec<&String> = lines.iter().filter(|l| l.contains(words)).collect();
-        assert_eq!(found.len(), 1, "{words}: {lines:#?}");
-        found[0].clone()
-    };
-    let bench = line("bench \u{2014}");
-    assert!(
-        bench.contains("\u{25cf} bench \u{2014} landing 4m"),
-        "{bench}"
-    );
-    assert!(
-        bench.contains("tip=\"not landed yet: 2 unpushed commits \u{b7} 3 nudges\""),
-        "{bench}"
-    );
-    let lint = line("lint \u{2014}");
-    assert!(lint.contains("\u{25cf} lint \u{2014} working 4m"), "{lint}");
-    assert!(!lint.contains("tip="), "{lint}");
-    assert!(
-        line("lab-sweep \u{2014}").contains("2 workers: 1 landing, 1 working"),
-        "{lines:#?}"
-    );
-
-    let (mut app, sid, _host) = desk("land");
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
-    let row = app.status_session_row(&handle);
-    assert!(!row.landing, "before Land's instruction");
-    tell_hold(&mut app, &sid, Some(held()));
-    let row = app.status_session_row(&handle);
-    assert!(row.landing);
-    assert_eq!(
-        row.landing_tip.as_deref(),
-        Some(
-            "not landed yet: 2 unpushed commits; open in its report: follow-up, not pushed \
-             \u{b7} 3 nudges"
-        )
-    );
-}
-
-#[test]
 fn the_page_says_why_as_the_hold_moves() {
     let (mut app, sid, _host) = desk("land");
     let line = |app: &App| {
@@ -1001,8 +910,8 @@ fn tell_stop(
 }
 
 /// Session 0's chip title as its hover draws it under `view`, its spoken description, the
-/// Settings page's state line, the tab's hover, the worker row's tip and `status held=`.
-fn stop_surfaces(app: &mut App, view: crate::autopilot::AutopilotView) -> [String; 6] {
+/// Settings page's state line, the tab's hover and `status held=`.
+fn stop_surfaces(app: &mut App, view: crate::autopilot::AutopilotView) -> [String; 5] {
     let chip = ChipGlass::default();
     let title = crate::claude_lights::title_parts(
         &app.harness_glass,
@@ -1025,14 +934,11 @@ fn stop_surfaces(app: &mut App, view: crate::autopilot::AutopilotView) -> [Strin
         unreachable!("a Settings instance")
     };
     let line = settings.harness_snapshot().projection().sessions[0].state_line();
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
-    let tip = app.status_session_row(&handle).landing_tip;
     [
         title,
         spoken.unwrap_or_default(),
         line.unwrap_or_default(),
         driven(app).unwrap_or_default(),
-        tip.unwrap_or_default(),
         status(app, "held"),
     ]
 }
@@ -1069,10 +975,9 @@ fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
                 before.iter().all(|s| !s.contains(STOPPED_TYPING)),
                 "{case}: CONTROL: {before:#?}"
             );
-            assert_eq!(before[5], "-", "{case}");
+            assert_eq!(before[4], "-", "{case}");
             tell_stop(&mut app, &sid, Some(standing));
-            let [title, spoken, line, hover, tip, field] =
-                stop_surfaces(&mut app, AutopilotView::Land);
+            let [title, spoken, line, hover, field] = stop_surfaces(&mut app, AutopilotView::Land);
             assert!(
                 title.starts_with(&format!(
                     "autopilot: land \u{2014} {}{sep}not landed yet",
@@ -1106,13 +1011,6 @@ fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
                 )),
                 "{case}: {hover}"
             );
-            assert!(
-                tip.starts_with(&format!(
-                    "{}{sep}not landed yet: ",
-                    stop_words(held_by, HoldForm::Tip, false)
-                )),
-                "{case}: {tip}"
-            );
             assert_eq!(field, held_by.word(), "{case}");
             tell_stop(&mut app, &sid, None);
             let after = stop_surfaces(&mut app, AutopilotView::Land);
@@ -1120,7 +1018,7 @@ fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
                 after.iter().all(|s| !s.contains(STOPPED_TYPING)),
                 "{case}: the lift takes every stop word: {after:#?}"
             );
-            assert_eq!(after[5], "-", "{case}");
+            assert_eq!(after[4], "-", "{case}");
         }
     }
 }
@@ -1141,7 +1039,7 @@ fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
         &sid,
         Some(Exception::repeats_by(HeldBy::SameReply, true)),
     );
-    let [title, _, line, hover, _, field] = stop_surfaces(&mut app, AutopilotView::Cruise);
+    let [title, _, line, hover, field] = stop_surfaces(&mut app, AutopilotView::Cruise);
     assert!(
         title.starts_with(&format!(
             "autopilot: cruise \u{2014} {}",
@@ -1162,52 +1060,6 @@ fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
         )
     );
     assert_eq!(field, HeldBy::SameReply.word());
-    // A Cruise worker is never landing, and its row in the menu bar says the stop all the same.
-    {
-        use crate::status_item::{Glance, SessionRow, TaskRow, compose_status_menu, menu_lines};
-        const NOW: i64 = 1_800_000_000;
-        let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
-        let worker = SessionRow {
-            task: Some(TaskRow {
-                state: crate::task_record::TaskState::Working,
-                why: None,
-                from: "s-manager".to_string(),
-                entered: 7,
-                since_unix_ms: u64::try_from(NOW - 4 * 60).expect("positive") * 1000,
-                result_bytes: 0,
-                result_path: None,
-                seen: false,
-                finished: false,
-                own_report: false,
-            }),
-            ..app.status_session_row(&handle)
-        };
-        assert!(!worker.landing, "CONTROL: Cruise does not land");
-        let manager = SessionRow {
-            id: 99,
-            sid: "s-manager".to_string(),
-            title: "lab-sweep".to_string(),
-            agent: "busy",
-            ..SessionRow::default()
-        };
-        let glance = Glance::build(
-            &[manager, worker],
-            &[],
-            None,
-            u64::try_from(NOW).expect("positive") * 1000,
-            None,
-        );
-        let lines = menu_lines(&compose_status_menu(&glance, NOW), &[]);
-        let tip = format!(
-            "tip=\"{}\"",
-            stop_words(HeldBy::SameReply, HoldForm::Tip, true)
-        );
-        assert_eq!(
-            lines.iter().filter(|l| l.contains(&tip)).count(),
-            1,
-            "the worker's row says the stop: {lines:#?}"
-        );
-    }
     meta(&mut app, "set autopilot off");
     let off = stop_surfaces(&mut app, AutopilotView::Off);
     assert!(
@@ -1262,7 +1114,7 @@ fn the_stop_names_the_switch_to_land_only_under_cruise_where_it_asks() {
 }
 
 /// An outage wait (§14.17.5.2) is said by Settings ▸ Harness's state line and `status waiting=`
-/// only: the chip's title and description, the hover, the worker's tip, the needs and the
+/// only: the chip's title and description, the hover, the needs and the
 /// Messages stay as they were, and the wait's end or the supervisor's release takes it down.
 #[test]
 fn an_outage_wait_is_said_on_the_state_line_and_in_status_alone() {
@@ -1308,9 +1160,9 @@ fn an_outage_wait_is_said_on_the_state_line_and_in_status_alone() {
     );
     assert_eq!(status(&app, "waiting"), "overload");
     assert_eq!(
-        [&after[0], &after[1], &after[3], &after[4]],
-        [&before[0], &before[1], &before[3], &before[4]],
-        "no chip title, description, hover or tip says it"
+        [&after[0], &after[1], &after[3]],
+        [&before[0], &before[1], &before[3]],
+        "no chip title, description or hover says it"
     );
     assert_eq!(quiet(&app), was, "no Messages row, no need, no chip glass");
     tell(&mut app, Outage::Connection, false);
@@ -1346,7 +1198,7 @@ fn an_outage_wait_is_said_on_the_state_line_and_in_status_alone() {
 
 /// Land's one ask at the person's switch over a held tab (v6 §14.17 item 3) is said by Settings ▸
 /// Harness's state line and `status land_asked=` while its answer is unread, and only while the
-/// chip reads Land's `⤓`: the chip's title and description, the hover, the worker's tip and `held=`
+/// chip reads Land's `⤓`: the chip's title and description, the hover and `held=`
 /// stay as they were, and its answer or the supervisor's release takes it down.
 #[test]
 fn the_switchs_ask_is_said_on_the_state_line_and_in_status_while_it_stands() {
@@ -1368,9 +1220,9 @@ fn the_switchs_ask_is_said_on_the_state_line_and_in_status_while_it_stands() {
     );
     assert_eq!(status(&app, "land_asked"), "switch");
     assert_eq!(
-        [&after[0], &after[1], &after[3], &after[4], &after[5]],
-        [&before[0], &before[1], &before[3], &before[4], &before[5]],
-        "no chip title, description, hover, tip or held= says it"
+        [&after[0], &after[1], &after[3], &after[4]],
+        [&before[0], &before[1], &before[3], &before[4]],
+        "no chip title, description, hover or held= says it"
     );
     meta(&mut app, "set autopilot cruise");
     let cruise = stop_surfaces(&mut app, AutopilotView::Cruise);
@@ -1460,8 +1312,8 @@ fn self_meta(app: &mut App, rest: &str, conn: u64) -> String {
 }
 
 /// Where session 0's stop is said of a tab without a chip: `status held=`, its Overview line's
-/// driver, the tab's hover, the Settings page's state line and the worker row's tip.
-fn codex_stop_surfaces(app: &mut App, sid: &str) -> [String; 5] {
+/// driver, the tab's hover and the Settings page's state line.
+fn codex_stop_surfaces(app: &mut App, sid: &str) -> [String; 4] {
     let overview = app
         .overview_parts()
         .0
@@ -1489,20 +1341,17 @@ fn codex_stop_surfaces(app: &mut App, sid: &str) -> [String; 5] {
         .iter()
         .find(|row| row.local_id == 0)
         .and_then(HarnessSessionRow::state_line);
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
-    let tip = app.status_session_row(&handle).landing_tip;
     [
         status(app, "held"),
         overview,
         driven(app).unwrap_or_default(),
         line.unwrap_or_default(),
-        tip.unwrap_or_default(),
     ]
 }
 
 /// CODEX-ALAB'S OWN STOP IS SAID WHERE ATERM'S IS, WHILE ITS PROVEN CLAIM STANDS (§14.3.2): a stop
 /// codex-alab tells on its claim (`meta set harness_held`) is `status held=`'s arm, leads the
-/// Settings ▸ Harness state line and the worker row's tip in a self-claim's stop words led by its
+/// Settings ▸ Harness state line in a self-claim's stop words led by its
 /// own name (`codex-alab stopped typing: …`, whose restart leaves out aterm's ask at a switch to
 /// Land), so neither reads as aterm's stop, and is said after the
 /// mode on the Overview and the hover, which name the native codex-alab autopilot
@@ -1515,7 +1364,7 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
     use crate::harness_glass::stop_words;
     use aterm_agent::harness::acts::{HeldBy, STOPPED_TYPING};
     use aterm_agent::supervise::policy::exception::Exception;
-    let quiet = |surfaces: &[String; 5], case: &str| {
+    let quiet = |surfaces: &[String; 4], case: &str| {
         assert_eq!(surfaces[0], "-", "{case}: {surfaces:#?}");
         assert!(
             surfaces.iter().all(|s| !s.contains(STOPPED_TYPING)),
@@ -1558,7 +1407,7 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
             self_meta(&mut app, &format!("set harness_held {}", held_by.word()), 4),
             "OK\n"
         );
-        let [field, overview, hover, line, tip] = codex_stop_surfaces(&mut app, &sid);
+        let [field, overview, hover, line] = codex_stop_surfaces(&mut app, &sid);
         assert_eq!(field, held_by.word(), "{case}");
         let named = |form| format!("codex-alab {}", stop_words(held_by, form, false));
         let driven = format!("codex-alab autopilot (land: {})", named(HoldForm::Hover));
@@ -1569,7 +1418,6 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
             !line.contains(&stop_words(held_by, HoldForm::Line, true)),
             "{case}: aterm's restart, its switch to Land's ask, is not codex-alab's: {line}"
         );
-        assert_eq!(tip, named(HoldForm::Tip), "{case}");
     }
     assert_eq!(self_meta(&mut app, "unset harness_held", 4), "OK\n");
     quiet(&codex_stop_surfaces(&mut app, &sid), "its unset");
@@ -1583,11 +1431,13 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
 
     let (mut app, sid, _host) = desk("cruise");
     tell_stop(&mut app, &sid, Some(Exception::repeats(HeldBy::SameReply)));
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
     assert_eq!(status(&app, "held"), "same-reply", "CONTROL: aterm's claim");
-    assert_eq!(
-        app.status_session_row(&handle).landing_tip.as_deref(),
-        Some(stop_words(HeldBy::SameReply, HoldForm::Tip, false).as_str()),
+    assert!(
+        driven(&app).is_some_and(|hover| hover.contains(&stop_words(
+            HeldBy::SameReply,
+            HoldForm::Hover,
+            false
+        ))),
         "CONTROL: aterm's claim"
     );
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
@@ -1598,9 +1448,8 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
         aterm_slog::Actor::Ctl
     ));
     assert_eq!(status(&app, "held"), "-", "no claim of aterm's");
-    assert_eq!(
-        app.status_session_row(&handle).landing_tip,
-        None,
+    assert!(
+        !driven(&app).is_some_and(|hover| hover.contains(STOPPED_TYPING)),
         "no claim of aterm's"
     );
 }
@@ -1608,7 +1457,7 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
 /// CODEX-ALAB'S STOP GIVES WAY WHERE ATERM'S DOES, ON EVERY SURFACE AT ONCE (§14.3.2): its told
 /// stop is said only under a face that carries a mode, as aterm's own is, so once codex-alab tells
 /// its own landing (`landed@v1`) or leaves the turn to a person (`left-to-person@v1`) none of
-/// `status held=`, the worker row's tip, the Overview, the hover and the Settings state line says
+/// `status held=`, the Overview, the hover and the Settings state line says
 /// it, and once its task is open again every one does, the claim and the kept stop standing
 /// throughout. NEGATIVE CONTROL: under the open face before each, every surface says it.
 #[test]
@@ -1673,10 +1522,6 @@ fn a_codex_alabs_stop_gives_way_to_its_landed_or_quiet_face_on_every_surface() {
 struct HoldSurfaces {
     /// `status land_held= land_nudges= land_since=`.
     status: [String; 3],
-    /// Whether the menu bar's row reads it landing, and This Mac's `landing` count.
-    landing: (bool, usize),
-    /// The worker row's tip.
-    tip: String,
     /// The Overview's held line and its driver.
     overview: (String, String),
     /// The tab's hover.
@@ -1686,13 +1531,11 @@ struct HoldSurfaces {
 }
 
 impl HoldSurfaces {
-    /// Nothing of a Land hold anywhere: `-` in `status`, no landing, and no hold words on any
-    /// line.
+    /// Nothing of a Land hold anywhere: `-` in `status`, and no hold words on any line.
     fn assert_none(&self, case: &str) {
         assert_eq!(self.status, ["-", "-", "-"], "{case}: {self:#?}");
-        assert_eq!(self.landing, (false, 0), "{case}: {self:#?}");
         assert_eq!(self.overview.0, "", "{case}: {self:#?}");
-        for words in [&self.tip, &self.hover, &self.line] {
+        for words in [&self.hover, &self.line] {
             assert!(
                 !words.contains("not landed yet")
                     && !words.contains("landing since")
@@ -1739,12 +1582,8 @@ fn codex_hold_surfaces(app: &mut App, sid: &str) -> HoldSurfaces {
         .iter()
         .find(|row| row.local_id == 0)
         .and_then(HarnessSessionRow::state_line);
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
-    let row = app.status_session_row(&handle);
     HoldSurfaces {
         status: land_fields(app),
-        landing: (row.landing, app.status_glance().here.landing),
-        tip: row.landing_tip.unwrap_or_default(),
         overview,
         hover: driven(app).unwrap_or_default(),
         line: line.unwrap_or_default(),
@@ -1762,8 +1601,8 @@ fn held_line() -> String {
 
 /// CODEX-ALAB'S OWN LAND HOLD IS SHOWN WHERE ATERM'S IS, WHILE ITS PROVEN CLAIM STANDS (§14.3.3): a
 /// hold codex-alab tells on its claim (`meta set harness_land`) is `status land_held= land_nudges=
-/// land_since=`, makes the tab landing on the menu bar (its row and This Mac's count), and is said
-/// on the worker row's tip, the Overview's held line, the hover and the Settings ▸ Harness state
+/// land_since=`, and is said
+/// on the Overview's held line, the hover and the Settings ▸ Harness state
 /// line in aterm's hold words led by its own name (`codex-alab: not landed yet: …`), as aterm's
 /// own is said there; a stop it told beside it names it once (`codex-alab stopped typing: … · not
 /// landed yet: …`); its nudges and its land act's instant move as told; its own landing, a
@@ -1786,8 +1625,6 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
             ["needs,repo,open", "3", since.as_str()],
             "{case}: {surfaces:#?}"
         );
-        assert_eq!(surfaces.landing, (true, 1), "{case}: {surfaces:#?}");
-        assert_eq!(surfaces.tip, format!("codex-alab: {tip}"), "{case}");
         assert_eq!(surfaces.overview.0, format!("codex-alab: {tip}"), "{case}");
         assert_eq!(
             surfaces.overview.1, "codex-alab autopilot (land)",
@@ -1838,12 +1675,6 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
     );
     let begun = codex_hold_surfaces(&mut app, &sid);
     assert_eq!(begun.status, ["-", "0", since.as_str()], "{begun:#?}");
-    assert_eq!(
-        begun.landing,
-        (true, 1),
-        "Land's instruction typed: landing"
-    );
-    assert_eq!(begun.tip, "", "no yield read, no nudge: no tip");
     assert_eq!(begun.overview.0, "", "no yield read: no held line");
     assert_eq!(begun.hover, "codex-alab autopilot (land)", "no yield read");
     assert!(
@@ -1861,7 +1692,6 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
     );
     let nudged = codex_hold_surfaces(&mut app, &sid);
     assert_eq!(nudged.status, ["-", "1", since.as_str()]);
-    assert_eq!(nudged.tip, "codex-alab: 1 nudge");
     assert!(nudged.line.ends_with(" \u{b7} 1 nudge"), "{}", nudged.line);
 
     assert_eq!(self_meta(&mut app, &held_line(), 4), "OK\n");
@@ -1873,15 +1703,6 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
     );
     let stopped = codex_hold_surfaces(&mut app, &sid);
     let stop = |form| format!("codex-alab {}", stop_words(HeldBy::SameReply, form, false));
-    assert_eq!(
-        stopped.tip,
-        format!(
-            "{}{}{tip}",
-            stop(HoldForm::Tip),
-            crate::native_ui::FACT_SEPARATOR
-        ),
-        "the stop names its holder once"
-    );
     assert_eq!(
         stopped.hover,
         format!(
@@ -1933,16 +1754,10 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
 
     let (mut app, sid, _host) = desk("land");
     tell_hold(&mut app, &sid, Some(held()));
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
     assert_eq!(
         land_fields(&app),
         ["needs,repo,open", "3", since.as_str()],
         "CONTROL: aterm's claim"
-    );
-    assert_eq!(
-        app.status_session_row(&handle).landing_tip.as_deref(),
-        Some(tip.as_str()),
-        "CONTROL: aterm's own words, no name"
     );
     assert_eq!(driven(&app).as_deref(), Some(WHY), "CONTROL: aterm's claim");
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
@@ -1954,9 +1769,6 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
     ));
     assert!(app.harness_glass[&0].hold().is_some(), "still on the glass");
     assert_eq!(land_fields(&app), ["-", "-", "-"], "no claim of aterm's");
-    let row = app.status_session_row(&handle);
-    assert!(!row.landing, "no claim of aterm's");
-    assert_eq!(row.landing_tip, None, "no claim of aterm's");
 }
 
 /// The words aterm's loop tells beside a hold whose agent listed two items over an untracked
@@ -2195,8 +2007,8 @@ fn tell_quoted(
 }
 
 /// A REWORDED ITEM REFRESHES EVERY SURFACE THOUGH THE HOLD IS EQUAL (slice 4b): the chip's title
-/// and description, the state line, the tab's hover and the worker row's tip quote the new words
-/// once the loop tells them, the hold itself told again unchanged.
+/// and description, the state line and the tab's hover quote the new words once the loop tells
+/// them, the hold itself told again unchanged.
 /// Negative control: the stored hold's equality alone deciding whether the window reads again
 /// (main's `set_land_held`) leaves every surface on the old words.
 #[test]
@@ -2209,7 +2021,7 @@ fn a_reworded_item_refreshes_every_surface_though_the_hold_is_equal() {
     );
     tell_quoted(&mut app, &sid, Some(&quoted_said(old)), Some(listed_hold()));
     let before = stop_surfaces(&mut app, AutopilotView::Land);
-    for said in &before[..5] {
+    for said in &before[..4] {
         assert!(
             said.contains(old.trim_end_matches('.')),
             "CONTROL: {before:#?}"
@@ -2217,7 +2029,7 @@ fn a_reworded_item_refreshes_every_surface_though_the_hold_is_equal() {
     }
     tell_quoted(&mut app, &sid, Some(&quoted_said(new)), Some(listed_hold()));
     let after = stop_surfaces(&mut app, AutopilotView::Land);
-    for said in &after[..5] {
+    for said in &after[..4] {
         assert!(
             said.contains("pull request for the") && !said.contains(old.trim_end_matches('.')),
             "{after:#?}"

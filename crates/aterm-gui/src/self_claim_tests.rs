@@ -163,7 +163,6 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
             aterm_slog::Actor::Ctl,
         )
         .expect("the proven claim stands")
-        .revision
     };
     let lined = || Copy {
         resume: Ok(self_claimed::Resume {
@@ -187,9 +186,9 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
     let alive_as_proven = |pid: u32, start: &str| pid == 4242 && start == proven.start;
     forget(sid);
     let first = claim(1);
-    assert!(first > revision);
+    assert!(first.revision > revision);
     let rings = crate::harness_host::rings_here();
-    assert!(refresh_by(ctx, &proven, first, || Some(lined())));
+    assert!(refresh_by(ctx, &proven, first.placement, || Some(lined())));
     assert_eq!(crate::harness_host::rings_here(), rings + 1);
     let claimed = rollout_target(ctx).expect("the claim's own target");
     assert_eq!(
@@ -267,19 +266,19 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
     );
 
     let again = claim(2);
-    assert!(again > released, "the claim moves the revision");
+    assert!(again.revision > released, "the claim moves the revision");
     assert_eq!(
         tap_target_by(ctx, 4242, alive_as_proven),
         None,
         "a claim no copy was read for names nothing yet, as before the release kept one"
     );
     let rings = crate::harness_host::rings_here();
-    assert!(refresh_by(ctx, &proven, again, || Some(lined())));
+    assert!(refresh_by(ctx, &proven, again.placement, || Some(lined())));
     assert_eq!(crate::harness_host::rings_here(), rings + 1);
     assert_eq!(
         tap_target_by(ctx, 4242, alive_as_proven),
         Some(TapTarget::Claimed(RolloutTarget {
-            revision: again,
+            revision: again.revision,
             ..claimed
         }))
     );
@@ -304,7 +303,7 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
     assert_eq!(tap_target_by(ctx, 4242, |_, _| true), None);
 
     let third = claim(3);
-    assert!(refresh_by(ctx, &proven, third, || Some(lined())));
+    assert!(refresh_by(ctx, &proven, third.placement, || Some(lined())));
     let _ = release(copy_of(4242, &proven.start, self_claimed::Seen::Never), 1);
     assert_eq!(
         copy_of_tab(sid).map(|copy| (copy.seen, copy.resume)),
@@ -474,15 +473,12 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
         aterm_slog::Actor::Ctl,
     )
     .expect("a claim");
-    assert!(refresh_by(
-        ctx,
-        &proven,
-        first.revision,
-        || Some(standing())
-    ));
+    assert!(refresh_by(ctx, &proven, first.placement, || Some(
+        standing()
+    )));
     assert!(copy_of_tab(sid).is_some(), "the standing claim publishes");
 
-    assert!(!refresh_by(ctx, &proven, first.revision, || {
+    assert!(!refresh_by(ctx, &proven, first.placement, || {
         assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
         let revision = ctx.meta.lock().unwrap().supervisor_revision;
         assert!(finish_release(
@@ -511,7 +507,7 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
         aterm_slog::Actor::Ctl,
     )
     .expect("the same identity claims again");
-    assert!(refresh_by(ctx, &proven, next.revision, || Some(copy(
+    assert!(refresh_by(ctx, &proven, next.placement, || Some(copy(
         self_claimed::Seen::Never
     ))));
     assert_eq!(
@@ -519,7 +515,12 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
         self_claimed::Seen::Removed,
         "a passive read-only copy preserves that this identity's record was already seen"
     );
-    assert!(refresh_by(ctx, &proven, next.revision, || Some(standing())));
+    assert!(refresh_by(
+        ctx,
+        &proven,
+        next.placement,
+        || Some(standing())
+    ));
     assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
     let passive_rev = ctx.meta.lock().unwrap().supervisor_revision;
     assert!(finish_release(
@@ -546,7 +547,7 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
         }
         c
     };
-    assert!(refresh_by(ctx, &proven, next.revision, || Some(
+    assert!(refresh_by(ctx, &proven, next.placement, || Some(
         initializing()
     )));
     assert_eq!(
@@ -557,7 +558,12 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
         )),
         "a passive read-only copy prevents a re-claim from regressing to initializing"
     );
-    assert!(refresh_by(ctx, &proven, next.revision, || Some(standing())));
+    assert!(refresh_by(
+        ctx,
+        &proven,
+        next.placement,
+        || Some(standing())
+    ));
     assert!(!finish_release(
         ctx,
         &proven,
@@ -579,12 +585,9 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
         true,
         Some(copy(self_claimed::Seen::Removed))
     ));
-    assert!(!refresh_by(
-        ctx,
-        &proven,
-        next.revision,
-        || Some(standing())
-    ));
+    assert!(!refresh_by(ctx, &proven, next.placement, || Some(
+        standing()
+    )));
     assert!(matches!(
         copy_of_tab(sid).unwrap().seen,
         self_claimed::Seen::Removed
@@ -600,7 +603,12 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
         aterm_slog::Actor::Ctl,
     )
     .expect("a next claim");
-    assert!(refresh_by(ctx, &proven, next.revision, || Some(standing())));
+    assert!(refresh_by(
+        ctx,
+        &proven,
+        next.placement,
+        || Some(standing())
+    ));
     assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
     let revision = ctx.meta.lock().unwrap().supervisor_revision;
     let alive = std::cell::Cell::new(true);
@@ -632,15 +640,94 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
         aterm_slog::Actor::Ctl,
     )
     .expect("a next claim");
-    assert!(refresh_by(ctx, &proven, next.revision, || Some(copy(
+    assert!(refresh_by(ctx, &proven, next.placement, || Some(copy(
         self_claimed::Seen::Never
     ))));
     assert_eq!(copy_of_tab(sid).unwrap().seen, self_claimed::Seen::Removed);
     forget(sid);
-    assert!(refresh_by(ctx, &proven, next.revision, || Some(copy(
+    assert!(refresh_by(ctx, &proven, next.placement, || Some(copy(
         self_claimed::Seen::Never
     ))));
     assert_eq!(copy_of_tab(sid).unwrap().seen, self_claimed::Seen::Never);
+    forget(sid);
+}
+
+/// A RECORD READ BEGUN BEFORE A RENEWAL IN PLACE NEVER PUBLISHES OVER THAT RENEWAL'S OWN READ
+/// (review of 2020f39c770, findings 3 and 5). A `meta-change` on another connection begins its
+/// off-lock read of the record ([`meta_changed`]: the standing claim first, then the read) while
+/// the record still names the old line. codex-alab writes a new line and renews its claim in place,
+/// which keeps the revision, and that renewal's read ([`claimed`]) publishes the new line. The
+/// read begun before it then finds the claim placed again since and publishes nothing, so aterm's
+/// copy, the line a crash relaunch types, keeps the new line. Ordered by the revision alone, as
+/// before, the stale read published last and the copy went back to the old line.
+#[test]
+fn a_read_begun_before_a_renewal_in_place_cannot_overwrite_its_newer_copy() {
+    use crate::session_timeline::claim_supervisor_as;
+    const OLD: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
+    const NEW: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b78";
+    let handle = crate::session_store::test_handle_on(7596, -1);
+    let ctx = handle.ctx.as_ref();
+    let sid = ctx.self_id.as_str();
+    let proven = Proven {
+        pid: 4242,
+        start: "a renewing identity".to_string(),
+    };
+    let now = crate::metrics::now_us();
+    let claim = || {
+        claim_supervisor_as(
+            ctx,
+            "codex-alab@4242",
+            Some(1),
+            None,
+            Some(proven.clone()),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the proven claim stands")
+    };
+    let naming = |thread: &str| Copy {
+        resume: Ok(self_claimed::Resume {
+            argv: vec!["/opt/alab/bin/codex".into(), "resume".into(), thread.into()],
+            session: thread.to_string(),
+            codex_home: None,
+            codex_auth_path: None,
+            cwd: None,
+        }),
+        ..copy_of(4242, &proven.start, present(Some(thread)))
+    };
+    let line = || {
+        copy_of_tab(sid)
+            .and_then(|copy| copy.resume.ok())
+            .map(|resume| resume.session)
+    };
+    forget(sid);
+    let first = claim();
+    assert!(refresh_by(ctx, &proven, first.placement, || Some(naming(
+        OLD
+    ))));
+    let (_, begun) = standing(ctx).expect("the proven claim stands");
+    let renewed = claim();
+    assert_eq!(
+        renewed.revision, first.revision,
+        "POSITIVE CONTROL: the renewal is in place"
+    );
+    assert!(refresh_by(ctx, &proven, renewed.placement, || Some(
+        naming(NEW)
+    )));
+    assert_eq!(line().as_deref(), Some(NEW));
+    assert!(
+        !refresh_by(ctx, &proven, begun, || Some(naming(OLD))),
+        "a read begun before the renewal publishes nothing"
+    );
+    assert_eq!(
+        line().as_deref(),
+        Some(NEW),
+        "the copy keeps the renewal's newer line"
+    );
+    assert!(
+        refresh_by(ctx, &proven, renewed.placement, || Some(naming(NEW))),
+        "NEGATIVE CONTROL: a read begun at the latest placement publishes"
+    );
     forget(sid);
 }
 

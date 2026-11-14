@@ -405,6 +405,7 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
         artifact: Some("aa".repeat(32)),
         macho_sha256: Some("bb".repeat(32)),
         linux: None,
+        windows: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

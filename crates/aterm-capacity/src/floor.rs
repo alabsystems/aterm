@@ -7,7 +7,8 @@
 //! from the same inputs ([`Watch`]): the owner's `[disk]` knobs in aterm.toml ([`Knobs::read`])
 //! and the room the watch measured ([`crate::room`]). Measured build claims retain only the
 //! emergency line or an explicit owner floor ([`admission_floor`]); the cleanup target already
-//! includes room for builds and is not an additional reservation.
+//! includes room for builds and is not an additional reservation. The rebuildable budget
+//! ([`budget`]) is a cleaning target beside the lines: no line and no admission reads it.
 
 use crate::room::Rooms;
 
@@ -65,6 +66,10 @@ pub const ROOM_HI_PCT: u64 = 10;
 
 /// The room's cap is at most this many GiB ([`room_bounds`]).
 pub const ROOM_HI_GIB: u64 = 256;
+
+/// The cap on a volume's used bytes is at most this percent of its size, and exactly that
+/// where aterm.toml writes no `disk.cap_used_gib` ([`budget`]).
+pub const CAP_USED_PCT: u64 = 80;
 
 /// The `(least, most)` a measured ROOM (the second-largest daily two-hour fall of free space over a week) is clamped to on a volume of `total` bytes; with fewer than two days measured the room is the least.
 #[must_use]
@@ -270,6 +275,63 @@ pub const fn admission_floor(knobs: Knobs, lines: &Lines) -> u64 {
         lines.floor
     } else {
         lines.emergency
+    }
+}
+
+/// THE REBUILDABLE BUDGET of one volume, in bytes ([`budget`]): how many of the bytes aterm
+/// could rebuild (build caches and build directories) fit under the cap on the volume's used
+/// bytes, once the bytes it could not rebuild are counted. A cleaning target: no line
+/// ([`Lines`]) and no admission ([`admission_floor`]) reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    /// The most used bytes the volume is held to: `disk.cap_used_gib` as written, or
+    /// [`CAP_USED_PCT`] of the volume where that is smaller or the key is unwritten.
+    pub cap: u64,
+    /// Whether [`Self::cap`] is the written figure (`false`: the volume's share).
+    pub cap_written: bool,
+    /// The used bytes aterm could not rebuild: the volume's used bytes less
+    /// [`Self::rebuildable`], never below 0.
+    pub kept: u64,
+    /// The rebuildable bytes the cap leaves room for: [`Self::cap`] less [`Self::kept`], never
+    /// below 0.
+    pub target: u64,
+    /// The rebuildable bytes on the volume now, as the caller sized them.
+    pub rebuildable: u64,
+}
+
+impl Budget {
+    /// How far [`Self::rebuildable`] is over [`Self::target`] (`0`: at it or under).
+    #[must_use]
+    pub const fn over(&self) -> u64 {
+        self.rebuildable.saturating_sub(self.target)
+    }
+
+    /// How far [`Self::rebuildable`] is under [`Self::target`] (`0`: at it or over).
+    #[must_use]
+    pub const fn under(&self) -> u64 {
+        self.target.saturating_sub(self.rebuildable)
+    }
+}
+
+/// The rebuildable budget of a volume of `total` bytes with `used` of them used and
+/// `rebuildable` of those sized as rebuildable. The cap is `cap_used_gib` (aterm.toml's
+/// `disk.cap_used_gib`; `None`: unwritten) held to [`CAP_USED_PCT`] of the volume; the kept
+/// bytes are `used` less `rebuildable`, and the target is the cap less the kept bytes, each
+/// never below 0. A `rebuildable` sized short (a bounded walk) counts the rest as kept: the
+/// kept bytes are then a ceiling, and the target and [`Budget::over`] floors. A `rebuildable`
+/// above `used` (storage counted twice) keeps nothing, and the target is then the whole cap.
+#[must_use]
+pub fn budget(cap_used_gib: Option<u64>, total: u64, used: u64, rebuildable: u64) -> Budget {
+    let share = (total / 100).saturating_mul(CAP_USED_PCT);
+    let written = cap_used_gib.map(|g| g.saturating_mul(GIB));
+    let cap = written.map_or(share, |c| c.min(share));
+    let kept = used.saturating_sub(rebuildable);
+    Budget {
+        cap,
+        cap_written: written.is_some_and(|c| c <= share),
+        kept,
+        target: cap.saturating_sub(kept),
+        rebuildable,
     }
 }
 

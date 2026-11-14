@@ -115,6 +115,12 @@ mod unix {
 
     fn make_pipe() -> Option<(RawFd, RawFd)> {
         let mut fds = [0 as libc::c_int; 2];
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "this terminal library does not link aterm-uds (a dev-dependency only); its \
+                      wake pipe is made once and never closed, so no read waits on its EOF and no \
+                      write on EPIPE"
+        )]
         // SAFETY: `fds` is a writable array of two descriptors.
         let made = unsafe { libc::pipe(fds.as_mut_ptr()) };
         if made != 0 {

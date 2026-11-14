@@ -107,7 +107,7 @@ fn entries(dir: &Path) -> std::collections::BTreeSet<PathBuf> {
     all
 }
 
-fn changed_device(lab: &Lab) {
+pub(crate) fn changed_device(lab: &Lab) {
     changed_device_at(&lab.paths[0]);
 }
 
@@ -2713,6 +2713,427 @@ fn an_open_session_reads_while_pending_and_refuses_an_invalidated_completion() {
     assert_eq!(files(lab._home.path()), before_invalidated);
 }
 
+/// A stand-in lab whose first Mac holds a registry of machines, read as the shared file
+/// `lab/machines` by the materializer's passes. No live vault, registry or account is read.
+struct Shelf {
+    lab: Lab,
+    original: Paths,
+    /// The stand-in `aterm.toml`, which no test writes: sharing is on.
+    config: std::path::PathBuf,
+}
+
+impl Shelf {
+    /// The lab, its registry holding the machine `m7`.
+    fn new() -> Self {
+        let lab = Lab::new(&[Role::Writer, Role::Writer]);
+        let original = lab.paths[0].clone();
+        let config = lab._home.path().join("aterm.toml");
+        crate::alab::Registry::at(original.clone()).open().unwrap();
+        let shelf = Self {
+            lab,
+            original,
+            config,
+        };
+        shelf.machine("m7");
+        shelf
+    }
+
+    /// The writer this Mac's lineage selects now puts a machine row labelled `label`.
+    fn machine(&self, label: &str) {
+        use crate::{
+            alab::registry::MACHINE,
+            typed::{grid::tests::put, keys},
+        };
+        let pk = keys::machine_pk(label);
+        crate::alab::Registry::at(self.original.clone())
+            .write(vec![vec![
+                put(&MACHINE, &pk, "label", json!(label)),
+                put(&MACHINE, &pk, "status", json!("active")),
+            ]])
+            .unwrap();
+    }
+
+    /// One ordinary materializer pass over every shared file.
+    fn pass(&self) -> Vec<crate::file::materialize::Outcome> {
+        crate::file::materialize::pass(
+            &self.original,
+            &self.config,
+            None,
+            &crate::file::materialize::Pass {
+                read_by: hang(),
+                vault_wait: crate::file::materialize::VAULT_WAIT,
+                again: false,
+                now_ms: 1_800_000_000_000,
+            },
+        )
+    }
+
+    fn file(&self, file: &crate::file::Type) -> aterm_file::File {
+        aterm_file::File::at(&crate::file::root(&self.original), &file.file())
+    }
+
+    /// What a read of `lab/machines` answers: the machines' labels, in order, and the home of
+    /// this Mac's writer lineage the snapshot was projected from.
+    fn machines(&self) -> (Vec<String>, u64) {
+        let machines = self.file(&crate::file::MACHINES);
+        let mut labels: Vec<String> = machines
+            .read()
+            .rows()
+            .iter()
+            .map(|row| row.cell("label").to_owned())
+            .collect();
+        labels.sort();
+        (
+            labels,
+            machines.frontier().map_or(0, |frontier| frontier.era),
+        )
+    }
+
+    /// Every file's pass ended in `word` (`why`), every file's status says the same, and what
+    /// each pass did to its snapshot is `recorded`.
+    #[track_caller]
+    fn all(
+        &self,
+        outcomes: &[crate::file::materialize::Outcome],
+        word: aterm_file::Word,
+        why: Option<aterm_file::Why>,
+        recorded: aterm_file::Recorded,
+    ) {
+        assert_eq!(outcomes.len(), crate::file::FILES.len());
+        for outcome in outcomes {
+            assert_eq!(
+                (outcome.word, outcome.why, outcome.recorded),
+                (word, why, Some(recorded)),
+                "{}: {:?}",
+                outcome.name,
+                outcome.detail
+            );
+            assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
+        }
+        for file in crate::file::FILES {
+            let status = self.file(file).status();
+            assert_eq!((status.word, status.why), (word, why), "{}", file.name);
+        }
+    }
+
+    /// A pass over a home a succession fences: `held` (`succession`) for every file, with
+    /// `recorded` what it did to each snapshot, never `live` by any way a reader asks, and with
+    /// nothing written to this Mac's vault, custody or tables, its successor's home included (no
+    /// record authored, none ingested, no receipt).
+    #[track_caller]
+    fn held_pass(&self, recorded: aterm_file::Recorded) {
+        use aterm_file::{Why, Word};
+        let before = files(&self.original.dir);
+        let outcomes = self.pass();
+        self.all(&outcomes, Word::Held, Some(Why::Succession), recorded);
+        assert_eq!(
+            crate::file::materialize::standing(&self.original, hang()),
+            (Word::Held, Some(Why::Succession))
+        );
+        assert_eq!(
+            files(&self.original.dir),
+            before,
+            "the pass wrote nothing outside the shared files"
+        );
+    }
+
+    /// How the materializer's walk says this Mac's lineage stands, and at which home.
+    fn walk(&self) -> (Standing, u64, Paths) {
+        let held = materializer_generation_until(
+            &self.original,
+            hang(),
+            &crate::file::materialize::Projecting::in_test(),
+        )
+        .unwrap();
+        (held.standing, held.era, held.paths)
+    }
+
+    /// Invalidate the completion of the original's succession, as a later source receipt does.
+    fn invalidate(selection: &Selection) {
+        let mut invalidated = selection.clone();
+        invalidated.complete = Some([0; 32]);
+        invalidated.save().unwrap();
+    }
+
+    /// The strict readers and writers refuse while the lineage is unsettled, as before SF-03.
+    #[track_caller]
+    fn strict_paths_refuse(&self) {
+        for refused in [
+            observed_generation_until(&self.original, hang()).map(drop),
+            completed_generation_until(&self.original, hang()).map(drop),
+            crate::alab::Registry::at(self.original.clone())
+                .view_until(hang())
+                .map(drop),
+        ] {
+            assert_eq!(refused.err().unwrap().to_string(), PRESERVING);
+        }
+        assert!(guard(&self.original, true).is_err());
+        assert!(selected(&self.original).is_err());
+    }
+}
+
+/// SF-03's exit (docs/DESIGN-shared-files-2026-11-11.md §4, §8, §9 risk 7): the materializer
+/// alone reads the records a fenced home holds, through a succession that has not finished and
+/// through one whose completion was invalidated, and what it snapshots there is `held`, never
+/// `live`; a snapshot never moves back to an older home.
+///
+/// Three stand-in labs, each a registry of machines read as `lab/machines`.
+///
+/// The first is read at every step. A record that arrived before the fence (`m8`) is
+/// snapshotted from the fenced original while its succession is unfinished (`Preserving`):
+/// `held`. The succession completes and the successor's home is snapshotted `live`. Its
+/// completion is then invalidated three times: under a pass that had already read the
+/// successor as the newest home, which records `held` and projects nothing; with the successor
+/// holding exactly the records the original holds, where only the order of the homes keeps the
+/// original's view from replacing the successor's snapshot; and after the successor authored
+/// `m9`, which the original never holds. Each time the strict paths refuse as they did, the
+/// pass opens the original as `Unsettled`, records `held`, and the snapshot stays the
+/// successor's, also where the frontier kept beside that snapshot is lost.
+///
+/// The second is never read at its successor: the succession completes, the successor authors
+/// `m9`, and the completion is invalidated before any pass. The unsettled pass then projects
+/// the original: the rows a reader gets gain `m8`, lack `m9` (what a read of an original home
+/// after an invalidated completion can mislead), and are `held`. The completion made again,
+/// the successor's home replaces the snapshot, `m9` with it, `live`.
+///
+/// The third is fenced with no selection, the file that says how a succession stands and the
+/// last of the fence's three a reservation writes: a reservation cut short after its first
+/// file and after its second, and a selection lost after the succession completed and the
+/// successor authored `m9`. Each is `Unsettled` and `held`, and the rows that lack `m9` are
+/// never `live`.
+///
+/// Every held pass leaves this Mac's vault, custody and tables byte for byte as they were: it
+/// authors nothing, ingests nothing and persists no receipt. A home a completed succession
+/// superseded is not read by the materializer's check either.
+///
+/// NEGATIVE CONTROLS, each observed on this test (2026-11-12):
+/// - with `with_custody` calling a home `newest` unless it is `Preserving`, the first lab's
+///   unsettled pass is no longer a fenced home's:
+///   `` left: (Held, Some(Custody), Some(Kept(Behind))) ``
+///   `` right: (Held, Some(Succession), Some(Kept(Behind))) ``,
+///   and where it projects (`file::model_read_tests`, the same change) the original's rows are
+///   `live`: `` left: Seen { custody: 2, era: 0, sera: 0, sfr: 1, word: 1, met: 0, .. } ``;
+/// - with `Frontier::admits_over` ordering two reads by their table generation and records
+///   alone, never their home, the first lab's unsettled pass replaces the successor's snapshot
+///   with the original's:
+///   `` left: (Held, Some(Succession), Some(Recorded { replaced: true })) ``
+///   `` right: (Held, Some(Succession), Some(Kept(Behind))) ``;
+/// - with `materializer_generation_until` refusing an invalidated completion, as it did before
+///   this slice, `walk` fails on `Commons writer succession is still preserving old records`;
+///   with `check_materialize` refusing an unsettled home as `check_read` does, its `unwrap`
+///   fails on the same words;
+/// - with `materializer_generation_until` calling a home with no selection the newest whatever
+///   fences it, the third lab's walk reads `` left: (Newest, 0, ..) right: (Unsettled, 0, ..) ``
+///   and, that assertion set aside, its first pass records the fenced home's rows `live`:
+///   `` left: (Live, None, Some(Recorded { replaced: true })) ``
+///   `` right: (Held, Some(Succession), Some(Recorded { replaced: true })) ``;
+/// - with `File::record` admitting any read over a snapshot whose frontier file is gone, the
+///   first lab's unsettled pass replaces the successor's rows, `m9` with them:
+///   `` left: (Held, Some(Succession), Some(Recorded { replaced: true })) ``
+///   `` right: (Held, Some(Succession), Some(Kept(Behind))) ``.
+#[test]
+fn a_materializer_snapshots_held_records_through_an_unfinished_and_an_invalidated_succession_and_never_calls_them_live()
+ {
+    use crate::file::materialize::Projecting;
+    use aterm_file::{Kept, Recorded, Why, Word};
+    let replaced = Recorded::Recorded { replaced: true };
+    let behind = Recorded::Kept(Kept::Behind);
+    let labels = |list: &[&str]| -> Vec<String> { list.iter().map(|x| (*x).to_owned()).collect() };
+
+    // THE FIRST LAB: every home is read as it becomes the one a pass opens.
+    let mut shelf = Shelf::new();
+    let original = shelf.original.clone();
+    shelf.all(&shelf.pass(), Word::Live, None, replaced);
+    assert_eq!(shelf.machines(), (labels(&["m7"]), 0));
+    assert_eq!(shelf.walk(), (Standing::Newest, 0, original.clone()));
+
+    // 1. UNFINISHED. A record arrives, the writer is fenced, and its successor is never
+    // admitted: the import stops before any record moves.
+    shelf.machine("m8");
+    let mut selection = reserved(&shelf.lab);
+    assert!(import(&mut selection).is_err());
+    assert_eq!(
+        completed_generation_until(&original, hang())
+            .err()
+            .unwrap()
+            .to_string(),
+        PRESERVING,
+        "the strict selection refuses, as it did on m2"
+    );
+    assert_eq!(shelf.walk(), (Standing::Preserving, 0, original.clone()));
+    shelf.held_pass(replaced);
+    assert_eq!(
+        shelf.machines(),
+        (labels(&["m7", "m8"]), 0),
+        "the record the fenced home held is snapshotted"
+    );
+
+    // 2. COMPLETE. The successor is admitted and imports: its home is the newest, and `live`.
+    let next = move_admitted_candidate(&mut shelf.lab);
+    import(&mut selection).unwrap();
+    assert_eq!(shelf.walk(), (Standing::Newest, 1, next.clone()));
+    shelf.all(&shelf.pass(), Word::Live, None, replaced);
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8"]), 1));
+    // A home a completed succession superseded is not the materializer's to read.
+    let superseded = Observation::observe(&original, hang()).unwrap();
+    assert_eq!(
+        superseded
+            .check_materialize(hang(), &Projecting::in_test())
+            .err()
+            .unwrap()
+            .to_string(),
+        "original Commons writer is fenced by succession"
+    );
+
+    // 3. INVALIDATED UNDER A PASS that read the successor as the newest home before it opened
+    // custody: the pass projects nothing and records `held`.
+    let racing = selection.clone();
+    crate::file::seam::after_standing(move || Shelf::invalidate(&racing));
+    shelf.all(
+        &shelf.pass(),
+        Word::Held,
+        Some(Why::Succession),
+        Recorded::Recorded { replaced: false },
+    );
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8"]), 1));
+
+    // 4. INVALIDATED, the successor holding exactly the original's records. The strict paths
+    // refuse; the materializer's walk names the original, unsettled, and its check admits it
+    // where a reader's refuses.
+    shelf.strict_paths_refuse();
+    assert_eq!(shelf.walk(), (Standing::Unsettled, 0, original.clone()));
+    let unsettled = Observation::observe(&original, hang()).unwrap();
+    assert_eq!(
+        unsettled.check_read(hang()).err().unwrap().to_string(),
+        PRESERVING
+    );
+    unsettled
+        .check_materialize(hang(), &Projecting::in_test())
+        .unwrap();
+    shelf.held_pass(behind);
+    assert_eq!(
+        shelf.machines(),
+        (labels(&["m7", "m8"]), 1),
+        "an earlier home never replaces the snapshot of a later one"
+    );
+
+    // The completion made again, the successor authors a record its original never holds.
+    import(&mut selection).unwrap();
+    shelf.machine("m9");
+    shelf.all(&shelf.pass(), Word::Live, None, replaced);
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8", "m9"]), 1));
+
+    // 5. INVALIDATED AFTER THE SUCCESSOR AUTHORED. The reader keeps the successor's rows.
+    Shelf::invalidate(&selection);
+    shelf.strict_paths_refuse();
+    assert_eq!(shelf.walk(), (Standing::Unsettled, 0, original.clone()));
+    shelf.held_pass(behind);
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8", "m9"]), 1));
+    // The frontier kept beside the successor's snapshot lost: the unsettled view cannot be
+    // shown to be no older, so it is behind still, and the reader keeps `m9`.
+    let files_root = crate::file::root(&original);
+    for file in crate::file::FILES {
+        std::fs::remove_file(files_root.frontier(&file.file())).unwrap();
+    }
+    shelf.held_pass(behind);
+    assert_eq!(shelf.machines().0, labels(&["m7", "m8", "m9"]));
+    // The completion made again, the successor's read writes its frontier again.
+    import(&mut selection).unwrap();
+    shelf.all(
+        &shelf.pass(),
+        Word::Live,
+        None,
+        Recorded::Recorded { replaced: false },
+    );
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8", "m9"]), 1));
+
+    // THE SECOND LAB: no pass reads the successor before its completion is invalidated.
+    let mut shelf = Shelf::new();
+    let original = shelf.original.clone();
+    shelf.all(&shelf.pass(), Word::Live, None, replaced);
+    shelf.machine("m8");
+    let mut selection = reserved(&shelf.lab);
+    let next = move_admitted_candidate(&mut shelf.lab);
+    import(&mut selection).unwrap();
+    shelf.machine("m9");
+    assert_eq!(shelf.walk(), (Standing::Newest, 1, next));
+    Shelf::invalidate(&selection);
+    shelf.strict_paths_refuse();
+    assert_eq!(shelf.walk(), (Standing::Unsettled, 0, original));
+    // The read still answers the last snapshot, `live` as its pass left it, with no custody.
+    let quiet = crate::file::seam::custody_opens();
+    assert_eq!(shelf.machines(), (labels(&["m7"]), 0));
+    assert_eq!(crate::file::seam::custody_opens(), quiet);
+    // The unsettled pass projects the original: `held`, with the record the fence held and
+    // without the one its successor authored.
+    shelf.held_pass(replaced);
+    assert_eq!(
+        shelf.machines(),
+        (labels(&["m7", "m8"]), 0),
+        "the original's records, which lack what its successor wrote"
+    );
+    // The pass again changes nothing, and is `held` again.
+    shelf.held_pass(Recorded::Recorded { replaced: false });
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8"]), 0));
+    // The completion made again: the later home replaces the snapshot, `live`.
+    import(&mut selection).unwrap();
+    shelf.all(&shelf.pass(), Word::Live, None, replaced);
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8", "m9"]), 1));
+
+    // THE THIRD LAB: a fenced home with no selection. The fence is the reservation, the
+    // successor's link and the selection, written in that order; the selection alone says how
+    // the succession stands, and a home fenced without one is never the newest.
+    let mut shelf = Shelf::new();
+    let original = shelf.original.clone();
+    shelf.all(&shelf.pass(), Word::Live, None, replaced);
+    shelf.machine("m8");
+    let selection_file = root(&original).join(STATE);
+    let unselected = |shelf: &Shelf| {
+        assert!(fenced(&original).unwrap());
+        assert!(
+            guard(&original, true).is_err(),
+            "a fenced home authors nothing"
+        );
+        assert_eq!(shelf.walk(), (Standing::Unsettled, 0, original.clone()));
+    };
+
+    // 6. A RESERVATION CUT SHORT after its first file: the reservation alone. The pass projects
+    // the record that arrived before the fence, `held`.
+    reserved(&shelf.lab);
+    std::fs::remove_file(&selection_file).unwrap();
+    std::fs::remove_file(candidate(&original).dir.join(LINK)).unwrap();
+    unselected(&shelf);
+    shelf.held_pass(replaced);
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8"]), 0));
+    // Cut short after its second: the reservation and the successor's link.
+    reserved(&shelf.lab);
+    std::fs::remove_file(&selection_file).unwrap();
+    unselected(&shelf);
+    shelf.held_pass(Recorded::Recorded { replaced: false });
+
+    // 7. THE SELECTION LOST after the succession completed and the successor authored a record
+    // the original never holds, with no pass at the successor's home: the original's rows,
+    // which lack that record, are `held`.
+    let mut selection = reserved(&shelf.lab);
+    let next = move_admitted_candidate(&mut shelf.lab);
+    import(&mut selection).unwrap();
+    shelf.machine("m9");
+    assert_eq!(shelf.walk(), (Standing::Newest, 1, next));
+    std::fs::remove_file(&selection_file).unwrap();
+    unselected(&shelf);
+    shelf.held_pass(Recorded::Recorded { replaced: false });
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8"]), 0));
+    // Recovery reserves again, writing a selection with no completion; the completion mark the
+    // import left says the successor may have authored (m9 is not here), so the original is
+    // `Unsettled`, not `Preserving`. The import completes again: the successor's home, `live`.
+    let mut resumed = reserved(&shelf.lab);
+    assert_eq!(shelf.walk(), (Standing::Unsettled, 0, original.clone()));
+    shelf.held_pass(Recorded::Recorded { replaced: false });
+    import(&mut resumed).unwrap();
+    shelf.all(&shelf.pass(), Word::Live, None, replaced);
+    assert_eq!(shelf.machines(), (labels(&["m7", "m8", "m9"]), 1));
+}
+
 /// A candidate that was admitted but whose import has not finished is never read: a read of the
 /// original names the original and answers its own declaration, rather than opening the
 /// candidate's custody and answering as if no table were there (`registry: not imported`).
@@ -3734,8 +4155,8 @@ fn a_busy_vault_keeps_a_labels_registry_generation_busy_not_the_first() {
 /// what [`Lab`] builds, with its vault read from a URL as the default ALab's is, so a member's
 /// log admission can hand a bundle (`client::HandedVault`), and read on this thread as the
 /// default ALab's ([`seams::alab_is`]) so a succession enrolls a successor by itself.
-struct Served {
-    lab: Lab,
+pub(crate) struct Served {
+    pub(crate) lab: Lab,
     url: String,
     server: Option<aterm_secrets::server::Running>,
     /// Every read of the server this fixture started waits the hang detector on this thread,
@@ -3750,7 +4171,7 @@ impl Drop for Served {
     }
 }
 
-fn served() -> Served {
+pub(crate) fn served() -> Served {
     aterm_spec::fs_lane::join();
     let home = aterm_tempfile::tempdir().unwrap();
     let store = home.path().join("served");
@@ -3891,7 +4312,7 @@ fn present(member: &Paths, home: &Paths, trust: &Trust, statement: &Allowed) -> 
 
 /// A second Mac a person allowed into the served lab at its first member's desk, before any
 /// loss: a current member that is no part of the first member's writer lineage.
-fn allowed_member(served: &mut Served, name: &str) -> Paths {
+pub(crate) fn allowed_member(served: &mut Served, name: &str) -> Paths {
     let lab = &served.lab;
     let home = Paths::for_home(&lab._home.path().join(name));
     client::machine_identity(&home).unwrap();
@@ -3923,7 +4344,7 @@ fn allowed_member(served: &mut Served, name: &str) -> Paths {
 }
 
 /// Whether the succession `original` fenced is sealed and selects its successor home.
-fn completes(original: &Paths) -> bool {
+pub(crate) fn completes(original: &Paths) -> bool {
     Selection::read(original)
         .ok()
         .flatten()
@@ -4176,6 +4597,61 @@ fn a_successor_whose_plain_ask_nobody_answered_is_admitted_on_the_statement() {
         .unwrap()
         .writer()
         .unwrap();
+}
+
+/// A reserved successor home that was emptied (its folder removed, or restored without its link)
+/// holds no successor of this writer: the recovery pass ends refused at every pass, makes nothing
+/// in it and signs nothing, and the status a person reads says why. Before, the statement stopped
+/// at the lost link, the plain ask that follows a refused statement ran, and the pass ended `Ok`
+/// with the emptied home as the paths to serve. In a release build that ask fetches the vault's
+/// envelope and makes a vault identity in the home (`client::join_with_until`, `machine_identity`);
+/// a test binary's ask is refused first as a lab identity's (A12), so this test pins the pass's
+/// refusal and its reason, not the join.
+///
+/// NEGATIVE CONTROL: `advance_at` without the link check: `pass 0 serves the emptied home`.
+#[test]
+fn an_emptied_candidate_home_gets_no_key_and_asks_nothing() {
+    let served = served();
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    let config = original.home.join("config.toml");
+    data(lab);
+    changed_device(lab);
+    reserved(lab);
+    let next = candidate(&original);
+    assert!(
+        linked(&next).unwrap().is_some(),
+        "CONTROL: the reserved home links to its selection"
+    );
+    std::fs::remove_dir_all(&next.home).unwrap();
+    let held = client::load_records(&original).unwrap().encode();
+    for pass in 0..2 {
+        let advanced = advance(&original, &config);
+        assert!(
+            !next.home.exists(),
+            "pass {pass} made something in the emptied home: {:?}",
+            files(&next.home).keys().collect::<Vec<_>>()
+        );
+        assert!(
+            advanced.is_err(),
+            "pass {pass} serves the emptied home: {advanced:?}"
+        );
+        assert!(!root(&original).join(STATEMENT).exists(), "pass {pass}");
+    }
+    assert_eq!(
+        client::load_records(&original).unwrap().encode(),
+        held,
+        "nothing is signed"
+    );
+    assert!(guard(&original, true).is_err(), "the original stays fenced");
+    let why = statement_refused(&original).unwrap();
+    assert!(why.contains("does not link"), "{why}");
+    let (report, _) = status(&original, hang()).unwrap();
+    assert_eq!(report["state"].as_str(), Some("pending"));
+    assert_eq!(
+        report["sources"][0]["statement_refused"].as_str(),
+        Some(why.as_str())
+    );
 }
 
 /// A new seat is signed only by a member that just read the vault's newest records and whose

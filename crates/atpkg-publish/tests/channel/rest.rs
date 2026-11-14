@@ -971,6 +971,111 @@ fn an_unreadable_main_of_record_never_starts_its_git_fetch() {
     assert_eq!(rig.fake.seen().len(), attempts, "no API retry");
 }
 
+/// A fetch whose new main moves a populated submodule's gitlink fetches the host's repository
+/// alone, though git's default (`fetch.recurseSubmodules=on-demand`) would start a fetch in
+/// that submodule, which inherits this identity's helper and the unscoped TLS pins through
+/// `GIT_CONFIG_PARAMETERS` but not the pins at the repository's URL: `fetch_repo` and
+/// `fetch_main` each bring the new main, and the submodule's remote, which no fetch could
+/// reach, is never asked. NEGATIVE CONTROL: either fetch without `--recurse-submodules=no`
+/// starts the submodule's fetch, which fails, and the host's fetch with it.
+#[test]
+fn a_fetch_never_starts_a_fetch_in_a_populated_submodule() {
+    use atpkg_publish::artifact::package::MAIN_OF_RECORD;
+
+    let rig = Rig::new();
+    let root = rig.dir.path();
+    let git = |dir: &Path, args: &[&str]| {
+        let fixture = [
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "protocol.file.allow=always",
+        ];
+        main_record_git(dir, &[&fixture[..], args].concat())
+    };
+    let utf8 = |path: &Path| path.to_str().expect("a UTF-8 scratch").to_string();
+    let sub = root.join("sub");
+    let upstream = root.join("upstream");
+    for repo in [&sub, &upstream] {
+        std::fs::create_dir(repo).expect("a repository");
+        git(repo, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(repo.join("README"), "fixture\n").expect("a file");
+        git(repo, &["add", "README"]);
+    }
+    git(&sub, &["commit", "--quiet", "-m", "sub"]);
+    git(
+        &upstream,
+        &["submodule", "add", "--quiet", &utf8(&sub), "sub"],
+    );
+    git(
+        &upstream,
+        &["commit", "--quiet", "-m", "with its submodule"],
+    );
+    let mirror = root.join("mirror");
+    let bare = utf8(&mirror.join("fixture-dev/packs.git"));
+    git(
+        root,
+        &["clone", "--quiet", "--bare", &utf8(&upstream), &bare],
+    );
+    let nowhere = format!("file://{}", root.join("no-such-submodule.git").display());
+    let checkout = |name: &str| {
+        let checkout = root.join(name);
+        git(
+            root,
+            &[
+                "clone",
+                "--quiet",
+                "--recurse-submodules",
+                &bare,
+                &utf8(&checkout),
+            ],
+        );
+        git(
+            &checkout.join("sub"),
+            &["remote", "set-url", "origin", &nowhere],
+        );
+        git(
+            &checkout,
+            &[
+                "config",
+                &format!("url.file://{}/.insteadOf", mirror.display()),
+                "https://github.com/",
+            ],
+        );
+        checkout
+    };
+    let (repo, main) = (checkout("fetch-repo"), checkout("fetch-main"));
+    let moved = format!("160000,{},sub", "1".repeat(40));
+    git(&upstream, &["update-index", "--cacheinfo", &moved]);
+    git(
+        &upstream,
+        &["commit", "--quiet", "-m", "moves its submodule"],
+    );
+    git(&upstream, &["push", "--quiet", &bare, "main"]);
+    let sha = git(&upstream, &["rev-parse", "HEAD"]);
+    rig.fake.add_commit(
+        SLUG,
+        CommitSpec {
+            sha: sha.clone(),
+            message: "moves its submodule".into(),
+            author_login: Some(LOGIN.into()),
+            author_name: "Fixture".into(),
+            date: "2026-11-13T00:00:00Z".into(),
+            paths: vec!["sub".into()],
+        },
+    );
+    rig.fake.set_branch(SLUG, "refs/heads/main", &sha);
+    let host = rig.host_at("https://github.com");
+    host.fetch_repo(&slug(), &repo)
+        .expect("fetch_repo fetches the repository alone");
+    assert_eq!(git(&repo, &["rev-parse", "refs/remotes/origin/main"]), sha);
+    host.fetch_main(&slug(), &main, MAIN_OF_RECORD)
+        .expect("fetch_main fetches the repository alone");
+    assert_eq!(git(&main, &["rev-parse", MAIN_OF_RECORD]), sha);
+}
+
 #[test]
 fn git_hands_its_token_over_whatever_helpers_and_use_http_path_the_users_config_holds() {
     let rig = Rig::new();

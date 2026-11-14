@@ -19,7 +19,8 @@
 use super::markdown::{DOC, edit_line, markdown_world, rechecked, rival_does};
 use super::*;
 
-/// The flags the landing gives a judgment's child, besides its checks and `--base`/`--events`.
+/// The flags the landing gives a judgment's child, besides `--base`/`--events` and a round's
+/// `--judged`/`--shared`.
 const FLAGS: [&str; 4] = ["--input-drift", "--admit", "--timeout", "--test-cores"];
 /// Where a tree states its verifier's contract.
 const CONTRACT: &str = "verify/contract";
@@ -104,14 +105,14 @@ fn words(
     root: &Path,
     verifier: &Path,
     base: &str,
-    checks: &[&str],
+    round: Option<Round<'_>>,
     resources: &LandResources,
 ) -> Vec<String> {
     let cmd = judgment_command(
         verifier,
         root,
         base,
-        checks,
+        round,
         Path::new("/events"),
         resources,
         &crate::EnvSnapshot::default(),
@@ -207,14 +208,14 @@ impl Landing<'_> {
             Entry::Resume(handoff) => handoff.words.clone(),
         };
         let resources = options(&land_words).expect("this image takes the landing's words");
-        let child = |root: &Path, verifier: &Path, base: &str, checks: &[&str]| {
+        let child = |root: &Path, verifier: &Path, base: &str, round: Option<Round<'_>>| {
             let tree = contract_at(root);
             assert_eq!(
                 verifier,
                 build(self.scratch, &tree, &by).path,
                 "a child runs as its tree's build"
             );
-            let words = words(&contract, root, verifier, base, checks, &resources);
+            let words = words(&contract, root, verifier, base, round, &resources);
             self.log
                 .borrow_mut()
                 .runs
@@ -235,7 +236,7 @@ impl Landing<'_> {
                 Ok(image)
             },
             judge: &mut |root: &Path, verifier: &Path, base: &str, poll: Poll<'_>| {
-                let taken = child(root, verifier, base, &[]);
+                let taken = child(root, verifier, base, None);
                 let n = self.log.borrow().runs.len() - 1;
                 if let Some(ran) = (self.on_judge)(n, poll) {
                     return ran;
@@ -256,8 +257,21 @@ impl Landing<'_> {
                 crates(&["a"])
             },
             lane: &mut |_: &Path, _: &str| Lane::Pass,
-            recheck: &mut |root: &Path, verifier: &Path, base: &str| match child(
-                root, verifier, base, &RECHECKS,
+            // A shared path a crate may own reaches every crate here: only the worlds' shared
+            // Markdown is answered by a round.
+            reach: &|_: &Path, _: &str, paths: Option<&[String]>| match paths {
+                None => reaches(&["a"]),
+                Some(_) => Reach::Everything(WHOLE.into()),
+            },
+            recheck: &mut |root: &Path, verifier: &Path, base: &str, delta: &Delta| match child(
+                root,
+                verifier,
+                base,
+                Some(Round {
+                    judged: &delta.judged,
+                    shared: Path::new("/shared"),
+                    mechanical: delta.mechanical,
+                }),
             ) {
                 Ok(()) => rechecked(),
                 Err(why) => {
@@ -384,10 +398,7 @@ fn a_rejudge_tree_whose_verifier_drops_a_flag_the_starting_run_passes_lands_as_t
             git(&world.work, &["rev-parse", &format!("{}^2", handoff.at)]),
             moved
         );
-        assert_eq!(
-            (handoff.rejudges, handoff.composes, &handoff.cone),
-            (1, 0, &m1)
-        );
+        assert_eq!((handoff.composes, &handoff.cone), (0, &m1));
         assert_eq!(handoff.branch, Some(crates(&["a"])));
         assert_eq!(handoff.words, ["--test-cores", "4"]);
         assert_eq!(
@@ -485,10 +496,7 @@ fn a_first_judgment_of_a_merge_the_landing_made_runs_as_the_merged_tree() {
         };
         assert_eq!(handoff.step, aterm_land::Step::Qualify);
         assert_eq!(handoff.base, m1);
-        assert_eq!(
-            (handoff.rejudges, &handoff.cone, handoff.branch.as_ref()),
-            (0, &m1, None)
-        );
+        assert_eq!((&handoff.cone, handoff.branch.as_ref()), (&m1, None));
         assert_eq!(handoff.stated, Stated::default());
         assert_eq!(
             log.branches,
@@ -549,7 +557,13 @@ fn a_recheck_hands_over_with_its_composition_count() {
         let moved = moved.into_inner();
         let said = &log.said;
         let recheck = &log.runs.last().expect("a recheck ran").1;
-        assert_eq!(recheck[..3], RECHECKS, "{recheck:?}");
+        assert!(
+            recheck.windows(2).any(|pair| pair[0] == "--judged")
+                && recheck
+                    .windows(2)
+                    .any(|pair| pair == ["--shared", "/shared"]),
+            "the last run is the round: {recheck:?}"
+        );
         if lie {
             assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
             assert!(recheck.windows(2).any(|pair| pair == ["--admit", "wait"]));
@@ -565,7 +579,6 @@ fn a_recheck_hands_over_with_its_composition_count() {
         assert_eq!(handoff.step, aterm_land::Step::Recheck);
         assert_eq!(handoff.base, moved);
         assert_eq!(handoff.composes, 1, "the recheck's composition is spent");
-        assert_eq!(handoff.rejudges, 0);
         assert_eq!(handoff.stated.checked.len(), 1);
         assert_eq!(log.runs.len(), 2, "{:#?}", log.runs);
         assert_eq!(
@@ -780,8 +793,8 @@ fn a_recheck_whose_merge_changes_the_build_recipe_hands_on_twice_with_its_count(
 /// at hop [`HOPS`]; main then moves into the branch's file and, in the same commit, retires
 /// `--admit` too. The re-judge's own verifier is another image again, and that step hands over
 /// as its own first hop, with the pass made at hop 2, the branch's crates (read by the image
-/// that ran it) and one re-judge; its receiver, whose own build is itself, judges and lands,
-/// stating both judgments. A step that kept the hop count of the one before would refuse to
+/// that ran it); its receiver, whose own build is itself, judges and lands, stating both
+/// judgments. A step that kept the hop count of the one before would refuse to
 /// hand on "after 2 handoffs of this step": COULD NOT RUN, nothing pushed.
 #[test]
 fn a_rejudge_after_a_step_that_ran_where_it_was_handed_hands_on_from_its_first_hop() {
@@ -829,31 +842,18 @@ fn a_rejudge_after_a_step_that_ran_where_it_was_handed_hands_on_from_its_first_h
     };
     for handoff in [first, second] {
         assert_eq!(
-            (
-                handoff.step,
-                &handoff.at,
-                &handoff.base,
-                handoff.rejudges,
-                &handoff.stated
-            ),
+            (handoff.step, &handoff.at, &handoff.base, &handoff.stated),
             (
                 aterm_land::Step::Qualify,
                 &first.at,
                 &m1,
-                0,
                 &Stated::default()
             )
         );
     }
     assert_eq!(
-        (
-            rejudge.step,
-            &rejudge.base,
-            rejudge.rejudges,
-            rejudge.composes,
-            &rejudge.cone
-        ),
-        (aterm_land::Step::Qualify, &moved, 1, 0, &m1)
+        (rejudge.step, &rejudge.base, rejudge.composes, &rejudge.cone),
+        (aterm_land::Step::Qualify, &moved, 0, &m1)
     );
     assert_eq!(
         git(&world.work, &["rev-parse", &format!("{}^1", rejudge.at)]),
@@ -915,7 +915,6 @@ fn a_resume_of_a_file_that_is_not_the_checkouts_own_handoff_leaves_it_as_it_was(
         hop: 1,
         at: head.clone(),
         base: head.clone(),
-        rejudges: 0,
         composes: 0,
         cone: head,
         branch: None,
@@ -923,7 +922,7 @@ fn a_resume_of_a_file_that_is_not_the_checkouts_own_handoff_leaves_it_as_it_was(
     };
     let bytes = String::from_utf8(sample.encode().expect("it encodes"))
         .expect("UTF-8")
-        .replace(r#""schema":1"#, r#""schema":2"#);
+        .replace(r#""schema":2"#, r#""schema":3"#);
     let notes = world.work.join("notes.txt");
     let own =
         PathBuf::from(git(&world.work, &["rev-parse", "--absolute-git-dir"])).join(handoff::FILE);
@@ -971,7 +970,6 @@ fn a_handoff_of_words_this_build_does_not_take_could_not_run_naming_them() {
         hop: 1,
         at: head.clone(),
         base: head.clone(),
-        rejudges: 0,
         composes: 0,
         cone: head.clone(),
         branch: None,
@@ -1002,7 +1000,7 @@ fn a_handoff_of_words_this_build_does_not_take_could_not_run_naming_them() {
 /// A handoff the receiver cannot honour could not run, naming why and the rerun, before
 /// anything is judged or pushed: one handed to another image, for another checkout, over a base
 /// or a cone its commit does not hold, from a push source the landing refuses, past this
-/// image's re-judge or composition bound, or whose checkout left its commit (HEAD moved, or the
+/// image's composition bound, or whose checkout left its commit (HEAD moved, or the
 /// checkout gained changes) between the hop and the resume. NEGATIVE CONTROL: the same handoff,
 /// honoured, lands.
 #[test]
@@ -1022,21 +1020,13 @@ fn a_handoff_the_receiver_cannot_honour_could_not_run() {
         hop: 1,
         at: at.clone(),
         base: m0.clone(),
-        rejudges: 0,
         composes: 0,
         cone: m0.clone(),
         branch: None,
         stated: Stated::default(),
     };
-    let tree = git(&world.work, &["rev-parse", "HEAD^{tree}"]);
-    let interrupted = |n: usize| aterm_types::land_trailer::Interrupted {
-        tree: tree.clone(),
-        base: m0.clone(),
-        tip: m0.clone(),
-        secs: u64::try_from(n).expect("small"),
-    };
     let passed = aterm_types::land_trailer::Checked {
-        tree: tree.clone(),
+        tree: git(&world.work, &["rev-parse", "HEAD^{tree}"]),
         rows: vec![aterm_types::land_trailer::Row {
             check: "test".into(),
             word: "ok".into(),
@@ -1083,19 +1073,6 @@ fn a_handoff_the_receiver_cannot_honour_could_not_run() {
             "remote fetch and push URLs must address the same repository".to_owned(),
             honoured.clone(),
             Prep::SplitPush,
-        ),
-        (
-            "the landing was handed over at re-judge 4, past this image's bound of 3".to_owned(),
-            Handoff {
-                rejudges: 4,
-                branch: Some(crates(&["a"])),
-                stated: Stated {
-                    interrupted: (0..4).map(interrupted).collect(),
-                    ..Stated::default()
-                },
-                ..honoured.clone()
-            },
-            Prep::None,
         ),
         (
             "landing race count exceeds its original bound".to_owned(),
@@ -1266,7 +1243,6 @@ fn a_handed_step_whose_revision_the_kept_judgment_passed_is_not_run_again() {
             hop: 1,
             at: at.clone(),
             base: m0.clone(),
-            rejudges: 0,
             composes: 0,
             cone: m0.clone(),
             branch: None,
@@ -1316,9 +1292,7 @@ fn a_handed_step_whose_revision_the_kept_judgment_passed_is_not_run_again() {
 /// `--input-drift` from its verifier. The rerun resumes at the push with the kept receipt, finds
 /// that main does not compose, merges it and hands the re-judge to the merge's verifier: the
 /// handoff carries the kept receipt (the earlier run's two interrupted judgments and its pass),
-/// the re-judge count of this run (1, fewer than that receipt's Aterm-Interrupted lines, so the
-/// receiver resumes with the handed count and does not count the receipt), no branch crates
-/// (the resumed landing judged nothing) and the cone they are read over (the main commit the
+/// no branch crates (the resumed landing judged nothing) and the cone they are read over (the main commit the
 /// kept judgment merged). The receiver reads the crates over that cone as itself, judges and
 /// lands, stating every judgment. NEGATIVE CONTROL: without the hop the re-judge refuses the
 /// starting image's words and the landing ends with the KI's line, pushing nothing.
@@ -1388,13 +1362,8 @@ fn a_resumed_landing_whose_moved_main_does_not_compose_is_judged_again_as_the_me
             panic!("one handoff: {:#?}", log.handoffs);
         };
         assert_eq!(
-            (
-                handoff.step,
-                &handoff.base,
-                handoff.rejudges,
-                handoff.composes
-            ),
-            (aterm_land::Step::Qualify, &moved, 1, 0)
+            (handoff.step, &handoff.base, handoff.composes),
+            (aterm_land::Step::Qualify, &moved, 0)
         );
         assert_eq!(
             (&handoff.cone, handoff.branch.as_ref(), &handoff.stated),
@@ -1426,8 +1395,8 @@ fn a_resumed_landing_whose_moved_main_does_not_compose_is_judged_again_as_the_me
 /// that revision goes to the push with the kept receipt. Main has moved into the branch's file
 /// and, in the same commit, retired `--input-drift` from its verifier, so the re-judge's own
 /// verifier is another image, and that step hands over as its own first hop, with the kept
-/// receipt, no branch crates (nothing was judged here), the cone the kept judgment merged and one
-/// re-judge; its receiver judges and lands, stating both judgments. A step that kept the hop
+/// receipt, no branch crates (nothing was judged here) and the cone the kept judgment merged;
+/// its receiver judges and lands, stating both judgments. A step that kept the hop
 /// count it was handed would refuse to hand on "after 2 handoffs of this step": COULD NOT RUN,
 /// nothing pushed.
 #[test]
@@ -1453,7 +1422,6 @@ fn a_rejudge_after_a_handed_step_the_kept_judgment_stood_for_hands_on_from_its_f
         hop: HOPS,
         at: at.clone(),
         base: m0.clone(),
-        rejudges: 0,
         composes: 0,
         cone: m0.clone(),
         branch: None,
@@ -1483,14 +1451,8 @@ fn a_rejudge_after_a_handed_step_the_kept_judgment_stood_for_hands_on_from_its_f
         panic!("one handoff: {:#?}", log.handoffs);
     };
     assert_eq!(
-        (
-            rejudge.step,
-            rejudge.hop,
-            &rejudge.base,
-            rejudge.rejudges,
-            rejudge.composes
-        ),
-        (aterm_land::Step::Qualify, 1, &moved, 1, 0)
+        (rejudge.step, rejudge.hop, &rejudge.base, rejudge.composes),
+        (aterm_land::Step::Qualify, 1, &moved, 0)
     );
     assert_eq!(
         (&rejudge.cone, rejudge.branch.as_ref(), &rejudge.stated),

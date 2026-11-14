@@ -1197,6 +1197,7 @@ fn lane_a(run: &Run, rec: &mut Record) -> Result<(), Fail> {
             sign_in_as: EMAIL,
             env: &env,
             deadline: WakeDeadline::after(HANG),
+            window: None,
         },
         &person,
     );

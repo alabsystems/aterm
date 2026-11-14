@@ -203,10 +203,16 @@ fn supervise_with_capture(
             break child.wait();
         }
         match child.exited() {
-            Ok(true) if members_ended(child.id()) => {
-                owner.front.as_ref().unwrap().reaped();
-                break super::super::reap_accounted(owner.spawned.child_mut());
-            }
+            Ok(true) => match owner.spawned.group_members_ended() {
+                Ok(true) => {
+                    owner.front.as_ref().unwrap().reaped();
+                    break super::super::reap_accounted(owner.spawned.child_mut());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            },
             Ok(_) => {}
             Err(error) => {
                 failure.get_or_insert(error);
@@ -249,31 +255,6 @@ fn supervise_with_capture(
     Ok(ControllerOutcome { root, signal: None })
 }
 
-/// DATA for deciding when to reap the pinned leader. A second complete listing
-/// cannot gain a new member; actual native kernel absence is checked afterwards.
-fn members_ended(group: u32) -> bool {
-    let Some(first) = aterm_uds::process::group_members(group).filter(|m| m.complete) else {
-        return false;
-    };
-    let ended = |pid| {
-        matches!(
-            aterm_uds::process::process_presence(pid),
-            aterm_uds::process::ProcessPresence::Exited
-                | aterm_uds::process::ProcessPresence::Absent
-        )
-    };
-    if !first.pids.iter().all(|&pid| ended(pid)) {
-        return false;
-    }
-    let Some(second) = aterm_uds::process::group_members(group).filter(|m| m.complete) else {
-        return false;
-    };
-    second
-        .pids
-        .iter()
-        .all(|pid| first.pids.contains(pid) && ended(*pid))
-}
-
 struct Owner {
     spawned: Spawned,
     cohort: Option<Cohort>,
@@ -297,7 +278,7 @@ impl Drop for Owner {
         while self.spawned.child_mut().owns_unreaped() {
             let _ = self.spawned.kill_group();
             let ended = self.spawned.child_mut().exited().unwrap_or(false);
-            if ended && members_ended(self.spawned.child_mut().id()) {
+            if ended && self.spawned.group_members_ended().unwrap_or(false) {
                 break;
             }
             super::pause();

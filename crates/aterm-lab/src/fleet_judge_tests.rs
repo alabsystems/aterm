@@ -239,14 +239,68 @@ fn in_a_round_every_said_comes_before_any_asked() {
     let seen = |asked: bool, said: bool| Seen {
         rank: Some(2),
         round: Some(0),
+        first: false,
         asked,
         said,
+        lines: usize::from(asked) + usize::from(said),
         marked: !(asked && said),
     };
     assert!(filled_in_order(&[seen(true, true), seen(false, true)]));
     assert!(filled_in_order(&[seen(false, true), seen(false, true)]));
     assert!(!filled_in_order(&[seen(true, true), seen(true, false)]));
     assert!(!filled_in_order(&[seen(true, false), seen(false, false)]));
+}
+
+/// EACH MACHINE'S MOST PRESSING session, and every asking or stalled one,
+/// shows its leading line before any machine shows a second line or another
+/// session's words: an asking machine's first with its `said:` alone beside
+/// a busy machine's first with its `said:` is in order, as is an asking
+/// machine's second session cut part way, and a busy first whose leading
+/// line is its `attention:` alone; a first with no word while another
+/// session shows one, an asking second session with no word while a busy
+/// first shows one, or a first's `asked:` before an asking session is
+/// whole, is not.
+#[test]
+fn each_machines_first_says_its_leading_line_before_any_second() {
+    let seen = |urgent: bool, first: bool, asked: bool, said: bool| Seen {
+        rank: Some(if urgent { 0 } else { 2 }),
+        round: (!urgent).then_some(0),
+        first,
+        asked,
+        said,
+        lines: usize::from(asked) + usize::from(said),
+        marked: !(asked && said),
+    };
+    let asking_first = seen(true, true, false, true);
+    let busy_first = seen(false, true, false, true);
+    assert!(filled_in_order(&[asking_first, busy_first]));
+    assert!(filled_in_order(&[
+        seen(true, true, true, true),
+        seen(true, false, false, true),
+        seen(false, true, false, true),
+    ]));
+    assert!(!filled_in_order(&[
+        seen(true, true, true, true),
+        seen(false, true, false, false),
+    ]));
+    assert!(!filled_in_order(&[
+        seen(true, true, false, true),
+        seen(false, true, true, true),
+    ]));
+    assert!(!filled_in_order(&[seen(false, true, true, false)]));
+    let attention_only = Seen {
+        lines: 1,
+        ..seen(false, true, false, false)
+    };
+    assert!(filled_in_order(&[
+        seen(true, true, false, true),
+        attention_only
+    ]));
+    assert!(!filled_in_order(&[
+        seen(true, true, false, true),
+        seen(true, false, false, false),
+        seen(false, true, false, true),
+    ]));
 }
 
 /// An excerpt line of `width` characters, cut keeping its head (or, with

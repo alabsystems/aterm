@@ -77,6 +77,17 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
         linux_verifier_aarch64_sha256: None,
         linux_verifier_aarch64_size: None,
         linux_verifier_interface: None,
+        // Stamped after assembly, as a Linux handoff is, by `Manifest::set_windows_artifact`
+        // when the cut publishes a Windows zip; `emit` then writes them.
+        windows_x86_64: None,
+        windows_x86_64_sha256: None,
+        windows_x86_64_size: None,
+        // Stamped beside the zip by `crate::windows_pin::stamp` when the cut publishes the
+        // Windows bootstrap verifier.
+        windows_verifier_x86_64: None,
+        windows_verifier_x86_64_sha256: None,
+        windows_verifier_x86_64_size: None,
+        windows_verifier_interface: None,
         dmg_x86_64: None,
         dmg_x86_64_sha256: None,
         min_os: Some(i.min_os.to_string()),

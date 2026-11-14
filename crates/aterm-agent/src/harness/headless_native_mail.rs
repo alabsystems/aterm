@@ -83,6 +83,175 @@ fn saved_google<S>(
     Ok(session.map(|session| (account, endpoint, session)))
 }
 
+/// The login source a saved Google grant signs in on ([`run_gmail`]): a refusal there is held
+/// against the account's grant, never against an IMAP address.
+const GOOGLE_OAUTH_SOURCE: &str = "google-mail-oauth";
+
+/// `account`'s saved Google mail session in `home`, as [`poll`] loads it: the grant in that
+/// home's aterm mail folder, decrypted with that home's machine key, with no network request and
+/// no renewal lease. `None` where no grant is saved; an error where one is saved and does not
+/// load. Nothing of it is logged.
+pub(super) fn saved_google_session(
+    home: &Path,
+    account: &str,
+) -> Result<Option<aterm_mail::oauth::session::Shared>, String> {
+    aterm_mail::oauth::session::shared(home, account)
+}
+
+/// What [`poll`] does with `target`'s mail, decided before it reads anything: [`poll`] acts on
+/// it, and [`MailboxConfig::reads_without_browser`] judges by it, so whether the mailbox is
+/// read and how are one decision. `S` is the saved Google session the loader gave.
+pub(super) enum Plan<S> {
+    /// [`poll`] answers nothing: the mailbox's other readers (its folder, IMAP, HTTP mailbox
+    /// or the fleet's relay) read it.
+    Defer,
+    /// Every poll ends with this, before anything is read: a saved grant that does not load,
+    /// or a Gmail route with neither a grant nor an app password.
+    Refused(&'static str),
+    /// Gmail, through the account's saved Google grant.
+    Google {
+        account: String,
+        imap: ParsedImapUrl,
+        session: S,
+    },
+    /// Gmail over IMAP, signed in to with a password.
+    GmailImap {
+        imap: ParsedImapUrl,
+        login: String,
+        password: String,
+    },
+    /// Proton's own API, signed in to with the mailbox's login and password.
+    Proton { login: String, password: String },
+}
+
+/// [`Plan`] for `target`'s mail in `source_cfg`, the saved Google grant loaded by `load` (an
+/// error: one is saved and does not load). A grant is asked for only where the route is an
+/// admitted native Google one ([`managed_google_target`]).
+pub(super) fn plan<S>(
+    source_cfg: &MailboxConfig,
+    target: Option<&str>,
+    load: impl FnOnce(&str) -> Result<Option<S>, String>,
+) -> Plan<S> {
+    let routed = source_cfg.routed_for(target);
+    let cfg = &*routed;
+    if cfg.dir.is_some() || cfg.http_url.is_some() {
+        return Plan::Defer;
+    }
+    let explicit_imap = cfg.effective_imap_url(target);
+    if let Some(url) = &explicit_imap {
+        let Some(imap) = parse_imap_url(url) else {
+            return Plan::Defer;
+        };
+        if !imap.tls || !imap.host.eq_ignore_ascii_case("imap.gmail.com") {
+            return Plan::Defer;
+        }
+    }
+    match saved_google(source_cfg, target, load) {
+        Ok(Some((account, imap, session))) => {
+            return Plan::Google {
+                account,
+                imap,
+                session,
+            };
+        }
+        Err(why) => return Plan::Refused(why),
+        Ok(None) => {}
+    }
+    if managed_google_target(source_cfg, target).is_some()
+        && cfg
+            .password_for(target)
+            .is_none_or(|password| password.chars().all(char::is_whitespace))
+        && explicit_imap
+            .as_deref()
+            .and_then(parse_imap_url)
+            .and_then(|url| url.password)
+            .is_none_or(|password| password.chars().all(char::is_whitespace))
+    {
+        return Plan::Refused(GOOGLE_AUTH_MISSING);
+    }
+    if let Some(url) = explicit_imap {
+        let Some(imap) = parse_imap_url(&url) else {
+            return Plan::Defer;
+        };
+        let Some(login) = imap
+            .user
+            .clone()
+            .or_else(|| cfg.webmail_user_for(target))
+            .filter(|u| !u.trim().is_empty())
+        else {
+            return Plan::Defer;
+        };
+        let Some(password) = imap
+            .password
+            .clone()
+            .or_else(|| cfg.password_for(target))
+            .map(|pw| {
+                pw.chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect::<String>()
+            })
+            .filter(|pw| !pw.is_empty())
+        else {
+            return Plan::Defer;
+        };
+        return Plan::GmailImap {
+            imap,
+            login,
+            password,
+        };
+    }
+    let Some(url) = cfg.effective_webmail_url(target) else {
+        return Plan::Defer;
+    };
+    if !is_proton_webmail_url(&url) {
+        return Plan::Defer;
+    }
+    let (Some(login), Some(password)) = (
+        cfg.webmail_user_for(target)
+            .filter(|u| !u.trim().is_empty()),
+        cfg.password_for(target).filter(|pw| !pw.trim().is_empty()),
+    ) else {
+        return Plan::Defer;
+    };
+    Plan::Proton { login, password }
+}
+
+impl<S> Plan<S> {
+    /// Whether a poll that took this plan reads `target`'s mail on this machine with no
+    /// browser, as `cfg` (its routed view) holds it: `None` where [`poll`] defers to the
+    /// mailbox's other readers. A login this Mac holds as refused on its source
+    /// ([`super::super::mailbox_routes::login_held`]) is not tried, as [`run_gmail`] and the
+    /// Proton reader decide, so it reads nothing until its wait ends; Proton's API is counted
+    /// on macOS alone.
+    pub(super) fn reads(&self, cfg: &MailboxConfig, target: Option<&str>) -> Option<bool> {
+        let held = |source: &str, login: &str| {
+            super::super::mailbox_routes::login_held(
+                cfg.login_record.as_deref(),
+                source,
+                login,
+                super::super::mailbox_routes::unix_now(),
+            )
+            .is_some()
+        };
+        match self {
+            Self::Defer => None,
+            Self::Refused(_) => Some(false),
+            Self::Google { account, .. } => Some(!held(GOOGLE_OAUTH_SOURCE, account)),
+            Self::GmailImap { login, .. } => {
+                Some(cfg.effective_imap_url(target).is_some_and(|url| {
+                    !held(&super::super::mailbox_routes::login_source(&url), login)
+                }))
+            }
+            Self::Proton { login, .. } => Some(
+                cfg!(target_os = "macos")
+                    && cfg.effective_webmail_url(target).is_some_and(|url| {
+                        !held(&super::super::mailbox_routes::login_source(&url), login)
+                    }),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 fn managed_google_login(cfg: &MailboxConfig, target: Option<&str>) -> Option<String> {
     managed_google_target(cfg, target).map(|(login, _)| login)
@@ -115,76 +284,26 @@ pub(super) fn poll(
     let source_cfg = &fresh_source;
     let routed = source_cfg.routed_for(target);
     let cfg = &*routed;
-    let explicit_imap = cfg.effective_imap_url(target);
-    if let Some(ref url) = explicit_imap {
-        let imap = parse_imap_url(url)?;
-        if !imap.tls || !imap.host.eq_ignore_ascii_case("imap.gmail.com") {
-            return None;
+    let expired = |error: &'static str| {
+        if deadline.expired() || error == super::super::auth_deadline::EXPIRED {
+            expiry_words
+        } else {
+            error
         }
-    }
-    if let Some(home) = aterm_types::dirs::home_dir() {
-        match saved_google(source_cfg, target, |account| {
-            aterm_mail::oauth::session::shared(&home, account)
-        }) {
-            Ok(Some((account, imap, session))) => {
-                return Some(
-                    run_gmail(
-                        cfg,
-                        target,
-                        deadline,
-                        once,
-                        seen_otps,
-                        imap,
-                        Some(session),
-                        account,
-                        None,
-                    )
-                    .map_err(|error| {
-                        if deadline.expired() || error == super::super::auth_deadline::EXPIRED {
-                            expiry_words
-                        } else {
-                            error
-                        }
-                    }),
-                );
-            }
-            Err(why) => return Some(Err(why)),
-            Ok(None) => {}
-        }
-    }
-    if managed_google_target(source_cfg, target).is_some()
-        && cfg
-            .password_for(target)
-            .is_none_or(|password| password.chars().all(char::is_whitespace))
-        && explicit_imap
-            .as_deref()
-            .and_then(parse_imap_url)
-            .and_then(|url| url.password)
-            .is_none_or(|password| password.chars().all(char::is_whitespace))
-    {
-        return Some(Err(GOOGLE_AUTH_MISSING));
-    }
-    if let Some(url) = explicit_imap {
-        let imap = parse_imap_url(&url)?;
-        if deadline.left().is_err() {
-            return Some(Err(expiry_words));
-        }
-        let login = imap
-            .user
-            .clone()
-            .or_else(|| cfg.webmail_user_for(target))
-            .filter(|u| !u.trim().is_empty())?;
-        let password = imap
-            .password
-            .clone()
-            .or_else(|| cfg.password_for(target))
-            .map(|pw| {
-                pw.chars()
-                    .filter(|ch| !ch.is_whitespace())
-                    .collect::<String>()
-            })
-            .filter(|pw| !pw.is_empty())?;
-        return Some(
+    };
+    let home = source_cfg.grant_home();
+    let plan = plan(source_cfg, target, |account| {
+        home.as_deref()
+            .map_or(Ok(None), |home| saved_google_session(home, account))
+    });
+    match plan {
+        Plan::Defer => None,
+        Plan::Refused(why) => Some(Err(why)),
+        Plan::Google {
+            account,
+            imap,
+            session,
+        } => Some(
             run_gmail(
                 cfg,
                 target,
@@ -192,44 +311,47 @@ pub(super) fn poll(
                 once,
                 seen_otps,
                 imap,
+                Some(session),
+                account,
                 None,
-                login,
-                Some(password),
             )
-            .map_err(|error| {
-                if deadline.expired() || error == super::super::auth_deadline::EXPIRED {
-                    expiry_words
-                } else {
-                    error
-                }
-            }),
-        );
-    }
-    let url = cfg.effective_webmail_url(target)?;
-    if !is_proton_webmail_url(&url) {
-        return None;
-    }
-    if deadline.left().is_err() {
-        return Some(Err(expiry_words));
-    }
-    let login = cfg
-        .webmail_user_for(target)
-        .filter(|u| !u.trim().is_empty())?;
-    let password = cfg
-        .password_for(target)
-        .filter(|pw| !pw.trim().is_empty())?;
-    Some(
-        run(
-            source_cfg, cfg, target, deadline, once, seen_otps, login, password,
-        )
-        .map_err(|error| {
-            if deadline.expired() || error == super::super::auth_deadline::EXPIRED {
-                expiry_words
-            } else {
-                error
+            .map_err(expired),
+        ),
+        Plan::GmailImap {
+            imap,
+            login,
+            password,
+        } => {
+            if deadline.left().is_err() {
+                return Some(Err(expiry_words));
             }
-        }),
-    )
+            Some(
+                run_gmail(
+                    cfg,
+                    target,
+                    deadline,
+                    once,
+                    seen_otps,
+                    imap,
+                    None,
+                    login,
+                    Some(password),
+                )
+                .map_err(expired),
+            )
+        }
+        Plan::Proton { login, password } => {
+            if deadline.left().is_err() {
+                return Some(Err(expiry_words));
+            }
+            Some(
+                run(
+                    source_cfg, cfg, target, deadline, once, seen_otps, login, password,
+                )
+                .map_err(expired),
+            )
+        }
+    }
 }
 
 #[expect(
@@ -253,7 +375,7 @@ fn run_gmail(
     }
     let mut seen = load_seen_digests(cfg.seen_file.as_deref());
     let source = if managed.is_some() {
-        "google-mail-oauth".to_owned()
+        GOOGLE_OAUTH_SOURCE.to_owned()
     } else {
         super::super::mailbox_routes::login_source(
             &cfg.effective_imap_url(target).ok_or("No Gmail endpoint")?,

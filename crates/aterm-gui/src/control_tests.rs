@@ -23782,8 +23782,8 @@ fn a_typed_turn_whose_head_types_no_key_writes_its_rest_only_where_the_pace_fits
     );
 }
 
-/// EVERY LINE A DRIVE SERVES HAS ONE KIND, read off its selector, verb and at most one word of
-/// its arguments (the design's §2.3), and the gate passes it as that kind. A `spawn` is a spawn
+/// Every line a drive serves has one kind, read from its selector, verb and argument grammar,
+/// and the gate passes it as that kind. A `spawn` is a spawn
 /// whatever follows it: the lock judges a malformed one as a spawn, and only then does the gate
 /// refuse its grammar. CONTROL: a verb a drive does not serve, a selector on `hold` and a
 /// `close` with none have no kind, and the gate refuses each in the same words.
@@ -23803,6 +23803,8 @@ fn every_drive_line_has_one_kind_and_the_gate_is_keyed_by_it() {
     let image = "ab".repeat(32);
     let mut table: Vec<(String, K)> = vec![
         ("board".to_owned(), K::Read),
+        ("update status".to_owned(), K::Read),
+        ("update holds".to_owned(), K::Read),
         (
             r#"service-repair {"schema":1,"op":"inspect","payload":{"job":"server"}}"#.to_owned(),
             K::Read,
@@ -23909,6 +23911,15 @@ fn every_drive_line_has_one_kind_and_the_gate_is_keyed_by_it() {
     // CONTROL: no kind, and the gate's refusal is the table's, word for word.
     for line in [
         "frobnicate",
+        "update",
+        "update check",
+        "update apply",
+        "update retry",
+        "update status check",
+        "update status\napply",
+        "update holds retry",
+        "update unread=ok check",
+        "@s-00000000000000aa update status",
         "settings set columns 80",
         "close s-00000000000000aa",
         "board accept @s-00000000000000aa passed",
@@ -23956,6 +23967,8 @@ fn the_lock_caps_a_granted_driver_before_the_gate_looks_at_anything() {
         (format!("@{w} status"), K::Read),
         (format!("@{w} inbox"), K::Read),
         ("board".to_owned(), K::Read),
+        ("update status".to_owned(), K::Read),
+        ("update holds".to_owned(), K::Read),
         (format!("await task @{w} since=0"), K::Read),
         (
             "accounts-renew start=0123456789abcdef0123456789abcdef".to_owned(),
@@ -24058,6 +24071,208 @@ fn the_lock_caps_a_granted_driver_before_the_gate_looks_at_anything() {
         panic!("a reader's line is the fleet gate's to refuse");
     };
     assert_eq!((scope, act), (reader, None));
+}
+
+/// THE FLEET ACTIVITY RECORD HAS ONE ROW FOR EACH LINE THE LOCK DECIDES. A line this Mac's fleet
+/// access refuses is a blocked row naming the level in force, the level the act needs and the
+/// session that asked; a line the gate passes is an admitted one; a line the gate refuses in its
+/// own words has none. A read no session asked for (aterm's own poll) and a fleet service's
+/// request have none either. NEGATIVE CONTROL: dropping `drive_admission`'s note on the lock's
+/// refusal fails "blocked"; noting before `drive_gate` answers fails "the gate's refusal".
+#[cfg(unix)]
+#[test]
+fn a_driven_line_the_lock_decides_has_one_row_in_the_fleet_activity_record() {
+    use aterm_types::fleet_activity::{Outcome, Plain, Way};
+    const ASKER: &str = "s-0123456789abcdef0123";
+    let store = crate::session_store::new_store();
+    let (target, _rx) = pipe_session(93);
+    let sid = target.sid.clone();
+    store.write().unwrap().register(target);
+    let w = sid.as_str();
+    let drive = Scope::Fleet {
+        content: true,
+        drive: true,
+    };
+    let node = "05".repeat(16);
+    let driver = || crate::fabric::Driver {
+        node: "05".repeat(16),
+        host: "mac-05 (node 05050505)".to_owned(),
+    };
+    // What one line leaves in the record: (type, blocked as (level, needs), who asked).
+    type Noted = Vec<(Plain, Option<(FleetAccess, FleetAccess)>, Option<String>)>;
+    let judge = |line: String| -> Noted {
+        drop(crate::fleet_activity::noted());
+        let _answer = drive_admission(Request::parse(line), drive, &store);
+        crate::fleet_activity::noted()
+            .into_iter()
+            .map(|row| {
+                assert_eq!(
+                    (row.way, row.node.as_str(), row.host.as_deref(), row.n),
+                    (Way::In, node.as_str(), Some("mac-05"), 1)
+                );
+                let blocked = match row.outcome {
+                    Outcome::Admitted => None,
+                    Outcome::Blocked { level, needs } => Some((level, needs)),
+                };
+                (row.what, blocked, row.by)
+            })
+            .collect()
+    };
+    let by = Some(ASKER.to_owned());
+    {
+        let _driving = crate::fabric::DrivingAs::requested(
+            driver(),
+            aterm_types::control_verbs::Requester::of(Some(ASKER), Some("claude"), None, None),
+        );
+        // Read Only, the default: a read is admitted, everything else blocked.
+        let read_only = FleetAccess::ReadOnly;
+        assert_eq!(
+            judge(format!("@{w} status")),
+            [(Plain::Read, None, by.clone())]
+        );
+        assert_eq!(judge("board".to_owned()), [(Plain::Read, None, by.clone())]);
+        for (line, what, needs) in [
+            (
+                format!("@{w} turn timeout=20000 hi"),
+                Plain::Typed,
+                FleetAccess::ReadWrite,
+            ),
+            (
+                format!("@{w} post key=k kind=note -- hi"),
+                Plain::Message,
+                FleetAccess::ReadWrite,
+            ),
+            (format!("hold {w} on"), Plain::Hold, FleetAccess::ReadWrite),
+            (format!("@{w} close"), Plain::Close, FleetAccess::ReadWrite),
+            (
+                "spawn agent=claude len=5".to_owned(),
+                Plain::NewJob,
+                FleetAccess::Full,
+            ),
+        ] {
+            assert_eq!(
+                judge(line.clone()),
+                [(what, Some((read_only, needs)), by.clone())],
+                "blocked: {line}"
+            );
+        }
+        // Read and Write: the writes are admitted, a new job still blocked.
+        let _level = FleetAccessForTest::set(FleetAccess::ReadWrite);
+        assert_eq!(
+            judge(format!("@{w} turn timeout=20000 hi")),
+            [(Plain::Typed, None, by.clone())]
+        );
+        assert_eq!(
+            judge(format!("@{w} post key=k kind=note -- hi")),
+            [(Plain::Message, None, by.clone())]
+        );
+        assert_eq!(
+            judge("spawn agent=claude len=5".to_owned()),
+            [(
+                Plain::NewJob,
+                Some((FleetAccess::ReadWrite, FleetAccess::Full)),
+                by.clone()
+            )]
+        );
+        // The gate's refusal: the lock admits a close, and this driver started no such tab; no
+        // session of that name is here; a verb a drive does not serve has no kind.
+        let _level = FleetAccessForTest::set(FleetAccess::Full);
+        for line in [
+            format!("@{w} close"),
+            "@s-ffffffffffffffffffff status".to_owned(),
+            "theme list".to_owned(),
+        ] {
+            assert_eq!(judge(line.clone()), [], "the gate's refusal: {line}");
+        }
+        // A fleet service's request is aterm's own, whoever's connection carries it: its act
+        // and its read alike (the gate judges `vault status` a read, and the record has no
+        // row for it, as the Mac that sent it has none).
+        assert_eq!(
+            judge("accounts-renew start=0123456789abcdef0123456789abcdef".to_owned()),
+            []
+        );
+        assert_eq!(judge("vault status".to_owned()), []);
+    }
+    // A driver that names no session: its read is a poll, and what it does to a session counts.
+    let _driving = crate::fabric::DrivingAs::enter(driver());
+    assert_eq!(judge(format!("@{w} status")), []);
+    assert_eq!(judge("board".to_owned()), []);
+    assert_eq!(
+        judge(format!("@{w} turn timeout=20000 hi")),
+        [(
+            Plain::Typed,
+            Some((FleetAccess::ReadOnly, FleetAccess::ReadWrite)),
+            None
+        )]
+    );
+}
+
+/// THE SENDER AND THE DRIVEN MAC NAME A LINE'S KIND ALIKE: `aterm ctl` records what it sent by
+/// `aterm_types::fleet_activity::kind_of_line`, the driven Mac what it judged by `drive_kind`,
+/// which reads the same table, and a request has the same type on both Macs' records. A fleet
+/// service's line is in no record: the sender's table has no kind for one, whatever kind the
+/// gate's own parser judges it by.
+#[cfg(unix)]
+#[test]
+fn the_sender_reads_a_drive_lines_kind_as_the_gate_does() {
+    let w = "s-0123456789abcdef0123";
+    for line in [
+        format!("@{w} status"),
+        format!("@{w} text"),
+        format!("@{w} screen"),
+        format!("@{w} result"),
+        format!("@{w} inbox"),
+        format!("@{w} inbox seen f1"),
+        format!("@{w} blocks"),
+        format!("@{w} post key=k kind=note -- hi"),
+        format!("@{w} turn hi"),
+        format!("@{w} key Enter"),
+        format!("@{w} send hi"),
+        format!("@{w} close"),
+        format!("hold {w} on"),
+        format!("await task @{w} since=0"),
+        "survey".to_owned(),
+        "version".to_owned(),
+        "board".to_owned(),
+        "requests".to_owned(),
+        "setup".to_owned(),
+        "update status".to_owned(),
+        "update holds".to_owned(),
+        "spawn cwd=/private/tmp".to_owned(),
+        "spawn agent=claude len=5".to_owned(),
+        "request claim path=/private/tmp".to_owned(),
+        "request show r1".to_owned(),
+    ] {
+        let request = Request::parse(line.clone());
+        let kind = drive_kind(&request.head()).ok();
+        assert!(kind.is_some(), "{line}");
+        assert_eq!(
+            aterm_types::fleet_activity::kind_of_line(&line),
+            kind,
+            "{line}"
+        );
+    }
+    for (line, judged) in [
+        ("vault status", DriveKind::Read),
+        (
+            "accounts-renew start=0123456789abcdef0123456789abcdef",
+            DriveKind::AccountsRenew,
+        ),
+    ] {
+        let request = Request::parse(line.to_owned());
+        assert_eq!(drive_kind(&request.head()), Ok(judged), "{line}");
+        assert_eq!(
+            aterm_types::fleet_activity::kind_of_line(line),
+            None,
+            "{line}"
+        );
+    }
+    // A line the gate serves under no kind is no request the sender records.
+    for line in ["theme list", "close", "request review r1"] {
+        let request = Request::parse(line.to_owned());
+        assert_eq!(aterm_types::fleet_activity::kind_of_line(line), None);
+        assert!(drive_kind(&request.head()).is_err(), "{line}");
+    }
 }
 
 /// A STOPPED LANE'S RECORD IS IN `update status`: `apply_lane=`, `apply_lane_build=`,

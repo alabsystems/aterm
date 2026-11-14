@@ -4,34 +4,35 @@
 //! A control connection's descriptor, read with `fcntl(2)`, which the library's
 //! `forbid(unsafe_code)` keeps out of its own tests.
 
-/// A control connection holds one descriptor, kept out of every child (`FD_CLOFORK`) from its
-/// dial on: on macOS a spawned child's exec-time close of an inherited copy, while a descriptor
-/// scan (an instance's job sampler) is inside a call on it, drains the socket for good, and the
-/// next reply read answers `EBADF` (`spawn: Bad file descriptor` in a loaded run of
-/// fabric_world's exactly_once).
+/// Wrapped and dialed control connections retain close-on-exec and the close-on-fork
+/// capability observed on an independent socket. An unsupported fork flag must not
+/// bypass either connection path's checks.
 #[cfg(target_vendor = "apple")]
 #[test]
-fn a_control_connection_is_kept_out_of_every_child() {
-    use std::os::fd::AsRawFd as _;
+fn a_control_connection_retains_the_supported_child_inheritance_flags() {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
     use std::os::unix::net::{UnixListener, UnixStream};
     /// `FD_CLOFORK` from Apple's `<sys/fcntl.h>`.
     const FD_CLOFORK: i32 = 2;
-    let marked = |s: &UnixStream| {
+    let flags = |s: &UnixStream| {
         // SAFETY: `F_GETFD` reads the flags of a descriptor `s` owns and touches no memory.
         let flags = unsafe { libc::fcntl(s.as_raw_fd(), libc::F_GETFD) };
         assert!(flags >= 0, "the connection's descriptor is open");
-        flags & FD_CLOFORK != 0
+        flags
     };
     let (near, far) = UnixStream::pair().expect("a socket pair");
-    aterm_uds::keep_out_of_children(&far).expect("mark probe");
-    if !marked(&far) {
-        return;
-    }
+    let supported = astream_sys::close_on_fork(far.as_fd())
+        .expect("an independent socket's observed close-on-fork support");
+    let expected = libc::FD_CLOEXEC | if supported { FD_CLOFORK } else { 0 };
+    let check = |stream: &UnixStream, operation: &str| {
+        assert_eq!(
+            flags(stream) & (libc::FD_CLOEXEC | FD_CLOFORK),
+            expected,
+            "{operation}: close-on-exec and the observed close-on-fork capability"
+        );
+    };
     let ctl = aterm_link::ctl::Ctl::from_stream(near).expect("wrap the stream");
-    assert!(
-        marked(ctl.get_ref()),
-        "a wrapped stream a child can inherit"
-    );
+    check(ctl.get_ref(), "a wrapped control stream");
     let dir = aterm_tempfile::Builder::new()
         .prefix("al-dial")
         .suffix(".noindex")
@@ -39,8 +40,8 @@ fn a_control_connection_is_kept_out_of_every_child() {
         .expect("a socket dir");
     let sock = dir.path().join("c.sock");
     let _listener = UnixListener::bind(&sock).expect("bind");
-    assert!(
-        marked(&aterm_link::ctl::dial(&sock).expect("dial")),
-        "a dialled stream a child spawned before its wrap can inherit"
+    check(
+        &aterm_link::ctl::dial(&sock).expect("dial"),
+        "a dialed control stream",
     );
 }

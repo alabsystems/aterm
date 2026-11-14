@@ -198,8 +198,8 @@ pub(crate) const TASK_WHY: &[&str] = &[
     WHY_USAGE_LIMIT,
 ];
 
-/// A failed conclusion's words for a person, by its `why=` (the Workers row, Done for you and the
-/// fact the menu bar keeps), a stalled record's by [`stall_words`].
+/// A failed conclusion's words for a person, by its `why=` (the Workers row and the
+/// fact Messages keeps), a stalled record's by [`stall_words`].
 #[must_use]
 pub(crate) fn failed_words(state: TaskState, why: Option<&str>) -> String {
     match (state, why) {
@@ -230,8 +230,7 @@ fn is_stall_why(why: &str) -> bool {
     aterm_types::control_verbs::is_stall_why(why)
 }
 
-/// A stalled task's words for a person, by its `why=` (the need's `what` and the menu bar's
-/// row). A worker refused as signed out says that a person must sign in, the one step nobody
+/// A stalled task's words for a person, by its `why=` (the need's `what`). A worker refused as signed out says that a person must sign in, the one step nobody
 /// else can take.
 #[must_use]
 pub(crate) fn stall_words(why: Option<&str>) -> String {
@@ -247,7 +246,7 @@ pub(crate) fn stall_words(why: Option<&str>) -> String {
 }
 
 /// Whether a worker trusted to folder `trusted_cwd` has its own report of how it ended, so no
-/// generic one goes beside it (no landing record, no failed record or fact, no Done for you row):
+/// generic one goes beside it (no landing record, no failed record or fact):
 /// a credit claim's worker (its claim-worker record in Messages,
 /// `App::note_worker_conclusion`) and aterm's disk worker (its disk-worker record, from the disk
 /// watch), each an automatic report and never an item to look at.
@@ -670,6 +669,75 @@ impl TaskRecord {
             fact_rev,
         })
     }
+
+    /// A RECORD NAMES NO RESULT THAT IS GONE. A record read from a stored row (a layout, a crash
+    /// journal, a seamless update's carry) keeps the result it names unless that result is known
+    /// to be gone from `tasks` ([`result_stands`]); then it names none and says `result_bytes=0`,
+    /// so `task` promises nothing `result` cannot read. The row was written by another process, at
+    /// another time: a layout aterm 0.198.0 wrote names files its own quit removed. A result that
+    /// could not be checked (the directory or the file would not open) stays named: the record
+    /// is what keeps its file from the restore's sweep (`task_launch::RestoredTasks::sweep`), and
+    /// a failed read is no proof the file is gone.
+    pub(crate) fn settle_result(&mut self, tasks: Option<&Path>) {
+        let Some(path) = &self.result_path else {
+            return;
+        };
+        match result_stands(path, tasks) {
+            Ok(true) => {}
+            Ok(false) => {
+                aterm_log::warn!(
+                    "task: the result {} a stored record names is not there; the record names none",
+                    path.display()
+                );
+                self.result_path = None;
+                self.result_bytes = 0;
+            }
+            Err(error) => aterm_log::warn!(
+                "task: the result {} a stored record names could not be checked ({error}); the \
+                 record keeps it",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Whether the result `path` names stands in `tasks`: the snapshot and the sidecar beside it that
+/// says where it came from (`result` answers from neither without the other,
+/// `aterm_agent::harness::result::answer`), each a regular file directly in `tasks`, read through
+/// the directory with no link followed. `Ok(false)` only where one of them is known to be missing
+/// or to be no regular file there (or `path` names nothing in `tasks`); an error where the
+/// directory or a name could not be read, which says neither.
+fn result_stands(path: &Path, tasks: Option<&Path>) -> std::io::Result<bool> {
+    let (Some(tasks), Some(name)) = (tasks, path.file_name()) else {
+        return Ok(false);
+    };
+    if path.parent() != Some(tasks) {
+        return Ok(false);
+    }
+    let sidecar = aterm_agent::harness::result::sidecar_of(Path::new(name));
+    let dir = match crate::pinned_dir::PinnedDir::open_resolved(tasks) {
+        Ok(dir) => dir,
+        // No tasks directory holds no result. The open also says `NotFound` of a directory that
+        // changed under it, which is not that: the path itself is asked.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(tasks)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(dir.holds_regular_file(name)? && dir.holds_regular_file(sidecar.as_os_str())?)
+}
+
+/// The result file stored task row `row` names ([`restore_row`]), `None` where the row does not
+/// read or names none. Whether the file is there is not asked: a quit keeps what the rows of the
+/// layout it wrote name, and a restore removes by these names what no record keeps
+/// (`task_launch::restored_results`).
+pub(crate) fn row_result(row: &str) -> Option<PathBuf> {
+    TaskRecord::from_carry_row(row, tasks_dir().as_deref(), Instant::now(), unix_ms_now())?
+        .result_path
 }
 
 /// The folder a carried `trusted_cwd=` names: pct-decoded, absolute, spelled
@@ -1302,59 +1370,66 @@ pub(crate) fn mark_session_task_with_context(
         Option<&str>,
     ) -> bool,
 ) -> Result<Option<MarkedWith>, MarkFenced> {
-    let outcome = ctx
-        .fabric
-        .run_unfenced(fence_wait, |hold| {
-            let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-            let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let owner = crate::harness_host::ATTENTION_OWNER;
-            if !when(hold, &meta, &timeline, meta.attention_owners.get(owner)) {
-                return None;
-            }
-            let attention_moved = match edit {
-                AttentionEdit::Keep => false,
-                AttentionEdit::Raise(text) | AttentionEdit::Restate(text) => {
-                    crate::session_timeline::put_supervisor_attention(
-                        &mut meta,
-                        &mut timeline,
-                        Some(text),
-                    )
+    let outcome =
+        ctx.fabric
+            .run_unfenced(fence_wait, |hold| {
+                let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+                let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                let owner = crate::harness_host::ATTENTION_OWNER;
+                if !when(hold, &meta, &timeline, meta.attention_owners.get(owner)) {
+                    return None;
                 }
-                AttentionEdit::TakeDown(stands) => {
-                    stands(meta.attention_owners.get(owner))
-                        && crate::session_timeline::put_supervisor_attention(
+                let attention_moved = match edit {
+                    AttentionEdit::Keep => false,
+                    AttentionEdit::Raise(text) | AttentionEdit::Restate(text) => {
+                        crate::session_timeline::put_supervisor_attention(
                             &mut meta,
                             &mut timeline,
-                            None,
+                            Some(text),
                         )
-                }
-            };
-            let asks = asks_standing(&meta, &timeline);
-            let (record, moved) = match mark {
-                Some(mark) => {
-                    let (record, moved) =
-                        timeline.mark_task(mark, &asks, Instant::now(), unix_ms_now());
-                    (Some(record), moved)
-                }
-                None => {
-                    let moved = if matches!(edit, AttentionEdit::Restate(_)) {
-                        timeline.restate_task_attention(asks)
-                    } else {
-                        timeline.note_task_attention(asks)
-                    };
-                    (timeline.task().cloned(), moved)
-                }
-            };
-            timeline.slog_take_wake();
-            drop(timeline);
-            drop(meta);
-            Some(MarkedWith {
-                record,
-                moved,
-                attention_moved,
+                    }
+                    AttentionEdit::TakeDown(stands) => {
+                        stands(meta.attention_owners.get(owner))
+                            && crate::session_timeline::put_supervisor_attention(
+                                &mut meta,
+                                &mut timeline,
+                                None,
+                            )
+                    }
+                };
+                let asks = asks_standing(&meta, &timeline);
+                let (record, moved) = match mark {
+                    Some(mark) => {
+                        let (record, moved) =
+                            timeline.mark_task(mark, &asks, Instant::now(), unix_ms_now());
+                        // A result under another session ID the record now names goes with this tab
+                        // too, once no record names it (`SessionTimeline::carried_results`).
+                        if let Some(path) = record.result_path.as_deref().and_then(|path| {
+                            crate::task_launch::carried_result_of(path, &ctx.self_id)
+                        }) {
+                            timeline.note_carried_result(path);
+                        }
+                        (Some(record), moved)
+                    }
+                    None => {
+                        let moved = if matches!(edit, AttentionEdit::Restate(_)) {
+                            timeline.restate_task_attention(asks)
+                        } else {
+                            timeline.note_task_attention(asks)
+                        };
+                        (timeline.task().cloned(), moved)
+                    }
+                };
+                timeline.slog_take_wake();
+                drop(timeline);
+                drop(meta);
+                Some(MarkedWith {
+                    record,
+                    moved,
+                    attention_moved,
+                })
             })
-        })
-        .ok_or(MarkFenced)?;
+            .ok_or(MarkFenced)?;
     let record_moved = outcome
         .as_ref()
         .is_some_and(|m| m.moved || m.attention_moved);
@@ -1696,11 +1771,30 @@ fn repair_result(
 /// `ctx`'s task record for a restore manifest ([`crate::restore::TerminalLeafRestore::task`]): the
 /// carry row without its ages, which grow while the record stands still and would have every image
 /// written anew. A row without them goes by the wall clock ([`TaskRecord::from_carry_row`]), which
-/// is what a restore has: aterm was not running to measure the time between.
+/// is what a restore has: aterm was not running to measure the time between. It carries the
+/// results the tab's record named under other session IDs
+/// (`SessionTimeline::push_carried_results`), which the restore of a layout a crash left clears
+/// where its record no longer names them (`task_launch::RestoredTasks`).
 pub(crate) fn restore_row(ctx: &SessionCtx) -> Option<String> {
     let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-    let row = timeline.task()?.carry_row(Instant::now());
-    Some(TaskRecord::carry_face(&row))
+    let mut row = TaskRecord::carry_face(&timeline.task()?.carry_row(Instant::now()));
+    timeline.push_carried_results(&mut row);
+    Some(row)
+}
+
+/// The result files stored task row `row` says its tab's record named under other session IDs
+/// (` carried=<name>,…`, `SessionTimeline::push_carried_results`): each name shaped as a done edge
+/// writes it, directly in the tasks directory. A name of another shape is passed over.
+pub(crate) fn row_carried(row: &str) -> Vec<PathBuf> {
+    let Some(tasks) = tasks_dir() else {
+        return Vec::new();
+    };
+    row.split_whitespace()
+        .filter_map(|word| word.strip_prefix("carried="))
+        .flat_map(|names| names.split(','))
+        .filter(|name| crate::task_launch::snapshot_sid(name).is_some())
+        .map(|name| tasks.join(name))
+        .collect()
 }
 
 /// Restores a parked worker's record ([`restore_row`]) onto `ctx`, in a restore other than a
@@ -1715,17 +1809,24 @@ pub(crate) fn restore_row(ctx: &SessionCtx) -> Option<String> {
 /// ([`disposable_worker`]). Returns whether this is such a worker, whose agent the restore leaves
 /// unlaunched. One whose relaunch is over without its agent is marked exited then
 /// ([`mark_restored_over`]).
+///
+/// The record keeps the result its row names only where that result stands
+/// ([`TaskRecord::settle_result`]). The session has a new ID and the file keeps its name, so the
+/// timeline notes it as the result the tab came back with ([`carried_result`]). The other results
+/// the row says the tab named under other IDs ([`row_carried`]) are not noted: no record names
+/// them, and the restore's sweep clears them (`task_launch::RestoredTasks`).
 pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, followed: bool, kept: bool) -> bool {
     let now = Instant::now();
     let now_unix_ms = unix_ms_now();
-    let Some(mut record) =
-        TaskRecord::from_carry_row(row, tasks_dir().as_deref(), now, now_unix_ms)
+    let tasks = tasks_dir();
+    let Some(mut record) = TaskRecord::from_carry_row(row, tasks.as_deref(), now, now_unix_ms)
     else {
         aterm_log::warn!(
             "task: the restored task record does not read ({row:?}); its tab returns as a person's"
         );
         return false;
     };
+    record.settle_result(tasks.as_deref());
     let disposable = !kept && disposable_worker(record.trusted_cwd.as_deref());
     let gone = (!followed && !kept) || disposable;
     match record.state {
@@ -1754,12 +1855,23 @@ pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, followed: bool, kept: b
             record.carried_entered = Some(record.entered);
         }
     }
-    ctx.timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .seed_task(record);
+    let carried = carried_result(ctx, &record);
+    let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    timeline.seed_task(record);
+    timeline.seed_carried_results(carried.into_iter().collect());
+    drop(timeline);
     crate::session_timeline::keep_worker_autopilot(ctx);
     disposable
+}
+
+/// The result `record`, just read from a stored row for `ctx`'s session, names under an earlier
+/// session ID of the tab (`task_launch::carried_result_of`): the file stays where the row names
+/// it, and goes with the tab by that path.
+fn carried_result(ctx: &SessionCtx, record: &TaskRecord) -> Option<PathBuf> {
+    record
+        .result_path
+        .as_deref()
+        .and_then(|path| crate::task_launch::carried_result_of(path, &ctx.self_id))
 }
 
 /// Whether a worker trusted to folder `trusted_cwd` is disposable: aterm's disk worker, which a
@@ -1817,25 +1929,42 @@ pub(crate) fn note_program_block(
 /// Restores a carried task record onto `ctx` during seamless-update adoption, with the asks the
 /// carried escalations stand as ([`asks_standing`]). The told NEEDS YOU sets do not cross, so the
 /// needs entry's words stand for it until its loop tells the set again, which is no news by
-/// itself ([`Asks::joins`]).
+/// itself ([`Asks::joins`]). The record keeps the result its row names only where that result
+/// stands ([`TaskRecord::settle_result`]); one an earlier session ID of the tab names (a tab a
+/// restore brought back before this update) is noted as [`seed_restored`] notes it, and so is
+/// each the row says the predecessor's tab named under another ID ([`row_carried`]): the session
+/// keeps its ID, no sweep runs, and only this tab's close or quit removes them.
 pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
     let Some(row) = row else {
         return;
     };
+    let tasks = tasks_dir();
     let Some(mut record) =
-        TaskRecord::from_carry_row(row, tasks_dir().as_deref(), Instant::now(), unix_ms_now())
+        TaskRecord::from_carry_row(row, tasks.as_deref(), Instant::now(), unix_ms_now())
     else {
         aterm_log::warn!(
             "task: the carried task record does not read ({row:?}); the session crosses without one"
         );
         return;
     };
+    record.settle_result(tasks.as_deref());
     record.carried_entered = Some(record.entered);
+    let mut carried: Vec<PathBuf> = Vec::new();
+    for path in carried_result(ctx, &record).into_iter().chain(
+        row_carried(row)
+            .iter()
+            .filter_map(|path| crate::task_launch::carried_result_of(path, &ctx.self_id)),
+    ) {
+        if !carried.contains(&path) {
+            carried.push(path);
+        }
+    }
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     record.asks = asks_standing(&meta, &timeline);
     record.attention = !record.asks.is_empty();
     timeline.seed_task(record);
+    timeline.seed_carried_results(carried);
     drop(timeline);
     drop(meta);
     crate::session_timeline::keep_worker_autopilot(ctx);

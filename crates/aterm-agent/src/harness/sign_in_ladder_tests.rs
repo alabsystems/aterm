@@ -45,11 +45,14 @@ fn a_machine_with_nothing_has_no_route_and_names_every_one_it_tried() {
 }
 
 /// Each route's words at their longest (every field's longest word, the longest vault finding,
-/// many hosts, the longest way a run ends, a failed run's prefix) fit the record and the ledger
-/// reason whole, so no route a no-route or failed record names is ever cut off.
+/// many hosts, the longest way a run ends with its opener's longest reason, a failed run's
+/// prefix) fit the record and the ledger reason whole, the upkeep's and a renewal by hand's, so
+/// no route a no-route or failed record names, and no reason, is ever cut off.
 #[test]
 fn the_longest_words_fit_the_record_and_the_ledger_whole() {
-    use super::super::accounts::{AUTO_SIGN_IN, AttemptOutcome, LEDGER_WHY_MAX, ROUTES_MAX};
+    use super::super::accounts::{
+        AUTO_SIGN_IN, AttemptOutcome, HAND_SIGN_IN, LEDGER_WHY_MAX, ROUTES_MAX,
+    };
     use super::super::cli::Renewal;
     let longest = |words: Vec<String>| words.into_iter().max_by_key(String::len).unwrap();
     let vaults = [
@@ -105,39 +108,58 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
     };
     let (read, ran) = (longest_read(false), longest_read(true));
     let host = "h".repeat(super::super::open_url::Met::HOST_MAX);
+    // Every word at its longest: on the longest host, with the longest reason its opener gives.
+    let why = "w".repeat(super::super::open_url::Met::WHY_MAX);
     let mets: Vec<Option<Met>> = std::iter::once(None)
         .chain(
             [
                 MetWord::BrowserStart,
                 MetWord::BrowserControl,
+                MetWord::BrowserSignIn,
+                MetWord::WindowNoDesktop,
+                MetWord::WindowBotCheck,
+                MetWord::WindowBlockPage,
+                MetWord::WindowHumanCheck,
+                MetWord::WindowClosed,
+                MetWord::WindowWrongAccount,
                 MetWord::BotCheck,
                 MetWord::BlockPage,
                 MetWord::Stall,
+                MetWord::NotAuthorized,
             ]
             .into_iter()
-            .map(|word| Some(Met::new(word, Some(&host)))),
+            .map(|word| Some(Met::new(word, Some(&host)).because(&why))),
         )
         .collect();
-    let how = longest(
-        [
-            Renewal::Renewed,
-            Renewal::AuthFailed,
-            Renewal::WrongAccount,
-            Renewal::Failed,
-            Renewal::NeedsPerson,
-        ]
-        .into_iter()
-        .flat_map(|renewal| {
-            mets.iter()
-                .map(move |met| how_it_ended(renewal, Some(i32::MIN), met.as_ref()))
-        })
-        .collect(),
+    let hows: Vec<String> = [
+        Renewal::Renewed,
+        Renewal::AuthFailed,
+        Renewal::WrongAccount,
+        Renewal::Failed,
+        Renewal::NeedsPerson,
+        Renewal::BotCheck,
+    ]
+    .into_iter()
+    .flat_map(|renewal| {
+        mets.iter()
+            .map(move |met| how_it_ended(renewal, Some(i32::MIN), met.as_ref()))
+    })
+    .collect();
+    assert!(
+        hows.iter().any(|how| how.contains(&host)),
+        "a page's host is named"
     );
-    assert!(how.contains(&host), "the longest names its host: {how}");
+    let how = longest(hows);
+    assert!(
+        how.ends_with(&why),
+        "the longest keeps its whole reason: {how}"
+    );
+    let by_hand = format!("by hand: {how}");
     let records = [
         read.words(),
         failed_words(Route::Mailbox, &how, &ran),
         failed_words(Route::Profile, &how, &ran),
+        by_hand,
     ];
     for record in &records {
         assert!(
@@ -149,14 +171,17 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
             [
                 AttemptOutcome::NoRoute,
                 AttemptOutcome::Failed,
+                AttemptOutcome::Blocked,
                 AttemptOutcome::SignedIn,
             ]
             .into_iter()
             .map(|o| o.as_str().to_owned())
             .collect(),
         );
-        let reason = format!("{AUTO_SIGN_IN} {outcome}: {record}");
-        assert!(reason.len() <= LEDGER_WHY_MAX, "{reason}");
+        for by in [AUTO_SIGN_IN, HAND_SIGN_IN] {
+            let reason = format!("{by} {outcome}: {record}");
+            assert!(reason.len() <= LEDGER_WHY_MAX, "{reason}");
+        }
     }
     for route in [
         "profile(",
@@ -769,6 +794,83 @@ fn the_spacing_record_reads_back_only_as_written() {
     ] {
         assert_eq!(Started::parse(&text), None, "{text:?}");
     }
+}
+
+/// THIS MAC NAMES THE SIGN-IN IT IS RUNNING FOR AS LONG AS IT RUNS: a started sign-in's row is
+/// what [`Store::signing_in`] answers for its CLI's pool, and nothing for another's; its end
+/// removes the record; and a record whose process is gone, or that is not one this Mac writes,
+/// names nothing. Negative control: the same record with this process's number names its row.
+///
+/// [`Store::signing_in`]: super::super::accounts::Store::signing_in
+#[test]
+fn a_started_sign_in_is_named_until_it_ends() {
+    use super::super::accounts::{Cli, Store};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let store = Store::at_for(&dir.path().join("state"), Cli::Claude, dir.path());
+    let kimi = Store::at_for(&dir.path().join("state"), Cli::Kimi, dir.path());
+    std::fs::create_dir_all(store.shared_dir()).unwrap();
+    let now = 1_800_000_000;
+    assert_eq!(store.signing_in(), None, "no sign-in has started");
+    let lock = store
+        .signin_now()
+        .unwrap()
+        .expect("the sign-in lock is free");
+    let begun = SignIn::fixture(Cli::Claude, "m2-3", Why::Asked)
+        .begin(Cli::Claude, "m2-3", lock, &store, now)
+        .unwrap();
+    assert_eq!(store.signing_in().as_deref(), Some("m2-3"));
+    assert_eq!(
+        kimi.signing_in(),
+        None,
+        "another pool's rows are not signing in"
+    );
+    drop(begun);
+    assert_eq!(store.signing_in(), None, "its end ends the record");
+    assert!(!running_path(&store).exists());
+
+    let record = |pid: u32| Running {
+        cli: Cli::Claude.id().to_owned(),
+        label: "m2-3".to_owned(),
+        at: now,
+        pid,
+    };
+    let write = |text: &str| std::fs::write(running_path(&store), text).unwrap();
+    write(&record(std::process::id()).text());
+    assert_eq!(store.signing_in().as_deref(), Some("m2-3"));
+    #[cfg(windows)]
+    let mut command = {
+        let mut cmd = aterm_uds::spawnfd::command("cmd");
+        cmd.args(["/c", "exit 0"]);
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut command = aterm_uds::spawnfd::Command::new(crate::test_program::kept("/usr/bin/true"));
+    let mut child = command.spawn().expect("spawn");
+    let ended = child.id();
+    child.wait().expect("reap");
+    for gone in [0, ended] {
+        write(&record(gone).text());
+        assert_eq!(store.signing_in(), None, "no process {gone} runs it");
+    }
+    let live = record(std::process::id()).text();
+    for text in [
+        String::new(),
+        live.replace(RUNNING_HEAD, "aterm-signin-running-v0"),
+        live.replace("m2-3", "not/a/label"),
+        format!("{live}more\n"),
+        live.replace(&format!(" {}\n", std::process::id()), " soon\n"),
+    ] {
+        write(&text);
+        assert_eq!(store.signing_in(), None, "{text:?}");
+    }
+
+    // A later start's record is that start's: an earlier one ending leaves it.
+    let first = RunningMark::note(&store, Cli::Claude, "m2-2", now).unwrap();
+    let second = RunningMark::note(&store, Cli::Claude, "m2-3", now + 1).unwrap();
+    drop(first);
+    assert_eq!(store.signing_in().as_deref(), Some("m2-3"));
+    drop(second);
+    assert_eq!(store.signing_in(), None);
 }
 
 /// A started sign-in is spaced from the record every process on this Mac keeps: an automatic one

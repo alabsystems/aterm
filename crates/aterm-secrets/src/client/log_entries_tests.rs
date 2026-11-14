@@ -7232,16 +7232,16 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     // 4. `machine_named_in_vault` resolves log label `"m23"` to `"andrews-macbook"`, and revoking
     //    `m50` by its log label `"m23"` (`admin_revoke_stolen`) resolves `"m23"` to
     //    `"andrews-macbook"`, adds `"m23"` and its `node_key` to `aterm-swarm-roster`'s deny-lists,
-    //    strips `"m23"` from `ai-pool.toml`, and names `"m23"` in `needs_you_line`.
+    //    strips `"m23"` from `ai-pool.toml`, and names `"m23"` in `rotation_line`.
     assert_eq!(
         machine_named_in_vault(m22, &admin, "m23").unwrap(),
         "andrews-macbook"
     );
     let stolen = admin_revoke_stolen(m22, &admin, "m23", true).expect("revoke m23 by log label");
     assert!(
-        stolen.needs_you_line.contains("m23"),
-        "expected m23 in needs_you_line, got: {}",
-        stolen.needs_you_line
+        stolen.rotation_line.contains("m23"),
+        "expected m23 in rotation_line, got: {}",
+        stolen.rotation_line
     );
     let admin = admin_open(m22).unwrap();
     let roster = crate::swarm_roster::SwarmRoster::from_document(&admin.published_doc)

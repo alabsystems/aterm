@@ -21,6 +21,7 @@ use aterm_secrets::{
 };
 use std::path::{Path, PathBuf};
 
+mod boundary;
 mod closure;
 mod conflict;
 mod identified;

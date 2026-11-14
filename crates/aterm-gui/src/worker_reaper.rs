@@ -307,7 +307,7 @@ impl crate::App {
             .retired_workers_mut()
             .drop_aged(aterm_time::unix_millis().unwrap_or(0));
         if !aged.is_empty() {
-            forget_results(&aged);
+            forget_results(&self.store, &aged);
             self.settle_retired_windows(&aged);
         }
         steps

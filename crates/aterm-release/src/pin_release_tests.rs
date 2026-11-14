@@ -96,6 +96,10 @@ struct Shape {
     signed: [Option<Vec<u8>>; 2],
     /// The verifier bytes the release serves, per architecture (`None`: not uploaded).
     served: [Option<Vec<u8>>; 2],
+    /// The Windows verifier bytes the appcast signs (`None`: not signed).
+    windows_signed: Option<Vec<u8>>,
+    /// The Windows verifier bytes the release serves (`None`: not uploaded).
+    windows_served: Option<Vec<u8>>,
     /// The machine whose key signs the appcast.
     signer: [u8; 32],
     /// The appcast's commit and build.
@@ -106,7 +110,7 @@ struct Shape {
     /// Whether the release carries its appcast only as the archived pair.
     archived: bool,
     /// One text replacement in the signed appcast (before it is signed).
-    edit: Option<(&'static str, &'static str)>,
+    edit: Option<(String, String)>,
     /// The roster's `valid_until`.
     valid_until: &'static str,
     /// The channel head, when it is another release (`None`: the pinned one is the head).
@@ -120,6 +124,8 @@ impl Shape {
         Self {
             signed: [Some(x86.clone()), Some(arm.clone())],
             served: [Some(x86), Some(arm)],
+            windows_signed: None,
+            windows_served: None,
             signer: MACHINE,
             commit: commit(),
             build: 100,
@@ -163,7 +169,17 @@ impl Shape {
         if any {
             text.push_str(&format!("linux_verifier_interface = {}\n", pin::INTERFACE));
         }
-        if let Some((from, to)) = self.edit {
+        if let Some(bytes) = &self.windows_signed {
+            text.push_str(&format!(
+                "windows_verifier_x86_64 = \"{}\"\nwindows_verifier_x86_64_sha256 = \"{}\"\n\
+                 windows_verifier_x86_64_size = {}\nwindows_verifier_interface = {}\n",
+                pin::windows_asset_name("0.100.0", "x86_64"),
+                digest(bytes),
+                bytes.len(),
+                pin::WINDOWS_INTERFACE
+            ));
+        }
+        if let Some((from, to)) = &self.edit {
             assert!(text.contains(from), "the edit {from:?} applies to:\n{text}");
             text = text.replace(from, to);
         }
@@ -209,6 +225,12 @@ fn world(shape: &Shape) -> World {
             );
         }
     }
+    if let Some(bytes) = &shape.windows_served {
+        fake.add_asset(
+            id,
+            AssetSpec::uploaded(&pin::windows_asset_name("0.100.0", "x86_64"), bytes),
+        );
+    }
     let head = match &shape.head {
         None => id,
         Some(head) => {
@@ -251,6 +273,8 @@ fn world(shape: &Shape) -> World {
     std::fs::create_dir_all(root.path().join("tools")).unwrap();
     std::fs::create_dir_all(root.path().join("crates/aterm-bootstrap-verify")).unwrap();
     std::fs::write(root.path().join("tools/install.sh"), &script).unwrap();
+    std::fs::create_dir_all(root.path().join("apps/aterm-win")).unwrap();
+    std::fs::write(root.path().join(pin::WINDOWS_SCRIPT), windows_script()).unwrap();
     std::fs::write(root.path().join("RELEASES.ledger"), LEDGER).unwrap();
     let scratch = aterm_tempfile::Builder::new()
         .prefix("aterm-pin-scratch-")
@@ -520,7 +544,7 @@ fn a_signed_appcast_of_another_signer_channel_or_interface_is_refused() {
         ),
     ] {
         let mut shape = Shape::good();
-        shape.edit = Some(edit);
+        shape.edit = Some((edit.0.to_string(), edit.1.to_string()));
         world(&shape).refuses(&Tags(commit()), why);
     }
 }
@@ -543,6 +567,147 @@ fn a_release_the_channel_head_does_not_serve_is_refused() {
     world(&shape).refuses(&Tags(commit()), "cannot supply the channel's policy");
 }
 
+/// get-aterm.ps1 as a checkout carries it before a pin: its three lines empty.
+fn windows_script() -> String {
+    format!(
+        "# get-aterm.ps1\n{}rest\n",
+        pin::WindowsPin::default().lines()
+    )
+}
+
+/// A synthetic x86-64 console executable's header, standing in for the Windows verifier.
+fn windows_verifier() -> Vec<u8> {
+    let mut bytes = vec![0u8; 1024];
+    bytes[..2].copy_from_slice(b"MZ");
+    bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+    bytes[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+    bytes[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+    bytes[0x96..0x98].copy_from_slice(&0x0022u16.to_le_bytes());
+    bytes[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+    bytes[0xdc..0xde].copy_from_slice(&3u16.to_le_bytes());
+    bytes
+}
+
+/// `good`, whose appcast also signs, and whose release also serves, the Windows verifier.
+fn windows_shape() -> Shape {
+    let bytes = windows_verifier();
+    Shape {
+        windows_signed: Some(bytes.clone()),
+        windows_served: Some(bytes),
+        ..Shape::good()
+    }
+}
+
+impl World {
+    /// `read_windows_record`, then `write_windows_pin` with what it read, as
+    /// `windows_pin_from_release` runs them.
+    fn pin_windows(&self, git: &dyn GitRunner, ask: &Ask<'_>) -> Result<pin::WindowsPin, String> {
+        let record = read_windows_record(self.root.path(), git, ask)?;
+        crate::windows_pin::write_windows_pin(self.root.path(), &record)
+    }
+
+    /// The Windows refusal `why` for `v0.100.0`, with get-aterm.ps1 and both records untouched
+    /// and no download left behind.
+    fn refuses_windows(&self, git: &dyn GitRunner, why: &str) {
+        let masters = [self.master.as_str()];
+        let said = self
+            .pin_windows(git, &self.ask(TAG, &masters))
+            .expect_err(why);
+        assert!(said.contains(why), "{why}: {said}");
+        assert_eq!(
+            std::fs::read_to_string(self.root.path().join(pin::WINDOWS_SCRIPT)).unwrap(),
+            windows_script(),
+            "{why}: get-aterm.ps1 untouched"
+        );
+        assert!(
+            !self.root.path().join(pin::WINDOWS_RECORD).exists(),
+            "{why}: no record"
+        );
+        assert_eq!(
+            std::fs::read_dir(self.scratch.path()).unwrap().count(),
+            0,
+            "{why}: the download directory is gone"
+        );
+    }
+}
+
+/// A release whose appcast signs its Windows verifier pins get-aterm.ps1 to it, by the chain
+/// install.sh's pin is read under, and touches nothing of install.sh's.
+#[test]
+fn a_signed_release_pins_its_windows_verifier() {
+    let w = world(&windows_shape());
+    let masters = [w.master.as_str()];
+    let ask = w.ask(TAG, &masters);
+    let bytes = windows_verifier();
+    let record = read_windows_record(w.root.path(), &Tags(commit()), &ask).unwrap();
+    assert_eq!(
+        record,
+        pin::WindowsRecord(pin::Record {
+            repo: SLUG.into(),
+            tag: TAG.into(),
+            build_number: 100,
+            commit: commit(),
+            interface: pin::WINDOWS_INTERFACE,
+            verifiers: vec![pin::Receipt {
+                arch: "x86_64".into(),
+                asset: pin::windows_asset_name("0.100.0", "x86_64"),
+                sha256: digest(&bytes),
+                size: bytes.len() as u64,
+            }],
+        })
+    );
+    assert_eq!(
+        std::fs::read_dir(w.scratch.path()).unwrap().count(),
+        0,
+        "the downloads are removed"
+    );
+    let pinned = w.pin_windows(&Tags(commit()), &ask).unwrap();
+    assert_eq!(pinned, record.pin());
+    let written = std::fs::read_to_string(w.root.path().join(pin::WINDOWS_SCRIPT)).unwrap();
+    let committed = std::fs::read_to_string(w.root.path().join(pin::WINDOWS_RECORD)).unwrap();
+    assert_eq!(
+        pin::check_windows(&written, Some(&committed), LEDGER),
+        Ok(pinned)
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.root.path().join("tools/install.sh")).unwrap(),
+        w.script,
+        "install.sh's pin is untouched"
+    );
+}
+
+/// NEGATIVE CONTROLS: a release whose appcast signs no Windows verifier (every release before
+/// the fields), one that does not serve it, serves other bytes, signs a file that is no
+/// Windows executable, or names an interface this tree's get-aterm.ps1 does not call, writes
+/// nothing.
+#[test]
+fn a_windows_verifier_the_release_does_not_sign_and_serve_is_refused() {
+    world(&Shape::good()).refuses_windows(&Tags(commit()), "names no Windows bootstrap verifier");
+    let mut shape = windows_shape();
+    shape.windows_served = None;
+    world(&shape).refuses_windows(&Tags(commit()), "lacks its x86_64 bootstrap verifier asset");
+    let mut shape = windows_shape();
+    let mut tampered = windows_verifier();
+    tampered[600] ^= 1;
+    shape.windows_served = Some(tampered);
+    world(&shape).refuses_windows(&Tags(commit()), "does not match");
+    let elf = verifier(LinuxTarget::X86_64, false);
+    let shape = Shape {
+        windows_signed: Some(elf.clone()),
+        windows_served: Some(elf),
+        ..Shape::good()
+    };
+    world(&shape).refuses_windows(&Tags(commit()), "no MZ header");
+    let mut shape = windows_shape();
+    let (now, older) = (pin::WINDOWS_INTERFACE, pin::WINDOWS_INTERFACE - 1);
+    shape.edit = Some((
+        format!("windows_verifier_interface = {now}"),
+        format!("windows_verifier_interface = {older}"),
+    ));
+    world(&shape).refuses_windows(&Tags(commit()), &format!("speaks interface {older}"));
+}
+
 /// `ship pin-verifier` takes a release tag after `--from-release`, or one record path,
 /// and nothing else.
 #[test]
@@ -557,6 +722,10 @@ fn pin_verifier_takes_a_release_or_a_record_and_nothing_else() {
         Ok(Cmd::PinVerifier(PinSource::Release("v0.145.0".into())))
     );
     assert_eq!(
+        parse(&["pin-verifier", "--windows", "--from-release", "v0.145.0"]),
+        Ok(Cmd::PinWindowsVerifier("v0.145.0".into()))
+    );
+    assert_eq!(
         parse(&["pin-verifier", "dist/aterm-bootstrap-verify-pin.toml"]),
         Ok(Cmd::PinVerifier(PinSource::Record(
             "dist/aterm-bootstrap-verify-pin.toml".into()
@@ -569,6 +738,18 @@ fn pin_verifier_takes_a_release_or_a_record_and_nothing_else() {
         &["pin-verifier", "--from-release", "v0.145.0", "extra"],
         &["pin-verifier", "dist/a.toml", "dist/b.toml"],
         &["pin-verifier", "--record", "dist/a.toml"],
+        &["pin-verifier", "--windows"],
+        &["pin-verifier", "--windows", "dist/a.toml"],
+        &["pin-verifier", "--windows", "--from-release"],
+        &["pin-verifier", "--windows", "--from-release", "--dry-run"],
+        &[
+            "pin-verifier",
+            "--windows",
+            "--from-release",
+            "v0.145.0",
+            "extra",
+        ],
+        &["pin-verifier", "--from-release", "v0.145.0", "--windows"],
     ] {
         assert!(parse(bad).is_err(), "{bad:?}");
     }

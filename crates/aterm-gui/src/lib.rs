@@ -810,8 +810,11 @@ mod fabric;
 mod fabric_launch;
 mod fact_menu;
 mod find_bar;
+#[cfg(any(unix, test))]
+mod fleet_activity;
 mod fleet_glance;
 mod fleet_listen;
+mod fleet_traffic;
 mod footer_card_plate;
 mod foreground_handback;
 mod frame_key;
@@ -3796,16 +3799,24 @@ enum Wake {
     StatusAction {
         action: status_item::StatusAction,
     },
+    /// The menu-bar item's menu is opening, painted already ([`App::on_status_menu_opening`]).
     #[cfg(target_os = "macos")]
     StatusMenuOpening {
-        painted: Option<Box<status_item::Glance>>,
+        /// The latest refusal by this Mac's lock that the painted menu shows
+        /// (`status_item::Glance::blocked_shown_ms`); `None` where it shows none.
+        seen_blocked_ms: Option<u64>,
     },
+    /// The fleet traffic's reader added the record up to a new answer
+    /// ([`fleet_traffic::FleetTraffic`]): the menu-bar item's glance is rebuilt.
+    #[cfg(unix)]
+    #[cfg_attr(test, expect(dead_code, reason = "a unit test starts no reader"))]
+    FleetTraffic,
     /// This Mac's stored fleet access changed (`aterm_agent::fleet_access::CHANGED`, which
     /// `aterm fleet access` and another window's lock post): the App reads the file again
     /// ([`App::reread_fleet_access`]). The notification carries no level.
     #[cfg(target_os = "macos")]
     FleetAccessChanged,
-    SiblingScan(Vec<status_item::SiblingInstance>),
+    SiblingScan(Vec<sibling_scan::SiblingInstance>),
     /// This machine's name as `machine-name.toml` holds it, from [`machine_title::spawn`]'s
     /// reader: the menu bar's machine title follows it.
     #[cfg(target_os = "macos")]
@@ -3814,10 +3825,6 @@ enum Wake {
     /// ([`App::machine_name_not_set`]).
     #[cfg(target_os = "macos")]
     MachineNameNotSet(machine_title::NameUnset),
-    #[cfg(target_os = "macos")]
-    SiblingRaised {
-        pid: u32,
-    },
     FleetRead,
     FabricRead,
     #[cfg(target_os = "macos")]
@@ -9289,7 +9296,7 @@ const fn handoff_deferrable_input(event: &WindowEvent) -> bool {
 impl Wake {
     /// Whether this wake's handler only refreshes an observation of the world that no restore
     /// image reads: a surface ready to draw, a vitals reading, the disk board and its looks,
-    /// the menu bar's sibling, machine-name and fleet rows. Such a wake is not activity for the
+    /// a sibling scan, a fleet read, the fleet traffic, this machine's name. Such a wake is not activity for the
     /// crash journal ([`crash_journal::Lane::note_activity`]): it owes no capture and no
     /// settle, so a window at rest does not build a restore image after each reading. Every
     /// other wake is activity, the safe side: a capture equal to the last one writes nothing.
@@ -9302,6 +9309,8 @@ impl Wake {
             | Wake::HostNote(harness_host::HostNote::DiskLooked)
             | Wake::SiblingScan(_)
             | Wake::FleetRead => true,
+            #[cfg(unix)]
+            Wake::FleetTraffic => true,
             #[cfg(target_os = "macos")]
             Wake::MachineName(_) | Wake::MachineNameNotSet(_) => true,
             _ => false,
@@ -10377,6 +10386,10 @@ struct App {
     #[cfg(unix)]
     handoff_carried_messages: Vec<u64>,
     quit_capture: Option<restore::RestoreManifest>,
+    /// The worker sessions closed since [`Self::quit_capture`] was taken, whose files in the
+    /// tasks directory the run's end settles against the layout it writes
+    /// ([`task_launch::QuitClosed`]).
+    quit_closed_tasks: task_launch::QuitClosed,
     crash_journal: crash_journal::Lane,
     end_session: crash_journal::EndSessionCadence,
     session_log_journal: session_log_journal::Lane,
@@ -10516,12 +10529,13 @@ struct App {
     #[cfg(target_os = "macos")]
     access_look: Option<Instant>,
     status_fingerprint: Option<u64>,
-    status_drawn: Vec<status_item::Glance>,
-    status_painted: Option<status_item::Glance>,
-    status_gen: u16,
+    /// The fleet traffic the menu-bar item's glance copies, and its background reader
+    /// ([`App::fleet_traffic`]): unset until the first glance built with the event loop's proxy
+    /// in hand, `None` inside where no reader could start.
+    fleet_traffic: std::sync::OnceLock<Option<fleet_traffic::FleetTraffic>>,
     #[cfg(any(test, debug_assertions))]
     person_look: Option<WindowId>,
-    siblings: Vec<status_item::SiblingInstance>,
+    siblings: Vec<sibling_scan::SiblingInstance>,
     fleet_glance: Option<fleet_glance::FleetGlance>,
     /// The Network State band's Fleet Field as last projected from the glance's slot
     /// ([`App::reproject_fleet_field`]); `None` with no glance or no fleet, where the band draws
@@ -13152,7 +13166,7 @@ impl App {
     }
 
     /// The card asked for `words`: nothing is posted. A verified grant that reads off
-    /// (`regressed`) lights the System State menu line; the ask is remembered in the record.
+    /// (`regressed`) lights the System State signal line; the ask is remembered in the record.
     fn hold_fda_need(&mut self, words: &consent_card::NeedWords, now: Instant) {
         self.consent_card_message = None;
         if words.regressed {
@@ -13593,7 +13607,7 @@ impl App {
     /// The launch check's looks again at a verified grant it read off while this process settled
     /// ([`consent_card::SettleLook`]). Each reads the probe afresh: held, the launch read was the
     /// young process's; still off at the settled look, the grant is a need as any regression is
-    /// (one menu-bar line, no page), whose note says the update needs it re-allowed when this
+    /// (one need's line, no page), whose note says the update needs it re-allowed when this
     /// build is not the one that verified it (or this process is an update's successor); still
     /// off at the focus look after it, only the log says so.
     fn tick_fda_settle_look(&mut self, now: Instant) {
@@ -15510,6 +15524,7 @@ impl App {
             #[cfg(unix)]
             handoff_carried_messages: Vec::new(),
             quit_capture: None,
+            quit_closed_tasks: task_launch::QuitClosed::default(),
             crash_journal: crash_journal::Lane::inert(),
             end_session: crash_journal::EndSessionCadence::default(),
             session_log_journal: session_log_journal::Lane::inert(),
@@ -15600,9 +15615,7 @@ impl App {
             #[cfg(target_os = "macos")]
             access_look: None,
             status_fingerprint: None,
-            status_drawn: Vec::new(),
-            status_painted: None,
-            status_gen: 0,
+            fleet_traffic: std::sync::OnceLock::new(),
             #[cfg(any(test, debug_assertions))]
             person_look: None,
             siblings: Vec::new(),
@@ -19258,7 +19271,6 @@ impl ApplicationHandler<Wake> for App {
         if crate::spawn::take_palette_refused() {
             self.note_palette_refused();
         }
-        self.note_person_refusals();
         self.note_rewind_focus();
         #[cfg(target_os = "macos")]
         self.tick_lock_face(Instant::now());
@@ -20010,6 +20022,7 @@ impl App {
                 #[cfg(all(a11y_tree, any(test, debug_assertions)))]
                 lines.extend(self.harness_a11y_lines());
                 lines.extend(self.status_item_chrome_lines());
+                lines.extend(self.system_state_chrome_line());
                 let _ = reply.send(lines);
             }
             Wake::ReadPanes { session, reply } => {
@@ -21291,16 +21304,14 @@ impl App {
                 self.dispatch_status_action(action);
             }
             #[cfg(target_os = "macos")]
-            Wake::StatusMenuOpening { painted } => {
+            Wake::StatusMenuOpening { seen_blocked_ms } => {
                 self.clear_front_move_license();
-                self.on_status_menu_opening(painted.map(|glance| *glance));
+                self.on_status_menu_opening(seen_blocked_ms);
             }
+            #[cfg(unix)]
+            Wake::FleetTraffic => self.mark_status_dirty(),
             #[cfg(target_os = "macos")]
             Wake::FleetAccessChanged => self.reread_fleet_access(),
-            #[cfg(target_os = "macos")]
-            Wake::SiblingRaised { pid } => {
-                let _ = self.apprt.activate_instance(pid);
-            }
             Wake::ConfirmedClose { replay } => self.replay_confirmed_close(el, replay),
             #[cfg(target_os = "macos")]
             Wake::CloseSheetAnswered { serial, proceed } => {
@@ -24912,7 +24923,6 @@ static LINUX_WINDOW_START_ONCE_OPEN: std::sync::atomic::AtomicBool =
 fn linux_launch_without_a_window(headless: bool) -> bool {
     #[cfg(target_os = "linux")]
     {
-        aterm_update::linux_capture_executable();
         match linux_trial_start(headless, !headless && display_answered()) {
             LinuxTrialStart::Window => false,
             LinuxTrialStart::Session => {
@@ -27448,8 +27458,9 @@ pub fn main_entry_with_network(
                 .send_event(Wake::DevBuildWrites(writes));
         }
     }
-    // Windows runs no checker (`aterm_update::enabled`); it announces the build a local build
-    // loop staged, read from one pointer file now and on a slow timer.
+    // Windows runs no in-process checker (`aterm_update::enabled`); its watch announces the
+    // build staged on this machine (the signed release channel's or a local build loop's),
+    // read now and on a slow timer, and checks the release channel when that is due.
     #[cfg(windows)]
     if aterm_update::staged_notice_enabled() {
         crate::update_control::spawn_windows_staged_watch(event_loop.create_proxy());
@@ -28390,6 +28401,7 @@ pub fn main_entry_with_network(
         #[cfg(unix)]
         handoff_carried_messages: Vec::new(),
         quit_capture: None,
+        quit_closed_tasks: task_launch::QuitClosed::default(),
         crash_journal,
         end_session: crash_journal::EndSessionCadence::default(),
         session_log_journal,
@@ -28498,9 +28510,7 @@ pub fn main_entry_with_network(
         #[cfg(target_os = "macos")]
         access_look: None,
         status_fingerprint: None,
-        status_drawn: Vec::new(),
-        status_painted: None,
-        status_gen: 0,
+        fleet_traffic: std::sync::OnceLock::new(),
         #[cfg(any(test, debug_assertions))]
         person_look: None,
         siblings: Vec::new(),

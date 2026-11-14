@@ -41,7 +41,8 @@ pub use source::{
 
 /// The private vault entries that determine default repository acquisition. Other vault
 /// entries must not invalidate a clone whose source and credential remain unchanged.
-pub const VAULT_INPUT_ENTRIES: [&str; 2] = ["gh_access_token", inventory::ENTRY];
+pub const VAULT_INPUT_ENTRIES: [&str; 2] =
+    [agh::identity::vault::Slot::Dev.entry(), inventory::ENTRY];
 
 /// Whether a Git executable is installed ([`crate::items::github::installed_git`]): managed
 /// Git is preferred, with developer-tools or system Git as fallbacks. This reads metadata
@@ -194,10 +195,12 @@ pub fn run_repository_credential_withdrawal(
 
 const INPUT_MAX: usize = 64 * 1024;
 
-/// The GitHub token the ALab vault's sync writes, under the home: the repository stage's token
+/// The GitHub token the ALab vault's sync writes under `home`: the repository stage's token
 /// source unless init.toml's `[github]` names another. It is the file agh adopts as its dev
 /// profile when there is no agh.toml (agh design §6.10), so the two name one file.
-pub(crate) const TOKEN_FILE: &str = agh::identity::vault::DEV_TOKEN_FILE;
+pub(crate) fn token_file(home: &Path) -> PathBuf {
+    agh::identity::vault::Slot::Dev.path(home)
+}
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -301,7 +304,7 @@ pub(super) fn token_here(sys: &dyn System, user: &User) -> bool {
     let source = profile_source(sys, user).unwrap_or_else(|| Github {
         account: String::new(),
         owner: String::new(),
-        token_file: Path::new(&user.home).join(TOKEN_FILE),
+        token_file: token_file(Path::new(&user.home)),
         token_key: None,
     });
     read_token(sys, user, &source).is_ok()
@@ -439,7 +442,7 @@ pub(crate) fn items_for_execution_with_withdrawal_guard(
 /// What `sync.clone` reads of the GitHub step an `aterm init` owes ([`crate::init::owed_clone`]):
 /// whether the token it reads is on this Mac, and the step's mark.
 pub(crate) struct TokenRead {
-    /// The token is here: the vault's ([`TOKEN_FILE`]), or the `token_file` init.toml's
+    /// The token is here: the vault's ([`token_file`]), or the `token_file` init.toml's
     /// `[github]` names.
     pub(crate) landed: bool,
     /// Why a token file that is there cannot be used (not a regular file of the user's, a
@@ -466,7 +469,7 @@ pub(crate) fn token_read(sys: &dyn System, ctx: &Ctx) -> Result<Option<TokenRead
     let table = profile(sys, user)?.and_then(|profile| profile.github);
     let path = match asked(table, user)? {
         Asked::Off => return Ok(None),
-        Asked::Default => Path::new(&user.home).join(TOKEN_FILE),
+        Asked::Default => token_file(Path::new(&user.home)),
         Asked::Scoped(config) | Asked::Profile(config) => config.token_file,
     };
     let read = sys.read_owned_file(&path, user.uid, INPUT_MAX, true);
@@ -588,7 +591,7 @@ fn asked(table: Option<Table>, user: &User) -> Result<Asked, String> {
         return Ok(Asked::Scoped(Github {
             account,
             owner,
-            token_file: Path::new(&user.home).join(TOKEN_FILE),
+            token_file: token_file(Path::new(&user.home)),
             token_key: None,
         }));
     };

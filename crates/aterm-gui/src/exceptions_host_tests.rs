@@ -326,7 +326,7 @@ fn a_refused_restatement_leaves_its_entry_open() {
     assert!(app.messages.digest_deadline().is_some());
 }
 
-/// Settings, `aterm ctl messages need=later live`, and the menu-bar status item read from the same digest.
+/// Settings and `aterm ctl messages need=later live` read from the same digest.
 #[test]
 fn the_surfaces_read_one_digest() {
     let mut app = App::headless_for_test();
@@ -348,12 +348,6 @@ fn the_surfaces_read_one_digest() {
     assert!(
         live.is_empty(),
         "an open exception is never a live row: {live:?}"
-    );
-    assert_eq!(
-        app.status_item_chrome_line(),
-        "statusitem title=\u{276f} needs=0 stuck=0 exceptions=1 done=0 fleet=off access=read \
-         shown=read",
-        "the menu-bar cue an agent can read"
     );
 }
 

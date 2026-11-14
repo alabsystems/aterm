@@ -62,9 +62,15 @@ fn set(paths: &[&Path]) -> BTreeSet<PathBuf> {
 // ---------------------------------------------------------------------------------------------
 // Where a pane is.
 
+/// The session id of the pane whose key is `key`, in a session id's form.
+fn session(key: u64) -> String {
+    format!("s-{key:020x}")
+}
+
 fn pane(key: u64, shell: u32, front: u32, report: Option<CwdReport>) -> PaneFacts {
     PaneFacts {
         key,
+        session: session(key),
         shell_pid: shell,
         front_pid: front,
         report,
@@ -223,7 +229,8 @@ fn a_cd_shorter_than_one_discovery_never_moves_the_tab_segment() {
 // ---------------------------------------------------------------------------------------------
 // The engine, driven directly with injected process reads.
 
-/// An engine whose process reads are a table the test fills, counted.
+/// An engine whose process reads are a table the test fills, counted, and whose build-start
+/// lines are a list the test fills (none until it does).
 struct Rig {
     engine: Engine,
     _to: Sender<ToWalker>,
@@ -231,6 +238,7 @@ struct Rig {
     cwd_reads: Rc<Cell<usize>>,
     exe_reads: Rc<Cell<usize>>,
     other_pool: Rc<RefCell<Option<PathBuf>>>,
+    starts: Rc<RefCell<Vec<atpkg::build_start::Start>>>,
 }
 
 impl Rig {
@@ -241,6 +249,7 @@ impl Rig {
         let cwd_reads: Rc<Cell<usize>> = Rc::default();
         let exe_reads: Rc<Cell<usize>> = Rc::default();
         let other_pool: Rc<RefCell<Option<PathBuf>>> = Rc::default();
+        let starts: Rc<RefCell<Vec<atpkg::build_start::Start>>> = Rc::default();
         engine.reads = PaneReads {
             cwd: Box::new({
                 let (cwd, n) = (Rc::clone(&cwd), Rc::clone(&cwd_reads));
@@ -263,6 +272,10 @@ impl Rig {
                     Some(VolumeKey::Fsid(if elsewhere { 2 } else { 1 }))
                 }
             }),
+            starts: Box::new({
+                let starts = Rc::clone(&starts);
+                move || starts.borrow().clone()
+            }),
         };
         engine.take_facts(Facts {
             home: Some(home.to_path_buf()),
@@ -276,6 +289,7 @@ impl Rig {
             cwd_reads,
             exe_reads,
             other_pool,
+            starts,
         }
     }
 
@@ -599,6 +613,247 @@ fn a_tab_is_the_union_of_its_panes_projects() {
     focus.demand(DiskScope::Tab(tab_id(1)), Pace::Look, t0);
     focus.engine.discover_if_due(t0);
     assert_eq!(members(&focus), set(&[&one]));
+}
+
+/// A BUILD BY PATH IS ITS TAB'S (DC-01): a tab whose pane sits in one repository and whose
+/// build compiled a linked worktree elsewhere (`cd <worktree> && targo ...`, `--manifest-path`,
+/// `-C`) holds that worktree and its build mirror, named by the build-start line the build
+/// left under the pane's session. The line's build folder lies inside the mirror and is no
+/// root of its own. Negative controls: with no line, and with the same line under a session
+/// no pane has, the tab holds its pane's repository alone and no scope holds the worktree;
+/// and the line gives the other tab nothing.
+#[test]
+fn a_worktree_a_tabs_session_built_in_by_path_is_a_root_of_that_tab() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+    let b = base(&tmp);
+    let home = b.join("home");
+    let (main, wt, two) = (home.join("main"), home.join("wt"), home.join("two"));
+    mkdir(&main.join(".git"));
+    mkdir(&wt.join("src"));
+    write(&wt.join(".git"), 30);
+    mkdir(&two);
+    let root = atpkg::build_cache::cache_root(&home);
+    let build = atpkg::build_cache::build_dir(&root, &wt);
+    mkdir(&build);
+    let mirror = build_mirror(&root, &wt);
+    let line = |session: String| atpkg::build_start::Start {
+        session,
+        workspace: wt.clone(),
+        build: Some(build.clone()),
+        pid: 4242,
+        at_ms: 1_731_450_000_000,
+    };
+    let t0 = Instant::now();
+    let discovered = |lines: Vec<atpkg::build_start::Start>| {
+        let mut r = Rig::new(&home);
+        *r.starts.borrow_mut() = lines;
+        r.facts(&[(1, 1, &main), (2, 2, &two)], &[], &[]);
+        for scope in [
+            DiskScope::Tab(tab_id(1)),
+            DiskScope::Tab(tab_id(2)),
+            DiskScope::Aterm,
+        ] {
+            r.demand(scope, Pace::Look, t0);
+        }
+        r.engine.discover_if_due(t0);
+        r.board()
+    };
+    let members = |board: &Published, scope: DiskScope| -> BTreeSet<PathBuf> {
+        board
+            .members(scope)
+            .iter()
+            .map(|c| c.path.clone())
+            .collect()
+    };
+    let (one, other) = (DiskScope::Tab(tab_id(1)), DiskScope::Tab(tab_id(2)));
+
+    let board = discovered(vec![line(session(1))]);
+    assert_eq!(members(&board, one), set(&[&main, &wt, &mirror]));
+    let held = board.members(one);
+    let claim = |path: &Path| {
+        held.iter()
+            .find(|c| c.path.as_path() == path)
+            .expect("a member")
+    };
+    assert_eq!(
+        (claim(&wt).kinds.clone(), claim(&wt).linked_worktree),
+        (BTreeSet::from([RootKind::Project]), true),
+        "the worktree, a linked one"
+    );
+    assert_eq!(claim(&mirror).kinds, BTreeSet::from([RootKind::Build]));
+    assert!(
+        build.starts_with(&mirror) && !members(&board, DiskScope::Aterm).contains(&build),
+        "the line's build folder is counted in the mirror"
+    );
+    assert_eq!(members(&board, other), set(&[&two]), "the other tab");
+
+    // Negative controls: no line, and a line under a session no pane has.
+    for (what, lines) in [
+        ("no line", Vec::new()),
+        ("another session's line", vec![line(session(9))]),
+    ] {
+        let board = discovered(lines);
+        assert_eq!(members(&board, one), set(&[&main]), "{what}");
+        assert_eq!(
+            members(&board, DiskScope::Aterm),
+            set(&[&main, &two]),
+            "{what}"
+        );
+    }
+}
+
+/// The board after one discovery of tab 1 (pane 1 at `at`), tab 2 (pane 2 at `two`) and aterm,
+/// with the build-start lines `lines`, and what that discovery touched.
+fn built_board(
+    home: &Path,
+    at: &Path,
+    two: &Path,
+    lines: Vec<atpkg::build_start::Start>,
+    other_pool: Option<&Path>,
+) -> (Published, Vec<PathBuf>) {
+    let t0 = Instant::now();
+    let mut r = Rig::new(home);
+    *r.starts.borrow_mut() = lines;
+    *r.other_pool.borrow_mut() = other_pool.map(Path::to_path_buf);
+    r.facts(&[(1, 1, at), (2, 2, two)], &[], &[]);
+    for scope in [
+        DiskScope::Tab(tab_id(1)),
+        DiskScope::Tab(tab_id(2)),
+        DiskScope::Aterm,
+    ] {
+        r.demand(scope, Pace::Look, t0);
+    }
+    let ((), touched) = aterm_diskwalk::touched::record(|| r.engine.discover_if_due(t0));
+    (r.board(), touched)
+}
+
+/// The paths `scope` holds on `board`.
+fn held(board: &Published, scope: DiskScope) -> BTreeSet<PathBuf> {
+    board
+        .members(scope)
+        .iter()
+        .map(|c| c.path.clone())
+        .collect()
+}
+
+/// A build-start line of pane `key`'s session.
+fn built(
+    key: u64,
+    workspace: &Path,
+    build: Option<&Path>,
+    at_ms: u64,
+) -> atpkg::build_start::Start {
+    atpkg::build_start::Start {
+        session: session(key),
+        workspace: workspace.to_path_buf(),
+        build: build.map(Path::to_path_buf),
+        pid: 4242,
+        at_ms,
+    }
+}
+
+/// A LINE NAMES ONLY WHAT A PANE'S OWN DIRECTORY COULD (DC-01): a build-start line's workspace
+/// and build folder each pass the path test, a no-follow directory test and the pool test
+/// before anything under them is opened, so a line naming home itself, a protected folder, a
+/// link, a file, a folder on another pool or one that is gone adds no root, and a build folder
+/// in a protected folder adds none either. A build folder outside the workspace and its build
+/// mirror (`--target-dir`) is a build root of its own. NEGATIVE CONTROL: with no line the
+/// tab holds its pane's repository alone, and the target directory is no one's.
+#[test]
+fn a_build_start_line_names_only_roots_a_panes_own_directory_could() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+    let b = base(&tmp);
+    let home = b.join("home");
+    let (main, two) = (home.join("main"), home.join("two"));
+    mkdir(&main.join(".git"));
+    mkdir(&two);
+    let protected = home.join("Documents/proj");
+    mkdir(&protected.join(".git"));
+    let real = home.join("real");
+    mkdir(&real.join(".git"));
+    let link = home.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("a link");
+    let file = home.join("file");
+    write(&file, 10);
+    let far = home.join("far");
+    mkdir(&far.join(".git"));
+    let (wt, out) = (home.join("wt"), home.join("out"));
+    mkdir(&wt.join(".git"));
+    mkdir(&out);
+    let (wt3, hidden_out) = (home.join("wt3"), home.join("Documents/out"));
+    mkdir(&wt3.join(".git"));
+    mkdir(&hidden_out);
+    let lines = vec![
+        built(1, &home, None, 1),
+        built(1, &protected, None, 2),
+        built(1, &link, None, 3),
+        built(1, &file, None, 4),
+        built(1, &far, None, 5),
+        built(1, &home.join("gone"), None, 6),
+        built(1, &wt, Some(&out), 7),
+        built(1, &wt3, Some(&hidden_out), 8),
+    ];
+    let (board, touched) = built_board(&home, &main, &two, lines, Some(&far));
+    let one = DiskScope::Tab(tab_id(1));
+    assert_eq!(held(&board, one), set(&[&main, &wt, &out, &wt3]));
+    let kinds = |path: &Path| {
+        board
+            .members(one)
+            .iter()
+            .find(|c| c.path.as_path() == path)
+            .map(|c| c.kinds.clone())
+    };
+    assert_eq!(kinds(&out), Some(BTreeSet::from([RootKind::Build])));
+    assert_eq!(kinds(&wt), Some(BTreeSet::from([RootKind::Project])));
+    assert!(
+        touched
+            .iter()
+            .all(|p| !p.starts_with(home.join("Documents")) && !p.starts_with(&real)),
+        "nothing under a protected folder or through a link was opened: {touched:?}"
+    );
+    assert_eq!(held(&board, DiskScope::Tab(tab_id(2))), set(&[&two]));
+
+    // The negative control: no line.
+    let (board, _) = built_board(&home, &main, &two, Vec::new(), Some(&far));
+    assert_eq!(held(&board, one), set(&[&main]));
+    assert!(!held(&board, DiskScope::Aterm).contains(&out));
+}
+
+/// A TAB HOLDS ITS SESSION'S NEWEST LINES, IN THE RECORD'S ORDER: of a session's lines it takes
+/// the last 64 the record holds, whatever time a line claims, so a line dated far ahead (forged,
+/// or written by a clock that later stepped back) outranks none written after it. NEGATIVE
+/// CONTROL: the 65th line from the end, which claims the latest time of all, adds no root.
+#[test]
+fn a_tabs_built_roots_are_its_newest_lines_in_the_records_order() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+    let b = base(&tmp);
+    let home = b.join("home");
+    let (main, two) = (home.join("main"), home.join("two"));
+    mkdir(&main.join(".git"));
+    mkdir(&two);
+    let workspaces: Vec<PathBuf> = (0..=MAX_BUILT_PER_PANE)
+        .map(|n| home.join(format!("w{n:02}")))
+        .collect();
+    for w in &workspaces {
+        mkdir(&w.join(".git"));
+    }
+    let lines: Vec<atpkg::build_start::Start> = workspaces
+        .iter()
+        .enumerate()
+        .map(|(n, w)| {
+            let at = if n == 0 { u64::MAX / 2 } else { n as u64 };
+            built(1, w, None, at)
+        })
+        .collect();
+    let (board, _) = built_board(&home, &main, &two, lines, None);
+    let mut expected: BTreeSet<PathBuf> = workspaces[1..].iter().cloned().collect();
+    expected.insert(main.clone());
+    let one = DiskScope::Tab(tab_id(1));
+    assert_eq!(held(&board, one), expected);
+    assert!(
+        !held(&board, one).contains(&workspaces[0]),
+        "the oldest line, however late it claims to be"
+    );
 }
 
 /// A FIRST ASK IS OWED, NOT ZERO (main's d8a5126907, on F2a's engine): a discovery covers the

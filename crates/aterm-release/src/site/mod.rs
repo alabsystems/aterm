@@ -2196,6 +2196,43 @@ fn fetch_live(world: &mut dyn World, url: &str) -> Option<BTreeMap<&'static str,
     Some(live)
 }
 
+/// What `--check-access` asks: whether Google accepts the key at `key` and lets its account
+/// update the Hosting site that `site`'s firebase.json and `env` name. A token exchange, a
+/// read of the site and an IAM permission test; nothing is deployed and no policy changes.
+fn access(world: &Real, env: &Env, site: Option<&Path>, key: &Path) -> Result<String, String> {
+    let in_config = site.map(hosting::config::read).transpose()?;
+    let target = hosting::site(
+        in_config.as_ref().and_then(|config| config.site.as_deref()),
+        env.firebase_site.as_deref(),
+    )?;
+    let access = world.check_access(key, target.as_deref())?;
+    Ok(format!(
+        "Hosting site {} in project {} reports {}; no deployment or policy change performed",
+        access.site,
+        access.project,
+        hosting::access::UPDATE
+    ))
+}
+
+/// [`access`] for the site the clone at `repo` is set to deploy, with the key at `key`: what
+/// a release's step 1 asks before it builds anything (`provision::layer`).
+///
+/// # Errors
+/// The settings cannot be read, or the key, the site or the permission cannot be verified.
+pub(crate) fn access_of(repo: &Path, key: &Path) -> Result<String, String> {
+    let env = Env::from_process(repo, None)?;
+    let world = Real {
+        unset: std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .filter(|k| crate::release_steps::launcher_env(k))
+            .collect(),
+        launch: Rc::new(Plain),
+        curl: std::sync::Arc::new(crate::github::Launched(Plain)),
+        reader: aterm_update_core::release_asset::Reader::anonymous(),
+    };
+    access(&world, &env, env.site_dir.as_deref(), key)
+}
+
 /// CLI entry point for `ship site` and the post-promote hook ([`USAGE`]).
 #[must_use]
 pub fn run_cli(args: &[String], repo: &Path) -> i32 {
@@ -2243,14 +2280,7 @@ pub fn run_cli(args: &[String], repo: &Path) -> i32 {
             .ok_or_else(|| "no service-account key is configured".to_string())
             .and_then(|key| {
                 if opts.check_access {
-                    let in_config = site.map(hosting::config::read).transpose()?;
-                    let target = hosting::site(
-                        in_config.as_ref().and_then(|config| config.site.as_deref()),
-                        env.firebase_site.as_deref(),
-                    )?;
-                    let access = world.check_access(&key, target.as_deref())?;
-                    Ok(format!("Hosting site {} in project {} reports {}; no deployment or policy change performed",
-                        access.site, access.project, hosting::access::UPDATE))
+                    access(&world, &env, site, &key)
                 } else {
                     world.check_key(&key)?;
                     Ok("Google accepted the configured key; no site was built or deployed; Hosting deployment permission is untested".into())

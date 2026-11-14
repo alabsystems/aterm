@@ -1758,24 +1758,23 @@ pub fn status(repo: &Path) -> Result<(), String> {
 
 fn status_rows(remote: &crate::github_remote::Remote) -> Result<Vec<String>, String> {
     let mut rows = Vec::new();
-    for name in remote.list("refs/aterm-release/line/")?.keys() {
-        if let Some(sha) = remote.get(name)? {
-            remote.fetch_exact(&sha)?;
-            let bytes = remote.blob(&sha, Path::new("line.toml"))?;
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|error| format!("invalid fleet line UTF-8: {error}"))?;
-            let state = parse_state(text, name)?;
-            rows.push(format!(
-                "v{} {} {} step={} boundary={} at={} head={}",
-                state.line.version,
-                state.holder.host,
-                state.holder.sid,
-                state.step,
-                state.boundary,
-                state.at,
-                state.line.head()
-            ));
-        }
+    let lines = remote.list("refs/aterm-release/line/")?;
+    remote.import_snapshot(lines.values().cloned())?;
+    for (name, sha) in lines {
+        let bytes = remote.blob(&sha, Path::new("line.toml"))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| format!("invalid fleet line UTF-8: {error}"))?;
+        let state = parse_state(text, &name)?;
+        rows.push(format!(
+            "v{} {} {} step={} boundary={} at={} head={}",
+            state.line.version,
+            state.holder.host,
+            state.holder.sid,
+            state.step,
+            state.boundary,
+            state.at,
+            state.line.head()
+        ));
     }
     Ok(rows)
 }

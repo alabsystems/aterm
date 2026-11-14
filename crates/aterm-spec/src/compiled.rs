@@ -287,8 +287,8 @@ enum Rhs {
 #[derive(Debug)]
 struct CAction {
     guard: Option<Test>,
-    /// `(slot, rhs)` in declaration order.
-    updates: Vec<(usize, Rhs)>,
+    /// `(slot, rhs, repeated_target)` in declaration order; repeat flags are resolved once.
+    updates: Vec<(usize, Rhs, bool)>,
 }
 
 /// A model resolved for the walks in [`crate::interp`].
@@ -532,7 +532,8 @@ impl Compiled {
                     }
                     e => Rhs::Det(scope.num(e, &mut bound)),
                 };
-                updates.push((slot, rhs));
+                let repeated = updates.iter().any(|(previous, _, _)| *previous == slot);
+                updates.push((slot, rhs, repeated));
             }
             actions.push(CAction {
                 guard: a.guard.as_ref().map(|g| scope.test(g, &mut bound)),
@@ -667,7 +668,27 @@ impl Compiled {
         let width = s.len();
         rows.extend_from_slice(s);
         let mut made = 1;
-        for (slot, rhs) in &act.updates {
+        for (slot, rhs, repeated) in &act.updates {
+            if *repeated {
+                let (low, high) = match rhs {
+                    Rhs::Det(e) => {
+                        let value = e.value(s, locals);
+                        (value, value)
+                    }
+                    Rhs::Range(lo, hi) => (lo.value(s, locals), hi.value(s, locals)),
+                };
+                let mut kept = 0;
+                for row in 0..made {
+                    let value = rows[row * width + slot];
+                    if low <= value && value <= high {
+                        rows.copy_within(row * width..(row + 1) * width, kept * width);
+                        kept += 1;
+                    }
+                }
+                rows.truncate(kept * width);
+                made = kept;
+                continue;
+            }
             match rhs {
                 Rhs::Det(e) => {
                     let v = e.value(s, locals);

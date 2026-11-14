@@ -304,7 +304,7 @@ fn need_alone(held: &str) -> Seen {
     s.window.hover[1].1 = format!("driven by aterm (land: {WAITS_ON_YOU})");
     s.window.page[2].1 = format!(
         "head=land-c: Window 2, tab 4\nstate={WAITS_ON_YOU}: {} \u{b7} landing since 03:20",
-        super::super::NEED
+        crate::forever::NEED
     );
     s
 }
@@ -322,7 +322,7 @@ fn l6_is_its_need_alone() {
     );
     let worded = seen(
         "needs",
-        &format!("needs you: {}", super::super::NEED),
+        &format!("needs you: {}", crate::forever::NEED),
         "x",
         false,
     );
@@ -813,201 +813,6 @@ fn a_work_reply_under_land_holds_on_its_defense_alone() {
         false,
     );
     assert!(matches!(legs(&both, &cx(), DEFENSE), Verdict::Fail(_)));
-    assert_eq!(
-        defense_tip(1),
-        "not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} 1 nudge"
-    );
-}
-
-/// A row of [`Window::worker`] at `t`: its manager's count word, its own word, its tip.
-fn wrow(t: i64, count: &str, row: &str, tip: Option<&str>) -> (i64, String) {
-    let mut e = format!("mgr|mgr \u{2014} 1 worker: 1 {count}\nrow|{row}");
-    if let Some(tip) = tip {
-        e.push_str(&format!("\ntip|{tip}"));
-    }
-    j(t, &e)
-}
-
-/// Cover's worker: its first land reply holds on its defense, the nudge's defense lands it.
-fn worker() -> Seen {
-    let mut s = seen("defense", DEFENSE_WORDS, "x", true);
-    s.window.label = "worker".into();
-    s.window.worker = vec![
-        j(500, "-"),
-        wrow(2_000, "working", "\u{25cf} worker \u{2014} working #", None),
-        wrow(
-            12_000,
-            "landing",
-            "\u{25cf} worker \u{2014} landing #",
-            None,
-        ),
-        wrow(
-            40_000,
-            "landing",
-            "\u{25cf} worker \u{2014} landing #",
-            Some(&defense_tip(0)),
-        ),
-        wrow(
-            72_000,
-            "landing",
-            "\u{25cf} worker \u{2014} landing #",
-            Some(&defense_tip(1)),
-        ),
-        wrow(
-            132_000,
-            "landed",
-            "\u{2713} worker \u{2014} landed # \u{b7} 128 B",
-            None,
-        ),
-    ];
-    s
-}
-
-/// L15's row (§12.4.1, 3c's tip): `working` before Land's instruction, `landing` while it holds
-/// with the hold's tip once read, its manager counting it; never `landing` once landed.
-#[test]
-fn the_workers_row_works_then_lands_with_the_holds_tip() {
-    let cx = Ctx {
-        chain: Chain::Worker,
-        program: "claude",
-        t0: T0,
-    };
-    let good = worker();
-    assert!(
-        matches!(worker_row(&good, &cx), Verdict::Pass(_)),
-        "{:?}",
-        worker_row(&good, &cx)
-    );
-    let mut still = good.clone();
-    still.window.worker[3] = wrow(
-        40_000,
-        "working",
-        "\u{25cf} worker \u{2014} working #",
-        None,
-    );
-    assert!(
-        matches!(worker_row(&still, &cx), Verdict::Fail(_)),
-        "working while it holds"
-    );
-    let mut row_only = good.clone();
-    row_only.window.worker[3] = wrow(
-        40_000,
-        "landing",
-        "\u{25cf} worker \u{2014} working #",
-        Some(&defense_tip(0)),
-    );
-    assert!(
-        matches!(worker_row(&row_only, &cx), Verdict::Fail(_)),
-        "its row says working while its manager counts it landing"
-    );
-    let mut untipped = good.clone();
-    untipped.window.worker[4] = wrow(
-        72_000,
-        "landing",
-        "\u{25cf} worker \u{2014} landing #",
-        None,
-    );
-    assert!(
-        matches!(worker_row(&untipped, &cx), Verdict::Fail(_)),
-        "no tip once status read the hold"
-    );
-    let mut other = good.clone();
-    other.window.worker[4] = wrow(
-        72_000,
-        "landing",
-        "\u{25cf} worker \u{2014} landing #",
-        Some("not landed yet: needs you \u{b7} 1 nudge"),
-    );
-    assert!(
-        matches!(worker_row(&other, &cx), Verdict::Fail(_)),
-        "another leg's tip"
-    );
-    let mut uncounted = good.clone();
-    uncounted.window.worker[3] = wrow(
-        40_000,
-        "working",
-        "\u{25cf} worker \u{2014} landing #",
-        Some(&defense_tip(0)),
-    );
-    assert!(
-        matches!(worker_row(&uncounted, &cx), Verdict::Fail(_)),
-        "its manager still counts it working"
-    );
-    let mut early = good.clone();
-    early.window.worker[1] = wrow(2_000, "landing", "\u{25cf} worker \u{2014} landing #", None);
-    assert!(
-        matches!(worker_row(&early, &cx), Verdict::Fail(_)),
-        "landing before the instruction"
-    );
-    let mut stale = good.clone();
-    stale.window.worker.push(wrow(
-        150_000,
-        "landing",
-        "\u{25cf} worker \u{2014} landing #",
-        Some(&defense_tip(1)),
-    ));
-    assert!(
-        matches!(worker_row(&stale, &cx), Verdict::Fail(_)),
-        "landing after it landed"
-    );
-    let mut unread = good.clone();
-    unread.window.worker.clear();
-    assert!(
-        matches!(worker_row(&unread, &cx), Verdict::Unobserved(_)),
-        "{:?}",
-        worker_row(&unread, &cx)
-    );
-    let mut quick = good;
-    quick.journal.retain(|(_, l)| !l.starts_with("DONE "));
-    quick.journal.push(j(13_000, "DONE seq=3 rule=land@v1 x"));
-    quick.window.worker.truncate(2);
-    quick.window.worker.push(wrow(
-        14_000,
-        "landed",
-        "\u{2713} worker \u{2014} landed # \u{b7} 128 B",
-        None,
-    ));
-    assert!(
-        matches!(worker_row(&quick, &cx), Verdict::Unobserved(_)),
-        "landed before a read could see it hold: {:?}",
-        worker_row(&quick, &cx)
-    );
-}
-
-/// L15 under slice 13a: once its defense got the land check, its row's tip is its nudges alone
-/// until the check's `LANDED` lands it; the same tip with no check out is a lost hold.
-#[test]
-fn the_workers_tip_is_its_nudges_alone_while_its_check_is_out() {
-    let cx = Ctx {
-        chain: Chain::Worker,
-        program: "claude",
-        t0: T0,
-    };
-    let mut checked = worker();
-    checked.window.worker.insert(
-        5,
-        wrow(
-            127_000,
-            "landing",
-            "\u{25cf} worker \u{2014} landing #",
-            Some("1 nudge"),
-        ),
-    );
-    let unchecked = checked.clone();
-    checked.journal.push(j(
-        126_000,
-        "TYPED seq=3 rule=land-check@v1 [aterm harness] Land check:",
-    ));
-    assert!(
-        matches!(worker_row(&checked, &cx), Verdict::Pass(_)),
-        "{:?}",
-        worker_row(&checked, &cx)
-    );
-    assert!(
-        matches!(worker_row(&unchecked, &cx), Verdict::Fail(_)),
-        "{:?}",
-        worker_row(&unchecked, &cx)
-    );
 }
 
 /// THE LIST IS READ FROM EITHER LAND NUDGE THAT QUOTES IT: Land's nudge (`You said this is left:

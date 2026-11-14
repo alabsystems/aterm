@@ -117,18 +117,17 @@ pub(super) fn fixture() -> Request {
 }
 
 #[test]
-fn unadmitted_and_lapsed_replies_name_exactly_one_lower_hex_operation_id() {
+fn unadmitted_lapsed_and_closed_replies_name_exactly_one_lower_hex_operation_id() {
     let id = "ab".repeat(16);
     for (state, expected) in [
         ("unadmitted", Reply::Unadmitted(id.clone())),
         ("lapsed", Reply::Lapsed(id.clone())),
+        ("closed", Reply::Closed(id.clone())),
     ] {
-        let reply = |id: &str| {
-            if state == "lapsed" {
-                lapsed_reply(id)
-            } else {
-                unadmitted_reply(id)
-            }
+        let reply = |id: &str| match state {
+            "lapsed" => lapsed_reply(id),
+            "closed" => closed_reply(id),
+            _ => unadmitted_reply(id),
         };
         let line = reply(&id).expect("a canonical id");
         assert_eq!(line, format!("OK native-act state={state} id={id}\n"));
@@ -148,6 +147,71 @@ fn unadmitted_and_lapsed_replies_name_exactly_one_lower_hex_operation_id() {
         }
         assert_eq!(reply(&"AB".repeat(16)), None);
         assert_eq!(reply("ab"), None);
+    }
+}
+
+/// An operation closes [`COMPLETION_US`] after its deadline, which no wire field moves: longer
+/// than a constructor waits for its new agent, so a grant delivered just before the deadline is
+/// still observed and committed before the close.
+#[test]
+fn the_close_follows_the_deadline_by_more_than_the_wait_for_the_new_agent() {
+    let held = super::super::Timings::PRODUCTION.held;
+    assert!(
+        held.as_micros() < u128::from(COMPLETION_US),
+        "{held:?} reaches the close"
+    );
+    let Request::Prepare(mut prepare) = fixture() else {
+        unreachable!("the fixture is a prepare")
+    };
+    assert_eq!(prepare.close_us(), prepare.deadline_us + COMPLETION_US);
+    let wire = Request::Prepare(prepare.clone()).encode().unwrap();
+    assert!(
+        !wire.contains(&prepare.close_us().to_string()),
+        "the close is derived, never sent"
+    );
+    prepare.deadline_us = u64::MAX - 1;
+    assert_eq!(prepare.close_us(), u64::MAX, "the close saturates");
+}
+
+/// A Commit answered `closed` for its own operation is [`Decision::Closed`], which claims nothing
+/// about execution; the same answer for another operation is Unknown.
+#[test]
+fn a_commit_answered_closed_for_its_own_operation_decides_closed() {
+    struct Answer(std::io::Cursor<Vec<u8>>);
+    impl std::io::Read for Answer {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(bytes)
+        }
+    }
+    impl std::io::Write for Answer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let binding = Binding {
+        id: "ab".repeat(16),
+        capability: "cd".repeat(32),
+    };
+    for (answered, decision) in [
+        (binding.id.clone(), Decision::Closed),
+        ("cd".repeat(16), Decision::Unknown),
+    ] {
+        let line = closed_reply(&answered).unwrap();
+        let mut client = crate::RelayClient::new(Answer(std::io::Cursor::new(line.into_bytes())));
+        assert_eq!(
+            commit(
+                &mut client,
+                "session",
+                &binding,
+                ImagePhase::Forward,
+                "0.1.0"
+            ),
+            decision,
+            "{answered}"
+        );
     }
 }
 
@@ -386,10 +450,16 @@ fn constructor_discovery_is_closed_canonical_and_separate_from_info() {
     }
     assert_eq!(Request::parse("constructors plans=own-image"), None);
     let info = format!(
-        "OK native-act state=info epoch={} native-act=1 handoff=blocked clock=monotonic-us own-image=grok-alab:upgrade",
+        "OK native-act state=info epoch={} native-act=1 handoff=close clock=monotonic-us own-image=grok-alab:upgrade",
         "34".repeat(16)
     );
     assert!(matches!(Reply::parse(&info), Some(Reply::Info { .. })));
+    // A host that still spells its handoff `blocked` held a granted operation's update hold with
+    // no close: a constructor built on the close refuses it.
+    assert_eq!(
+        Reply::parse(&info.replace("handoff=close", "handoff=blocked")),
+        None
+    );
     assert_eq!(Reply::parse(&(info + " plans=own-image")), None);
 }
 

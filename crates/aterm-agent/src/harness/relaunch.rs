@@ -1901,6 +1901,26 @@ fn completed_rollback_of(st: &St, prepare: &super::native_act::Prepare) -> bool 
         })
 }
 
+/// The record's own restart closed uncommitted ([`super::native_restart::Recovery::Closed`]) while
+/// the lane waited on its agent's exit: its exec grant may have run, so the record waits on the
+/// relaunch as one that ran ([`await_held`]), whose watch adopts that relaunch, ends the lane once
+/// nothing the restart may have started runs, or holds. Nothing is signalled or typed again.
+fn closed_relaunched(
+    opts: &Opts,
+    r: Report,
+    st: &mut St,
+    c: &mut Client,
+    hand: &mut Hand,
+    session: &str,
+    k: &dyn Kernel,
+) -> Report {
+    if !matches!(st.phase, upgrade::Phase::Relaunched { .. }) {
+        st.relaunched(now_s());
+    }
+    save(opts, session, st);
+    await_held(opts, r, st, c, hand, session, k)
+}
+
 fn relaunch_held(
     opts: &Opts,
     r: Report,
@@ -1912,6 +1932,9 @@ fn relaunch_held(
 ) -> Report {
     if st.native_retired_unissued {
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+    }
+    if st.native_closed.is_some() {
+        return closed_relaunched(opts, r, st, c, hand, session, k);
     }
     let has_private_constructor = match st.agent {
         upgrade::Agent::Claude => true,
@@ -1951,6 +1974,9 @@ fn relaunch_held(
                 // unadmitted one, the next pass mints the rollback afresh.
                 save(opts, session, st);
                 return said(r, super::native_restart::WAIT_LAPSED);
+            }
+            Ok(super::native_restart::Recovery::Closed) => {
+                return closed_relaunched(opts, r, st, c, hand, session, k);
             }
             Err(why) => return said(r, format!("wait:{why}")),
         }
@@ -1995,6 +2021,11 @@ fn relaunch_held(
                 save(opts, session, st);
                 return said(r, super::native_restart::WAIT_LAPSED);
             }
+            // It may have run: its relaunch is waited on and adopted, or the lane ends once
+            // nothing it may have started runs, never a wait on a recovery no host can answer.
+            Ok(super::native_restart::Recovery::Closed) => {
+                return closed_relaunched(opts, r, st, c, hand, session, k);
+            }
             Ok(
                 super::native_restart::Recovery::Admitted | super::native_restart::Recovery::Legacy,
             ) => {}
@@ -2019,6 +2050,9 @@ fn relaunch_held(
         save(opts, session, st);
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
     }
+    if st.native_closed.is_some() {
+        return closed_relaunched(opts, r, st, c, hand, session, k);
+    }
     if !st.native_prepare.is_empty() && st.agent_exit() != AgentExit::Gone {
         let tab = st.tab.clone();
         // A prepare/signal reply may have been lost before mutation. Prove an explicit
@@ -2040,6 +2074,9 @@ fn relaunch_held(
         if st.native_retired_unissued {
             save(opts, session, st);
             return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+        }
+        if st.native_closed.is_some() {
+            return closed_relaunched(opts, r, st, c, hand, session, k);
         }
     }
     // The relaunch waits only on the process the record names by pid and kernel start
@@ -2846,7 +2883,12 @@ fn await_held(
     let unissued = if checks_account_execution(&st.agent) {
         match super::native_restart::launch_unissued(c, &tab, st) {
             Ok(unissued) => unissued,
-            Err(why) => return said(r, format!("wait:{why}")),
+            Err(why) => {
+                if let Some(report) = replay_unread(opts, &r, st, c, session, why) {
+                    return report;
+                }
+                false
+            }
         }
     } else {
         false
@@ -2917,8 +2959,12 @@ fn await_held(
     });
     if unread {
         st.found_gone = found_gone;
-        save(opts, session, st);
-        return said(r, "wait:native-recovery");
+        if let Some(report) = replay_unread(opts, &r, st, c, session, "native-recovery") {
+            save(opts, session, st);
+            return report;
+        }
+        // Closed: the watch below settles the wait, which keeps its own found_gone.
+        found_gone = std::mem::take(&mut st.found_gone);
     }
     if st.native_retired_unissued {
         st.found_gone = found_gone;
@@ -2976,7 +3022,12 @@ fn await_held(
         save(opts, session, st);
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
     }
-    if new.is_some() && !super::native_restart::complete(opts, session, c, &st.tab.clone(), st) {
+    // A restart that closed answers no completion: its watch decides below instead.
+    if new.is_some()
+        && st.native_closed.is_none()
+        && !super::native_restart::complete(opts, session, c, &st.tab.clone(), st)
+        && st.native_closed.is_none()
+    {
         if st.native_retired_unissued {
             st.found_gone = found_gone;
         }
@@ -2989,6 +3040,38 @@ fn await_held(
                 "wait:native-outcome"
             },
         );
+    }
+    if st.native_closed.is_some() {
+        let conversation = (!fresh).then_some(session);
+        let found = new.take();
+        let waited = found.is_some();
+        match closed_relaunch(st, k, &records, conversation, old, found) {
+            Ok(relaunched) => {
+                if !waited {
+                    first_idle(c, hand, &st.tab, opts.timings.first_idle, || {
+                        records
+                            .session_file(relaunched.pid)
+                            .is_some_and(|sf| sf.status == "idle")
+                    });
+                }
+                new = Some(relaunched);
+            }
+            Err(super::native_restart::FAILED_CLOSED) => {
+                let r = said(r, super::native_restart::FAILED_CLOSED);
+                ledger(
+                    opts,
+                    &r,
+                    "the restart closed uncommitted and its shell is back with nothing running",
+                );
+                save(opts, session, st);
+                return r;
+            }
+            Err(wait) => {
+                st.found_gone = found_gone;
+                save(opts, session, st);
+                return said(r, wait);
+            }
+        }
     }
     match new {
         Some(sf) if fresh => {
@@ -3084,6 +3167,77 @@ fn await_held(
             }
             said(r, "wait:resume")
         }
+    }
+}
+
+/// A query of the record's binding did not read, which is all a later host epoch answers for a
+/// binding it never issued: only the saved prepare's replay can hear there that the restart
+/// closed ([`super::native_restart::Recovery::Closed`]), which [`await_held`] then settles by its
+/// watch (`None`), or that no exec grant was or can be issued under it, which ends the lane.
+/// Anything else is the lane's wait on `why`, as before the replay.
+fn replay_unread(
+    opts: &Opts,
+    r: &Report,
+    st: &mut St,
+    c: &mut Client,
+    session: &str,
+    why: &str,
+) -> Option<Report> {
+    if st.native_prepare.is_empty() {
+        return Some(said(r.clone(), format!("wait:{why}")));
+    }
+    let tab = st.tab.clone();
+    match super::native_restart::recover(opts, session, c, &tab, st) {
+        Ok(super::native_restart::Recovery::Closed) => None,
+        Ok(super::native_restart::Recovery::Lapsed) => {
+            Some(super::native_restart::end_lapsed(opts, r, st, session))
+        }
+        _ => {
+            save(opts, session, st);
+            Some(said(r.clone(), format!("wait:{why}")))
+        }
+    }
+}
+
+/// Settle the watch of the record's own closed restart ([`St::native_closed`]) once
+/// [`await_held`]'s wait ended, `found` the relaunch that wait found: `Ok` with the relaunch it
+/// adopts in place of the commit the host never made, the watch cleared (the one the wait found,
+/// else the watch's own, never `old`, the agent the record names); `Err` with the lane's wait
+/// while the watch holds, or [`super::native_restart::FAILED_CLOSED`] with the lane stopped and
+/// its watch cleared where nothing the restart may have started runs.
+fn closed_relaunch(
+    st: &mut St,
+    k: &dyn Kernel,
+    records: &Records,
+    conversation: Option<&str>,
+    old: u32,
+    found: Option<SessionFile>,
+) -> Result<SessionFile, &'static str> {
+    let Some(closed) = st.native_closed.clone() else {
+        return Err(super::native_restart::WAIT_CLOSED);
+    };
+    let files = records.session_files();
+    match super::native_restart::closed_watch(&closed, k, files.as_deref(), conversation) {
+        super::native_restart::Watch::Adopt(watched) => {
+            let Some(relaunched) = found.or((watched.pid != old).then_some(*watched)) else {
+                return Err(super::native_restart::WAIT_CLOSED);
+            };
+            aterm_log::info!(
+                "harness @{}: native restart {} closed at its deadline uncommitted; its relaunched \
+                 agent (pid {}) holds the conversation and is adopted by observation",
+                st.tab,
+                closed.id,
+                relaunched.pid
+            );
+            st.native_closed = None;
+            Ok(relaunched)
+        }
+        super::native_restart::Watch::Clear => {
+            st.native_closed = None;
+            st.stop("native-closed", now_s());
+            Err(super::native_restart::FAILED_CLOSED)
+        }
+        super::native_restart::Watch::Hold => Err(super::native_restart::WAIT_CLOSED),
     }
 }
 
@@ -4482,6 +4636,10 @@ pub(super) const CAUSE_ASKED: &str = "asked";
 
 /// The [`St::cause`] of a relaunch after aterm itself ended while the agent ran and the next launch reopened its tab ([`after_host_ended`]).
 pub(super) const CAUSE_HOST: &str = "host";
+/// The [`St::cause`] of a relaunch after aterm's account renewal signalled the agent and no
+/// successor took its session, so the renewal's worker hands the session back on the agent's own
+/// line ([`super::upgrade_drive::renewal_hand_back`]).
+pub(super) const CAUSE_RENEWAL: &str = "renewal";
 /// The [`St::cause`] of a Fable session's move onto [`FABLE_FALLBACK`] at Fable's own limit,
 /// `model:` then the model ([`Restart::Model`]).
 pub(super) const CAUSE_MODEL: &str = "model:";
@@ -4745,6 +4903,7 @@ pub(super) fn relaunch_cause(cause: &str) -> bool {
         || cause == CAUSE_STALL
         || cause == CAUSE_ASKED
         || cause == CAUSE_HOST
+        || cause == CAUSE_RENEWAL
         || cause.starts_with(CAUSE_MODEL)
         || cause.starts_with(CAUSE_MODEL_BACK)
         || cause.starts_with(CAUSE_ACCOUNT)
@@ -4798,6 +4957,11 @@ pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
         format!(
             "Restarted: someone asked aterm to restart {agent} (`aterm ctl restart`), so this \
              session was ended and restarted"
+        )
+    } else if cause == CAUSE_RENEWAL {
+        format!(
+            "Relaunched: aterm ended {agent} to move this session onto another login, which never \
+             took it, so it was restarted on the login it ran on"
         )
     } else if let Some(model) = cause.strip_prefix(CAUSE_MODEL) {
         format!(
@@ -5734,6 +5898,17 @@ fn restart_locked(
     if let Some(wait) = fence.broken() {
         return said(r, wait);
     }
+    if let Err(why) = super::native_restart::settle_closed(
+        &mut st,
+        super::native_restart::Fresh::Signal {
+            pid: snap.pid,
+            conversation: &session,
+        },
+        || records.session_files(),
+        k,
+    ) {
+        return said(r, format!("wait:{why}"));
+    }
     let Ok(mut c) = connect(opts, &tab) else {
         return said(r, "wait:no-socket");
     };
@@ -5847,6 +6022,13 @@ fn restart_locked(
                 break 'signal Some(super::native_restart::end_lapsed(
                     opts, &r, &mut st, &session,
                 ));
+            }
+            // A kept restart closed: nothing of this move was sent, and its watch stays with the
+            // record as it was before, settled before the next move signals.
+            Ok(super::native_restart::Recovery::Closed) => {
+                let _ =
+                    super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
+                break 'signal Some(said(r.clone(), super::native_restart::WAIT_CLOSED));
             }
             Ok(super::native_restart::Recovery::Unadmitted) | Err(_) => {
                 let why = super::native_restart::refusal_word(admission);
@@ -6219,7 +6401,7 @@ fn retry_checked_relaunch(
             drop(client);
             return Some(carry_in_flight(opts, r, st, session, &tab));
         }
-        native_restart::RelaunchObservation::Terminal(Recovery::Completed) => {
+        native_restart::RelaunchObservation::Terminal(Recovery::Completed | Recovery::Closed) => {
             save(opts, session, &st);
             drop(client);
             return Some(carry_in_flight(opts, r, st, session, &tab));
@@ -6301,6 +6483,12 @@ fn retry_checked_relaunch(
             }
             Ok(Recovery::Lapsed) => {
                 return stopped(native_restart::end_lapsed(opts, &r, &mut st, session));
+            }
+            // It may have run: the record waits on its relaunch, whose watch settles it.
+            Ok(Recovery::Closed) => {
+                st.relaunched(now_s());
+                save(opts, session, &st);
+                return stopped(said(r, native_restart::WAIT_CLOSED));
             }
             Ok(Recovery::Legacy) | Err(_) => {
                 save(opts, session, &st);
@@ -7587,7 +7775,9 @@ pub(super) fn restart_input(
     let wanted = match cause {
         ExitCause::Stall => super::restart_stamp::Cause::Stall,
         ExitCause::Asked => super::restart_stamp::Cause::Asked,
-        ExitCause::Exit | ExitCause::Carried | ExitCause::HostEnded => return None,
+        ExitCause::Exit | ExitCause::Carried | ExitCause::HostEnded | ExitCause::Renewal => {
+            return None;
+        }
     };
     let stamp =
         super::restart_stamp::standing(&opts.state, &snap.tab, snap.pid, &snap.start, now_s())?;
@@ -7617,6 +7807,8 @@ pub(super) enum ExitCause {
     Asked,
     /// Aterm itself ended while it ran.
     HostEnded,
+    /// Aterm's account renewal signalled it and no successor took its session.
+    Renewal,
 }
 
 /// The agent of a tab a crash of aterm took.
@@ -7983,6 +8175,7 @@ fn after_exit_as(
             (true, ExitCause::Stall) => CAUSE_STALL,
             (true, ExitCause::Asked) => CAUSE_ASKED,
             (true, ExitCause::HostEnded) => CAUSE_HOST,
+            (true, ExitCause::Renewal) => CAUSE_RENEWAL,
             (true, ExitCause::Exit | ExitCause::Carried) => CAUSE_EXIT,
         }
         .to_string(),
@@ -8105,6 +8298,13 @@ fn launch_after_exit(
             Ok(super::native_restart::Recovery::Lapsed) => {
                 return super::native_restart::end_lapsed(opts, &r, &mut st, &session);
             }
+            // The record replayed is the earlier move's, kept whole while its operation was
+            // unresolved: its watch, saved by the replay, is settled by the next pass on a
+            // record of this exit's own (its cause, target and login), never by a start planned
+            // on the earlier move's.
+            Ok(super::native_restart::Recovery::Closed) => {
+                return said(r, super::native_restart::WAIT_CLOSED);
+            }
             Ok(
                 super::native_restart::Recovery::Admitted
                 | super::native_restart::Recovery::Legacy
@@ -8112,6 +8312,17 @@ fn launch_after_exit(
             ) => return said(r, "wait:native-unresolved-operation"),
             Err(why) => return said(r, format!("wait:{why}")),
         }
+    }
+    // No fresh start over a process a closed restart's exec grant may have started.
+    let records = st.agent_records(&opts.home);
+    let conversation = (!starts_afresh(&st.cause)).then_some(session.as_str());
+    if let Err(why) = super::native_restart::settle_closed(
+        &mut st,
+        super::native_restart::Fresh::Start { conversation },
+        || records.session_files(),
+        &Live,
+    ) {
+        return said(r, format!("wait:{why}"));
     }
     // The agent this relaunch waits on, by its pid and kernel start: a prior record's exit
     // stamp, kept by a restart that carried it, spoke of another agent and goes ([`St::bind`]).
@@ -8162,6 +8373,10 @@ fn launch_after_exit(
             // here; the next pass judges a fresh start without it ([`host_ended_fresh`]).
             Ok(super::native_restart::Recovery::Lapsed) => {
                 return super::native_restart::end_lapsed(opts, &r, &mut st, &session);
+            }
+            Ok(super::native_restart::Recovery::Closed) => {
+                save(opts, &session, &st);
+                return said(r, super::native_restart::WAIT_CLOSED);
             }
             Err(why) => return said(r, format!("wait:{why}")),
         }
@@ -9609,6 +9824,8 @@ pub fn outcome(step: &str) -> Outcome {
             | WAIT_NATIVE_UNISSUED
             | super::native_restart::WAIT_RETIRED_UNISSUED
             | super::native_restart::WAIT_LAPSED
+            | super::native_restart::WAIT_CLOSED
+            | super::native_restart::WAIT_CLOSED_GRANTEE
             | super::native_restart::WAIT_UNADMITTED
             | super::native_restart::WAIT_CANCELLED
             | super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION

@@ -20,6 +20,7 @@ fn journal(done: Vec<String>) -> publish::Journal {
         artifact: Some("aa".repeat(32)),
         macho_sha256: Some("bb".repeat(32)),
         linux: None,
+        windows: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

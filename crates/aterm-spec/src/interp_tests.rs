@@ -5,6 +5,213 @@
 use super::*;
 use crate::test_models::{config_catalog_snapshot_model, ring_model, subscribe_model};
 
+#[test]
+fn admission_rejects_ambiguous_model_declarations() {
+    use crate::derive::{Invariant, InvariantKind, StateVar, bool_lit};
+    use std::panic::catch_unwind;
+
+    let model = Model {
+        name: "Admission",
+        consts: vec![],
+        vars: vec![StateVar { name: "x", init: 0 }],
+        fn_vars: vec![],
+        actions: vec![],
+        invariants: vec![],
+    };
+    assert_eq!(bmc(&model), Ok(1), "the unique finite model is valid");
+    assert!(Resolved::new(&model).is_some());
+    assert!(violated_invariants(&model).is_empty());
+
+    let mut scalar_alias = model.clone();
+    scalar_alias.name = "ScalarAlias";
+    scalar_alias.vars.push(StateVar { name: "x", init: 1 });
+    let mut constant_alias = model.clone();
+    constant_alias.name = "ConstantAlias";
+    constant_alias.consts = vec![("K", 1), ("K", 2)];
+    let mut role_alias = model.clone();
+    role_alias.name = "RoleAlias";
+    role_alias.consts = vec![("x", 7)];
+    let mut law_alias = model;
+    law_alias.name = "LawAlias";
+    let law = Invariant {
+        name: "Case",
+        kind: InvariantKind::Claim,
+        expr: bool_lit(true),
+    };
+    law_alias.invariants = vec![law.clone(), law];
+    for model in [scalar_alias, constant_alias, role_alias, law_alias] {
+        assert!(
+            catch_unwind(|| bmc(&model)).is_err(),
+            "{}: BMC must refuse ambiguous declarations before checking a collapsed map or law list",
+            model.name
+        );
+        assert!(
+            catch_unwind(|| Resolved::new(&model)).is_err(),
+            "{}",
+            model.name
+        );
+        assert!(
+            catch_unwind(|| Space::of(&model)).is_err(),
+            "{}",
+            model.name
+        );
+        assert!(
+            catch_unwind(|| model.init_state()).is_err(),
+            "{}",
+            model.name
+        );
+        assert!(
+            catch_unwind(|| violated_invariants(&model)).is_err(),
+            "{}: the empty-law fast path must still refuse ambiguous declarations",
+            model.name
+        );
+    }
+}
+
+#[test]
+fn conformance_rejects_ambiguous_declarations_before_observed_steps() {
+    use crate::derive::{Action, StateVar, Update, cst};
+    use std::panic::catch_unwind;
+
+    let mut model = Model {
+        name: "ObservedAdmission",
+        consts: vec![("K", 1)],
+        vars: vec![StateVar { name: "x", init: 0 }],
+        fn_vars: vec![],
+        actions: vec![Action {
+            name: "Tick",
+            guard: None,
+            updates: vec![Update {
+                var: "x",
+                expr: cst("K"),
+            }],
+        }],
+        invariants: vec![],
+    };
+    // Observations come from outside the interpreter; init_state is not called.
+    let prev = State::from([("x", 0)]);
+    let next = State::from([("x", 1)]);
+    assert_eq!(admits(&model, &prev, &next), Some("Tick"));
+    assert_eq!(admits(&model, &prev, &State::from([("x", 9)])), None);
+    model.consts.push(("K", 2));
+    assert!(catch_unwind(|| model.to_tla()).is_err());
+    assert!(catch_unwind(|| model.init_state()).is_err());
+    assert!(
+        catch_unwind(|| admits(&model, &prev, &State::from([("x", 2)]))).is_err(),
+        "conformance must not accept an observed step by collapsing duplicate constants"
+    );
+}
+
+#[test]
+fn repeated_updates_constrain_the_same_successor_value() {
+    use crate::derive::{Action, Expr, StateVar, Update, in_range, int, var};
+
+    let cases: Vec<(Expr, Expr, Vec<i64>)> = vec![
+        (int(1), int(2), vec![]),
+        (int(1), int(1), vec![1]),
+        (int(1), var("x"), vec![]),
+        (var("x"), int(0), vec![0]),
+        (in_range(int(2), int(1)), int(1), vec![]),
+        (int(1), in_range(int(2), int(1)), vec![]),
+        (
+            int(i64::MAX),
+            in_range(int(i64::MAX), int(i64::MAX)),
+            vec![i64::MAX],
+        ),
+        (
+            in_range(int(0), int(2)),
+            in_range(int(1), int(3)),
+            vec![1, 2],
+        ),
+        (in_range(int(0), int(2)), int(1), vec![1]),
+        (int(1), in_range(int(0), int(2)), vec![1]),
+        (in_range(int(0), int(1)), in_range(int(2), int(3)), vec![]),
+    ];
+    for (first, second, expected) in cases {
+        let model = Model {
+            name: "RepeatedUpdates",
+            consts: vec![],
+            vars: vec![
+                StateVar { name: "x", init: 0 },
+                StateVar { name: "y", init: 7 },
+            ],
+            fn_vars: vec![],
+            actions: vec![Action {
+                name: "Tick",
+                guard: None,
+                updates: vec![
+                    Update {
+                        var: "x",
+                        expr: first.clone(),
+                    },
+                    Update {
+                        var: "x",
+                        expr: second.clone(),
+                    },
+                ],
+            }],
+            invariants: vec![],
+        };
+        let state = model.init_state();
+        let named = model.successors("Tick", &state);
+        assert!(named.iter().all(|s| s["y"] == 7));
+        let interpreted: Vec<_> = named.iter().map(|s| s["x"]).collect();
+        let resolved = Resolved::new(&model).expect("declared scalar updates compile");
+        let compact = resolved.successors(0, &[0, 7]);
+        assert!(compact.iter().all(|s| s[1] == 7));
+        let compiled: Vec<_> = compact.iter().map(|s| s[0]).collect();
+        assert_eq!(compiled, expected, "compiled: {first:?} / {second:?}");
+        assert_eq!(interpreted, expected, "by name: {first:?} / {second:?}");
+    }
+}
+
+#[test]
+fn repeated_constraints_filter_interleaved_cartesian_rows() {
+    use crate::derive::{Action, StateVar, Update, in_range, int};
+
+    let model = Model {
+        name: "InterleavedUpdates",
+        consts: vec![],
+        vars: vec![
+            StateVar { name: "x", init: 0 },
+            StateVar { name: "y", init: 0 },
+        ],
+        fn_vars: vec![],
+        actions: vec![Action {
+            name: "Tick",
+            guard: None,
+            updates: vec![
+                Update {
+                    var: "x",
+                    expr: in_range(int(0), int(2)),
+                },
+                Update {
+                    var: "y",
+                    expr: in_range(int(3), int(4)),
+                },
+                Update {
+                    var: "x",
+                    expr: in_range(int(1), int(2)),
+                },
+                Update {
+                    var: "y",
+                    expr: in_range(int(4), int(5)),
+                },
+            ],
+        }],
+        invariants: vec![],
+    };
+    let named: Vec<_> = model
+        .successors("Tick", &model.init_state())
+        .iter()
+        .map(|s| vec![s["x"], s["y"]])
+        .collect();
+    let compact = Resolved::new(&model).unwrap().successors(0, &[0, 0]);
+    let expected = vec![vec![1, 4], vec![2, 4]];
+    assert_eq!(named, expected);
+    assert_eq!(compact, expected);
+}
+
 /// [`key_hash`]'s two shifts are the rotate by 5 of the `FxHash` mix, for keys of every
 /// length to 4 over values with every high and low bit pattern a rotate carries. NEGATIVE
 /// CONTROL: shifting right by 58 instead of 59 gives another hash.
@@ -720,7 +927,7 @@ fn compiled_walks_are_the_by_name_walks_on_the_resolution_corners() {
     let up = |v: &'static str, e: Expr| Update { var: v, expr: e };
     let m = Model {
         name: "Corners",
-        consts: vec![("x", 7), ("K", 1), ("K", 2), ("Buggy", 0)],
+        consts: vec![("K", 2), ("Buggy", 0)],
         vars: vec![
             StateVar { name: "y", init: 0 },
             StateVar { name: "x", init: 0 },
@@ -796,7 +1003,7 @@ fn compiled_walks_are_the_by_name_walks_on_the_resolution_corners() {
             Invariant {
                 name: "Bounded",
                 kind: crate::derive::InvariantKind::Claim,
-                expr: forall("k", int(1), var("i"), le(var("y"), add(cst("x"), var("k")))),
+                expr: forall("k", int(1), var("i"), le(var("y"), add(var("x"), var("k")))),
             },
             Invariant {
                 name: "SmallY",
@@ -890,35 +1097,32 @@ fn the_compiled_form_reads_what_eval_reads_and_fails_where_eval_fails() {
                 forall(i, int(k.into()), int(k.into()), body)
             }),
     ];
-    let m = Model {
-        name: "Reads",
-        consts: vec![],
-        vars: vec![
-            StateVar { name: "x", init: 0 },
-            StateVar { name: "y", init: 1 },
-        ],
-        fn_vars: vec![],
-        actions: vec![],
-        invariants: cases
-            .iter()
-            .map(|e| Invariant {
+    let mut panics = 0;
+    for (i, e) in cases.iter().enumerate() {
+        let m = Model {
+            name: "Reads",
+            consts: vec![],
+            vars: vec![
+                StateVar { name: "x", init: 0 },
+                StateVar { name: "y", init: 1 },
+            ],
+            fn_vars: vec![],
+            actions: vec![],
+            invariants: vec![Invariant {
                 name: "Case",
                 kind: crate::derive::InvariantKind::Claim,
                 expr: e.clone(),
-            })
-            .collect(),
-    };
-    let c = Compiled::new(&m).expect("compiles");
-    let env = m.eval_env(&m.init_state());
-    let s = c.init();
-    let mut panics = 0;
-    for (i, e) in cases.iter().enumerate() {
+            }],
+        };
+        let c = Compiled::new(&m).expect("compiles");
+        let env = m.eval_env(&m.init_state());
+        let s = c.init();
         let written = outcome(&|| e.eval(&env));
         let compiled = outcome(&|| c.expr(&m, e).eval(&s));
         assert_eq!(compiled, written, "case {i} read whole: {e:?}");
         panics += usize::from(written.is_err());
-        let written = outcome(&|| Value::Bool(m.check_invariant_in(&m.invariants[i], &env)));
-        let compiled = outcome(&|| Value::Bool(c.holds(i, &s)));
+        let written = outcome(&|| Value::Bool(m.check_invariant_in(&m.invariants[0], &env)));
+        let compiled = outcome(&|| Value::Bool(c.holds(0, &s)));
         assert_eq!(compiled, written, "case {i} read as a boolean: {e:?}");
     }
     assert!(panics >= 8, "only {panics} cases panic");

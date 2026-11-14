@@ -198,10 +198,64 @@ pub const SCENES: [(&str, &str); 25] = [
 /// The scenes a run films when none is named.
 pub const DEFAULT_SCENES: usize = 5;
 
+/// The planted star's side, px ([`plant_star`]).
+pub const STAR_SIDE: i64 = 3;
+/// The planted star's half period, ms: lit for one, dark for the next, 8 turns a second (4 flashes, over
+/// [`FLASH_MOST`]).
+pub const STAR_HALF_MS: u64 = 125;
+
+/// Where [`plant_star`] paints in a `width` x `height` frame: a square one pixel in from its bottom-right corner,
+/// in the window's padding past the last cell.
+#[must_use]
+pub fn star_box(width: usize, height: usize) -> PxBox {
+    let (x1, y1) = (
+        i64::try_from(width).unwrap_or(i64::MAX) - 1,
+        i64::try_from(height).unwrap_or(i64::MAX) - 1,
+    );
+    PxBox {
+        x0: x1 - STAR_SIDE,
+        y0: y1 - STAR_SIDE,
+        x1,
+        y1,
+    }
+}
+
+/// A planted star (`--plant-star`): the judge's own proof that it sees a flash. A [`STAR_SIDE`] square
+/// ([`star_box`]) painted into the frame the flash law reads at `ms`, on the frames of every other
+/// [`STAR_HALF_MS`] from 0: white on a dark page, black on a light one, the pixel's own colour between. It is
+/// never painted into the clean twin, so the page cannot excuse it, and the trail-contrast, line and pet
+/// readings read the frame as it was written.
+pub fn plant_star(frame: &mut Image, ms: u64) {
+    if (ms / STAR_HALF_MS) % 2 == 1 {
+        return;
+    }
+    let b = star_box(frame.width, frame.height);
+    let (Ok(x), Ok(y)) = (usize::try_from(b.x0), usize::try_from(b.y0)) else {
+        return;
+    };
+    if x >= frame.width || y >= frame.height {
+        return;
+    }
+    let lit = if luminance(frame.at(x, y)) < 0.5 {
+        [255, 255, 255]
+    } else {
+        [0, 0, 0]
+    };
+    frame.paint(b, lit);
+}
+
+/// What a planted star read: its box and how many of its pixels the flash law put over the bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StarRead {
+    pub at: PxBox,
+    pub over: usize,
+}
+
 /// The verb's own help (`trail-film --help`).
 pub const HELP: &str = "\
 usage: targo --unverified lab trail-film <out_dir> [style] [--pet off|cat|dog] [--theme NAME[,NAME]...|both]
          [--caret NAME[,NAME]...|both] [--scene NAME[,NAME]...|--all-scenes] [--no-replay] [--report-only]
+         [--plant-star]
        targo --unverified lab trail-film --list
 
 A cursor trail judged in motion. Each film is one scene (a scripted line of typing) replayed with no window through
@@ -210,7 +264,10 @@ the shipping effects and the real renderer, every 16 ms frame written under
 .cursor.txt, .status.txt, film.dims.txt), so trail-contrast, trail-companion and trail-census read one too. The
 style (a cursor_trail_style) defaults to \"rainbow\", --pet (a cursor_pet) to cat, --theme and --caret to both (dark and github-light; block and bar),
 --scene to typing, burst, context, enter and backspace. --no-replay judges the films already there. --list names
-the themes, carets and scenes.
+the themes, carets and scenes. --plant-star checks the judge itself: it paints a 3 px square one pixel in from
+each frame's bottom-right corner, lit every other eighth of a second (8 turns a second, white on a dark page, black
+on a light one), into the frame the flash law reads and not its clean twin. A STAR line says how many of its 9 px
+the law put over the bound, a film where it missed one breaks (star:), and the flash_* counts include the star's.
 
 The two rows a person types on are the scenes bottom-prompt (a shell prompt on the last row of a full page) and
 composer (Claude Code's input box). jump, enter-long, wall-69 to wall-73, coloured-prompt, verdict and long-build
@@ -225,13 +282,17 @@ FLASH     every pixel of every frame, by WCAG 2.3.1: a flash is a pair of opposi
           frames and is not over; one at 3.1 Hz is). flash_cells_over3 is the cells that hold such a pixel, worst
           the pixel with the most turns, their times and the layers trail-census sorts it into on those frames
           (ribbon, rail, star, pet, caret, other, none; a meteor is not a layer it knows). pet_*, caret_*,
-          icon_* and trail_* are the same count apart by place, and a place is a box, not what drew the pixel:
-          a pixel is the trail's own when fewer than half its turns fell in the pet's drawn box, the caret's
-          cell or a word icon's box (sparkle words are on, as in the app), else it is the place's that held
-          the most of them. The pet's box holds a turn on the frame it held the pixel and on the frame after,
-          when the pixel goes back to the page as the pet moves on; the caret's cell and an icon's box hold
-          their own frame's turns alone. Trail light under a pet that stands on it counts as the pet's; trail_worst's
-          layers say what the census made of the pixel. Two readings are not the law:
+          icon_*, page_* and trail_* are the same count apart by place, and a place is a box, not what drew
+          the pixel: a pixel is the trail's own when fewer than half its turns fell in the pet's drawn box,
+          the caret's cell or a word icon's box (sparkle words are on, as in the app), else it is the place's
+          that held the most of them. The pet's box holds a turn on the frame it held the pixel and on the
+          frame after, when the pixel goes back to the page as the pet moves on; the caret's cell and an icon's
+          box hold their own frame's turns alone. Trail light under a pet that stands on it counts as the pet's.
+          A pixel no box holds and over the bound is the page's own when the page alone (its clean twin, by the
+          same law) is over the bound there and the pixel's turns left once each of the page's has taken one
+          within a frame of it are not: text scrolling up the page. Under the bound it is the page's when the
+          page's turns take half of its busiest second's. trail_worst's layers say what the census made of it.
+          The law is on the effects: flash_px_over3 less page_px_over3. Two readings are not the law:
           lightness_* counts the same turns in CIE L* (a swing of 10, no ceiling), which a dark page's lights
           reach and the law's tenth of linear light does not; twin_* is the earlier scratch probe's count (rises of
           0.10 off the clean twin in the caret's rows and two each side, the caret's cell left out), with the
@@ -257,7 +318,7 @@ PET       trail-companion's reading of every frame: companion_on_letters and com
           pet's alpha fell by a tenth or more and rose again (a leave and return through the window's edge is not
           one); min_pose_dwell_ms the shortest time one pose stayed, poses_under_100ms how many stayed less.
 
-laws: flash_px_over3 = 0; lowered = 0 and caret_floor >= 3.0; companion_on_letters = 0, companion_on_caret = 0,
+laws: flash_px_over3 - page_px_over3 = 0; lowered = 0 and caret_floor >= 3.0; companion_on_letters = 0, companion_on_caret = 0,
 alpha_dip = 0, poses_under_100ms = 0 and no frame unread.
 exit: 0; 1 a film breaks a law (--report-only: 0); 2 a usage error, or a film that could not be made or read
 ";
@@ -327,10 +388,9 @@ pub fn most_within(times: &[u32], window: u32) -> (usize, usize) {
 /// in 992 ms of 16 ms frames. Cut by a step, that light keeps the law at every phase and one at 3.1 Hz breaks it.
 fn pixel_read(events: &HashMap<u32, Vec<u32>>, per: usize, step_ms: u32) -> PixelRead {
     let mut out = PixelRead::default();
-    let second = SECOND_MS.saturating_sub(step_ms).max(1);
     for (&px, times) in events {
         let (n, from) = most_in_a_second(times);
-        if most_within(times, second).0 > per * FLASH_MOST {
+        if over_bound(times, per, step_ms) {
             out.over.push(px);
         }
         let better = out
@@ -441,11 +501,13 @@ impl TwinRises {
     }
 }
 
-/// Where a pixel flashes: in the pet's drawn box, in the caret's cell, in a word icon's box, or in none of them,
-/// which is the trail's own.
-pub const PLACES: [&str; 4] = ["pet", "caret", "icon", "trail"];
+/// Where a pixel flashes: in the pet's drawn box, in the caret's cell, in a word icon's box, on the page itself (its
+/// clean twin turned with it), or in none of them, which is the trail's own.
+pub const PLACES: [&str; 5] = ["pet", "caret", "icon", "page", "trail"];
+/// The page's own among [`PLACES`]: the program's output, not the effects'.
+pub const PAGE: usize = 3;
 /// The trail's own among [`PLACES`].
-pub const TRAIL: usize = 3;
+pub const TRAIL: usize = 4;
 
 /// A frame's boxes: the pet's body and the flying head's, the caret's cell, and the word icons on glass.
 pub type Boxes = (Vec<Span>, Option<PxBox>, Vec<Span>);
@@ -462,14 +524,21 @@ pub type Boxes = (Vec<Span>, Option<PxBox>, Vec<Span>);
 /// also holds the turns on the frame after it held the pixel (`step_ms` on): a sprite that moves off a pixel
 /// turns it on the first frame its box no longer holds it, the cat's coat giving way to the page. The caret's
 /// cell and an icon's box are held on their own frame alone.
+///
+/// A pixel no box holds is the page's own ([`the_page_s`]) over the bound only when the page alone (`page`, its
+/// clean twin's turns by the same law) is over the bound in every second the pixel is and the effects' turns are
+/// in none: a build log's text scrolling up the page flashes with no effect's help. Under it, when the page's turns take half its busiest
+/// second's (a reading, not the law: a letter typed onto the page is not the trail's). The boxes are read
+/// first: the clean twin holds the caret, so a caret's flash read as the page's would leave the law.
 #[must_use]
 pub fn by_place(
     turns: &HashMap<u32, Vec<u32>>,
     (per, step_ms): (usize, u32),
     width: usize,
     boxes: &HashMap<u32, Boxes>,
-) -> [PixelRead; 4] {
-    let mut parts: [HashMap<u32, Vec<u32>>; 4] = Default::default();
+    page: &HashMap<u32, Vec<u32>>,
+) -> [PixelRead; 5] {
+    let mut parts: [HashMap<u32, Vec<u32>>; 5] = Default::default();
     for (&px, times) in turns {
         let (n, from) = most_in_a_second(times);
         let (x, y) = (
@@ -481,7 +550,7 @@ pub fn by_place(
                 .iter()
                 .any(|&(x0, x1, y0, y1)| x0 <= x && x < x1 && y0 <= y && y < y1)
         };
-        let mut held = [0usize; TRAIL];
+        let mut held = [0usize; PAGE];
         for t in &times[from..from + n] {
             let Some((bodies, cell, icons)) = boxes.get(t) else {
                 continue;
@@ -499,15 +568,92 @@ pub fn by_place(
             }
         }
         let boxed: usize = held.iter().sum();
-        let place = if 2 * boxed < n {
-            TRAIL
-        } else {
+        let place = if 2 * boxed >= n {
             // The first of the most: `max_by_key` keeps the last, so the places are read from the end.
-            (0..TRAIL).rev().max_by_key(|&p| held[p]).unwrap_or(TRAIL)
+            (0..PAGE).rev().max_by_key(|&p| held[p]).unwrap_or(TRAIL)
+        } else if page
+            .get(&px)
+            .is_some_and(|paged| the_page_s(times, paged, (per, step_ms)))
+        {
+            PAGE
+        } else {
+            TRAIL
         };
         parts[place].insert(px, times.clone());
     }
     parts.map(|p| pixel_read(&p, per, step_ms))
+}
+
+/// Whether a pixel's turns (`times`) are the page's own (`paged`, its clean twin's turns). Over the bound, only when
+/// the turns the page's take ([`taken`], each the one turn within a frame step it matches) are over the bound in
+/// every second the pixel is ([`over_wherever`]), and what is left of `times` is over it in none: a page under the
+/// bound is no excuse for effects that carry it over, not even where the page is over the bound at some other
+/// moment, and one turn of the page excuses one turn, not the three a frame each side of it can hold. Under the
+/// bound the place is a reading, not the law: the page's when it matches half the turns of the pixel's busiest
+/// second or more, so a letter typed onto the page is not read as the trail's.
+#[must_use]
+fn the_page_s(times: &[u32], paged: &[u32], (per, step_ms): (usize, u32)) -> bool {
+    if over_bound(times, per, step_ms) {
+        let (mut page, mut left) = (Vec::new(), Vec::new());
+        for (&t, page_s) in times.iter().zip(taken(times, paged, step_ms)) {
+            if page_s { page.push(t) } else { left.push(t) }
+        }
+        return over_wherever(times, &page, per, step_ms) && !over_bound(&left, per, step_ms);
+    }
+    let (n, from) = most_in_a_second(times);
+    let left = unmatched(&times[from..from + n], paged, step_ms).len();
+    2 * (n - left) >= n
+}
+
+/// Whether `part` (sorted, ms; some of `times`, sorted) is over the bound in every second `times` is, the seconds
+/// cut short by a frame step as [`over_bound`] cuts them.
+#[must_use]
+fn over_wherever(times: &[u32], part: &[u32], per: usize, step_ms: u32) -> bool {
+    let window = SECOND_MS.saturating_sub(step_ms).max(1);
+    let most = per * FLASH_MOST;
+    let within = |v: &[u32], from: u32| {
+        v.partition_point(|&t| t < from.saturating_add(window)) - v.partition_point(|&t| t < from)
+    };
+    // What a second holds changes only where a turn leaves it or comes into it: read every second that starts
+    // just after a turn or that ends just after one, and the one at each turn.
+    times
+        .iter()
+        .flat_map(|&t| [t, t + 1, (t + 1).saturating_sub(window)])
+        .all(|from| within(times, from) <= most || within(part, from) > most)
+}
+
+/// `times` (sorted, ms) less those `paged` (sorted) matches one for one ([`taken`]).
+#[must_use]
+fn unmatched(times: &[u32], paged: &[u32], step_ms: u32) -> Vec<u32> {
+    times
+        .iter()
+        .zip(taken(times, paged, step_ms))
+        .filter_map(|(&t, page_s)| (!page_s).then_some(t))
+        .collect()
+}
+
+/// Which of `times` (sorted, ms) `paged` (sorted) takes, one for one: each of `times` in turn takes the earliest of
+/// `paged` not yet taken within `step_ms` of it. The windows are all one width, so taking the earliest leaves the
+/// most for the rest.
+#[must_use]
+fn taken(times: &[u32], paged: &[u32], step_ms: u32) -> Vec<bool> {
+    let mut j = 0;
+    times
+        .iter()
+        .map(|&t| {
+            while j < paged.len() && paged[j].saturating_add(step_ms) < t {
+                j += 1;
+            }
+            let page_s = j < paged.len() && paged[j] <= t.saturating_add(step_ms);
+            j += usize::from(page_s);
+            page_s
+        })
+        .collect()
+}
+
+/// Whether `events` (sorted, ms; `per` make one count) are over the bound, as [`pixel_read`] reads one pixel's.
+fn over_bound(events: &[u32], per: usize, step_ms: u32) -> bool {
+    most_within(events, SECOND_MS.saturating_sub(step_ms).max(1)).0 > per * FLASH_MOST
 }
 
 /// CIE L* of a relative luminance, as a share of its range.
@@ -520,14 +666,17 @@ pub fn lightness(y: f64) -> f64 {
     }
 }
 
-/// A film's pixels over time: the law's flashes, the lightness reading and the scratch probe's.
+/// A film's pixels over time: the law's flashes, the lightness reading and the scratch probe's, and the law's
+/// turns of the page itself (the clean twins, [`Flicker::page`]).
 pub struct Flicker {
     width: usize,
     height: usize,
     last: Option<Image>,
+    last_page: Option<Image>,
     pub law: Turns,
     pub light: Turns,
     pub twin: TwinRises,
+    pub page: Turns,
 }
 
 impl Flicker {
@@ -539,10 +688,36 @@ impl Flicker {
             width,
             height,
             last: None,
+            last_page: None,
             law: Turns::new(px, FLASH_SWING, FLASH_DARK_BELOW),
             light: Turns::new(px, LIGHTNESS_SWING, f64::INFINITY),
             twin: TwinRises::new(px),
+            page: Turns::new(px, FLASH_SWING, FLASH_DARK_BELOW),
         }
+    }
+
+    /// The page itself at `ms`: a frame's clean twin, read by the law where it changed since the last one.
+    /// # Errors
+    /// A twin that is not the film's size.
+    pub fn page(&mut self, ms: u64, clean: &Image) -> Result<(), String> {
+        if (clean.width, clean.height) != (self.width, self.height) {
+            return Err(format!(
+                "the clean twin at {ms} ms is not the film's {}x{}",
+                self.width, self.height
+            ));
+        }
+        let ms = u32::try_from(ms).unwrap_or(u32::MAX);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let p = clean.at(x, y);
+                if self.last_page.as_ref().is_some_and(|l| l.at(x, y) == p) {
+                    continue;
+                }
+                self.page.see(y * self.width + x, luminance(p), ms);
+            }
+        }
+        self.last_page = Some(clean.clone());
+        Ok(())
     }
 
     /// The film's next frame, at `ms`. With its clean twin, the grid and the caret's cell, the scratch probe's
@@ -956,8 +1131,8 @@ pub struct Reading {
     pub light: PixelRead,
     pub twin: PixelRead,
     /// The law's flashes apart by [`PLACES`] ([`by_place`]), and the scratch probe's rises.
-    pub places: [PixelRead; 4],
-    pub twin_places: [PixelRead; 4],
+    pub places: [PixelRead; 5],
+    pub twin_places: [PixelRead; 5],
     /// The layers `trail-census` sorts the worst pixel into on the frames it turned on, most frames first; and
     /// the worst pixel of the trail's own.
     pub layers: Layers,
@@ -967,6 +1142,8 @@ pub struct Reading {
     pub contrast: ContrastRead,
     pub line: LineRead,
     pub pet: PetRead,
+    /// The planted star's reading, where one was planted ([`plant_star`]).
+    pub star: Option<StarRead>,
 }
 
 impl Reading {
@@ -999,12 +1176,21 @@ impl Reading {
     #[must_use]
     pub fn broken(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if !self.flash.over.is_empty() {
-            out.push(format!(
-                "flash: {} px flash faster than {FLASH_MOST} a second (over {} turns in one), the worst {} turns",
-                self.flash.over.len(),
-                2 * FLASH_MOST,
+        // The page's own flashes are the program's (a build log scrolling), not the effects'.
+        let effects = self.flash.over.len() - self.places[PAGE].over.len();
+        if effects > 0 {
+            let worst = if self.places[PAGE].over.is_empty() {
                 self.flash.turns
+            } else {
+                (0..PLACES.len())
+                    .filter(|&p| p != PAGE)
+                    .map(|p| self.places[p].turns)
+                    .max()
+                    .unwrap_or(0)
+            };
+            out.push(format!(
+                "flash: {effects} px flash faster than {FLASH_MOST} a second (over {} turns in one), the worst {worst} turns",
+                2 * FLASH_MOST,
             ));
         }
         let c = &self.contrast;
@@ -1046,6 +1232,16 @@ impl Reading {
             out.push(format!(
                 "pet: {} frames whose letters or caret were not read",
                 p.unread
+            ));
+        }
+        if let Some(star) = self
+            .star
+            .filter(|s| s.over < (STAR_SIDE * STAR_SIDE) as usize)
+        {
+            out.push(format!(
+                "star: the planted star flashed in {} of its {} px: the flash law missed a flash it was given",
+                star.over,
+                STAR_SIDE * STAR_SIDE
             ));
         }
         out
@@ -1194,6 +1390,16 @@ impl Reading {
             p.short_poses,
             p.unread
         );
+        if let Some(star) = self.star {
+            let _ = write!(
+                s,
+                "\n  STAR     planted_at={},{} star_px_over3={} of {}",
+                star.at.x0,
+                star.at.y0,
+                star.over,
+                STAR_SIDE * STAR_SIDE
+            );
+        }
         s
     }
 }
@@ -1308,7 +1514,7 @@ fn layer_of(png: &Path, grid: Grid, (x, y): (usize, usize)) -> Result<(Layer, bo
 /// The film under `dir` (its `film.<ms>.png` frames and their sidecars), read.
 /// # Errors
 /// No frame there, or a frame or sidecar that cannot be read.
-pub fn judge_film(dir: &Path) -> Result<Reading, String> {
+pub fn judge_film(dir: &Path, star: bool) -> Result<Reading, String> {
     let frames: Vec<(u64, PathBuf)> = frames_under(dir)?
         .into_iter()
         .filter_map(|p| frame_ms(&p).map(|ms| (ms, p)))
@@ -1335,19 +1541,26 @@ pub fn judge_film(dir: &Path) -> Result<Reading, String> {
     let mut shots = Vec::with_capacity(frames.len());
     let mut boxes: HashMap<u32, Boxes> = HashMap::new();
     for (ms, png) in &frames {
-        let frame = Image::read(png)?;
+        let mut frame = Image::read(png)?;
+        if star {
+            plant_star(&mut frame, *ms);
+        }
         // A film links a frame's twin to the last one written while the page is the same.
         let twin_path = sidecar(png, ".clean.png", true)
             .ok_or_else(|| format!("{}: no clean twin", png.display()))?;
         let inode = std::fs::metadata(&twin_path)
             .map_err(|e| format!("cannot read {}: {e}", twin_path.display()))?
             .ino();
-        if twin.as_ref().is_none_or(|(i, _)| *i != inode) {
+        let new_page = twin.as_ref().is_none_or(|(i, _)| *i != inode);
+        if new_page {
             twin = Some((inode, clean_twin(&frame, &twin_path)?));
         }
         let clean = twin.as_ref().map(|(_, c)| c);
         let (caret, _) = caret_cell(None, sidecar(png, ".cursor.txt", true))?;
         let flicker = flicker.get_or_insert_with(|| Flicker::new(frame.width, frame.height));
+        if let Some(clean) = clean.filter(|_| new_page) {
+            flicker.page(*ms, clean)?;
+        }
         out.width = frame.width;
         flicker.frame(*ms, &frame, clean.zip(caret).map(|(c, at)| (c, &grid, at)))?;
         if let Some((clean, at)) = clean.zip(caret) {
@@ -1370,10 +1583,27 @@ pub fn judge_film(dir: &Path) -> Result<Reading, String> {
     }
     if let Some(flicker) = &flicker {
         out.flash = flicker.law.read(out.step_ms);
-        out.places = by_place(&flicker.law.at, (2, out.step_ms), out.width, &boxes);
-        out.twin_places = by_place(&flicker.twin.at, (1, 0), out.width, &boxes);
+        out.places = by_place(
+            &flicker.law.at,
+            (2, out.step_ms),
+            out.width,
+            &boxes,
+            &flicker.page.at,
+        );
+        // The scratch probe reads rises off the clean twin: the page's own turns are not in it.
+        out.twin_places = by_place(&flicker.twin.at, (1, 0), out.width, &boxes, &HashMap::new());
         out.light = flicker.light.read(out.step_ms);
         out.twin = flicker.twin.read();
+        if star {
+            let at = star_box(flicker.width, flicker.height);
+            let width = i64::try_from(flicker.width).unwrap_or(i64::MAX);
+            let over = (at.y0..at.y1)
+                .flat_map(|y| (at.x0..at.x1).map(move |x| y * width + x))
+                .filter_map(|i| u32::try_from(i).ok())
+                .filter(|i| out.flash.over.binary_search(i).is_ok())
+                .count();
+            out.star = Some(StarRead { at, over });
+        }
     }
     out.line = line.read;
     out.pet = judge_pet(&shots);
@@ -1401,6 +1631,8 @@ pub struct Args {
     pub scenes: Vec<String>,
     pub replay: bool,
     pub report_only: bool,
+    /// `--plant-star`: [`plant_star`] in every frame judged.
+    pub plant_star: bool,
 }
 
 impl Args {
@@ -1508,6 +1740,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     };
     let replay = !take_flag(&mut rest, "--no-replay");
     let report_only = take_flag(&mut rest, "--report-only");
+    let plant_star = take_flag(&mut rest, "--plant-star");
     if let Some(flag) = rest.iter().find(|a| a.starts_with("--")) {
         return Err(Fail::usage(format!("trail-film: unknown flag {flag}")));
     }
@@ -1547,6 +1780,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         scenes,
         replay,
         report_only,
+        plant_star,
     })
 }
 
@@ -1693,7 +1927,7 @@ pub fn cmd_trail_film(args: &[String]) -> Res {
                     let Some((.., dir)) = films.get(i) else {
                         return;
                     };
-                    let read = judge_film(dir);
+                    let read = judge_film(dir, a.plant_star);
                     if let Ok(mut slots) = slots.lock() {
                         slots[i] = Some(read);
                     }

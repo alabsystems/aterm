@@ -530,9 +530,10 @@ impl Mark {
     /// Hand this window's claim to the tab's program `pid`, which asks for the password, so the
     /// attempt reads cut off once that program ends with no end written, whatever becomes of
     /// this window, and stays this window's to end: where a person's retry took the episode over
-    /// first, the line that retry keeps names the program ([`aterm_types::clt_mark::hand`]). The
-    /// claim the record holds then; this window's own where `pid`'s birth cannot be read; `None`
-    /// where the record holds it nowhere (two retries at once gave it up) or there is none.
+    /// first, the attempt the record keeps under it names the program
+    /// ([`aterm_types::clt_mark::hand`]). The claim the record holds then; this window's own
+    /// where `pid`'s birth cannot be read; `None` where the record holds it nowhere or there is
+    /// none.
     fn hand(&mut self, pid: i32) -> Option<aterm_types::clt_mark::Claim> {
         let claim = self.claim.take()?;
         let Some(path) = self.path.as_deref() else {
@@ -596,11 +597,11 @@ impl Mark {
         }
     }
 
-    /// Record how the attempt `claim` ended, in its own place: as the record's line, or under a
-    /// person's retry that took it over and asks on. Where the record holds it nowhere (two
-    /// retries at once gave it up), only a finish is written, as the account's. Says where the
-    /// record held `claim` ([`aterm_types::clt_mark::Took`]): as its line where it has no place,
-    /// this window's own attempt, and nowhere where the end could not be recorded.
+    /// Record how the attempt `claim` ended, in its own place: as the record's newest attempt,
+    /// or under a person's retry that took it over and asks on. Where the record holds it
+    /// nowhere, only a finish is written, as the account's. Says where the record held `claim`
+    /// ([`aterm_types::clt_mark::Took`]): as its newest where it has no place, this window's own
+    /// attempt, and nowhere where the end could not be recorded.
     fn end(
         &mut self,
         claim: &aterm_types::clt_mark::Claim,

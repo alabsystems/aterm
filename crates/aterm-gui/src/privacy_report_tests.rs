@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use super::*;
-use crate::consent_state::{ChangeKind, ConsentProbes};
+use crate::consent_state::{AxProbe, ChangeKind, ConsentProbes};
 const FIXTURE_DEBUGGER: DebuggerRow = DebuggerRow {
     probe: DebuggerProbe {
         mode: DebuggerMode::Disabled,
@@ -109,6 +109,7 @@ fn snapshot_with_warmup(
         warmup_last_ms: None,
         debugger: FIXTURE_DEBUGGER,
         devtools: FIXTURE_DEVTOOLS,
+        accessibility: AxProbe::Read { trusted: false },
         program_check: Some(crate::vitals_jobs::HeldCount {
             held: 0,
             oldest_ms: 0,
@@ -146,6 +147,10 @@ fn a_headless_app_wires_the_inert_consent_probe_arm() {
         let line = row(prefix);
         assert!(line.contains(" probe=refused_disabled "), "{line}");
     }
+    assert_eq!(
+        row("accessibility "),
+        "accessibility grant=unknown probe=refused_disabled"
+    );
     assert!(!pending);
 }
 
@@ -213,7 +218,8 @@ fn off_macos_the_report_claims_no_consent_layer_and_keeps_its_shape() {
         "{linux_lines:?}"
     );
     assert!(
-        linux_lines.contains(&"remediate fda=- files=- debugger=- devtools=-".to_string()),
+        linux_lines
+            .contains(&"remediate fda=- files=- debugger=- devtools=- accessibility=-".to_string()),
         "{linux_lines:?}"
     );
     let containment = |lines: &[String]| {
@@ -368,9 +374,10 @@ fn the_line_body_is_the_documented_shape() {
         "devtools state subject requests not_allowed answer_age_ms window_s probe \
          probe_age_ms grant list list_probe program_check program_check_oldest_ms \
          program_check_stranded",
+        "accessibility grant probe",
         "observer fda responsible log taskport",
         "access_card state asked_at opened_at verified_at renew_at needs",
-        "remediate fda files debugger devtools",
+        "remediate fda files debugger devtools accessibility",
         "note",
     ]
     .map(String::from)
@@ -665,6 +672,7 @@ fn the_privacy_facts_hop_makes_no_os_call() {
     static HARDENING: AtomicUsize = AtomicUsize::new(0);
     static DEVTOOLS: AtomicUsize = AtomicUsize::new(0);
     static LIST: AtomicUsize = AtomicUsize::new(0);
+    static ACCESSIBILITY: AtomicUsize = AtomicUsize::new(0);
     fn fda(_gate: ProbeGate) -> FdaProbe {
         FDA.fetch_add(1, Ordering::AcqRel);
         consent::classify_probe(ProbeOutcome::Ok)
@@ -691,6 +699,10 @@ fn the_privacy_facts_hop_makes_no_os_call() {
         LIST.fetch_add(1, Ordering::AcqRel);
         DevToolList::refused(DevToolListLabel::RefusedDisabled)
     }
+    fn accessibility(_gate: ProbeGate) -> AxProbe {
+        ACCESSIBILITY.fetch_add(1, Ordering::AcqRel);
+        AxProbe::Read { trusted: true }
+    }
     let counts = || {
         [
             &FDA,
@@ -712,6 +724,7 @@ fn the_privacy_facts_hop_makes_no_os_call() {
         hardening,
         devtools,
         devtools_list: list,
+        accessibility,
         subject: fake_subject,
         warm_subject: fake_subject,
         live: true,
@@ -724,6 +737,11 @@ fn the_privacy_facts_hop_makes_no_os_call() {
     let facts = app.privacy_facts(Scope::Owner);
     assert_eq!(facts.sessions.len(), 1, "the hop read the pool");
     assert_eq!(counts(), [0; 7], "the hop made an OS call");
+    assert_eq!(
+        ACCESSIBILITY.load(Ordering::Acquire),
+        0,
+        "the hop read the Accessibility grant"
+    );
 
     let identity = SigningIdentity {
         bundle_id: Some("com.example.subject".to_string()),
@@ -963,7 +981,14 @@ fn the_json_form_carries_the_documented_sub_objects() {
     };
     let observed = snapshot(2, FdaState::Denied, SpikeEvidence::UNMEASURED);
     let json = parse(&observed);
-    for key in ["folders", "debugger", "devtools", "observers", "remediate"] {
+    for key in [
+        "folders",
+        "debugger",
+        "devtools",
+        "accessibility",
+        "observers",
+        "remediate",
+    ] {
         assert!(json[key].is_object(), "{key}: {json:?}");
     }
     assert_eq!(json["sessions"].as_array().map(Vec::len), Some(2));
@@ -988,4 +1013,156 @@ fn the_json_form_carries_the_documented_sub_objects() {
         assert!(pending[row]["probe_age_ms"].is_null(), "{row}");
     }
     assert!(pending["devtools"]["subject"].is_null());
+}
+
+/// The `accessibility` row and the JSON's `accessibility` object say what one read of aterm's
+/// own Accessibility grant answered, in the `devtools` row's `grant=` words, and `remediate`
+/// names the Accessibility pane wherever there is one: granted, not granted, not read (a
+/// headless instance, `[privacy]` off, no executable, or one outside a `.app`), and off macOS,
+/// where the pane is `-` like the rest.
+#[test]
+fn the_accessibility_row_says_what_the_read_answered_and_names_its_pane() {
+    const PANE: Option<&str> = Some("settings:Privacy_Accessibility");
+    for (platform, probe, grant, label, pane) in [
+        (
+            "macos",
+            AxProbe::Read { trusted: true },
+            "granted",
+            "read",
+            PANE,
+        ),
+        (
+            "macos",
+            AxProbe::Read { trusted: false },
+            "not_granted",
+            "read",
+            PANE,
+        ),
+        (
+            "macos",
+            AxProbe::RefusedDisabled,
+            "unknown",
+            "refused_disabled",
+            PANE,
+        ),
+        (
+            "macos",
+            AxProbe::RefusedNoExe,
+            "unknown",
+            "refused_no_exe",
+            PANE,
+        ),
+        (
+            "macos",
+            AxProbe::RefusedOutOfBundle,
+            "unknown",
+            "refused_out_of_bundle",
+            PANE,
+        ),
+        (
+            "linux",
+            AxProbe::UnsupportedPlatform,
+            "unknown",
+            "unsupported_platform",
+            None,
+        ),
+    ] {
+        let mut snap = snapshot(1, FdaState::Denied, SpikeEvidence::UNMEASURED);
+        snap.platform = platform;
+        snap.accessibility = probe;
+        let lines = snap.lines();
+        let rows: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("accessibility "))
+            .collect();
+        assert_eq!(
+            rows,
+            [&format!("accessibility grant={grant} probe={label}")],
+            "{probe:?}"
+        );
+        let remediate = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("remediate "))
+            .expect("a remediate row");
+        assert!(
+            remediate.ends_with(&format!(" accessibility={}", pane.unwrap_or("-"))),
+            "{probe:?}: {remediate}"
+        );
+        let json: aterm_json::Value =
+            aterm_json::from_str(cmd_privacy_json(&snap).lines().nth(1).expect("JSON body"))
+                .expect("the JSON parses");
+        assert_eq!(json["accessibility"]["grant"].as_str(), Some(grant));
+        assert_eq!(json["accessibility"]["probe"].as_str(), Some(label));
+        assert_eq!(json["remediate"]["accessibility"].as_str(), pane);
+        assert!(
+            json["remediate"].get("accessibility").is_some(),
+            "{probe:?}: the key stays when the pane is null"
+        );
+    }
+}
+
+/// The report's `accessibility` row is the consent arm's answer: read once per report, after
+/// the main-thread hop and never in it, and not read at all while `[privacy] check` is off.
+/// The negative control: the same App with the arm's answer flipped reports the other grant,
+/// so a row that ignored the arm fails here.
+#[test]
+fn the_accessibility_row_is_the_injected_arm_s_answer() {
+    use std::cell::Cell;
+    thread_local! {
+        static TRUSTED: Cell<bool> = const { Cell::new(false) };
+        static READS: Cell<usize> = const { Cell::new(0) };
+    }
+    fn accessibility(_gate: ProbeGate) -> AxProbe {
+        READS.with(|reads| reads.set(reads.get() + 1));
+        AxProbe::Read {
+            trusted: TRUSTED.with(Cell::get),
+        }
+    }
+    let mut app = crate::App::headless_for_test();
+    app.consent.probes_for_test().accessibility = accessibility;
+    let report = |app: &crate::App| -> (String, aterm_json::Value) {
+        let before = READS.with(Cell::get);
+        let facts = app.privacy_facts(Scope::Owner);
+        assert_eq!(READS.with(Cell::get), before, "the hop read the grant");
+        let snapshot = facts.report(SigningIdentity::unknown());
+        let read = READS.with(Cell::get) - before;
+        let row = snapshot
+            .lines()
+            .into_iter()
+            .find(|l| l.starts_with("accessibility "))
+            .expect("an accessibility row");
+        let json: aterm_json::Value = aterm_json::from_str(
+            cmd_privacy_json(&snapshot)
+                .lines()
+                .nth(1)
+                .expect("JSON body"),
+        )
+        .expect("the JSON parses");
+        assert!(read <= 1, "one read per report, not {read}");
+        (format!("{row} reads={read}"), json["accessibility"].clone())
+    };
+
+    for (trusted, grant) in [(true, "granted"), (false, "not_granted")] {
+        TRUSTED.with(|cell| cell.set(trusted));
+        let (row, json) = report(&app);
+        assert_eq!(
+            row,
+            format!("accessibility grant={grant} probe=read reads=1"),
+            "the arm said {trusted}"
+        );
+        assert_eq!(json["grant"].as_str(), Some(grant), "{json:?}");
+        assert_eq!(json["probe"].as_str(), Some("read"), "{json:?}");
+    }
+
+    TRUSTED.with(|cell| cell.set(true));
+    app.set_privacy_for_test(crate::app_config::PrivacyConfig {
+        check: Some(false),
+        ..Default::default()
+    });
+    let (row, json) = report(&app);
+    assert_eq!(
+        row, "accessibility grant=unknown probe=refused_disabled reads=0",
+        "`[privacy] check = false` reads nothing"
+    );
+    assert_eq!(json["grant"].as_str(), Some("unknown"), "{json:?}");
 }

@@ -139,7 +139,10 @@ pub fn named(args: &aterm_sysprobe::procargs::ProcArgs2<'_>, own: Option<&Path>)
     }
 }
 
-/// [`read_unit`]'s reading of a command line `argv` and environment `env` (`KEY=value` words).
+/// [`read_unit`]'s reading of a command line `argv` and environment `env` (`KEY=value` words):
+/// the unit is `--crate-name` in package `CARGO_PKG_NAME`, of kind `test` under `--test` or,
+/// with no `--crate-type`, `--cfg test` (a `harness = false` test target), else its
+/// `--crate-type`.
 #[must_use]
 pub fn unit_of(
     argv: impl IntoIterator<Item = String>,
@@ -155,8 +158,15 @@ pub fn unit_of(
     let crate_name = after("--crate-name")?;
     let kind = if argv.iter().any(|a| a == "--test") {
         "test".to_owned()
+    } else if let Some(crate_type) = after("--crate-type") {
+        crate_type
+    } else if argv.windows(2).any(|w| w[0] == "--cfg" && w[1] == "test") {
+        // A `harness = false` test target: Cargo builds it in test mode, which the unit graph
+        // names `test`, but passes neither `--test` (no harness) nor `--crate-type` (rustc's
+        // default, a bin), only `--cfg test`.
+        "test".to_owned()
     } else {
-        after("--crate-type")?
+        return None;
     };
     let package = env
         .into_iter()

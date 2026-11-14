@@ -42,6 +42,9 @@ mod constructor_capabilities;
 #[path = "native_account_execution_tests.rs"]
 mod account_execution;
 #[cfg(unix)]
+#[path = "native_handoff_hold_tests.rs"]
+mod handoff_hold;
+#[cfg(unix)]
 #[path = "native_historical_closure_tests.rs"]
 mod historical_closure;
 #[cfg(unix)]
@@ -134,8 +137,12 @@ struct Facts {
     #[cfg(unix)]
     fence_gate: Option<PublicationGate>,
     processes: Arc<Mutex<BTreeMap<u32, Process>>>,
+    /// Advance the clock after this many observations of a process during outcome reads.
+    clock_after_process: Mutex<Option<(u32, u32, u64)>>,
     foreground: AtomicU32,
     signals: AtomicU32,
+    /// The kernel refuses the next signals: the source stays as it was.
+    signal_refused: AtomicBool,
     constructors: AtomicBool,
     /// Holds the next constructor check, once: a prepare's last read before its clock.
     constructor_gate: Mutex<Option<PublicationGate>>,
@@ -148,6 +155,9 @@ struct Facts {
     reservation_gate: Option<PublicationGate>,
     conversation_valid: Arc<AtomicBool>,
     clock: Arc<AtomicU64>,
+    /// `(n, at)`: the `n`th `foreground` read from now moves the clock to `at` first, once: a
+    /// request's own kernel reads outlasting a deadline or a close.
+    clock_jump: Mutex<Option<(u32, u64)>>,
     watch_available: AtomicBool,
     watch_unknown: AtomicBool,
     watch_count: AtomicU32,
@@ -327,7 +337,9 @@ impl Facts {
                 (900, process(900, 1, 900, 400, 20)),
             ]))),
             foreground: AtomicU32::new(4242),
+            clock_after_process: Mutex::new(None),
             signals: AtomicU32::new(0),
+            signal_refused: AtomicBool::new(false),
             constructors: AtomicBool::new(true),
             constructor_gate: Mutex::new(None),
             physical_target: None,
@@ -346,6 +358,7 @@ impl Facts {
             clock: Arc::new(AtomicU64::new(
                 aterm_agent::harness::native_act::monotonic_us().unwrap_or(1),
             )),
+            clock_jump: Mutex::new(None),
         }
     }
 
@@ -922,7 +935,19 @@ impl Kernel for Facts {
         Clock::Facts(Arc::clone(&self.clock))
     }
     fn process(&self, pid: u32) -> Option<Process> {
-        self.processes.lock().unwrap().get(&pid).cloned()
+        let process = self.processes.lock().unwrap().get(&pid).cloned();
+        let mut advance = self.clock_after_process.lock().unwrap();
+        if let Some((observed, left, _)) = advance.as_mut()
+            && *observed == pid
+        {
+            if *left > 1 {
+                *left -= 1;
+            } else {
+                let (_, _, now) = advance.take().unwrap();
+                self.clock.store(now, Ordering::SeqCst);
+            }
+        }
+        process
     }
     fn image(&self, image: &Image) -> bool {
         self.physical_target
@@ -930,6 +955,16 @@ impl Kernel for Facts {
             .is_none_or(|path| *path != image.path || image_exists(image))
     }
     fn foreground(&self, _: i32) -> Option<u32> {
+        let mut jump = self.clock_jump.lock().unwrap();
+        if let Some((left, at)) = *jump {
+            if left <= 1 {
+                self.clock.store(at, Ordering::SeqCst);
+                *jump = None;
+            } else {
+                *jump = Some((left - 1, at));
+            }
+        }
+        drop(jump);
         Some(self.foreground.load(Ordering::SeqCst))
     }
     fn own_target(&self, _: &str, _: &Image) -> bool {
@@ -949,6 +984,9 @@ impl Kernel for Facts {
     }
     fn signal(&self, _: i32, _: &Process, _: &crate::SessionCtx) -> String {
         self.signals.fetch_add(1, Ordering::SeqCst);
+        if self.signal_refused.load(Ordering::SeqCst) {
+            return "ERR signal refused\n".into();
+        }
         "OK signalled\n".into()
     }
     fn watch(&self, process: &Process) -> Option<DeathWatch> {
@@ -1508,10 +1546,186 @@ fn native_queue_input_drain_transition_and_lost_ack_conform_to_model() {
     assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
 }
 
-/// AN OWN-IMAGE MOVE WHOSE ACTOR IS GONE STOPS HOLDING THE UPDATE'S HANDOFF: every request on it
-/// must come from that actor's exact process, so with the actor dead it can start nothing more,
-/// though the child it moved runs on. Its input position stays until both have retired. A live
-/// actor whose connection dropped still holds it: it may recover its channel and go on.
+#[test]
+fn an_expired_own_image_move_closes_unknown_before_releasing_the_update() {
+    for trigger in 0..4 {
+        let h = crate::session_store::test_handle_on(7970 + trigger, -1);
+        let ctx = &h.ctx;
+        install(ctx, 71, &[Scope::Upgrade]);
+        let facts = Facts::new();
+        let request = plan(ctx, &facts);
+        let binding = admitted_binding(&run(
+            ctx,
+            &facts,
+            Request::prepare(request.clone()),
+            caller(),
+        ));
+        let operation = lookup(ctx, &binding).unwrap();
+        let guard = Arc::downgrade(
+            &operation
+                .lock()
+                .unwrap()
+                .custody
+                .as_ref()
+                .unwrap()
+                .handoff_guard()
+                .unwrap(),
+        );
+        facts.enter_target();
+        assert_eq!(
+            run(
+                ctx,
+                &facts,
+                Request::Precommit(binding.clone(), ImagePhase::Forward),
+                caller()
+            ),
+            "OK native-act state=precommitted\n"
+        );
+        facts.clock.store(request.deadline_us - 1, Ordering::SeqCst);
+        reconcile_extinct_by(ctx, &facts);
+        assert!(
+            guard.upgrade().is_some(),
+            "CONTROL: an unexpired move retains its hold"
+        );
+        let actor = if trigger == 1 {
+            connection_closed_by(ctx, 71, &facts);
+            SupervisorInputCaller {
+                connection: Some(72),
+                ..caller()
+            }
+        } else {
+            caller()
+        };
+        facts.clock.store(request.deadline_us, Ordering::SeqCst);
+        if trigger == 0 {
+            reconcile_extinct_by(ctx, &facts);
+        } else {
+            let command = match trigger {
+                1 => Request::Recover(binding.clone()),
+                2 => Request::Precommit(binding.clone(), ImagePhase::Forward),
+                _ => Request::Commit(binding.clone(), ImagePhase::Forward, "0.1.0+g123".into()),
+            };
+            assert_eq!(run(ctx, &facts, command, actor.clone()), UNKNOWN);
+        }
+        assert!(
+            matches!(
+                operation.lock().unwrap().phase,
+                Phase::Completed(Decision::Unknown)
+            ),
+            "expiry is terminal before the hold is released (trigger {trigger})"
+        );
+        assert!(
+            guard.upgrade().is_none(),
+            "a live supervisor cannot retain the update at expiry"
+        );
+        assert!(facts.process(4242).is_some() && facts.process(500).is_some());
+        // Once closed, even an earlier clock observation cannot revive completion authority.
+        facts.clock.store(request.deadline_us - 1, Ordering::SeqCst);
+        for command in [
+            Request::Recover(binding.clone()),
+            Request::Precommit(binding.clone(), ImagePhase::Forward),
+            Request::Commit(binding.clone(), ImagePhase::Forward, "0.1.0+g123".into()),
+            Request::Query(binding.clone()),
+        ] {
+            assert_eq!(run(ctx, &facts, command, actor.clone()), UNKNOWN);
+        }
+        assert_eq!(ctx.fenced_writes.native.lock().unwrap().completed.len(), 1);
+        assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn own_image_commit_cannot_cross_its_deadline_during_outcome_observation() {
+    for observation in 1_u32..=2 {
+        let h = crate::session_store::test_handle_on(7996 + u64::from(observation), -1);
+        let ctx = &h.ctx;
+        install(ctx, 71, &[Scope::Upgrade]);
+        let facts = Facts::new();
+        let request = plan(ctx, &facts);
+        let binding = admitted_binding(&run(
+            ctx,
+            &facts,
+            Request::prepare(request.clone()),
+            caller(),
+        ));
+        facts.enter_target();
+        assert_eq!(
+            run(
+                ctx,
+                &facts,
+                Request::Precommit(binding.clone(), ImagePhase::Forward),
+                caller()
+            ),
+            "OK native-act state=precommitted\n"
+        );
+        facts.clock.store(request.deadline_us - 1, Ordering::SeqCst);
+        let revision = ctx.meta.lock().unwrap().supervisor_revision;
+        *facts.clock_after_process.lock().unwrap() = Some((500, observation, request.deadline_us));
+        assert_eq!(
+            run(
+                ctx,
+                &facts,
+                Request::Commit(binding.clone(), ImagePhase::Forward, "0.1.0+g123".into()),
+                caller()
+            ),
+            UNKNOWN
+        );
+        assert!(
+            facts.clock_after_process.lock().unwrap().is_none(),
+            "outcome read {observation} crossed expiry"
+        );
+        let operation = lookup(ctx, &binding).unwrap();
+        let op = operation.lock().unwrap();
+        assert!(matches!(op.phase, Phase::Completed(Decision::Unknown)));
+        assert!(op.custody.is_none());
+        assert_eq!(op.claim_outcome, ClaimOutcome::Lost);
+        drop(op);
+        assert_eq!(ctx.meta.lock().unwrap().supervisor_revision, revision);
+    }
+}
+
+#[test]
+fn own_image_expiry_preserves_an_already_committed_outcome() {
+    let h = crate::session_store::test_handle_on(7975, -1);
+    let ctx = &h.ctx;
+    install(ctx, 71, &[Scope::Upgrade]);
+    let facts = Facts::new();
+    let request = plan(ctx, &facts);
+    let binding = admitted_binding(&run(
+        ctx,
+        &facts,
+        Request::prepare(request.clone()),
+        caller(),
+    ));
+    facts.enter_target();
+    assert_eq!(
+        run(
+            ctx,
+            &facts,
+            Request::Precommit(binding.clone(), ImagePhase::Forward),
+            caller()
+        ),
+        "OK native-act state=precommitted\n"
+    );
+    let command = Request::Commit(binding.clone(), ImagePhase::Forward, "0.1.0+g123".into());
+    let committed = run(ctx, &facts, command.clone(), caller());
+    assert!(
+        committed.starts_with("OK native-act state=committed "),
+        "{committed}"
+    );
+    facts.clock.store(request.deadline_us, Ordering::SeqCst);
+    reconcile_extinct_by(ctx, &facts);
+    assert_eq!(
+        run(ctx, &facts, Request::Query(binding), caller()),
+        committed
+    );
+    assert_eq!(run(ctx, &facts, command, caller()), committed);
+    assert_eq!(ctx.fenced_writes.native.lock().unwrap().completed.len(), 1);
+}
+
+/// An own-image move whose actor is gone before expiry stops holding the update's handoff:
+/// every request must come from that exact process, so it can start nothing more. Its input
+/// position stays until both actor and child retire. A live actor may recover before expiry.
 #[test]
 fn an_own_image_move_whose_actor_is_gone_lets_the_update_handoff_go_on() {
     let h = crate::session_store::test_handle_on(7931, -1);

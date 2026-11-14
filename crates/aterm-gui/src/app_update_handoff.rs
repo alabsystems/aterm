@@ -42,6 +42,14 @@ fn boundary_guard_holds_handoff(now: std::time::Instant) -> Option<String> {
 /// guard between this reading and the Commit's; then the guard. `Err` while an item already in
 /// its section holds the handoff, the latch dropped with it; otherwise the latch, which the
 /// handoff keeps while it is in flight.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHandoffHold",
+        action = "Latch",
+        reason = "The update's handoff latches the boundary registry as it starts; app_update_handoff_boundary's own tests bind the latch"
+    )
+)]
 fn start_at_boundary(
     now: std::time::Instant,
 ) -> Result<app_update_handoff_boundary::HandoffLatch<'static>, String> {
@@ -58,6 +66,14 @@ fn start_at_boundary(
 /// Commit, which a free reading leaves standing: one budget, [`MAX_BOUNDARY_WAIT`]. Within it the
 /// refusal says the update follows the item; past it this try is refused, its wait ends, and the
 /// updater's next check starts a new try with a new budget.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeHandoffHold",
+        action = "Handoff",
+        reason = "The handoff goes on only while no item holds the registry's guard, which a native operation's custody holds as HarnessNativeMutation until its release"
+    )
+)]
 fn boundary_wait_decision(
     held: Option<app_update_handoff_boundary::GuardedItem>,
     now: std::time::Instant,
@@ -2499,9 +2515,9 @@ fn spawn_fork_lane_successor(
     command: &mut aterm_uds::spawnfd::StdCommand,
     handed: &[std::os::fd::RawFd],
 ) -> std::io::Result<std::process::Child> {
-    // The fork the spawn makes keeps what the child holds (`fork_lane_child_holds`): the proof
-    // and Commit ends are kept out of children (`aterm_uds::pipe`, `FD_CLOFORK`), so each
-    // handed descriptor loses its mark for this fork alone, or the fork closes it in the child.
+    // Where the kernel retains FD_CLOFORK, ends from aterm_uds::pipe would close before
+    // pre_exec. Lift only marks actually present for this spawn and restore the parent's flags
+    // afterward. Kernels ignoring the request use normal inheritance and the pre-exec keep-list.
     let spawning = aterm_uds::spawn_lock::handing(handed);
     let spawned = command.spawn();
     drop(spawning);

@@ -1043,3 +1043,55 @@ fn a_config_reload_republishes_the_privacy_mirror() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The Accessibility read keeps the in-bundle fence of the other consent probes: macOS answers
+/// `AXIsProcessTrusted` for the app responsible for this process, which outside a `.app` is the
+/// terminal that started it, so no exe and an exe outside a bundle refuse without calling the
+/// read, and only an exe inside a `.app` reads, reporting what the read answered.
+#[test]
+fn the_accessibility_read_refuses_outside_an_app_bundle_without_reading() {
+    use std::cell::Cell;
+    use std::path::Path;
+    let reads = Cell::new(0_usize);
+    let read = |answer: bool| {
+        let reads = &reads;
+        move || {
+            reads.set(reads.get() + 1);
+            answer
+        }
+    };
+    for (exe, expected) in [
+        (None, AxProbe::RefusedNoExe),
+        (
+            Some(Path::new("/usr/local/bin/aterm")),
+            AxProbe::RefusedOutOfBundle,
+        ),
+        (
+            Some(Path::new("/Users//me/aterm/target/debug/aterm")),
+            AxProbe::RefusedOutOfBundle,
+        ),
+        (
+            Some(Path::new(
+                "/Applications/aterm.app/Contents/Resources/aterm",
+            )),
+            AxProbe::RefusedOutOfBundle,
+        ),
+    ] {
+        assert_eq!(accessibility_with(exe, read(true)), expected, "{exe:?}");
+        assert_eq!(reads.get(), 0, "{exe:?}: the read ran outside a bundle");
+        assert_eq!(expected.grant(), "unknown", "{expected:?}");
+    }
+    assert_eq!(AxProbe::RefusedNoExe.label(), "refused_no_exe");
+    assert_eq!(AxProbe::RefusedOutOfBundle.label(), "refused_out_of_bundle");
+
+    let bundled = Some(Path::new("/Applications/aterm.app/Contents/MacOS/aterm"));
+    for trusted in [true, false] {
+        let before = reads.get();
+        assert_eq!(
+            accessibility_with(bundled, read(trusted)),
+            AxProbe::Read { trusted },
+            "inside a bundle the row is the read's answer"
+        );
+        assert_eq!(reads.get(), before + 1, "one read inside a bundle");
+    }
+}

@@ -2639,7 +2639,7 @@ fn automatic_clone(
             Ok(None) => {}
         }
     }
-    let token = Path::new(&ctx.users[0].home).join(crate::init_github::TOKEN_FILE);
+    let token = crate::init_github::token_file(Path::new(&ctx.users[0].home));
     if sys
         .stat(&token)
         .is_err_and(|why| why.kind() == std::io::ErrorKind::NotFound)

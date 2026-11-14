@@ -3897,11 +3897,11 @@ fn check_notes_follow_the_exact_dispatched_plan() {
                 "the requested Check's reason is visible"
             );
             // A Check only reads, and pressing it again is its remedy: its result is the page's
-            // note alone, never the tab's diamond or the menu line (design §3.6).
+            // note alone, never the tab's diamond or the signal line (design §3.6).
             assert!(!indicators(&app, instance, view).attention);
             let tab = app.windows[&wid].tab_set.active().unwrap();
             assert!(!tab.presentation.indicators.attention);
-            assert!(crate::system_state_access::menu_line(&matching).is_none());
+            assert!(crate::system_state_access::signal_line(&matching).is_none());
             // A later field edit hides the note, and a poll of the same status does not restore it.
             type_into(
                 &mut app,
@@ -3984,7 +3984,7 @@ fn vault_readings_follow_the_edited_source_across_polls() {
     assert!(!indicators(&app, instance, view).attention);
     assert!(contains(&app, wid, &independent));
     assert!(
-        crate::system_state_access::menu_line(&old).is_some(),
+        crate::system_state_access::signal_line(&old).is_some(),
         "the menu still describes the saved source, not an unsubmitted draft"
     );
 
@@ -4014,7 +4014,7 @@ fn vault_readings_follow_the_edited_source_across_polls() {
 
     let mut unknown = current;
     unknown.observed_vault_url = None;
-    assert!(crate::system_state_access::menu_line(&unknown).is_none());
+    assert!(crate::system_state_access::signal_line(&unknown).is_none());
     fresh(&mut app, unknown);
     type_into(&mut app, wid, view, "system-state/url", edited);
     assert!(!contains(&app, wid, new_code));
@@ -5966,15 +5966,15 @@ fn records_that_keep_changing_show_on_the_page_alone() {
 }
 
 /// While the launch's offer waits for the page's first tick its headline is the one signal
-/// (design §3.3, §3.6): readings that light the tab and give the menu bar a System State line
+/// (design §3.3, §3.6): readings that light the tab and give `aterm ctl chrome` a System State line
 /// light neither while the offer waits, and do once nothing is offered.
 #[test]
-fn a_waiting_launch_offer_lights_neither_the_tab_nor_the_menu_line() {
+fn a_waiting_launch_offer_lights_neither_the_tab_nor_the_signal_line() {
     let status = fixture_status("needs-you").unwrap();
     let mut app = App::headless_for_test();
     let (_, instance, view) = page(&mut app);
     fresh(&mut app, status.clone());
-    assert!(app.system_state_menu_line().is_some());
+    assert!(app.system_state_signal_line().is_some());
     assert!(indicators(&app, instance, view).attention);
 
     let mut app = App::headless_for_test();
@@ -5984,7 +5984,7 @@ fn a_waiting_launch_offer_lights_neither_the_tab_nor_the_menu_line() {
     app.attach_system_state_offer(request.clone());
     fresh(&mut app, status);
     assert!(request.pending());
-    assert_eq!(app.system_state_menu_line(), None);
+    assert_eq!(app.system_state_signal_line(), None);
     assert!(!indicators(&app, instance, view).attention);
 }
 
@@ -6785,7 +6785,7 @@ fn a_page_whose_sign_outs_wait_for_check_again_owes_no_presence_look() {
 }
 
 /// §4.9 "Joining ALab…": the join's quiet ends at 30 s, after which the person is told to press
-/// Allow. The loop wakes once at that moment whether or not the page shows, so the menu line and
+/// Allow. The loop wakes once at that moment whether or not the page shows, so the signal line and
 /// the tab's diamond say it then too.
 #[test]
 fn the_join_quiet_ends_at_30_s_whether_or_not_the_page_shows() {

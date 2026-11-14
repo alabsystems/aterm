@@ -16,6 +16,17 @@ use crate::checks::{CHECKS, Check, DEV, RELEASE, RELEASE_BUNDLE, RELEASE_TREE, W
 /// NOT RUN, as a release's always does. `verify land` passes it to every judgment.
 pub const INPUT_DRIFT: &str = "--input-drift";
 
+/// `--judged <commit>`: with [`SHARED`] and `--base`, a round of `verify land`
+/// ([`Args::judged`]).
+pub const JUDGED: &str = "--judged";
+
+/// `--shared <file>`: the paths a round's cone is read from ([`Args::shared`]).
+pub const SHARED: &str = "--shared";
+
+/// `--by-hand`: with [`JUDGED`] and [`SHARED`], the round's merge is not the one Git makes of
+/// the judged commit and the base ([`Args::by_hand`]).
+pub const BY_HAND: &str = "--by-hand";
+
 /// What the command line asked for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Args {
@@ -42,6 +53,18 @@ pub struct Args {
     pub packages: Vec<String>,
     pub all: bool,
     pub base: Option<String>,
+    /// [`JUDGED`]: the commit a judgment already stands for. With [`Self::shared`] and `--base`
+    /// the run is a round of `verify land`: its checks read the change since `--base` as ever
+    /// (so fmt, census and export-scan read the whole of it), and its crates are those of that
+    /// cone that the shared paths, each compared with this commit's tree, or the change since
+    /// this commit reach (`crate::changed::resolve_round`).
+    pub judged: Option<String>,
+    /// [`SHARED`]: the file that names a round's shared paths, each ended by a NUL.
+    pub shared: Option<PathBuf>,
+    /// [`BY_HAND`]: the round's merge was resolved or edited by hand, so a shared path may be
+    /// a change of the base's that the merge dropped, whose file is the judged commit's own:
+    /// the paths are compared with no one tree, and no member is judged alone for one.
+    pub by_hand: bool,
     pub app: Option<PathBuf>,
     /// `--fix`: `fmt` or `census` rewrites what it finds.
     pub fix: bool,
@@ -151,7 +174,8 @@ impl Usage {
 ///
 /// # Errors
 /// An unknown word or flag, a flag without its value, a value that is not one,
-/// options that contradict each other or the checks named, `--tree`, `--bundle` or `--checks`
+/// options that contradict each other or the checks named, `--judged` without `--shared` or
+/// either without `--base`, `--by-hand` without them, `--tree`, `--bundle` or `--checks`
 /// without `release`, a `--checks` name that is no check of the release (or of the half named),
 /// `--fix` under `release`, or a release run of `measure` without `--app`, or of no `measure`
 /// with one.
@@ -187,6 +211,9 @@ where
             "-p" | "--package" | "--scope" => a.packages.push(value(&flag)?),
             "--all" => a.all = true,
             "--base" => a.base = Some(value("--base")?),
+            JUDGED => a.judged = Some(value(JUDGED)?),
+            SHARED => a.shared = Some(PathBuf::from(value(SHARED)?)),
+            BY_HAND => a.by_hand = true,
             "--app" => a.app = Some(PathBuf::from(value("--app")?)),
             "--fix" => a.fix = true,
             "--cell" => a.cells.push(value("--cell")?),
@@ -308,6 +335,23 @@ where
     }
     if a.base.is_some() && (a.all || !a.packages.is_empty()) {
         return usage("--base picks the change cone's base; -p and --all replace the cone".into());
+    }
+    if a.judged.is_some() != a.shared.is_some() {
+        return usage(format!(
+            "{JUDGED} and {SHARED} go together: a round names the judged commit and its shared \
+             paths"
+        ));
+    }
+    if a.by_hand && a.judged.is_none() {
+        return usage(format!(
+            "{BY_HAND} says how a round's merge was made; it needs {JUDGED} and {SHARED}"
+        ));
+    }
+    if a.judged.is_some() && (a.release || a.all || !a.packages.is_empty() || a.base.is_none()) {
+        return usage(format!(
+            "{JUDGED} and {SHARED} select a round's cone since --base; they need it, and -p, \
+             --all and `release` replace the cone"
+        ));
     }
     if a.compile_only
         && (a.release
@@ -515,7 +559,8 @@ Run aterm's checks in place, alone or in any combination.
   verify release --tree           its tree half: no bundle, nothing timed
   verify watch                    idle-capacity main samples; journaled verdicts, no gate
   verify land                     merge main, judge the cone since it, push; compose a
-                                  moved main or re-judge its delta (`verify land --help`)
+                                  moved main, or judge the merge over what the two
+                                  share (`verify land --help`)
   verify release --bundle [--app <APP>]
                                   its bundle CLI half: appkit needs no app;
                                   measure needs one after the build and tree
@@ -564,6 +609,14 @@ Options:
       --all               the whole workspace (default: the change cone)
       --base <ref>        the cone's base (origin/main, else main; no fetch);
                           cannot combine with -p or --all, which replace the cone
+      --judged <commit> --shared <file> [--by-hand]
+                          with --base, a round of `verify land`: the crates are
+                          those of the cone since --base that the paths the
+                          file names (each ended by a NUL), or the change
+                          since the judged commit, reach, while each check
+                          still reads the change since --base; --by-hand: the
+                          merge was resolved or edited by hand, so no crate
+                          is judged alone for a path the file names
       --app <APP>         the release bundle `measure` judges
       --fix               with fmt alone: rewrite the files it finds unformatted;
                           with census alone: move the test modules it finds out of line

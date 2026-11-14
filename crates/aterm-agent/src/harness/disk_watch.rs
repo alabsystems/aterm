@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::{cadence, discover, fill, idle, maintenance, reserve};
+use super::{cadence, discover, fill, idle, maintenance, reserve, worktree};
 use crate::harness::cli::{self, DiskLook, DiskTick, Env};
 
 const LOOK_EVERY: Duration = Duration::from_secs(60);
@@ -26,6 +26,7 @@ struct Watch {
     rooms: super::room::Rooms,
     fill: Option<(String, fill::Fill)>,
     notes: Vec<String>,
+    worktrees: worktree::Schedule,
 }
 
 impl Watch {
@@ -37,6 +38,7 @@ impl Watch {
             rooms: super::room::Rooms::load(state),
             fill: None,
             notes: Vec::new(),
+            worktrees: worktree::Schedule::new(),
         }
     }
 
@@ -161,6 +163,37 @@ impl Watch {
         );
         if let cli::ReserveMove::Released(bytes) = moved {
             freed = freed.saturating_add(bytes);
+        }
+        // The worktree step runs hourly on a look with no pressure pass due, never ahead of
+        // one: under pressure it waits for a look between passes (a pass that freed nothing
+        // stops being due), and it is bounded by its wall and its git's.
+        if !due && self.worktrees.due(started) {
+            let snap = Snapshot::read();
+            let open = worktree::open_sessions(home);
+            let transcripts = home.join(".claude/projects");
+            let look = cli::WorktreeLook {
+                state: &env.state,
+                home,
+                now,
+                transcripts: Some(&transcripts),
+                session_cwds: &snap.sessions.cwds,
+                session_cwd_unknown: snap.sessions.unknown.as_deref(),
+                open: &open,
+                table: Some(&table),
+            };
+            held.validate_for(&pass_path)?;
+            let done = cli::disk_worktree_step(&look, config, &mut self.worktrees, &|| {
+                held.validate_for(&pass_path).is_ok()
+            });
+            freed = freed.saturating_add(done.freed());
+            if !done.removed.is_empty() {
+                writeln!(
+                    out,
+                    "disk watch: removed {} merged worktree(s), {} back",
+                    done.removed.len(),
+                    super::human_bytes(done.freed())
+                )?;
+            }
         }
         if !due {
             credit(fill, freed, volume.free, measure().map(|r| r.free), started);

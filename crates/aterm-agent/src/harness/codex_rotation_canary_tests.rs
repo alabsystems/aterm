@@ -10,6 +10,9 @@ mod model;
 #[path = "codex_terminal_evidence_tests.rs"]
 mod terminal_evidence;
 
+#[path = "codex_rotation_unattached_tests.rs"]
+mod unattached;
+
 struct Fresh<'a>(&'a Reader);
 impl UsageReader for Fresh<'_> {
     fn read(

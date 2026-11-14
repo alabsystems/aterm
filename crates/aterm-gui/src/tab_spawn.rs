@@ -355,9 +355,23 @@ fn tab_spawn_factory(
     factory
 }
 
-/// A plain drive owns a new shell, not an idle spare with another session's history.
+/// A plain drive owns a new shell, not an idle spare with another session's history, and what
+/// another Mac's drive asks for starts with that Mac's mark in its environment
+/// ([`for_fleet_drive`]), which a shell already running has not.
 fn can_adopt_spare(ask: &SpawnAsk) -> bool {
-    ask.task.is_none() && !ask.shell
+    ask.task.is_none() && !ask.shell && !ask.fleet
+}
+
+/// `factory` for a tab another Mac's fleet drive asked for ([`SpawnAsk::fleet`]): everything
+/// the tab runs carries the mark of another machine's request
+/// (`aterm_agent::harness::remote_renew::FOR_PEER_ENV`), so a sign-in started in it opens no
+/// window and no browser on this Mac's desk. It is in the environment from the tab's first
+/// process on, which a mark made when the spawn is answered would not be.
+fn for_fleet_drive(mut factory: crate::spawn::SessionFactory) -> crate::spawn::SessionFactory {
+    let mark = aterm_agent::harness::remote_renew::FOR_PEER_ENV;
+    factory.env_add.retain(|(name, _)| name != mark);
+    factory.env_add.push((mark.to_owned(), "1".to_owned()));
+    factory
 }
 
 /// Result returned by the spawner thread ([`crate::Wake::TabSpawned`]).
@@ -1403,7 +1417,7 @@ impl App {
             observe,
             task,
             shell,
-            fleet: _,
+            fleet,
             background,
             unasked,
             theme,
@@ -1481,6 +1495,11 @@ impl App {
             task.is_some() || shell,
         );
         factory.require_cwd = shell;
+        let factory = if fleet {
+            for_fleet_drive(factory)
+        } else {
+            factory
+        };
         #[cfg(windows)]
         let factory = {
             let mut factory = factory;

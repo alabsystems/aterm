@@ -15,7 +15,31 @@
 extern crate self as aterm_spec;
 
 #[cfg(feature = "anchors")]
-pub use aterm_spec_macros::{liveness, model, ty_model};
+pub use aterm_spec_macros::{liveness, model};
+
+/// Author a model whose declarations share the emitted TLA+ namespace.
+/// Generated names (`vars`, `Init`, `Next`, `Spec`) cannot be redeclared.
+///
+/// ```compile_fail
+/// let _ = aterm_spec::ty_model! { Collision {
+///     var count = 0;
+///     action Next { count = count; }
+///     invariant Bounded: count == 0;
+/// } };
+/// ```
+///
+/// Names cannot be reused across declaration roles either.
+///
+/// ```compile_fail
+/// let _ = aterm_spec::ty_model! { Collision {
+///     const Bound = 0;
+///     var count = 0;
+///     action Advance { count = count; }
+///     invariant Bound: count == 0;
+/// } };
+/// ```
+#[cfg(feature = "anchors")]
+pub use aterm_spec_macros::ty_model;
 
 mod bound_projection;
 pub mod check;

@@ -400,7 +400,9 @@ fn early_tippy_stage(_: &Ctx, spec: &StageSpec) -> Report {
 
 /// A pooled release tree reserves the bounded whole-workspace lint
 /// envelope before its first source preflight callback, then gives that exact claim to lint and
-/// drops it at lint's boundary.
+/// drops it at lint's boundary. The first callback is the released shim's, the one stage the
+/// lint and the source guards all wait for: the guards start beside the lint, so what one of
+/// them sees of the lint's claim depends on which started first.
 /// Ordinary and unpooled runs keep just-in-time admission. NEGATIVE CONTROLS: moving the early
 /// claim back into `staged`, admitting it twice, or applying it to either control changes these
 /// callback-time ledger snapshots or the admission count.
@@ -426,7 +428,7 @@ fn pooled_release_preclaims_lint_once_and_only_until_lint_ends() {
             EnvSnapshot::default(),
             dir.path().join(format!("scratch-{name}")),
         )
-        .with_checks(&[Check::Lint, Check::Fmt])
+        .with_checks(&[Check::ReleasedShim, Check::Lint, Check::Fmt])
         .with_release(release)
         .with_memory(book(dir.path()))
         .with_quiet(Some(Admit::Wait));
@@ -461,15 +463,21 @@ fn pooled_release_preclaims_lint_once_and_only_until_lint_ends() {
         let early = release && pooled;
         let expected = seen.asked[0].1;
         assert!(expected > 0, "{name}: {seen:?}");
-        assert_eq!(seen.looked.len(), 2, "{name}: {seen:?}");
-        assert_eq!(seen.looked[0].1.len(), usize::from(early));
+        assert_eq!(seen.looked.len(), 3, "{name}: {seen:?}");
+        let (first, held_first) = &seen.looked[0];
+        assert!(first.starts_with("released-shim"), "{name}: {seen:?}");
+        assert_eq!(held_first.len(), usize::from(early), "{name}: {seen:?}");
         assert!(
-            seen.looked[0].1.is_empty()
-                || seen.looked[0].1[0].0 == "verify tippy lint (--workspace)",
+            held_first.is_empty() || held_first[0].0 == "verify tippy lint (--workspace)",
             "{name}: {seen:?}"
         );
+        let (_, held_by_lint) = seen
+            .looked
+            .iter()
+            .find(|(title, _)| title.starts_with("tippy"))
+            .unwrap_or_else(|| panic!("{name}: lint never ran: {seen:?}"));
         assert_eq!(
-            seen.looked[1].1,
+            *held_by_lint,
             [("verify tippy lint (--workspace)".to_owned(), expected)],
             "{name}: lint owns the one claim"
         );
@@ -765,9 +773,11 @@ fn a_stages_memory_claim_covers_the_builds_its_children_start() {
             .all(|(_, _, _, run)| run.as_deref() == Some(aterm_capacity::NO_COVER)),
         "{seen:?}"
     );
+    // The formatter claims nothing. It starts beside the lint, so the ledger may hold the lint's
+    // claim as it runs; the marker is its own stage's all the same.
     assert!(
         seen.iter()
-            .filter(|(_, held, ..)| held.is_empty())
+            .filter(|(title, ..)| *title != lint.0)
             .all(|(_, _, stage, _)| stage.is_none()),
         "a stage that claimed nothing has no marker of its own: {seen:?}"
     );

@@ -840,10 +840,15 @@ fn source_and_type_preflight_finish_before_test_codegen() {
         !ready(&p, &none, &none, 0, test, u64::MAX),
         "the test run follows its compile"
     );
+    // The guards and the lint wait for none of each other: each starts beside those running.
+    let mut started = none.clone();
+    for (running, &i) in preflight.iter().enumerate() {
+        assert!(ready(&p, &started, &none, running, i, u64::MAX));
+        started[i] = true;
+    }
     let mut done = none.clone();
     for i in preflight {
         assert!(!ready(&p, &done, &done, 0, compile, u64::MAX));
-        assert!(ready(&p, &done, &done, 0, i, u64::MAX));
         done[i] = true;
     }
     assert!(ready(&p, &done, &done, 0, compile, u64::MAX));
@@ -853,6 +858,81 @@ fn source_and_type_preflight_finish_before_test_codegen() {
     assert!(ready(&p, &started, &done, 0, doc, u64::MAX));
     started[test] = true;
     assert!(ready(&p, &started, &done, 1, doc, u64::MAX));
+}
+
+/// THE GUARDS RUN TOGETHER. In the dev set the released shim, whose build's lane is its own, is
+/// first and alone; formatting, the source guards, the export scan and the lint then wait for it
+/// and for none of each other, so all four start beside one another, and everything after them
+/// waits for all five. NEGATIVE CONTROL: with any one of the five unfinished the test compile
+/// does not start, so no red of the preflight is found after test code generation began; and a
+/// plan without the released shim starts the four at once.
+#[test]
+fn the_guards_and_the_lint_run_together_once_the_released_shim_is_done() {
+    use crate::sched::{awaited, ready};
+    let p = plan(&ctx(
+        &DEV,
+        Scope::changed("origin/main", vec!["seed".into()], true),
+    ));
+    let at = |id| p.iter().position(|s| s.id == id).expect("planned");
+    let shim = at(StageId::ReleasedShim);
+    let together = [
+        StageId::Formatting,
+        StageId::Census,
+        StageId::ExportScan,
+        StageId::Tippy,
+    ]
+    .map(at);
+    let compile = at(StageId::TestCompile);
+    assert!(p[shim].after_stages.is_empty());
+    for i in together {
+        assert_eq!(p[i].after_stages, [StageId::ReleasedShim], "{:?}", p[i].id);
+        assert_eq!(awaited(&p, i).collect::<Vec<_>>(), [shim]);
+    }
+    let mut all = vec![shim];
+    all.extend(together);
+    assert_eq!(awaited(&p, compile).collect::<Vec<_>>(), all);
+
+    let none = vec![false; p.len()];
+    assert!(ready(&p, &none, &none, 0, shim, u64::MAX));
+    for i in together {
+        assert!(!ready(&p, &none, &none, 0, i, u64::MAX), "{:?}", p[i].id);
+    }
+    let mut done = none.clone();
+    done[shim] = true;
+    let mut started = done.clone();
+    for (running, i) in together.into_iter().enumerate() {
+        assert!(
+            ready(&p, &started, &done, running, i, u64::MAX),
+            "{:?} waits for a guard beside it",
+            p[i].id
+        );
+        started[i] = true;
+    }
+    for unfinished in all.iter().copied() {
+        let mut done = vec![false; p.len()];
+        for &i in all.iter().filter(|&&i| i != unfinished) {
+            done[i] = true;
+        }
+        assert!(
+            !ready(&p, &done, &done, 0, compile, u64::MAX),
+            "the test compile started before {:?} ended",
+            p[unfinished].id
+        );
+        done[unfinished] = true;
+        assert!(ready(&p, &done, &done, 0, compile, u64::MAX));
+    }
+
+    let no_shim = plan(&ctx(
+        &[Check::Fmt, Check::Census, Check::ExportScan, Check::Lint],
+        Scope::changed("origin/main", vec!["seed".into()], true),
+    ));
+    let none = vec![false; no_shim.len()];
+    let mut started = none.clone();
+    for i in 0..no_shim.len() {
+        assert!(no_shim[i].after_stages.is_empty(), "{:?}", no_shim[i].id);
+        assert!(ready(&no_shim, &started, &none, i, i, u64::MAX));
+        started[i] = true;
+    }
 }
 
 /// Export reuses the main target only after the test compile has populated it. An export-only

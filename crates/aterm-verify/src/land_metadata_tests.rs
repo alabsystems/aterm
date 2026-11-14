@@ -139,7 +139,7 @@ fn the_wording_data_filename_does_not_waive_shared_changes() {
     });
     assert_eq!(
         code,
-        exit::FAILED,
+        exit::CONFLICT,
         "conflicting data is not waived: {said:#?}"
     );
     assert_eq!(

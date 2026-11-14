@@ -226,9 +226,10 @@ fn a_signalled_restart_past_its_deadline_lets_the_update_handoff_go_on() {
         let (handle, facts, request, actor) = fixture(8311 + u64::from(survivor));
         let ctx = &handle.ctx;
         let deadline_us = request.deadline_us;
+        let request_close_us = request.close_us();
         let binding = admitted_binding(&run(ctx, &facts, Request::prepare(request), actor.clone()));
         assert_eq!(
-            run(ctx, &facts, Request::Signal(binding.clone()), actor),
+            run(ctx, &facts, Request::Signal(binding.clone()), actor.clone()),
             "OK native-act state=signalled\n"
         );
         if survivor {
@@ -277,6 +278,27 @@ fn a_signalled_restart_past_its_deadline_lets_the_update_handoff_go_on() {
             !drain.is_drained(),
             "the input position stays while the source may still write (survivor={survivor})"
         );
+        // Its close seals nothing: it never granted, so it keeps its later positive retirement
+        // (and the NoExec record that retirement publishes) instead of an opaque `closed`.
+        facts.clock.store(request_close_us, Ordering::SeqCst);
+        reconcile_extinct_by(ctx, &facts);
+        assert_eq!(
+            run(
+                ctx,
+                &facts,
+                Request::Reconcile(binding.clone()),
+                actor.clone()
+            ),
+            UNKNOWN
+        );
+        {
+            let op = operation.lock().unwrap();
+            assert!(
+                !matches!(op.phase, Phase::Completed(_)),
+                "an ungranted restart is not closed (survivor={survivor})"
+            );
+            assert!(op.custody.is_some());
+        }
         facts.processes.lock().unwrap().remove(&4242);
         facts.processes.lock().unwrap().remove(&7000);
         facts.foreground.store(400, Ordering::SeqCst);

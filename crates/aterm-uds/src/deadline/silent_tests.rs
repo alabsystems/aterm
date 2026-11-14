@@ -32,6 +32,28 @@ fn an_expired_probe_does_not_start_and_a_failed_probe_is_not_silence() {
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::{ExitStatus, Output};
 
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_signed_stand_in_executes_as_a_script_interpreter() {
+    let shell = super::stand_in(std::path::Path::new("/bin/sh"));
+    let dir = aterm_tempfile::tempdir().expect("script directory");
+    let script = dir.path().join("interpreter-script");
+    aterm_tempfile::stand_in(
+        &script,
+        &format!("#!{}\nprintf 'interpreter ran\\n'\n", shell.display()),
+    )
+    .expect("script fixture");
+    let mut command = crate::spawnfd::command(&script);
+    let output = super::super::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+        .expect("signed interpreter executes");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"interpreter ran\n");
+}
+
 fn run(code: i32, stderr: &str) -> Output {
     Output {
         status: ExitStatus::from_raw(code << 8),
@@ -226,186 +248,79 @@ fn a_placed_stand_in_is_never_replaced() {
     );
 }
 
-/// The cache keeps one stand-in per source name: a source rebuilt twice leaves one entry, the
-/// older ones removed once their source no longer names them and no lookup asked for them within
-/// the idle bound. CONTROLS: an entry a process holds open, one a lookup asked for within the
-/// bound, one whose source (another file of the same name) still names it, and one whose source
-/// was never recorded are each kept, as is an entry of another name.
-#[cfg(target_vendor = "apple")]
+/// Rebinding a source name cannot substitute bytes after the held source was selected.
 #[test]
-fn a_rebuilt_source_leaves_one_stand_in() {
+fn a_stand_in_copies_its_held_source_after_the_path_is_rebound() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let source = dir.path().join("tool");
+    std::fs::write(&source, b"original image").unwrap();
+    let (mut held, _) = crate::regular_file::open(&source).unwrap();
+    let replacement = dir.path().join("replacement");
+    std::fs::write(&replacement, b"different image from a new file").unwrap();
+    std::fs::rename(&replacement, &source).unwrap();
+    let meta = held.metadata().unwrap();
+    let original = super::signed_stand_in_opened(&cache, &source, &mut held, &meta, &mut |_| {});
+    assert_eq!(std::fs::read(&original).unwrap(), b"original image");
+    let current = super::signed_stand_in(&cache, &source, &mut |_| {});
+    assert_ne!(original, current);
+    assert_eq!(
+        std::fs::read(current).unwrap(),
+        b"different image from a new file"
+    );
+}
+
+/// A changed held source refuses publication rather than caching bytes under stale metadata.
+#[test]
+fn a_stand_in_refuses_a_source_changed_after_its_metadata_was_read() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let source = dir.path().join("tool");
+    std::fs::write(&source, b"original image").unwrap();
+    let (mut held, meta) = crate::regular_file::open(&source).unwrap();
+    std::fs::write(&source, b"a different, longer image").unwrap();
+    let signing_started = std::cell::Cell::new(false);
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::signed_stand_in_opened(&cache, &source, &mut held, &meta, &mut |_| {
+            signing_started.set(true);
+        })
+    }));
+    assert!(refused.is_err());
+    assert!(!signing_started.get(), "refused before signing");
+    assert!(!super::kept_for(&cache, &source, &meta).exists());
+    let current = super::signed_stand_in(&cache, &source, &mut |_| {});
+    assert_eq!(
+        std::fs::read(current).unwrap(),
+        b"a different, longer image"
+    );
+}
+
+/// An old returned path remains valid after its source changes or disappears, with no
+/// open file or live process to reveal a future exec. A timeout is not assessment proof.
+#[test]
+fn a_delayed_stand_in_survives_source_replacement_and_age() {
+    use std::os::unix::fs::MetadataExt as _;
     use std::time::{Duration, SystemTime};
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let cache = dir.path().join("cache");
-    let named = cache.join("named");
-    let binary = dir.path().join("tool");
-    let mut sign = |fresh: &std::path::Path| {
-        let mut bytes = std::fs::read(fresh).expect("the fresh copy");
-        bytes.extend_from_slice(b" signed");
-        std::fs::write(fresh, bytes).expect("sign the fresh copy");
-    };
-    let idle = |kept: &std::path::Path| {
-        std::fs::File::open(kept.parent().expect("its version directory"))
-            .expect("open the version directory")
-            .set_modified(SystemTime::now() - Duration::from_secs(2 * 60 * 60))
-            .expect("age the version directory");
-    };
-    let entries = || {
-        let mut names: Vec<String> = std::fs::read_dir(&named)
-            .expect("the cache")
-            .map(|entry| entry.expect("an entry").path())
-            .filter(|path| path.is_dir())
-            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    };
-    let version = |kept: &std::path::Path| {
-        kept.parent()
-            .and_then(|parent| parent.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .expect("a version directory")
-    };
-    let mut build = |bytes: &[u8]| {
-        std::fs::write(&binary, bytes).expect("the binary is rebuilt");
-        super::signed_stand_in(&cache, &binary, &mut sign)
-    };
-
-    let other = dir.path().join("other");
-    std::fs::write(&other, b"another program").expect("another binary");
-    let unrelated = super::signed_stand_in(&cache, &other, &mut |_| {});
-    idle(&unrelated);
-
-    let first = build(b"version one");
-    idle(&first);
-    let second = build(b"version two, longer");
-    idle(&second);
-    let third = build(b"version three, longer still");
+    let source = dir.path().join("tool");
+    std::fs::write(&source, b"first image").unwrap();
+    let first = super::signed_stand_in(&cache, &source, &mut |_| {});
+    let inode = std::fs::metadata(&first).unwrap().ino();
+    std::fs::File::open(first.parent().unwrap())
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(24 * 60 * 60))
+        .unwrap();
+    std::fs::write(&source, b"second image is different").unwrap();
+    let second = super::signed_stand_in(&cache, &source, &mut |_| {});
+    assert_ne!(first, second, "the source change selects a new image");
+    std::fs::remove_file(&source).unwrap();
+    assert_eq!(std::fs::read(&first).unwrap(), b"first image");
+    assert_eq!(std::fs::metadata(&first).unwrap().ino(), inode);
     assert_eq!(
-        entries(),
-        [version(&unrelated), version(&third)],
-        "rebuilt twice, one stand-in of it is left"
+        std::fs::read(&second).unwrap(),
+        b"second image is different"
     );
-    assert_eq!(
-        std::fs::read(&third).unwrap(),
-        b"version three, longer still signed"
-    );
-
-    let held = std::fs::File::open(&third).expect("a process holds it open");
-    idle(&third);
-    let fourth = build(b"version four, the longest yet");
-    assert!(third.is_file(), "an entry held open is kept");
-    drop(held);
-
-    let fifth = build(b"version five, longer than four");
-    assert!(
-        fourth.is_file(),
-        "an entry asked for within the bound is kept"
-    );
-    assert!(
-        !third.exists(),
-        "once nothing holds it, the superseded entry goes"
-    );
-
-    let twin_dir = dir.path().join("twin");
-    std::fs::create_dir(&twin_dir).expect("another directory");
-    let twin_source = twin_dir.join("tool");
-    std::fs::write(&twin_source, b"a twin of the same name").expect("the twin");
-    let twin = super::signed_stand_in(&cache, &twin_source, &mut |_| {});
-    idle(&twin);
-    idle(&fourth);
-    idle(&fifth);
-    let unrecorded = named.join("tool-1-2.3-4");
-    std::fs::create_dir(&unrecorded).expect("an entry no source was recorded for");
-    std::fs::write(unrecorded.join("tool"), b"old").expect("its stand-in");
-    idle(&unrecorded.join("tool"));
-    let sixth = build(b"version six, longer than the fifth");
-    assert!(
-        twin.is_file(),
-        "a source that still names its entry keeps it"
-    );
-    assert!(
-        unrecorded.join("tool").is_file(),
-        "an entry whose source is unknown is kept"
-    );
-    assert!(
-        !fourth.exists() && !fifth.exists(),
-        "idle, unheld, superseded entries go"
-    );
-    assert!(sixth.is_file());
-    assert!(unrelated.is_file(), "an entry of another name is kept");
-}
-
-/// A stand-in a lookup returns is never removed by an eviction that judged it idle before the
-/// lookup stamped it: the source is a hard link of the recorded one under the same name, so the
-/// eviction never reads the name the lookup found it by. CONTROL: once idle again with no lookup,
-/// the same eviction removes it.
-#[test]
-fn a_stand_in_found_while_its_eviction_runs_is_kept() {
-    use std::time::{Duration, SystemTime};
-    let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let cache = dir.path().join("cache");
-    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-    std::fs::create_dir(&a).expect("one directory");
-    std::fs::create_dir(&b).expect("another directory");
-    let recorded = a.join("tool");
-    let twin = b.join("tool");
-    std::fs::write(&recorded, b"version one").expect("the binary");
-    std::fs::hard_link(&recorded, &twin).expect("another name for it");
-    let old = super::signed_stand_in(&cache, &recorded, &mut |_| {});
-    let age = |kept: &std::path::Path| {
-        std::fs::File::open(kept.parent().expect("its version directory"))
-            .expect("open the version directory")
-            .set_modified(SystemTime::now() - Duration::from_secs(2 * 60 * 60))
-            .expect("age the version directory");
-    };
-    age(&old);
-    let rebuilt = a.join(".tool.new");
-    std::fs::write(&rebuilt, b"version two, longer").expect("the rebuild");
-    std::fs::rename(&rebuilt, &recorded).expect("the rebuild replaces the recorded name");
-    let new = super::kept_at(&cache, &recorded);
-    assert_ne!(new, old, "the rebuild is a new version");
-    super::place_stand_in(&cache, &recorded, &new, &mut |_| {});
-    let new_version = new.parent().expect("its version directory");
-
-    let found = std::cell::RefCell::new(None);
-    super::remove_superseded(new_version, "tool", super::STAND_IN_IDLE, &|_| {
-        // The lookup runs after the eviction read the stamp and before it removes the entry.
-        *found.borrow_mut() = Some(super::signed_stand_in(&cache, &twin, &mut |_| {
-            panic!("the old version is placed already")
-        }));
-        false
-    });
-    let found = found
-        .into_inner()
-        .expect("the eviction asked whether it was in use");
-    assert_eq!(found, old, "the twin finds the old version");
-    assert!(found.is_file(), "the stand-in the lookup returned is kept");
-
-    age(&old);
-    super::remove_superseded(new_version, "tool", super::STAND_IN_IDLE, &|_| false);
-    assert!(!old.exists(), "idle with no lookup, it goes");
-    assert!(new.is_file());
-}
-
-/// A stand-in a process runs, holding no descriptor of it, is in use; a file nothing opened is not.
-#[cfg(target_vendor = "apple")]
-#[test]
-fn a_running_stand_in_is_in_use() {
-    let cat = super::stand_in(std::path::Path::new("/bin/cat"));
-    let mut child = crate::spawnfd::command(&cat)
-        .stdin(crate::spawnfd::Stdio::piped())
-        .stdout(crate::spawnfd::Stdio::piped())
-        .spawn()
-        .expect("spawn the stand-in");
-    let stdin = super::cat_echoes(&mut child);
-    assert!(super::in_use(&cat), "{} runs", cat.display());
-    drop(stdin);
-    assert!(child.wait().expect("reap").success());
-    let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let idle = dir.path().join("idle");
-    std::fs::write(&idle, b"nobody opens this").expect("a file");
-    assert!(!super::in_use(&idle), "nothing holds {}", idle.display());
 }
 
 /// OFF APPLE A COPY'S MODE IS SET ONLY ON THE FILE ITS CHILD MADE. A link to a FIFO put at

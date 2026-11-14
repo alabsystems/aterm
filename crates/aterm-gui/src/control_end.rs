@@ -497,7 +497,7 @@ pub(crate) fn cmd_end(
     let mut view = || {
         let fresh =
             aterm_vitals::sys::SysQuery::parse("left").map_or(2_000, |q| q.freshness_default_ms());
-        let (held, _) = crate::sys_host::SYS.fresh(Duration::from_millis(fresh), false);
+        let (held, _) = crate::sys_host::SYS.fresh_left(Duration::from_millis(fresh), false);
         let snap = held?.snap;
         let left = snap.left.clone()?;
         *read.borrow_mut() = Some(Arc::clone(&left));
@@ -602,7 +602,8 @@ pub(crate) fn agents_left_now(
     let readers = crate::vitals_left::LeftReaders::kernel();
     let fresh =
         aterm_vitals::sys::SysQuery::parse("left").map_or(2_000, |q| q.freshness_default_ms());
-    let Some(view) = fresh_left(crate::sys_host::SYS.fresh(Duration::from_millis(fresh), false))
+    let Some(view) =
+        fresh_left(crate::sys_host::SYS.fresh_left(Duration::from_millis(fresh), false))
     else {
         return aterm_agent::harness::leftover::LeftRead::Unchecked;
     };

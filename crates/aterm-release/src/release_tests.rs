@@ -478,3 +478,38 @@ malformed\trow\n\
     assert!(!newer("+2.0", "1.0"));
     assert!(!newer("1.+2", "1.1"));
 }
+
+/// A red's line accounts for every branch: what it stopped, what had ended and how, and a build
+/// it leaves running on purpose. NEGATIVE CONTROL: the bare `nothing` of a red that came last
+/// said none of it.
+#[test]
+fn a_red_line_names_what_it_stops_what_had_ended_and_what_goes_on() {
+    assert_eq!(red_stops(&["build", "export"], &[], false), "build, export");
+    assert_eq!(red_stops(&[], &[], false), "nothing");
+    assert_eq!(
+        red_stops(
+            &[],
+            &[
+                (Branch::Export, Ended::Passed, 751),
+                (Branch::Build, Ended::Passed, 7_500)
+            ],
+            false
+        ),
+        format!(
+            "nothing (ended before it: export passed after {}, build passed after {})",
+            fmt_dur(751),
+            fmt_dur(7_500)
+        )
+    );
+    let kept = red_stops(&["export"], &[], true);
+    assert!(
+        kept.starts_with("export; the build goes on") && kept.contains("the next hop"),
+        "{kept}"
+    );
+    let unsettled = red_stops(&[], &[(Branch::Export, Ended::CouldNotRun, 9)], true);
+    assert!(
+        unsettled.starts_with("nothing (ended before it: export could not run after ")
+            && unsettled.contains("the build goes on"),
+        "{unsettled}"
+    );
+}

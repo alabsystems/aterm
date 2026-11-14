@@ -90,6 +90,11 @@ fn a_wake_pipe_is_cloexec_and_a_wake_into_a_full_one_never_blocks() {
 fn a_wake_pipe_is_kept_out_of_children_where_the_kernel_keeps_the_mark() {
     let kernel_keeps = cfg!(target_vendor = "apple") && {
         let mut probe = [0i32; 2];
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the FD_CLOFORK capability probe needs a pipe nothing has marked, to mark it \
+                      by hand and read whether the kernel keeps the mark"
+        )]
         // SAFETY: valid 2-int out-array for pipe(2).
         let made = unsafe { libc::pipe(probe.as_mut_ptr()) };
         assert_eq!(made, 0, "probe pipe");

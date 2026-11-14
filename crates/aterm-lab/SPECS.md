@@ -921,8 +921,8 @@ src/git_starts_tests.rs	the_read_summary_counts_starts_and_wall_time_per_read	gi
 ## 24. What aterm checked, on every surface (Autopilot v6 slice 9c)
 
 `forever`'s judge holds 9c's surfaces to the receipt 9b journals (`forever_checked.rs`): `status`'s
-four `landed_*` fields, the Done for you row's tip (L16, L17), the worker's `checked=` on `await
-task`, `result` and its row's tip (L15), the landed chip's title read in front (L1, L7, L16–L19),
+four `landed_*` fields, the worker's `checked=` on `await task` and `result` (L15), the landed
+chip's title read in front (L1, L7, L16–L19),
 and the leg each chain's folder makes, with two chains
 whose folders make the legs no other chain does: land-n (L18, a repository with no remote) and
 land-o (L19, a plain folder). Read the same way as §1.
@@ -930,18 +930,16 @@ land-o (L19, a plain folder). Read the same way as §1.
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 checked-status-fields	contract	forever::checked::{status_agrees,receipt_at,fields_of,leg_of,receipt_of}	For status_agrees(chain, seen, t0) with R the RECEIPT lines journaled after t0: a status read after t0 lacking any of landed_head=, landed_on=, landed_leg=, landed_repo= ⇒ Fail. Else Fail iff some read's four fields (landed_on and landed_repo percent-decoded) differ from fields_of(receipt_at(t)) where its task= is landed and from `- - - -` elsewhere (receipt_at(t) = the last of R journaled by t, else the first of R), or the last of R has a leg other than leg_of(chain) (no-remote for Repo::NoRemote, no-repo for Repo::Plain, on-main otherwise), a head other than the first 12 digits of seen.head where both are named, or an on-main ref other than origin/main. Otherwise Unobserved iff the chain lands (Chain::lands or a scenario whose receipt the lab judges) and no read said landed or R is empty; else Pass. No read after t0 ⇒ Unobserved.	-	1	-
-checked-done-tip	contract	forever::checked::done_tip	done_tip(seen, t0) with r the last receipt after t0: none ⇒ Unobserved; Pass iff some Done for you tip read after t0 (not `-`) equals mode_words::landed_tip(Some(r)) and contains `<r.head> on origin/main`; else Fail.	-	1	-
-checked-worker	contract	forever::checked::worker_checked	worker_checked(seen, t0) with r the last receipt after t0: none ⇒ Unobserved; Pass iff the manager's await task output has the token checked=<r.checked_word()>, result's header ends ` checked=<word>`, and some worker row's tip after t0 equals mode_words::checked_words(Some(r)); else Fail naming each that did not.	-	1	-
+checked-worker	contract	forever::checked::worker_checked	worker_checked(seen, t0) with r the last receipt after t0: none ⇒ Unobserved; Pass iff the manager's await task output has the token checked=<r.checked_word()>, and result's header ends ` checked=<word>`; else Fail naming each that did not.	-	1	-
 checked-title	contract	forever::checked::{title_checked,titled}	title_checked(seen, t0): no window read ⇒ Pass, saying SKIPPED. Else with T the title reads after t0 whose chip wears face=landed (window.front's line split by split_title, and each window.title read whose latest window.chip line by then has face=landed), `-` and `?` dropped: T empty ⇒ Unobserved; Fail iff some title read at t lacks mode_words::landed_brief(receipt_at(t)) (landed_brief(None) where the journal holds no receipt); else Pass. titled(s) ⇔ s ∈ {L1, L7, L16, L17, L18, L19}.	-	1	-
-checked-wants-join	contract	forever::checked::{with_checked,judged}	with_checked(chain, s, seen, t0, v) = v where ¬judged(chain, s); else the wants W = [status_agrees] ++ [done_tip if s ∈ {L16, L17}] ++ [worker_checked if s = L15] ++ [title_checked if titled(s)], joined to v: Fail if v or some W fails, else Unobserved if v or some W is, else Pass, its words v's followed by `; checked: <WORD> (<why>)` for each W. judged(chain, s) ⇔ receipt::judged(chain, s) is Some ∨ s ∈ {W2, W4, W5, W6, W9, W10, W11, O1, the switch scenarios}.	-	1	-
+checked-wants-join	contract	forever::checked::{with_checked,judged}	with_checked(chain, s, seen, t0, v) = v where ¬judged(chain, s); else the wants W = [status_agrees] ++ [worker_checked if s = L15] ++ [title_checked if titled(s)], joined to v: Fail if v or some W fails, else Unobserved if v or some W is, else Pass, its words v's followed by `; checked: <WORD> (<why>)` for each W. judged(chain, s) ⇔ receipt::judged(chain, s) is Some ∨ s ∈ {W2, W4, W5, W6, W9, W10, W11, O1, the switch scenarios}.	-	1	-
 ```
 
 ```tsv
 file	test	primary	also
 src/forever_checked_tests.rs	status_agrees_with_the_receipt_and_says_dash_off_the_landing	checked-status-fields	
 src/forever_checked_tests.rs	each_folder_makes_its_own_leg	checked-status-fields	
-src/forever_checked_tests.rs	the_done_rows_tip_names_the_head	checked-done-tip	
-src/forever_checked_tests.rs	the_workers_await_result_and_row_say_checked	checked-worker	
+src/forever_checked_tests.rs	the_workers_await_and_result_say_checked	checked-worker	
 src/forever_checked_tests.rs	the_landed_title_says_its_own_receipt	checked-title	
 ```
 

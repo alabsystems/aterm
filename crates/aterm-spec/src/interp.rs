@@ -299,6 +299,8 @@ pub struct Resolved(Compiled);
 
 impl Resolved {
     /// Resolve `m`; `None` for a model whose updates write a name its initial state does not bind.
+    /// # Panics
+    /// If [`Model::init_state`] refuses the declaration names.
     #[must_use]
     pub fn new(m: &Model) -> Option<Self> {
         Compiled::new(m).map(Self)
@@ -358,17 +360,6 @@ macro_rules! walk {
 
 const MAX_STATES: usize = 100_000;
 
-/// The BFS drivers evaluate the `&Action`/`&Invariant` they hold rather than re-resolving each
-/// by name ([`Model::successors`] / [`Model::check_invariant`] find the first record with that
-/// name), which agrees only when names are distinct within a model: with a duplicate, the
-/// by-name form would evaluate the first record twice and never the second.
-#[cfg_attr(trust_verify, trust::skip)]
-fn names_are_unique(m: &Model) -> bool {
-    let actions: BTreeSet<&'static str> = m.actions.iter().map(|a| a.name).collect();
-    let invariants: BTreeSet<&'static str> = m.invariants.iter().map(|i| i.name).collect();
-    actions.len() == m.actions.len() && invariants.len() == m.invariants.len()
-}
-
 /// A copy of `m` with the named constants overridden.
 #[must_use]
 pub fn with_consts(m: &Model, overrides: &[(&str, i64)]) -> Model {
@@ -390,20 +381,18 @@ pub fn with_buggy(m: &Model, b: i64) -> Model {
 /// Exhaustive bounded model check.
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`] (a model-bounds regression, never a property of a healthy derived model).
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn bmc(m: &Model) -> Result<usize, (State, &'static str)> {
     bmc_fired(m).0
 }
 
 /// A separate, explicit work budget for a reduced proof target. Exhaustion still refuses.
+/// # Panics
+/// If `limit` is zero, or under the same conditions as [`bmc`].
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn bmc_with_limit(m: &Model, limit: usize) -> Result<usize, (State, &'static str)> {
     assert!(limit > 0, "a model-check budget must be positive");
-    assert!(
-        names_are_unique(m),
-        "{}: duplicate action/invariant name",
-        m.name
-    );
     walk!(bmc_on(m, limit)).0
 }
 
@@ -415,11 +404,6 @@ pub type BmcFired = (Result<usize, (State, &'static str)>, BTreeSet<&'static str
 /// As [`bmc`].
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn bmc_fired(m: &Model) -> BmcFired {
-    debug_assert!(
-        names_are_unique(m),
-        "{}: duplicate action/invariant name",
-        m.name
-    );
     let (verdict, fired) = walk!(bmc_on(m, MAX_STATES));
     let fired = m
         .actions
@@ -465,6 +449,7 @@ fn bmc_on<W: Walker>(
 /// The prove-and-catch protocol (the `Buggy` convention), interpreter tier.
 /// # Panics
 /// On an invariant violation at `Buggy = 0`, or a vacuous property (no counterexample at `Buggy = 1`).
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn prove_and_catch(m: &Model) -> usize {
     let proven = match bmc(&with_buggy(m, 0)) {
@@ -494,17 +479,15 @@ pub fn prove_and_catch(m: &Model) -> usize {
 /// The invariants some reachable state of `m` violates, all of them in one walk where checking each alone costs a walk apiece.
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`], or on an expression the interpreter cannot evaluate (a function-valued model).
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn violated_invariants(m: &Model) -> BTreeSet<&'static str> {
     if m.invariants.is_empty() {
+        // Check the declaration namespace without starting a state walk.
+        m.assert_valid_names();
         return BTreeSet::new();
     }
-    debug_assert!(
-        names_are_unique(m),
-        "{}: duplicate action/invariant name",
-        m.name
-    );
     walk!(violated_invariants_on(m))
 }
 
@@ -544,14 +527,10 @@ fn violated_invariants_on<W: Walker>(m: &Model, w: &W) -> BTreeSet<&'static str>
 /// The actions that fire (have a successor from some reachable state) anywhere in `m`'s bounded space.
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`] (a model-bounds regression), exactly like [`bmc`].
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fired_actions(m: &Model) -> BTreeSet<&'static str> {
-    debug_assert!(
-        names_are_unique(m),
-        "{}: duplicate action/invariant name",
-        m.name
-    );
     walk!(fired_actions_on(m))
 }
 
@@ -585,6 +564,7 @@ fn fired_actions_on<W: Walker>(m: &Model, w: &W) -> BTreeSet<&'static str> {
 /// Whether each of `actions` is a VIOLATION STEP of `m`.
 /// # Panics
 /// If `m` declares no action named one of `actions`, or its reachable space exceeds [`MAX_STATES`], exactly like [`bmc`].
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn violation_steps(m: &Model, actions: &[&str]) -> Vec<Option<bool>> {
@@ -600,6 +580,7 @@ pub fn violation_steps(m: &Model, actions: &[&str]) -> Vec<Option<bool>> {
 /// If `m` declares no action named one of `actions`, if its reachable space exceeds [`MAX_STATES`]
 /// while a bound cannot be proved by its closed projection or an action has not yet landed lawful, or on an
 /// expression the interpreter cannot evaluate (a function-valued model).
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn mutant_report(m: &Model, actions: &[&str]) -> (BTreeSet<&'static str>, Vec<Option<bool>>) {
@@ -713,14 +694,10 @@ fn mutant_report_on<W: Walker>(
 /// Every state reachable in `m`'s bounded space, each once, in BFS order.
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`], exactly like [`bmc`].
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn reachable_states(m: &Model) -> Vec<State> {
-    debug_assert!(
-        names_are_unique(m),
-        "{}: duplicate action/invariant name",
-        m.name
-    );
     walk!(reachable_on(m))
 }
 
@@ -750,14 +727,10 @@ fn reachable_on<W: Walker>(m: &Model, w: &W) -> Vec<State> {
 /// A reachable state with no successor under any action that is not declared final.
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`], exactly like [`bmc`].
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn find_deadlock(m: &Model, is_final: impl Fn(&State) -> bool) -> Option<State> {
-    debug_assert!(
-        names_are_unique(m),
-        "{}: duplicate action/invariant name",
-        m.name
-    );
     walk!(find_deadlock_on(m, &is_final))
 }
 
@@ -1061,6 +1034,7 @@ fn fair_indices(m: &Model, names: &[&str], kind: &str) -> Vec<usize> {
 /// A reachable non-progress cycle under `fairness`.
 /// # Panics
 /// If `fairness` names an action the model does not declare, or names one action both weakly and strongly fair (one of the two would be dead text).
+/// Also if [`Model::init_state`] refuses the declaration names.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn find_nonprogress_cycle(
@@ -1107,14 +1081,10 @@ impl Space {
     /// Walk `m`'s reachable space.
     /// # Panics
     /// If the reachable space exceeds [`MAX_STATES`], exactly like [`bmc`].
+    /// Also if [`Model::init_state`] refuses the declaration names.
     #[must_use]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn of(m: &Model) -> Self {
-        debug_assert!(
-            names_are_unique(m),
-            "{}: duplicate action/invariant name",
-            m.name
-        );
         let (graph, walked) = match Compiled::new(m) {
             Some(c) => {
                 let (graph, walked) = explore_on(m, &c);
@@ -1315,14 +1285,19 @@ impl Space {
 }
 
 /// [`find_nonprogress_cycle`] for a declared [`Liveness`] obligation.
+/// # Panics
+/// As [`bmc`].
 #[must_use]
 pub fn nonprogress_under(m: &Model, live: &Liveness) -> Option<NonProgressCycle> {
     Space::of(m).nonprogress_under(live)
 }
 
 /// Tier-1 conformance twin of a two-step `ty trace validate`.
+/// # Panics
+/// If model declarations have duplicate or reserved names.
 #[must_use]
 pub fn admits(m: &Model, prev: &State, next: &State) -> Option<&'static str> {
+    m.assert_valid_names();
     let env = m.eval_env(prev);
     m.actions
         .iter()

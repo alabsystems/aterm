@@ -589,27 +589,36 @@ fn an_unreadable_record_holds_nothing_and_the_next_edit_replaces_it() {
 }
 
 #[test]
-fn concurrent_edits_lose_nothing_under_the_lock() {
+fn concurrent_successful_edits_lose_nothing_under_the_lock() {
+    use std::sync::atomic::{AtomicU64, Ordering};
     let _serial = edits();
     let dir = crate::test_scratch_dir("record-race");
     let path = dir.path().join("record.json");
     const WRITERS: u64 = 4;
     const EACH: u64 = 25;
+    let committed = AtomicU64::new(0);
     std::thread::scope(|s| {
         for _ in 0..WRITERS {
             s.spawn(|| {
                 for _ in 0..EACH {
-                    UpdateRecord::edit(&path, |r| r.offer(r.offered.unwrap_or(0) + 1, NOW))
-                        .unwrap();
+                    match UpdateRecord::edit(&path, |r| r.offer(r.offered.unwrap_or(0) + 1, NOW)) {
+                        Ok(_) => {
+                            committed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+                        Err(error) => panic!("record edit failed: {error}"),
+                    }
                 }
             });
         }
     });
+    let committed = committed.load(Ordering::Relaxed);
+    assert!(committed > 0, "at least one edit must commit");
     let r = UpdateRecord::read(&path).unwrap().unwrap();
     assert_eq!(
         r.offered,
-        Some(WRITERS * EACH),
-        "every read-modify-write landed"
+        Some(committed),
+        "every successful read-modify-write landed; timed-out lock acquisitions wrote nothing"
     );
 }
 

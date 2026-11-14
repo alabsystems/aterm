@@ -115,7 +115,9 @@ fn a_release_process_sets_a_lab_identity_aside_and_makes_an_unmarked_one() {
 }
 
 /// A process that would itself make a lab identity keeps the lab identity it finds: a debug
-/// build, a build in a virtual machine, a test binary, a lab lane's process.
+/// build, a build in a virtual machine, a test binary, a lab lane's process, a release app handed
+/// a scratch home (which would otherwise turn a lab's scratch home into a new Mac of the live
+/// ALab).
 ///
 /// NEGATIVE CONTROL: drop `start_over_as`'s `crate::lab_identity(making)` return: each of these
 /// sets the folder aside, and this test fails on the first.
@@ -133,6 +135,10 @@ fn a_process_that_makes_lab_identities_keeps_the_one_it_finds() {
         },
         crate::Making {
             lab_lane: true,
+            ..crate::Making::default()
+        },
+        crate::Making {
+            foreign_home: true,
             ..crate::Making::default()
         },
     ] {

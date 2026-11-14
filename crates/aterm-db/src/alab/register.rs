@@ -10,14 +10,15 @@
 //!
 //! A Mac's identity here is its Commons uuid, its fleet node and its membership label. A writer
 //! succession gives it a new uuid and a new seat: the earlier writers of its verified lineage
-//! ([`Me::former`]) are this Mac too, so it keeps the machine row and the label they held. The
+//! ([`Me::former`]) are this Mac too, so it keeps the machine row and the label they held, and a
+//! row a build before that birthed for its successor is folded back into it ([`fold`]). The
 //! IOPlatformUUID stays in this process: only a keyed digest of it ([`keys::hw_hint`]) is written.
 //! A Mac publishes its own node once on the machine row it adopted. A hint match without the §6 evidence is a finding,
 //! never an adoption, because VM clones share a machine identifier.
 
 use super::{
     checks::Finding,
-    registry::{MACHINE, MACHINE_FACTS, MODEL},
+    registry::{MACHINE, MACHINE_FACTS, MODEL, bound_machine, held_machines},
 };
 use crate::{
     Error, Result,
@@ -304,7 +305,8 @@ fn stated(
             row.insert(column, x);
         }
     }
-    // An owner merge's acknowledgment (`merged_into`) is this Mac's own word: only ever carried.
+    // An owner merge's acknowledgment (`merged_into`) is this Mac's own word: carried here, and
+    // stated only by the own-row branch's [`fold`].
     for column in MACHINE_FACTS.columns {
         if matches!(column.name, "n" | "seen" | "at") {
             continue;
@@ -593,13 +595,14 @@ fn birth_label(input: &Input<'_>, machines: &Projection) -> Result<String> {
     Err(Error::new("machine labels exhausted"))
 }
 
-/// The machines live enrollments other than this one are bound to.
+/// The machines live enrollments other than this one hold: each one's binding, and the machine
+/// its own `merged_into` moved it to ([`held_machines`]).
 fn bound_elsewhere<'a>(input: &Input<'_>, facts: &'a OwnedRead) -> BTreeSet<&'a str> {
     facts
         .rows
         .iter()
         .filter(|(uuid, _)| **uuid != input.me.uuid && input.live.contains(uuid.as_str()))
-        .filter_map(|(_, row)| text(&row.value, "mac"))
+        .flat_map(|(_, row)| held_machines(&row.value))
         .collect()
 }
 
@@ -625,7 +628,8 @@ fn reinstall(
     let me = input.me;
     let enrolled = day_of(input.now_ms.min(me.enrolled_ms.unwrap_or(u64::MAX)));
     // Per machine, the newest row that names this hint: an older row's age proves nothing when a
-    // later enrollment of the same machine was seen more recently.
+    // later enrollment of the same machine was seen more recently. A row counts for the machine
+    // its Mac is, a merged or folded one's for the machine it moved to.
     let mut newest: BTreeMap<&str, (u64, &str)> = BTreeMap::new();
     for (uuid, row) in &facts.rows {
         if *uuid == me.uuid || text(&row.value, "hw_hint") != Some(me.hw_hint.as_str()) {
@@ -639,7 +643,7 @@ fn reinstall(
             ));
             continue;
         }
-        let Some(mac) = text(&row.value, "mac") else {
+        let Some(mac) = bound_machine(&row.value) else {
             continue;
         };
         let seen = row
@@ -760,8 +764,9 @@ fn resolved(me: &Me, facts: &OwnedRead) -> (Me, Vec<Finding>) {
     )
 }
 
-/// Rule 0: the machine the newest earlier writer of this enrollment's lineage is bound to, with
-/// that writer's uuid. The lineage, less the writers [`resolved`] found on other hardware, is the proof a
+/// Rule 0: the machine the newest earlier writer of this enrollment's lineage is ([`bound_machine`]:
+/// the one its own `merged_into` names, else its binding), with that writer's uuid. The lineage,
+/// less the writers [`resolved`] found on other hardware, is the proof a
 /// reinstall's hint and dates stand in for, so nothing waits 30 days and the earlier uuid may
 /// still be seated. `Err` names a machine row the owner ended: the binding is for good, exactly
 /// as for this uuid's own row.
@@ -772,7 +777,11 @@ fn succession(
     found: &mut Vec<Finding>,
 ) -> std::result::Result<Option<(String, String)>, ()> {
     for uuid in input.me.former.iter().rev().map(|writer| &writer.uuid) {
-        let Some(mac) = facts.rows.get(uuid).and_then(|row| text(&row.value, "mac")) else {
+        let Some(mac) = facts
+            .rows
+            .get(uuid)
+            .and_then(|row| bound_machine(&row.value))
+        else {
             continue;
         };
         return match machines.rows.get(mac) {
@@ -789,6 +798,112 @@ fn succession(
         };
     }
     Ok(None)
+}
+
+/// A row this uuid birthed where rule 0 would have bound it to the machine its earlier writer is,
+/// had the build that wrote it had rule 0 (0.199.0 on m2, 2026-11-13: a second machine row under
+/// a label another Mac's row also held, while the earlier writer's row named m2): that machine
+/// and the earlier writer's uuid. The Mac folds the birth into that machine by its own facts row
+/// (§6: only a Mac's own facts row rebinds it), and no machine row is written.
+///
+/// Only where the own row binds `mac`, this uuid's own birth, and states no `merged_into`; where
+/// the record that birthed it had that writer's facts row in its causal past (`saw`, from
+/// [`birth_saw`]), so the birth is one rule 0 would have prevented, never one made before the
+/// earlier writer registered (a VM clone's successor, whose birth §6 keeps for good and `check`
+/// names as a clone); and on a heard pass, since the fold binds for good and a partial history
+/// can show a machine the owner ended as live, the reason a first row waits. A row the Mac
+/// adopted and a merge it already acknowledged are never moved, and a home with no earlier
+/// writer bound elsewhere folds nothing.
+fn fold(
+    input: &Input<'_>,
+    machines: &Projection,
+    facts: &OwnedRead,
+    (mac, own): (&str, &Value),
+    saw: &dyn Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    if !input.heard
+        || mac != keys::machine_pk(&input.me.uuid)
+        || own.get("merged_into").is_some_and(|into| !into.is_null())
+    {
+        return None;
+    }
+    succession(input, machines, facts, &mut Vec::new())
+        .ok()
+        .flatten()
+        .filter(|(into, writer)| into != mac && saw(writer))
+}
+
+/// Whether the record that first stated `uuid`'s facts row (its `n` 1, binding `uuid`'s own
+/// birth, signed by the writer that signed the row `facts` holds) had the facts row `facts` holds
+/// for `writer` in its causal past: the evidence that rule 0 would have bound that birth to
+/// `writer`'s machine instead ([`fold`]). Neither record outside this generation's history (a
+/// roll carried it) nor one past the quota is evidence of anything.
+fn birth_saw<'a>(
+    view: &'a crate::typed::View,
+    facts: &'a OwnedRead,
+    uuid: &str,
+) -> impl Fn(&str) -> bool + 'a {
+    let own_pk = keys::machine_pk(uuid);
+    let birth = facts.rows.get(uuid).and_then(|own| {
+        view.ops
+            .iter()
+            .filter(|op| op.actor == own.actor && !view.quota.over.contains(&op.id))
+            .filter_map(|op| {
+                op.changes
+                    .iter()
+                    .find(|c| c.collection == MACHINE_FACTS.name && c.key == uuid)
+                    .and_then(|c| c.value.as_ref())
+                    .map(|row| (op, row))
+            })
+            .min_by_key(|(op, _)| op.sequence)
+            .filter(|(_, row)| {
+                row.get("n").and_then(Value::as_u64) == Some(1)
+                    && text(row, "mac") == Some(own_pk.as_str())
+            })
+            .map(|(op, _)| op.id)
+    });
+    move |writer: &str| {
+        birth.is_some_and(|birth| {
+            facts
+                .rows
+                .get(writer)
+                .is_some_and(|row| view.causal.observes(&birth, &row.operation))
+        })
+    }
+}
+
+/// Whether a pass over `view` could fold `uuid`'s own row ([`fold`]), so its lineage is worth
+/// reading although the row is bound: a heard pass, the row binds `uuid`'s own birth and states
+/// no `merged_into`, and the record that birthed it saw the facts row of another enrollment that
+/// states `hw_hint` and is a live machine other than that birth. No other row can be the writer
+/// rule 0 names, since [`resolved`] drops an earlier writer whose row states other hardware.
+/// Its one reader is the store's plan, which builds only on unix.
+#[cfg(unix)]
+pub(super) fn may_fold(view: &crate::typed::View, uuid: &str, hw_hint: &str, heard: bool) -> bool {
+    let Some(facts) = view.owned.get(MACHINE_FACTS.name) else {
+        return false;
+    };
+    let own_pk = keys::machine_pk(uuid);
+    if !heard
+        || facts.rows.get(uuid).is_none_or(|own| {
+            text(&own.value, "mac") != Some(own_pk.as_str())
+                || own
+                    .value
+                    .get("merged_into")
+                    .is_some_and(|into| !into.is_null())
+        })
+    {
+        return false;
+    }
+    let machines = view.project(&MACHINE);
+    let saw = birth_saw(view, facts, uuid);
+    facts.rows.iter().any(|(writer, row)| {
+        writer != uuid
+            && text(&row.value, "hw_hint") == Some(hw_hint)
+            && bound_machine(&row.value)
+                .is_some_and(|mac| mac != own_pk && machines.rows.get(mac).is_some_and(Row::live))
+            && saw(writer)
+    })
 }
 
 /// What adoption picks: rule 0, then rules 1 to 3 of §6, in order, then 4.
@@ -935,14 +1050,17 @@ pub fn plan(input: &Input<'_>, view: &crate::typed::View) -> Result<Plan> {
     }
     let empty = OwnedRead::default();
     let facts = view.owned.get(MACHINE_FACTS.name).unwrap_or(&empty);
-    plan_projected(input, &view.cells, facts, &view.project(&MACHINE))
+    let saw = birth_saw(view, facts, &input.me.uuid);
+    plan_projected(input, &view.cells, facts, &view.project(&MACHINE), &saw)
 }
 
+/// [`plan`] over projected rows; `saw` is [`birth_saw`] for this uuid.
 fn plan_projected(
     input: &Input<'_>,
     cells: &Cells,
     facts: &OwnedRead,
     machines: &Projection,
+    saw: &dyn Fn(&str) -> bool,
 ) -> Result<Plan> {
     let (me, mut findings) = resolved(input.me, facts);
     let input = &Input { me: &me, ..*input };
@@ -951,25 +1069,32 @@ fn plan_projected(
     if let Some(own) = facts.rows.get(&me.uuid)
         && let Some(mac) = text(&own.value, "mac")
     {
+        let folds = fold(input, machines, facts, (mac, &own.value), saw);
+        // The machine this Mac is: the one its own facts row merged it into, else its binding.
+        let bound = folds
+            .as_ref()
+            .map(|(into, _)| into.as_str())
+            .or_else(|| text(&own.value, "merged_into"))
+            .unwrap_or(mac);
         // A binding is for good, so a machine row the owner ended holds this Mac rather than
         // have it restate facts under a row nobody uses any more; only the owner moves it.
-        if machines.rows.get(mac).is_some_and(|row| !row.live()) {
+        if machines.rows.get(bound).is_some_and(|row| !row.live()) {
             return Ok(Plan::quiet(
                 Outcome::Held,
                 vec![finding(
                     "bound-machine-retired",
                     MACHINE.name,
-                    vec![mac.to_owned()],
+                    vec![bound.to_owned()],
                 )],
             ));
         }
         let seen = own.value.get("seen").and_then(Value::as_u64).unwrap_or(0);
-        let mut node = own_node(input, machines, mac)?;
-        let renamed = number_change(input, machines, facts, mac)?;
+        let mut node = own_node(input, machines, bound)?;
+        let renamed = number_change(input, machines, facts, bound)?;
         let moves = !renamed.is_empty();
         let moved_label = renamed
             .iter()
-            .find(|change| change.key == format!("{mac}.label"))
+            .find(|change| change.key == format!("{bound}.label"))
             .and_then(|change| change.value.as_ref())
             .and_then(|value| CellValue::decode(value).ok())
             .and_then(|value| value.x.as_str().map(str::to_owned));
@@ -980,7 +1105,7 @@ fn plan_projected(
             .or_else(|| {
                 machines
                     .rows
-                    .get(mac)
+                    .get(bound)
                     .filter(|row| {
                         row.fields
                             .get("label")
@@ -993,10 +1118,18 @@ fn plan_projected(
             // enrollment's seat is no evidence here, since a successor's is a later label for
             // the same Mac and its lineage is read only until it is bound.
             .or_else(|| own.value.get("label").and_then(Value::as_str));
-        let row = stated(input, Some(&own.value), mac, None, label)?;
+        let predecessor = folds
+            .as_ref()
+            .filter(|_| own.value.get("predecessor").is_none_or(Value::is_null))
+            .map(|(_, predecessor)| predecessor.as_str());
+        let mut row = stated(input, Some(&own.value), mac, predecessor, label)?;
+        if let Some((into, _)) = &folds {
+            row.insert("merged_into", Value::from(into.as_str()));
+        }
         // Host names move without the Mac changing (a Bonjour clash renames the local host), and a
         // change spends a record of a lifetime quota, so they ride the 30-day rewrite. The other
-        // fields move at most once a day.
+        // fields move at most once a day; a fold says which Mac this is and goes out with the
+        // heard pass that decides it.
         let changed = MACHINE_FACTS
             .columns
             .iter()
@@ -1007,7 +1140,8 @@ fn plan_projected(
             .chosen
             .as_deref()
             .is_some_and(|label| own.value.get("label").and_then(Value::as_str) != Some(label));
-        let due = moves
+        let due = folds.is_some()
+            || moves
             || chosen_changed
             || seen.saturating_add(REFRESH_DAYS) <= today
             || (changed && seen < today);
@@ -1017,7 +1151,7 @@ fn plan_projected(
         if !due {
             return Ok(Plan {
                 outcome: Outcome::Refreshed {
-                    mac: mac.to_owned(),
+                    mac: bound.to_owned(),
                 },
                 changes: node,
                 findings: Vec::new(),
@@ -1040,7 +1174,7 @@ fn plan_projected(
         ));
         return Ok(Plan {
             outcome: Outcome::Refreshed {
-                mac: mac.to_owned(),
+                mac: bound.to_owned(),
             },
             changes,
             findings: Vec::new(),

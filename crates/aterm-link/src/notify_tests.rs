@@ -5591,6 +5591,7 @@ fn a_drop_flood_writes_bytes_in_proportion_to_its_drops() {
             }
             let dir = scratch(&format!("drop-flood-{mutant}-{full}"));
             let (mut n, fired) = appending(&dir, 1, "");
+            n.clock = Some(Instant::now());
             feed(&mut n, 1, "s-0", "v=1 t=1 attention=paged");
             if full {
                 let mut off = 2;
@@ -5685,9 +5686,9 @@ fn a_flood_of_distinct_need_drops_writes_bytes_in_proportion_to_its_drops() {
     for mutant in [false, true] {
         let dir = scratch(&format!("need-drop-flood-{mutant}"));
         let (mut n, fired) = appending(&dir, 1, "");
+        n.clock = Some(Instant::now());
         let sel = Sel::Need(None);
         n.cfg.on = vec![sel.clone()];
-        n.cfg.window_ms = 3_600_000;
         n.standing_whole = mutant;
         let face = |i: u64| format!("/f/f1/pub/n-a/s-{i}/ev");
         let mut off = 0;

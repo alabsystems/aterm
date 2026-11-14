@@ -9682,6 +9682,7 @@ impl App {
                     self.hand_back(wid);
                 }
             }
+            MenuAction::HandBackAll => self.hand_back_all(),
             MenuAction::SetRole => {
                 if let Some(wid) = self.frontmost_window {
                     let _ = self.begin_active_session_meta_edit(

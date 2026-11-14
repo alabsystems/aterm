@@ -22,11 +22,14 @@
 //! a byte for the reader's patience ([`PATIENCE`] unless [`Reader::patient`] says otherwise): it
 //! stops on lack of progress, never on a count. A round in which neither route reached any host
 //! ends at once: the link is down ([`crate::note_link_down`]), and the caller's own cadence comes
-//! back to it.
+//! back to it. A listing of a repository's releases ([`Reader::releases`]) has the API route
+//! alone, so a try of it that reaches no host ends it at once too, without holding the link down.
 //!
 //! The API leg reads each release once per reader and rests while GitHub says its allowance is
-//! spent, so one reader asks the metered route for one listing plus one request per asset; a
-//! caller that paces its own checks reads [`Reader::api_requests`].
+//! spent, so one reader asks the metered route for one listing plus one request per asset (a
+//! release [`Reader::releases`] listed, from a page of the API's listing of a repository's
+//! releases, needs no listing of its own); a caller that paces its own checks reads
+//! [`Reader::api_requests`].
 //!
 //! The route changes where the bytes come from, never what is accepted: every caller judges
 //! them (a signature, a pinned SHA-256) exactly as before. The web route and the asset CDN are
@@ -284,6 +287,39 @@ impl<T> Try<T> {
     }
 }
 
+/// One release as the API's releases listing names it ([`Reader::releases`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedRelease {
+    /// Its tag.
+    pub tag: String,
+    /// Whether it is a draft (listed only to a token that may push).
+    pub draft: bool,
+    /// Whether it is a prerelease.
+    pub prerelease: bool,
+    /// Its assets' names, as listed.
+    pub assets: Vec<String>,
+}
+
+/// The most releases one [`Reader::releases`] lists: GitHub's largest page.
+pub const RELEASES_PAGE_MAX: u8 = 100;
+
+/// A release as the API's releases listing gives it, the fields read here. Its flags are
+/// required: a listing that does not say whether a release is a draft names none.
+#[derive(serde::Deserialize)]
+struct ListedJson {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<ListedAssetJson>,
+}
+
+/// An asset of a [`ListedJson`].
+#[derive(serde::Deserialize)]
+struct ListedAssetJson {
+    name: String,
+    id: u64,
+}
+
 /// A release as the API listed it.
 #[derive(Clone)]
 struct Listing {
@@ -320,7 +356,7 @@ struct ApiState {
 }
 
 /// Reads release assets: [`Reader::bytes`], [`Reader::to_file`], [`Reader::to_file_until`],
-/// [`Reader::latest_tag`].
+/// [`Reader::latest_tag`], and lists releases: [`Reader::releases`].
 ///
 /// Its patience is the reader's, shared by every read it serves, at once or one after another:
 /// once no route has delivered a byte for the patience, each later read tries each route once
@@ -550,12 +586,127 @@ impl Reader {
         self.rounds(
             None,
             &|| 0,
-            &mut || self.head_tag(&url, &asset),
+            Some(&mut || self.head_tag(&url, &asset)),
             &mut || match self.listing(&asset) {
                 Ok(listing) => Try::Delivered(listing.tag),
                 Err(leg) => leg.cast(),
             },
         )
+    }
+
+    /// Page `page` (from 1) of `owner/repo`'s releases in pages of `count` (1 to
+    /// [`RELEASES_PAGE_MAX`]): the API's listing, which names them newest first by creation, each
+    /// with its tag, its draft and prerelease flags and its assets' names. A page shorter than
+    /// `count` is the listing's last. Only the API lists releases, so this is one metered request
+    /// per try ([`Reader::api_requests`]), tried with the reader's patience as any API try is,
+    /// and a try that reaches no host ends it at once; it claims nothing from
+    /// [`Reader::api_releases`]. GitHub lists a draft only to a token that may push. Each
+    /// published release listed is remembered, so a later read of its assets through the API
+    /// route asks for no listing of its own.
+    /// # Errors
+    /// [`AssetError`]: absent (no such repository), refused (names that are not URL-safe, page 0,
+    /// or a page longer than asked for), or unavailable.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn releases(
+        &self,
+        owner: &str,
+        repo: &str,
+        count: u8,
+        page: u32,
+    ) -> Result<Vec<ListedRelease>, AssetError> {
+        use crate::cdn::path_segment_safe;
+        if !(path_segment_safe(owner) && path_segment_safe(repo)) {
+            return Err(AssetError::Refused(format!(
+                "{owner}/{repo} is not a URL-safe repository name"
+            )));
+        }
+        if page == 0 {
+            return Err(AssetError::Refused(format!(
+                "{owner}/{repo}: the API numbers listing pages from 1"
+            )));
+        }
+        let count = count.clamp(1, RELEASES_PAGE_MAX);
+        let path = format!("/repos/{owner}/{repo}/releases?per_page={count}&page={page}");
+        // The web route has no listing: the API's tries are the only ones.
+        self.rounds(None, &|| 0, None, &mut || {
+            self.list_releases(owner, repo, &path, count)
+        })
+    }
+
+    /// One try of [`Reader::releases`]: the API's page at `path`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn list_releases(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        count: u8,
+    ) -> Try<Vec<ListedRelease>> {
+        if let Some(why) = self.resting() {
+            return Try::failed(why);
+        }
+        self.api_requests.fetch_add(1, Ordering::Relaxed);
+        let answer = match self.api.get(path) {
+            Ok(answer) => answer,
+            Err(e) => return self.api_failure(&e).cast(),
+        };
+        match answer.status {
+            200 => {}
+            404 => {
+                return Try::Absent(format!("{owner}/{repo}: the API has no such repository"));
+            }
+            status => {
+                return self
+                    .api_failure(&RestError::Status {
+                        status,
+                        retry_after_secs: answer.retry_after_secs(),
+                        message: rate_limit_note(&answer).unwrap_or_else(|| answer.message()),
+                    })
+                    .cast();
+            }
+        }
+        let listed: Vec<ListedJson> = match aterm_json::from_slice(&answer.body) {
+            Ok(listed) => listed,
+            Err(e) => {
+                return Try::failed(format!(
+                    "{owner}/{repo}: the API's releases listing is not the JSON it documents ({e})"
+                ));
+            }
+        };
+        if listed.len() > usize::from(count) {
+            return Try::Refused(format!(
+                "{owner}/{repo}: the API listed {} releases for a page of {count}",
+                listed.len()
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut releases = Vec::with_capacity(listed.len());
+        for release in listed {
+            if !release.draft && crate::cdn::path_segment_safe(&release.tag_name) {
+                let tag_path = release_path(owner, repo, Release::Tag(&release.tag_name));
+                if !state.listings.iter().any(|l| l.paths.contains(&tag_path)) {
+                    state.listings.push(Listing {
+                        paths: vec![tag_path],
+                        tag: release.tag_name.clone(),
+                        assets: release
+                            .assets
+                            .iter()
+                            .map(|a| (a.name.clone(), a.id))
+                            .collect(),
+                    });
+                }
+            }
+            releases.push(ListedRelease {
+                tag: release.tag_name,
+                draft: release.draft,
+                prerelease: release.prerelease,
+                assets: release.assets.into_iter().map(|a| a.name).collect(),
+            });
+        }
+        Try::Delivered(releases)
     }
 
     /// The rounds of one read into `sink`.
@@ -581,36 +732,45 @@ impl Reader {
         self.rounds(
             stop,
             &moved,
-            &mut || self.transfer(&url, cap, sink, shape, Route::Web, stop),
+            Some(&mut || self.transfer(&url, cap, sink, shape, Route::Web, stop)),
             &mut || self.api_transfer(asset, cap, sink, shape, stop),
         )
     }
 
-    /// Alternate `web` and `api` tries until one delivers, either ends the read, or no try of
-    /// this reader has delivered or moved `moved` for the patience. A try that moved it starts
-    /// the next round at once.
+    /// Alternate `web` (when the read has a web route) and `api` tries until one delivers, either
+    /// ends the read, or no try of this reader has delivered or moved `moved` for the patience. A
+    /// try that moved it starts the next round at once. A round in which every route tried
+    /// reached no host ends at once; only one in which both routes did holds the link down
+    /// ([`crate::note_link_down`]), since a machine that reaches the web route can be cut off
+    /// from the API host alone.
     #[cfg_attr(trust_verify, trust::skip)]
     fn rounds<T>(
         &self,
         stop: Option<&AtomicBool>,
         moved: &dyn Fn() -> u64,
-        web: &mut dyn FnMut() -> Try<T>,
+        mut web: Option<&mut dyn FnMut() -> Try<T>>,
         api: &mut dyn FnMut() -> Try<T>,
     ) -> Result<T, AssetError> {
         let mut pause = self.pause;
         loop {
             halt(stop)?;
-            let before = moved();
-            let web_failed = match self.judged(web()) {
-                Ok(t) => return t,
-                Err(failed) => failed,
+            let web_failed = match web.as_mut() {
+                Some(web) => {
+                    let before = moved();
+                    match self.judged(web()) {
+                        Ok(t) => return t,
+                        Err(_) if moved() > before => {
+                            // The web route delivered bytes before it failed: it works, so
+                            // continue there.
+                            self.heard();
+                            pause = self.pause;
+                            continue;
+                        }
+                        Err(failed) => Some(failed),
+                    }
+                }
+                None => None,
             };
-            if moved() > before {
-                // The web route delivered bytes before it failed: it works, so continue there.
-                self.heard();
-                pause = self.pause;
-                continue;
-            }
             halt(stop)?;
             let before = moved();
             let api_failed = match self.judged(api()) {
@@ -622,13 +782,21 @@ impl Reader {
                 pause = self.pause;
                 continue;
             }
+            let web_unreached = web_failed.as_ref().map(|failed| failed.1);
             let unavailable = AssetError::Unavailable {
-                web: web_failed.0,
+                web: web_failed.map_or_else(|| "the web route lists no releases".into(), |f| f.0),
                 api: api_failed.0,
             };
-            if web_failed.1 && api_failed.1 {
-                crate::note_link_down();
-                return Err(unavailable);
+            if api_failed.1 {
+                match web_unreached {
+                    Some(true) => {
+                        crate::note_link_down();
+                        return Err(unavailable);
+                    }
+                    // The only route reached no host: the read ends, the web host unjudged.
+                    None => return Err(unavailable),
+                    Some(false) => {}
+                }
             }
             let left = self.patience.saturating_sub(self.quiet_for());
             if left.is_zero() {
@@ -1228,7 +1396,7 @@ fn sink_len(sink: &Path) -> u64 {
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_capped(body: &Path, cap: u64) -> Result<Vec<u8>, AssetError> {
     use std::io::Read as _;
-    let file = std::fs::File::open(body)
+    let (file, _) = aterm_uds::regular_file::open(body)
         .map_err(|e| AssetError::Refused(format!("read the delivered asset: {e}")))?;
     let mut bytes = Vec::new();
     file.take(cap.saturating_add(1))

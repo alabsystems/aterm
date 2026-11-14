@@ -80,13 +80,18 @@ pub(super) fn route(
     let owner = &journal.repositories[index].owner;
     let (dev_entry, dev, dev_current) = super::diagnosed(
         "development-credential",
-        credential(scope, journal, "gh_access_token", deadline),
+        credential(scope, journal, crate::entry_class::DEV_GH_TOKEN, deadline),
     )?;
     let dev_login = super::diagnosed("development-identity", dev.identity())?;
     let selected = if owner.eq_ignore_ascii_case(aterm_types::channel::PUBLIC_OWNER) {
         let (release_entry, release, current) = super::diagnosed(
             "release-credential",
-            credential(scope, journal, "gh_access_token_alabsystems", deadline),
+            credential(
+                scope,
+                journal,
+                crate::entry_class::RELEASE_GH_TOKEN,
+                deadline,
+            ),
         )?;
         let release_login = super::diagnosed("release-identity", release.identity())?;
         if dev_entry.value().as_slice() == release_entry.value().as_slice()

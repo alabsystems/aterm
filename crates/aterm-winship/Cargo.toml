@@ -8,7 +8,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "aterm-winship — the Windows owner loop: smoke a packaged build headless in an isolated environment, build and stage origin/main, and schedule that daily (dev tool, never shipped)"
+description = "aterm-winship — the Windows owner loop: smoke a packaged build headless in an isolated environment, build and stage origin/main, schedule that daily, and build a release cut's Windows zip and the receipt the release cutter admits (dev tool, never shipped)"
 
 [[bin]]
 name = "aterm-winship"
@@ -31,6 +31,20 @@ aterm-png = { workspace = true }
 # Windows), `deadline::output_within` (a bounded child run) and
 # `atomic_file::write` (temporary beside the file, then a rename).
 aterm-uds = { workspace = true }
+# The release handoff (`handoff`): the Windows target, its asset name, its size
+# cap and its zip check (`aterm_update_core::windows`), the definitions the
+# signed appcast and the cutter use; the zip and the toolchain hashed in-process
+# (aterm-digest) and spelled in hex (aterm-codec).
+aterm-update-core = { workspace = true }
+aterm-digest = { workspace = true }
+aterm-codec = { workspace = true }
+# The commit's trust.lock, read by the one parser the toolchain tools use.
+aterm-toolchain = { workspace = true }
+# The release receipt is a serde-derived TOML record, so this writer and the
+# release cutter, which links this crate, read one shape by compilation
+# (aterm-release derives its own records the same way).
+serde = { workspace = true, features = ["derive"] }
+aterm-toml = { workspace = true }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }

@@ -4,18 +4,25 @@
 //! `targo --unverified verify land` (design B10, `docs/DESIGN-fast-build-release-2026-11-05.md`
 //! §4.6): land this checkout's branch on main, judged.
 //!
-//! 1. Fetch main and merge it (M1), stopping on a conflict. The same rule owns each re-judge's
-//!    merge (step 4). A change's changelog entry is its own file under `changes/`, so two
-//!    branches' entries are disjoint paths and need no merge of their own.
+//! 1. Fetch main and merge it (M1). A conflict whose every path has a mechanical rule
+//!    ([`resolve`]) is resolved and committed, the rules named in its message, and that merge is
+//!    judged as any other; otherwise the landing stops with [`exit::CONFLICT`], the merge left
+//!    for the person. The same rule owns each re-judge's merge (step 4). A change's changelog
+//!    entry is its own file under `changes/`, so two branches' entries are disjoint paths and
+//!    need no merge of their own; the changelog rule serves branches written before that. M1 is
+//!    made by the verifier the branch's own tree builds, so a branch older than these rules
+//!    still stops on any conflict there, with [`exit::FAILED`].
 //! 2. Run the dev set over the cone since M1 (`verify --base M1`, B7's export scan included),
 //!    on the committed checkout: one that changes during the run pushes nothing. While it runs,
 //!    main is read at each stage boundary the run's events report and at least every [`POLL`]
-//!    (`docs/DESIGN-landing-economy.md` §2.0). The first tip step 4's rule does not compose
-//!    interrupts the run, ending its group ([`interrupt_judgment`]): the interrupted run is no
-//!    verdict, and step 4's merge and re-judge follow at once, counted toward [`REJUDGES`]. A
-//!    tip that composes (by either rule of step 4) changes nothing. Once the run reports a red (a check, a stage or a test
-//!    binary with no pass), even one step 3 may yet inherit, main is not read again: its end is
-//!    step 3's to decide, as without the poll.
+//!    (`docs/DESIGN-landing-economy.md` §2.0). The first tip against which nothing the run
+//!    would produce can stand (step 4) interrupts the run, ending its group
+//!    ([`interrupt_judgment`]): the interrupted run is no verdict, and step 4's merge and
+//!    re-judge follow at once. A tip that composes, that a round answers or whose conflict
+//!    keeps the judgment (step 4) changes nothing: the run finishes and stands for the tree it
+//!    ran on. Once the run reports a red (a
+//!    check, a stage or a test binary with no pass), even one step 3 may yet inherit, main is
+//!    not read again: its end is step 3's to decide, as without the poll.
 //! 3. A red main's lane verdict on the merged main commit names (B8's journal,
 //!    [`crate::judged`]; M1, or on a re-judge the moved main it merged; read once the run ends,
 //!    so a verdict the lane gave meanwhile counts), in a crate outside the branch's own
@@ -30,39 +37,72 @@
 //!    ([`version::independent_lock`]). The four immutable trees retain every other lock
 //!    byte and the source-proven binary-leaf identity boundary. That
 //!    is seconds of plumbing, so a main that moves again is composed onto again at once
-//!    ([`COMPOSES`] in a row at most, rechecks included). That count is the push's bound: no
+//!    ([`COMPOSES`] in a row at most since a judgment or round passed). That count is the push's bound: no
 //!    deadline spans the landings of one judgment, and each remote step runs under its own hang
 //!    detector ([`NETWORK`]; a write under [`WRITE`]). A remote step that fails or times out
 //!    having sent nothing (a read of main, a push agh says it did not send) is made again after
 //!    a doubling pause, [`RETRIES`] in a row at most; a push whose outcome is unknown is never
-//!    made again, and a main that holds its landing took it. Where the only shared paths are
-//!    Markdown no build, include or test reads (root `*.md`, `docs/**/*.md`,
-//!    a member's `SPECS.md`: [`aterm_census::no_reach`], regular files on both sides and in the
-//!    merge, named in no Rust code: [`Git::markdown_shared`]), merge M2 and recheck the merge
-//!    with only the source readers ([`RECHECKS`]), as the merge's own freshly built verifier,
-//!    over the cone since M2. A recheck that passes is recorded as `Aterm-Rechecked` and the
-//!    merge is pushed (composed onto again as any judgment is); any red it reports counts, and
-//!    a merge whose tree is not the one the rule tested is judged in full. Where neither rule
-//!    holds, merge M2 and judge the branch's
-//!    delta from M2 against its new dependencies (`verify --base M2`); after [`REJUDGES`]
-//!    re-judges it stops with the branch merged and judged (or its judgment interrupted), and
-//!    says so. Semantic breaks across disjoint files are B8's.
+//!    made again, and a main that holds its landing took it. Where the endpoints share any
+//!    other path and the merge is clean, THE ROUND: merge M2 and judge the merge (L), as L's own
+//!    freshly built verifier, with the dev set since M2 over the crates of the branch's cone
+//!    that main's change reaches (`crate::changed::resolve_round`): of the crates a judgment
+//!    of L since M2 would select, those the cone of the shared paths holds ([`Git::shared`],
+//!    [`Delta`]: each path of the branch's or of main's change that L holds unlike that side,
+//!    and each it holds unlike both) and those the cone of L since the judged commit holds,
+//!    which is what main changed, shared with the branch or not. A crate of the branch's cone
+//!    left out builds from the judged tree's own files, so the judgment answers for it. The
+//!    source readers ([`RECHECKS`]) read the branch's whole delta since M2, and the cross
+//!    cells close over the judgment's own seeds. A round that passes is recorded as
+//!    `Aterm-Rechecked` and the merge is pushed (composed onto again as any judgment is); a red
+//!    counts as in a judgment (step 3's rule, by the lane's verdict on M2), and a merge whose
+//!    tree is not the one the rule tested is judged in full. Shared Markdown no build, include
+//!    or test reads (root `*.md`, `docs/**/*.md`, a member's `SPECS.md`:
+//!    [`aterm_census::no_reach`]) is in no crate's cone, so it must be a regular file on both
+//!    sides and in the merge and named in no Rust code ([`Git::no_reach_holds`]); a round
+//!    of a merge Git made whose shared paths are all such Markdown judges no crate beyond
+//!    what the cone of those paths holds, as a disjoint composition judges none (a merge a
+//!    person made of them is judged over the crates main's change reaches, as any other
+//!    round). Where the Markdown rule does not
+//!    hold, where the round would judge every crate the branch's change reaches (what main
+//!    changed reaches them all, or the branch's change reaches every crate: [`Seams::reach`],
+//!    [`reaches_all`]), or where M2 does not descend from M1,
+//!    nothing a judgment of the branch produced stands: merge M2 and judge the branch's
+//!    delta from M2 against its new dependencies (`verify --base M2`). No count of re-judges
+//!    ends the landing: each merges the main tip that caused it, so none judges one tip twice,
+//!    and what ends it is a red, a conflict, a checkout that moved, [`COMPOSES`] push races,
+//!    [`RETRIES`] remote failures or a hang detector. Semantic breaks across disjoint files are
+//!    B8's. Where the merge of M2 CONFLICTS, the judgment stands for the tree it ran on all the
+//!    same ([`Composition::Held`]): a running one finishes, it is kept (step 6), and the merge
+//!    stops on the conflict for the person, unless the paths that merge is bound to share
+//!    already leave nothing standing ([`conflicting`]). The merge they commit is judged by a
+//!    round like the tool's own ([`Git::kept_merge`]), with two differences where its tree is
+//!    not the one Git's merge makes ([`Delta::mechanical`]): no shared path's crate is judged
+//!    alone, since a main change the merge dropped reads as no change beside the judged tree;
+//!    and one that shares a lock, a root manifest, a toolchain or lint file or a submodule's
+//!    entry is judged in full, as is any merge that shares Markdown a file may read
+//!    ([`round_delta`]).
 //! 5. The landing merge states what ran ([`aterm_types::land_trailer`]), an interrupted judgment
 //!    as interrupted. A branch whose head already merges the main it lands on is that merge,
 //!    restated with the trailers.
 //! 6. A judgment that passed is kept in the worktree ([`KEPT`]) until its landing is on main, so
 //!    no ending between the pass and the push loses it: the next run whose HEAD is the judged
 //!    commit, holding the judged tree, starts at step 4 with that receipt, and judges only what
-//!    step 4's rule says it must.
+//!    step 4's rule says it must. A next run whose HEAD merges a main commit into the judged
+//!    commit (its first parent the judged commit, its second a commit of main that descends
+//!    from the main the judgment merged) starts at the round of that merge: the merge a person
+//!    committed after a conflict, or the tool's own after a round of it that was killed or
+//!    went red. A whole judgment drops the record before it runs, so the tool's own merge
+//!    after a re-judge of it that was killed or went red is judged in full again, never by a
+//!    round, which judges less.
 //!
-//! Each judgment and each recheck runs as the verifier built from the tree it judges: the argv
+//! Each judgment and each round runs as the verifier built from the tree it judges: the argv
 //! its child gets, that child's parse of it, the reading of its record and every rule after it
 //! are one build's. Before each, the landing builds the checkout's verifier; where that build is
 //! not this process's own image (sha256, read at the start, before any build), the landing
 //! writes a handoff and replaces itself in place with that build as `land --resume <file>`
 //! ([`handoff`]). The receiver checks that the checkout still stands at the step's commit,
 //! parses the person's `land` words again and resumes the same step with the receipt, the
-//! re-judge and composition counts, and the branch's crates or the cone they are read over.
+//! composition count, and the branch's crates or the cone they are read over.
 //! A hop happens only between steps, never while a judgment, a build or a push runs: it
 //! carries no deadline, since none spans a judgment's push (step 4), and no unsettled write,
 //! since a write whose outcome is unknown ends the landing. Where step 6's kept judgment
@@ -79,7 +119,7 @@
 use crate::exit;
 use aterm_types::land_trailer::{Checked, Interrupted, Rechecked, Row, Stated};
 use aterm_uds::spawnfd::Command;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -87,6 +127,8 @@ use std::time::{Duration, Instant};
 mod engine;
 #[path = "land_handoff.rs"]
 pub mod handoff;
+#[path = "land_resolve.rs"]
+mod resolve;
 #[path = "land_version.rs"]
 mod version;
 
@@ -96,9 +138,6 @@ pub use handoff::{Handoff, Image};
 pub const REMOTE: &str = "origin";
 /// The branch the landing moves.
 pub const MAIN: &str = "main";
-/// How many times a moved main is merged and judged again before the tool stops. A judgment a
-/// main tip interrupted counts as the re-judge that follows it.
-pub const REJUDGES: usize = 3;
 /// How long a running judgment goes at most without main being read, between the stage
 /// boundaries its run reports (`docs/DESIGN-landing-economy.md` §2.0).
 pub const POLL: Duration = Duration::from_secs(180);
@@ -118,8 +157,9 @@ pub const HOPS: usize = 2;
 /// How many composition and pre-send obstruction races are allowed before the tool stops.
 /// A different writer or intent never renews this bound.
 pub const COMPOSES: usize = 10;
-/// The exit of a landing the tool stopped while main kept moving: the branch is merged and
-/// judged, not pushed (`EX_TEMPFAIL`, as a yielding `verify watch --sample`).
+/// The exit of a landing the tool stopped while main kept moving before its push
+/// ([`COMPOSES`]): the branch is merged and judged, not pushed (`EX_TEMPFAIL`, as a yielding
+/// `verify watch --sample`).
 pub const STOPPED: i32 = 75;
 /// How many remote failures in a row that sent nothing the push of a passed judgment makes
 /// again before the landing stops with its judgment kept: reads of main that failed or timed
@@ -139,8 +179,9 @@ const _: () = assert!(WRITE.as_secs() > agh::git::GIT_BUDGET.as_secs());
 /// worktree alone, which no fetch or push moves.
 pub const KEPT: &str = "refs/worktree/aterm/land-judged";
 
-/// The checks a recheck runs: the source readers, the only checks that read no-reach Markdown
-/// (`aterm_census::no_reach`).
+/// The checks every round must have run and passed, whatever its cone holds: the source
+/// readers, which read the branch's whole delta since the merged main, and the only checks
+/// that read no-reach Markdown (`aterm_census::no_reach`).
 pub const RECHECKS: [&str; 3] = ["fmt", "census", "export-scan"];
 /// The hang detector on a local git read or write.
 const LOCAL: Duration = Duration::from_secs(60);
@@ -272,6 +313,39 @@ impl Branch {
             Self::Everything(_) => true,
         }
     }
+}
+
+/// What a set of changed paths reaches ([`Seams::reach`]): every crate a judgment of them would
+/// select, its dependents, readers and namers included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// They reach every crate (a widened cone); the reason.
+    Everything(String),
+    /// The crates of their cone, by name.
+    Crates(BTreeSet<String>),
+    /// Their reach was not read (the toolchain did not resolve, the read did not end in time);
+    /// the reason. It says nothing either way, so it cuts no judgment and is not kept for the
+    /// next tip ([`branch_reach`]).
+    Unread(String),
+}
+
+/// What a round judges ([`recheck`]): the merge of a moved main into a judged commit. Where
+/// Git made the merge and each shared path is Markdown no cone holds, the source readers alone
+/// ([`RECHECKS`]); else the crates a judgment of the merge since the tip would select that the shared paths, or
+/// main's change since the judged commit, reach (`crate::changed::resolve_round`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delta {
+    /// The judged commit, the merge's first parent: the tree the kept judgment stands for, and
+    /// the one each shared path's files are compared with.
+    pub judged: String,
+    /// The shared paths ([`Git::shared`]), in byte order.
+    pub shared: Vec<String>,
+    /// Whether the merge's tree is the one Git's own merge of the two commits makes. Where it
+    /// is not (a conflict resolved, or the merge edited, by hand) a shared path may be one the
+    /// merge holds as the judged commit does, a change of main's it dropped: its file is then
+    /// no different from the judged tree's, so no member is judged alone on that comparison
+    /// ([`crate::cli::BY_HAND`]).
+    pub mechanical: bool,
 }
 
 /// Main's lane verdict on a main commit.
@@ -418,11 +492,19 @@ pub struct Seams<'a> {
     pub branch: &'a mut dyn FnMut(&Path, &str) -> Branch,
     /// Main's lane verdict on a main commit, read once each judgment ends.
     pub lane: &'a mut dyn FnMut(&Path, &str) -> Lane,
-    /// Rerun only the source readers ([`RECHECKS`]) on the checkout as it stands, as the
-    /// verifier at the second argument (the checkout's own fresh build, the landing's own
-    /// image), over the cone since a base commit: the recheck of a Markdown compose
-    /// ([`Composition::Rechecks`]). Nothing interrupts it.
-    pub recheck: &'a mut dyn FnMut(&Path, &Path, &str) -> Judged,
+    /// What changed paths reach in the checkout as it stands: with no paths, the change since
+    /// the base commit (the branch's own reach); else those paths, as changed since it (what
+    /// main's tip changed, with the paths it shares with the branch). Asked before a judgment
+    /// is cut ([`composition`]): it changes when a judgment restarts, never what a landing
+    /// judges.
+    pub reach: &'a Reaches<'a>,
+    /// Run the dev set on the checkout as it stands, as the verifier at the second argument
+    /// (the checkout's own fresh build, the landing's own image), since a base commit, its
+    /// crates those of that cone that the delta's shared paths or main's change since the
+    /// judged commit reach, no shared path's owner judged alone where the merge is not Git's
+    /// own ([`Delta::mechanical`]): a round ([`Composition::Rechecks`], or a merge of a kept
+    /// judgment, [`Git::kept_merge`]). Nothing interrupts it.
+    pub recheck: &'a mut dyn FnMut(&Path, &Path, &str, &Delta) -> Judged,
     /// Hand the landing to an image (the first argument) with the handoff file it wrote (the
     /// second), in the checkout (the third) ([`handoff::hand_over`]): production's replaces
     /// this process and returns only when that failed, with the exit.
@@ -587,7 +669,7 @@ fn drive(git: &Git<'_>, own: &Own<'_>, seams: &mut Seams<'_>) -> Result<i32, Str
     let merged = git.fetch()?;
     let start = git.head()?;
     if git.is_ancestor(&start, &merged)? {
-        git.forget();
+        let _ = git.forget();
         say(
             seams,
             format!("verify land: nothing to land — HEAD {start} is on {REMOTE}/{MAIN}"),
@@ -601,10 +683,44 @@ fn drive(git: &Git<'_>, own: &Own<'_>, seams: &mut Seams<'_>) -> Result<i32, Str
         Ok(None) => None,
         Ok(Some(Ok(kept))) => Some(kept),
         Ok(Some(Err(why))) => {
-            say(
-                seams,
-                format!("verify land: the kept judgment is not resumed: {why}"),
-            );
+            // HEAD is not the judged commit. Where it merges a main commit into it, the kept
+            // judgment stands for its first parent and a round judges the merge.
+            match git.kept_merge(&start, &merged) {
+                Ok(Some((kept, onto))) => {
+                    say(
+                        seams,
+                        format!(
+                            "verify land: an earlier run judged {} over the cone since {}, and \
+                             HEAD merges {onto} into that commit: the merge is judged for what it \
+                             changed for the branch",
+                            kept.tree, kept.merged
+                        ),
+                    );
+                    if merged != onto {
+                        say(
+                            seams,
+                            format!("verify land: {REMOTE}/{MAIN} has moved to {merged} since"),
+                        );
+                    }
+                    let moved = (merged != onto).then_some(merged);
+                    let revision = aterm_land::Revision {
+                        at: start,
+                        base: onto,
+                    };
+                    return engine::resume_merged(git, seams, own, &subject, revision, kept, moved);
+                }
+                Ok(None) => say(
+                    seams,
+                    format!("verify land: the kept judgment is not resumed: {why}"),
+                ),
+                Err(unread) => say(
+                    seams,
+                    format!(
+                        "verify land: the kept judgment is not resumed: {why}; whether HEAD \
+                         merges main into the commit it judged was not read ({unread})"
+                    ),
+                ),
+            }
             None
         }
         Err(why) => {
@@ -637,8 +753,14 @@ fn drive(git: &Git<'_>, own: &Own<'_>, seams: &mut Seams<'_>) -> Result<i32, Str
         None => {
             if !git.is_ancestor(&merged, &start)? {
                 match git.merge(&merged, &subject)? {
-                    Merge::Clean => {}
-                    Merge::Conflict(paths) => return Ok(conflicted(seams, &merged, &paths)),
+                    Merge::Clean { resolved } => {
+                        for line in resolved {
+                            say(seams, format!("verify land: resolved by rule: {line}"));
+                        }
+                    }
+                    Merge::Conflict { paths, refusals } => {
+                        return Ok(conflicted(seams, &merged, &paths, &refusals));
+                    }
                 }
             }
             (git.head()?, merged, None)
@@ -678,14 +800,29 @@ enum Judging {
     Elsewhere(Image),
 }
 
-/// How a recheck ([`recheck`]) came out.
+/// How a round ([`recheck`]) came out.
 enum Rechecking {
-    /// It passed: its recheck is in the receipt.
+    /// It passed: its round is in the receipt.
     Passed,
     /// The landing ends with this exit.
     Exit(i32),
     /// It did not run: the merge's own verifier is this image, which the landing goes on as.
     Elsewhere(Image),
+    /// It did not run: no round answers for the merge (said), which is judged in full.
+    Whole,
+}
+
+/// The record at [`KEPT`] as read ([`Git::kept_record`]): the commit it judged with the
+/// judgment, or why the record is not whole.
+type KeptRecord = Result<(String, Kept), String>;
+
+/// What the merge a round was asked of comes to ([`round_delta`]).
+enum Rounded {
+    /// A round judges it, over this delta.
+    Round(Delta),
+    /// No round answers for it, for this reason: it is judged in full over the cone since the
+    /// tip it merged.
+    Whole(String),
 }
 
 /// What the landing holds between its steps.
@@ -698,6 +835,9 @@ struct Held<'o> {
     cone: String,
     /// The receipt so far.
     stated: Stated,
+    /// The branch's reach over the cone since a main commit, as last read ([`Seams::reach`]):
+    /// one read answers every poll of a judgment over that commit.
+    reach: std::cell::RefCell<Option<(String, Reach)>>,
     /// This image's digest.
     own: &'o str,
     /// The handoffs the step about to run has taken: a resumed step's [`Handoff::hop`], 0 for
@@ -752,9 +892,10 @@ fn built(
     Ok(Built::Elsewhere(image))
 }
 
-/// A judgment an earlier run kept ([`Git::keep`]) that holds for this checkout ([`Git::kept`]).
+/// A judgment an earlier run kept ([`Git::keep`]) that holds for this checkout ([`Git::kept`]),
+/// or for the commit this checkout merged a main commit into ([`Git::kept_merge`]).
 struct Kept {
-    /// The judged tree, which HEAD holds.
+    /// The judged tree, which HEAD holds, or its first parent.
     tree: String,
     /// The main commit the judged commit merged: the base of its last judgment or recheck.
     merged: String,
@@ -980,17 +1121,111 @@ impl<'a> Wire<'a> {
 enum Composition {
     /// It does: the clean merge's tree and the rule's reason.
     Composes { tree: String, why: String },
-    /// It does once the source readers ([`RECHECKS`]) pass on the merge: the clean merge's tree,
-    /// and the shared paths, each no-reach Markdown ([`Git::markdown_shared`]).
+    /// Its judgment stands for the tree it ran on, and a round ([`recheck`]) judges the merge:
+    /// the clean merge's tree, and the shared paths ([`Git::shared`]).
     Rechecks { tree: String, shared: Vec<String> },
+    /// The merge conflicts (the reason names where), and the judgment still stands for the
+    /// tree it ran on: it finishes and is kept, the merge stops on the conflict for the person,
+    /// and the merge they commit is judged as a round ([`Git::kept_merge`]).
+    Held(String),
     /// It does not, for this reason: a merge and a new judgment come instead.
     Doomed(String),
 }
 
+/// [`Seams::reach`]'s question: the checkout's root, the commit the change is read since, and
+/// the changed paths asked about, or none for the whole change since that commit.
+pub type Reaches<'a> = dyn Fn(&Path, &str, Option<&[String]>) -> Reach + 'a;
+
+/// The branch's reach over the cone since `merged`, read once per main commit (`cache`); a
+/// reach that was not read is asked again for the next tip.
+fn branch_reach(
+    git: &Git<'_>,
+    reach: &Reaches<'_>,
+    cache: &std::cell::RefCell<Option<(String, Reach)>>,
+    merged: &str,
+) -> Reach {
+    if let Some((base, found)) = &*cache.borrow()
+        && base == merged
+    {
+        return found.clone();
+    }
+    let found = reach(git.root, merged, None);
+    if !matches!(found, Reach::Unread(_)) {
+        *cache.borrow_mut() = Some((merged.to_owned(), found.clone()));
+    }
+    found
+}
+
+/// Why nothing a judgment of the branch produces stands against a main tip whose change (with
+/// the paths it shares with the branch) reaches `main`, where the branch's own reach is
+/// `branch`: a round judges every crate of the branch's cone that `main` holds
+/// (`crate::changed::resolve_round`), so it would judge all of them again where `main` is every
+/// crate, or every crate the branch's change reaches, or where the branch's change reaches
+/// every crate (a round of a widened cone is the whole workspace). `None` where a round judges
+/// less than the judgment did, and where a reach was not read ([`Reach::Unread`]): nothing is
+/// then known to be lost by letting the judgment finish.
+fn reaches_all(main: &Reach, branch: &Reach) -> Option<String> {
+    match (main, branch) {
+        (Reach::Unread(_), _) | (_, Reach::Unread(_)) => None,
+        (Reach::Everything(why), _) => Some(format!(
+            "what it changed, with the paths it shares with the branch, reaches every crate \
+             ({why})"
+        )),
+        (_, Reach::Everything(why)) => Some(format!(
+            "the branch's change reaches every crate ({why}), so a round would judge all of it \
+             again"
+        )),
+        (Reach::Crates(main), Reach::Crates(branch))
+            if !branch.is_empty() && branch.is_subset(main) =>
+        {
+            Some(format!(
+                "what it changed, with the paths it shares with the branch, reaches every crate \
+                 the branch's change reaches ({})",
+                branch.iter().cloned().collect::<Vec<_>>().join(", ")
+            ))
+        }
+        (Reach::Crates(_), Reach::Crates(_)) => None,
+    }
+}
+
+/// The reach a round of main tip `tip` is bound to judge within the branch's cone
+/// ([`Seams::reach`]): of `shared`, the shared paths a crate may own, with the paths of main's
+/// change since `merged` that a crate may own by `layout`'s tree ([`Git::classed`]). A path of
+/// main's that Git names in no UTF-8 is read as Git would print it.
+fn round_reach(
+    git: &Git<'_>,
+    reach: &Reaches<'_>,
+    (merged, tip, layout): (&str, &str, &str),
+    shared: &[String],
+) -> Result<Reach, String> {
+    let theirs: Vec<String> = git
+        .files(merged, tip)?
+        .iter()
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    let (_, theirs) = git.classed(&theirs, layout)?;
+    let paths: BTreeSet<String> = theirs.into_iter().chain(shared.iter().cloned()).collect();
+    let paths: Vec<String> = paths.into_iter().collect();
+    Ok(reach(git.root, merged, Some(paths.as_slice())))
+}
+
 /// Test main's tip `tip` against `checked` (HEAD, merging `merged`): seconds of Git plumbing,
+/// and, only where the two share a path a crate may own, the reach of main's change with those
+/// paths and of the branch ([`round_reach`], [`Seams::reach`], the branch's cached in `cache`);
 /// the same whether the judgment still runs or has passed.
+///
+/// A clean merge that is not independent ([`Independence::Blocked`]) is answered by a round
+/// ([`Composition::Rechecks`]) unless nothing a judgment of `checked` produces can stand:
+/// a shared path Git names in no UTF-8, shared no-reach Markdown the rule does not hold for
+/// ([`Git::no_reach_holds`]: no cone holds its readers), or a round that would judge every
+/// crate the branch's change reaches ([`reaches_all`]). A tip that does not descend from
+/// `merged` is doomed as well. A merge that conflicts keeps the judgment
+/// ([`Composition::Held`]) unless the same holds of the merge a person then makes
+/// ([`conflicting`]).
 fn composition(
     git: &Git<'_>,
+    reach: &Reaches<'_>,
+    cache: &std::cell::RefCell<Option<(String, Reach)>>,
     merged: &str,
     tip: &str,
     checked: &str,
@@ -1012,35 +1247,139 @@ fn composition(
                 }
                 blocked @ Independence::Blocked { .. } => blocked,
             };
-            let markdown = match git.markdown_shared(merged, tip, checked, tree)? {
-                Ok(shared) => {
+            let mut shared = Vec::new();
+            let mut unnamed = None;
+            for path in git.shared(merged, tip, checked, tree)? {
+                match String::from_utf8(path) {
+                    Ok(path) => shared.push(path),
+                    Err(error) => {
+                        unnamed.get_or_insert_with(|| display_git_path(error.as_bytes()));
+                    }
+                }
+            }
+            let whole = if let Some(path) = unnamed {
+                Some(format!("{path} is no path a cone can be read from"))
+            } else if shared.is_empty() {
+                Some("no shared path was found to judge".to_owned())
+            } else {
+                match git.no_reach_holds(&shared, &[checked, tip, tree], tree)? {
+                    Err(why) => Some(why),
+                    // Markdown no cone holds: the source readers alone answer for it.
+                    Ok(owned) if owned.is_empty() => None,
+                    Ok(owned) => reaches_all(
+                        &round_reach(git, reach, (merged, tip, tree), &owned)?,
+                        &branch_reach(git, reach, cache, merged),
+                    ),
+                }
+            };
+            match whole {
+                None => {
                     return Ok(Composition::Rechecks {
                         tree: tree.clone(),
                         shared,
                     });
                 }
-                Err(why) => why,
-            };
-            // Why the Markdown rule did not hold, where it was the rule in question.
-            let markdown = match &blocked {
-                Independence::Blocked { paths, .. }
-                    if paths.iter().all(|path| path.ends_with(b".md")) =>
-                {
-                    format!(" ({markdown})")
-                }
-                Independence::Blocked { .. } | Independence::Composes(_) => String::new(),
-            };
-            format!("{blocked}{markdown}")
+                Some(why) => format!("{blocked}; {why}"),
+            }
         }
-        Some(Compose::Conflict) => "the merge is not clean".to_owned(),
+        Some(Compose::Conflict(conflicted)) => {
+            return conflicting(git, reach, cache, merged, tip, checked, conflicted);
+        }
     };
     Ok(Composition::Doomed(why))
+}
+
+/// Main's tip `tip`, whose merge into `checked` (merging `merged`) conflicts in `conflicted`:
+/// the judgment of `checked` is kept through the conflict ([`Composition::Held`]) unless
+/// nothing it produces can stand for the merge a person makes of the two, which
+/// [`Git::kept_merge`] and [`recheck`] judge over the paths that merge shares. Those are not
+/// known before it is made; what they hold at least is each path both sides changed to
+/// different entries and each conflicted path. Doomed where that merge is bound to be judged
+/// in full ([`round_delta`]): one of those paths is named in no UTF-8, can replan every crate
+/// ([`crate::changed::REPLANNING_PATHS`]), is a submodule's entry on either side, or is
+/// no-reach Markdown the rule does not hold for on the two sides ([`Git::no_reach_holds`],
+/// by `checked`'s layout and code: a file may read it, or it is no regular file in both).
+/// Doomed as well where the round of that merge would judge every crate the branch's change
+/// reaches ([`round_reach`], [`reaches_all`]). Like the cut rule it decides only whether a judgment goes on, never
+/// what a landing judges.
+fn conflicting(
+    git: &Git<'_>,
+    reach: &Reaches<'_>,
+    cache: &std::cell::RefCell<Option<(String, Reach)>>,
+    merged: &str,
+    tip: &str,
+    checked: &str,
+    conflicted: &[Vec<u8>],
+) -> Result<Composition, String> {
+    let why = format!(
+        "the merge conflicts in {}",
+        conflicted
+            .iter()
+            .map(|path| display_git_path(path))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let doomed = |what: String| Ok(Composition::Doomed(format!("{why}; {what}")));
+    let differing = git.files(checked, tip)?;
+    let mut paths: BTreeSet<Vec<u8>> = git
+        .files(merged, tip)?
+        .intersection(&git.files(merged, checked)?)
+        .filter(|path| differing.contains(*path))
+        .cloned()
+        .collect();
+    paths.extend(conflicted.iter().cloned());
+    let mut shared = Vec::new();
+    for path in paths {
+        match String::from_utf8(path) {
+            Ok(path) => shared.push(path),
+            Err(error) => {
+                return doomed(format!(
+                    "{} is no path a cone can be read from",
+                    display_git_path(error.as_bytes())
+                ));
+            }
+        }
+    }
+    if let Some(path) = shared
+        .iter()
+        .find(|path| crate::changed::replans_everything(path))
+    {
+        return doomed(format!(
+            "the merge that resolves it shares {path}, which can change how every crate is built \
+             or linted, so it is judged in full"
+        ));
+    }
+    if let Some(path) = git.gitlink(&shared, &[checked, tip])? {
+        return doomed(format!(
+            "the merge that resolves it shares the submodule entry {path}, so it is judged in \
+             full"
+        ));
+    }
+    let owned = match git.no_reach_holds(&shared, &[checked, tip], checked)? {
+        Ok(owned) => owned,
+        Err(unheld) => {
+            return doomed(format!(
+                "{unheld}, so the merge that resolves it is judged in full"
+            ));
+        }
+    };
+    // A merge made by hand is judged over what main's change reaches whatever it shares
+    // (`crate::changed::resolve_round`), so the reach is asked for shared Markdown too.
+    let whole = reaches_all(
+        &round_reach(git, reach, (merged, tip, checked), &owned)?,
+        &branch_reach(git, reach, cache, merged),
+    );
+    Ok(match whole {
+        Some(whole) => Composition::Doomed(format!("{why}; {whole}")),
+        None => Composition::Held(why),
+    })
 }
 
 /// Judge `at` (HEAD) over the cone since merged main `base`, inheriting its lane's reds
 /// once the run ends, outside `branch`'s crates. While it runs, each poll the run asks for
 /// reads main's tip ([`Git::fetch_unless`], the landing's own read, held to [`NETWORK`] and ended
-/// once the poll is moot) and tests a new one ([`composition`]); the first that does not compose
+/// once the poll is moot) and tests a new one ([`composition`], the branch's reach read once for
+/// the run); the first that is doomed
 /// interrupts the run, and nothing it wrote counts: it is stated as interrupted
 /// ([`Stated::interrupted`]). A poll that cannot read or test main changes nothing, and says so
 /// once per run of one reason, unless it became moot meanwhile. It runs as the checkout's own
@@ -1066,6 +1405,7 @@ fn judge(
         branch,
         cone,
         stated,
+        reach: cache,
         ..
     } = held;
     let branch = &*branch.get_or_insert_with(|| own_crates(git, seams, cone));
@@ -1074,13 +1414,40 @@ fn judge(
     ));
     let mut watch = aterm_land::Watch::new(base);
     let ran = {
-        let Seams { judge, say, .. } = &mut *seams;
+        let Seams {
+            judge, say, reach, ..
+        } = &mut *seams;
+        let reach = *reach;
+        // Each closure of a poll says its own line; a poll runs them one after another.
+        let say = std::cell::RefCell::new(say);
         let mut poll = |moot: Moot<'_>| {
             watch.poll(
                 moot,
                 &mut |moot| git.fetch_unless(NETWORK, moot),
-                &mut |tip| composition(git, base, tip, at).map(engine::composition),
-                &mut |why| say(&format!("verify land: {REMOTE}/{MAIN} was not read or tested during the judgment ({why}); it goes on")),
+                &mut |tip| {
+                    let found = composition(git, reach, cache, base, tip, at)?;
+                    // A tip the judgment outlives is said when it is read, once: the person
+                    // then knows of a conflict, or of the round to come, before the run ends.
+                    let went_on = match &found {
+                        Composition::Rechecks { shared, .. } => Some(format!(
+                            "shares {} with the branch: the judgment goes on and stands for the \
+                             tree it runs on, and a round judges the merge once it has passed",
+                            shared.join(", ")
+                        )),
+                        Composition::Held(why) => Some(format!(
+                            "does not merge cleanly ({why}): the judgment goes on and is kept, \
+                             and the merge will stop on the conflict for a person to resolve"
+                        )),
+                        Composition::Composes { .. } | Composition::Doomed(_) => None,
+                    };
+                    if let Some(went_on) = went_on {
+                        (say.borrow_mut())(&format!(
+                            "verify land: {REMOTE}/{MAIN} moved to {tip}, which {went_on}"
+                        ));
+                    }
+                    Ok(engine::composition(found))
+                },
+                &mut |why| (say.borrow_mut())(&format!("verify land: {REMOTE}/{MAIN} was not read or tested during the judgment ({why}); it goes on")),
             )
         };
         judge(git.root, &image.path, base, &mut poll)
@@ -1122,15 +1489,7 @@ fn judge(
     };
     // Read once the run ends: the lane judges main on its own schedule, so a verdict on `base`
     // that came while this ran counts, and none can depend on the branch.
-    let lane = (seams.lane)(git.root, base);
-    (seams.say)(&match &lane {
-        Lane::Red(items) => format!(
-            "verify land: main's lane judged {base} red ({} items)",
-            items.len()
-        ),
-        Lane::Pass => format!("verify land: main's lane judged {base} green"),
-        Lane::Unjudged(why) => format!("verify land: main's lane has not judged {base}: {why}"),
-    });
+    let lane = read_lane(git, seams, base);
     let decision = decide(&judged, &lane, branch);
     for id in &decision.inherited {
         (seams.say)(&format!(
@@ -1176,12 +1535,126 @@ fn judge(
     Ok(Judging::Passed)
 }
 
-/// Recheck `at` (HEAD, the merge of main tip `tip` a Markdown compose made) with the source
-/// readers over the cone since `tip` ([`Seams::recheck`]), as the merge's own verifier
-/// ([`built`]), which must be this image: else [`Rechecking::Elsewhere`], before anything ran.
-/// Nothing is inherited: a recheck reads no lane, so every red counts. It passes only when
-/// each of [`RECHECKS`] ran and said `ok`, and the checkout is still at `at`, clean: its
-/// recheck is then added to `held.stated`.
+/// Main's lane verdict on main commit `base` ([`Seams::lane`]), said.
+fn read_lane(git: &Git<'_>, seams: &mut Seams<'_>, base: &str) -> Lane {
+    let lane = (seams.lane)(git.root, base);
+    (seams.say)(&match &lane {
+        Lane::Red(items) => format!(
+            "verify land: main's lane judged {base} red ({} items)",
+            items.len()
+        ),
+        Lane::Pass => format!("verify land: main's lane judged {base} green"),
+        Lane::Unjudged(why) => format!("verify land: main's lane has not judged {base}: {why}"),
+    });
+    lane
+}
+
+/// What the round of `at` (a merge of main tip `tip` into a judged commit) judges: the judged
+/// commit and the paths the merge shares between the two sides ([`Git::shared`]), read from the
+/// commit and the receipt alone, so the image a round is handed to reads the same, and a merge
+/// this landing did not make (one a person committed after a conflict, [`Git::kept_merge`])
+/// is read as its own is.
+///
+/// No round answers ([`Rounded::Whole`]) where a round's crates, with the source readers, are
+/// not known to cover what the merge changed for the judged commit:
+/// - `at` is not a merge of `tip` into the commit whose tree the receipt's last judgment or
+///   round stands for, over a main `tip` descends from;
+/// - a shared path is named in no UTF-8;
+/// - shared no-reach Markdown fails its rule ([`Git::no_reach_holds`]: a file may read it, or
+///   it is no regular file on every side), whoever made the merge: no cone holds its readers;
+/// - the merge is not the one Git makes of the two ([`Delta::mechanical`]) and shares a path
+///   that can replan every crate ([`crate::changed::REPLANNING_PATHS`]: a lock, a root
+///   manifest, a toolchain or lint file) or a submodule's entry. A round compares such a path
+///   with the judged commit's, so a main change to it that the merge dropped reads as no
+///   change at all, though main's other files no longer agree with it.
+///
+/// # Errors
+/// A Git read failed.
+fn round_delta(git: &Git<'_>, at: &str, tip: &str, stated: &Stated) -> Result<Rounded, String> {
+    let whole = |why: String| Ok(Rounded::Whole(why));
+    let parents = git.parents(at)?;
+    let [judged, main] = parents.as_slice() else {
+        return whole(format!(
+            "{at} is no merge of two commits, so it is not a merge of {tip} into a judged commit"
+        ));
+    };
+    if main != tip {
+        return whole(format!("{at} merges {main}, not the main tip {tip}"));
+    }
+    let (previous, stood) = match stated.rechecks_since_judged().last() {
+        Some(round) => (round.onto.as_str(), round.tree.as_str()),
+        None => match stated.checked.last() {
+            Some(checked) => (checked.base.as_str(), checked.tree.as_str()),
+            None => {
+                return whole(format!(
+                    "no judgment passed before the round of {at}, so nothing stands for its \
+                     first parent"
+                ));
+            }
+        },
+    };
+    if git.tree(judged)? != stood {
+        return whole(format!(
+            "the first parent of {at} is {judged}, whose tree is not {stood}, the tree the \
+             last judgment stands for"
+        ));
+    }
+    if !git.is_ancestor(previous, tip)? {
+        return whole(format!(
+            "{tip} does not descend from {previous}, the main the judged commit merged"
+        ));
+    }
+    let tree = git.tree(at)?;
+    let mechanical = git.merge_tree(tip, judged)?.tree() == Some(tree.as_str());
+    let mut shared = Vec::new();
+    for path in git.shared(previous, tip, judged, &tree)? {
+        match String::from_utf8(path) {
+            Ok(path) => shared.push(path),
+            Err(error) => {
+                return whole(format!(
+                    "the shared path {} is no path a cone can be read from",
+                    display_git_path(error.as_bytes())
+                ));
+            }
+        }
+    }
+    if let Err(why) = git.no_reach_holds(&shared, &[judged, tip, &tree], &tree)? {
+        return whole(why);
+    }
+    if !mechanical {
+        if let Some(path) = shared
+            .iter()
+            .find(|path| crate::changed::replans_everything(path))
+        {
+            return whole(format!(
+                "the merge was resolved or edited by hand and shares {path}, which can change \
+                 how every crate is built or linted"
+            ));
+        }
+        if let Some(path) = git.gitlink(&shared, &[judged, tip, at])? {
+            return whole(format!(
+                "the merge was resolved or edited by hand and shares the submodule entry {path}"
+            ));
+        }
+    }
+    Ok(Rounded::Round(Delta {
+        judged: judged.clone(),
+        shared,
+        mechanical,
+    }))
+}
+
+/// THE ROUND: judge `at` (HEAD, a merge of main tip `tip` into the commit a judgment or an
+/// earlier round passed) with the dev set since `tip`, its crates selected from the shared
+/// paths alone ([`round_delta`], [`Seams::recheck`]), as the merge's own verifier ([`built`]),
+/// which must be this image: else [`Rechecking::Elsewhere`], before anything ran. A merge no
+/// round answers for ([`Rounded::Whole`]) is said and left to a full judgment
+/// ([`Rechecking::Whole`]), before a verifier is built. Its reds are
+/// decided as a judgment's ([`decide`]): by the lane's verdict on `tip`, read once the run
+/// ends, outside the branch's crates (`held.branch`, read over the cone since `tip` where no
+/// judgment of this landing read them). It passes only when each of [`RECHECKS`] also ran and
+/// said `ok` (the source readers answer for every path no cone holds), and the checkout is
+/// still at `at`, clean: the round is then added to `held.stated`.
 fn recheck(
     git: &Git<'_>,
     seams: &mut Seams<'_>,
@@ -1190,52 +1663,70 @@ fn recheck(
     held: &mut Held<'_>,
 ) -> Result<Rechecking, String> {
     let tree = git.tree(at)?;
+    let delta =
+        match round_delta(git, at, tip, &held.stated).map_err(|why| format!("{why}; {RERUN}"))? {
+            Rounded::Round(delta) => delta,
+            Rounded::Whole(why) => {
+                (seams.say)(&format!(
+                    "verify land: no round answers for {tree}: {why}; it is judged in full"
+                ));
+                return Ok(Rechecking::Whole);
+            }
+        };
     let image = match built(git, seams, (at, tip, &tree), held)? {
         Built::Here(image) => image,
         Built::Elsewhere(image) => return Ok(Rechecking::Elsewhere(image)),
         Built::Exit(code) => return Ok(Rechecking::Exit(code)),
     };
-    let stated = &mut held.stated;
+    let Held { branch, stated, .. } = held;
+    let branch = &*branch.get_or_insert_with(|| own_crates(git, seams, tip));
     (seams.say)(&format!(
-        "verify land: rechecking {tree} with {} over the cone since {tip}",
-        RECHECKS.join(", ")
+        "verify land: judging {tree} since {tip} over the crates of the branch's cone that the \
+         paths it shares with the branch ({}), or what {REMOTE}/{MAIN} changed since the judged \
+         commit, reach, {} over the branch's whole change{}",
+        delta.shared.join(", "),
+        RECHECKS.join(", "),
+        if delta.mechanical {
+            ""
+        } else {
+            "; the merge was resolved or edited by hand, so no shared path's crate is judged \
+             alone"
+        }
     ));
-    let judged = (seams.recheck)(git.root, &image.path, tip);
+    let judged = (seams.recheck)(git.root, &image.path, tip, &delta);
     if let Some(why) = git.moved_from(at)? {
         (seams.say)(&format!(
-            "verify land: COULD NOT RUN — during the recheck, {why}; nothing was pushed"
+            "verify land: COULD NOT RUN — during the round, {why}; nothing was pushed"
         ));
         return Ok(Rechecking::Exit(exit::COULD_NOT_RUN));
     }
-    let none = || "a recheck inherits nothing".to_owned();
-    let mut decision = decide(
-        &judged,
-        &Lane::Unjudged(none()),
-        &Branch::Everything(none()),
-    );
-    let ran: BTreeSet<&str> = judged.checks.iter().map(|row| row.check.as_str()).collect();
-    if ran != RECHECKS.into_iter().collect() {
-        decision.not_run.push(format!(
-            "the recheck ran {}, not {}",
-            ran.into_iter().collect::<Vec<_>>().join(", "),
-            RECHECKS.join(", ")
-        ));
-    }
-    for row in &judged.checks {
-        if row.word == "skip" {
-            decision.not_run.push(format!("{} (skipped)", row.check));
+    // Read once the run ends, as a judgment's is.
+    let lane = read_lane(git, seams, tip);
+    let mut decision = decide(&judged, &lane, branch);
+    for check in RECHECKS {
+        match judged.checks.iter().find(|row| row.check == check) {
+            Some(row) if row.word == "skip" => {
+                decision.not_run.push(format!("{check} (skipped)"));
+            }
+            Some(_) => {}
+            None => decision.not_run.push(format!("{check} (not in the run)")),
         }
+    }
+    for id in &decision.inherited {
+        (seams.say)(&format!(
+            "verify land: INHERITED {id} (main's lane named it red at {tip}, outside the branch's crates)"
+        ));
     }
     if !decision.counted.is_empty() {
         (seams.say)(&format!(
-            "verify land: FAIL — the recheck of {tree}: {} failed; nothing was pushed",
+            "verify land: FAIL — the round of {tree}: {} failed; nothing was pushed",
             decision.counted.join(", ")
         ));
         return Ok(Rechecking::Exit(exit::FAILED));
     }
     if !decision.not_run.is_empty() {
         (seams.say)(&format!(
-            "verify land: COULD NOT RUN — the recheck of {tree}: {} did not run; nothing was \
+            "verify land: COULD NOT RUN — the round of {tree}: {} did not run; nothing was \
              pushed",
             decision.not_run.join(", ")
         ));
@@ -1256,20 +1747,33 @@ fn recheck(
         secs: judged.secs,
         after: stated.checked.len(),
     });
+    for id in decision.inherited {
+        if !stated.inherited.contains(&id) {
+            stated.inherited.push(id);
+        }
+    }
     Ok(Rechecking::Passed)
 }
 
-fn conflicted(seams: &mut Seams<'_>, main: &str, paths: &[Vec<u8>]) -> i32 {
+/// Say that merging `main` conflicts in `paths`, which the merge leaves for the person, and why
+/// no rule resolved them (`refusals`, one per path, each on the one line): [`exit::CONFLICT`],
+/// which a landing queue tells from a red.
+fn conflicted(seams: &mut Seams<'_>, main: &str, paths: &[Vec<u8>], refusals: &[String]) -> i32 {
     (seams.say)(&format!(
-        "verify land: FAIL — merging {main} conflicts in {}; nothing was pushed. Fix: resolve \
-         them, commit the merge and run it again",
+        "verify land: CONFLICT — merging {main} conflicts in {} ({}); no path was resolved and \
+         nothing was pushed. Fix: resolve them, commit the merge and run it again",
         paths
             .iter()
             .map(|path| display_git_path(path))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        refusals
+            .iter()
+            .map(|why| why.replace(['\n', '\r'], " "))
+            .collect::<Vec<_>>()
+            .join("; ")
     ));
-    exit::FAILED
+    exit::CONFLICT
 }
 
 /// The landed line. Its re-judges count each merge of a moved main judged again, the ones an
@@ -1300,10 +1804,15 @@ fn landed_line(landing: &str, stated: &Stated) -> String {
 
 /// How a merge of main into the checkout went.
 enum Merge {
-    /// Merged and committed.
-    Clean,
-    /// Stopped on conflicts, left for the person: the conflicted paths.
-    Conflict(Vec<Vec<u8>>),
+    /// Merged and committed: `resolved` names each rule that ran and its path, empty where git
+    /// merged cleanly.
+    Clean { resolved: Vec<String> },
+    /// Stopped on conflicts, left for the person: the conflicted paths, and why no rule resolved
+    /// them, one line per path.
+    Conflict {
+        paths: Vec<Vec<u8>>,
+        refusals: Vec<String>,
+    },
 }
 
 /// Render Git path bytes on one diagnostic line, preserving invalid bytes as escapes.
@@ -1430,13 +1939,14 @@ fn is_lock_alone(paths: &[Vec<u8>]) -> bool {
 }
 
 /// What composing a checked commit onto moving main makes ([`Git::merge_tree`]): its tree, or
-/// a conflict, after which an ordinary worktree merge stops for the person.
+/// a conflict, after which an ordinary worktree merge ([`Git::merge`]) is resolved by rule or
+/// stops for the person.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Compose {
     /// The clean merge's tree.
     Tree(String),
-    /// Git's merge conflicts.
-    Conflict,
+    /// Git's merge conflicts: the conflicted paths, each once, as Git names them.
+    Conflict(Vec<Vec<u8>>),
 }
 
 impl Compose {
@@ -1444,7 +1954,7 @@ impl Compose {
     fn tree(&self) -> Option<&str> {
         match self {
             Compose::Tree(tree) => Some(tree),
-            Compose::Conflict => None,
+            Compose::Conflict(_) => None,
         }
     }
 }
@@ -1526,80 +2036,61 @@ impl Git<'_> {
             lock,
         })
     }
-    /// THE MARKDOWN RULE (`docs/DESIGN-landing-economy.md` §2.1): whether checked commit
-    /// `checked` (judged over the cone since `base`) composes onto main's tip `main` once the
-    /// source readers pass on their clean merge `tree`, where [`Self::independent_changes`]
-    /// found shared paths. `Ok(paths)` names every path both sides changed: each is
-    /// - in the no-reach class over the merge's own layout ([`aterm_census::no_reach::class`]):
-    ///   each shared path after the convergence discard (a shared `Cargo.lock` is not, so a
-    ///   lock beside Markdown is judged), and each path the merge holds unlike both sides;
-    /// - a regular non-executable file (mode 100644) in `checked`, `main` and the merge, so a
-    ///   rename on either side, a symlink, a gitlink or a deletion is judged;
-    /// - read by no file of the merge by [`aterm_census::no_reach::may_read`] (a Rust file, or a
-    ///   crate's Markdown, outside `crates/aterm-census` naming its file name, a docs directory
-    ///   above it or, for a spec table, `SPECS.md` from its own crate, in code or a doctest):
-    ///   the census guard's backstop for a read it cannot resolve;
-    ///
-    /// and the merge holds this land's own no-reach rule ([`Self::holds_this_rule`]), so the
-    /// class this binary read is the one census's guard holds the merge to. `Err(why)` says
-    /// which part does not hold. Unavailable entry evidence keeps every shared
-    /// path, as [`Self::independent_changes`] does.
-    fn markdown_shared(
+    /// THE SHARED PATHS of a merge `tree` of main commit `main` into checked commit `checked`,
+    /// both descending from `base`: each path of the branch's change that the merge holds
+    /// unlike the branch, each path of main's change that it holds unlike main, and each path
+    /// it holds unlike both. Every other path the merge holds as one side alone left it. For a
+    /// merge Git made cleanly these are the paths both sides changed, less those whose entry is
+    /// the same in all three, and the paths the merge itself moved or made (a rename it
+    /// followed).
+    fn shared(
         &self,
         base: &str,
         main: &str,
         checked: &str,
         tree: &str,
-    ) -> Result<Result<Vec<String>, String>, String> {
-        let theirs = self.files(base, main)?;
-        let ours = self.files(base, checked)?;
-        let mut shared: BTreeSet<Vec<u8>> = theirs.intersection(&ours).cloned().collect();
-        if let (Ok(main_changes), Ok(merge_changes)) = (
-            self.entry_changes(checked, main),
-            self.entry_changes(checked, tree),
-        ) {
-            shared.retain(|path| main_changes.contains(path) || merge_changes.contains(path));
-        }
-        let merged: BTreeSet<Vec<u8>> = self
-            .files(main, tree)?
-            .intersection(&self.files(checked, tree)?)
+    ) -> Result<BTreeSet<Vec<u8>>, String> {
+        let from_checked = self.files(checked, tree)?;
+        let from_main = self.files(main, tree)?;
+        let mut shared: BTreeSet<Vec<u8>> = self
+            .files(base, checked)?
+            .intersection(&from_checked)
             .cloned()
             .collect();
-        shared.extend(merged);
-        if shared.is_empty() {
-            return Ok(Err("no path is shared".into()));
+        shared.extend(self.files(base, main)?.intersection(&from_main).cloned());
+        shared.extend(from_checked.intersection(&from_main).cloned());
+        Ok(shared)
+    }
+
+    /// THE MARKDOWN RULE (`docs/DESIGN-landing-economy.md` §2.1) over `paths`, the shared paths
+    /// ([`Self::shared`]) of a merge `tree` of main's tip into a checked commit, `sides` being
+    /// those two commits and the merge (before a merge that conflicts is made, the two commits,
+    /// with the checked one as `tree`). A path in the no-reach class over `tree`'s own layout
+    /// ([`aterm_census::no_reach::class`]) is in no crate's cone, so a round's cone holds none
+    /// of its readers: the source readers alone answer for it, which holds only where each such
+    /// path is
+    /// - a regular non-executable file (mode 100644) in each of `sides`, so a rename on either
+    ///   side, a symlink, a gitlink or a deletion is judged in full;
+    /// - read by no file of `tree` by [`aterm_census::no_reach::may_read`] (a Rust file, or a
+    ///   crate's Markdown, outside `crates/aterm-census` naming its file name, a docs directory
+    ///   above it or, for a spec table, `SPECS.md` from its own crate, in code or a doctest):
+    ///   the census guard's backstop for a read it cannot resolve;
+    ///
+    /// and `tree` holds this land's own no-reach rule ([`Self::holds_this_rule`]), so the
+    /// class this binary read is the one census's guard holds the merge to. `Ok(owned)` names
+    /// the paths outside the class, which a crate may own (a shared `Cargo.lock` is one);
+    /// `Err(why)` says which part does not hold for a path in it.
+    fn no_reach_holds(
+        &self,
+        paths: &[String],
+        sides: &[&str],
+        tree: &str,
+    ) -> Result<Result<Vec<String>, String>, String> {
+        let (paths, owned) = self.classed(paths, tree)?;
+        if paths.is_empty() {
+            return Ok(Ok(owned));
         }
-        let mut paths = Vec::new();
-        for path in &shared {
-            match std::str::from_utf8(path) {
-                Ok(path) => paths.push(path.to_owned()),
-                Err(_) => {
-                    return Ok(Err(format!(
-                        "{} is no Markdown the rule names",
-                        display_git_path(path)
-                    )));
-                }
-            }
-        }
-        let listing = self.paths(&["ls-tree", "-r", "-z", "--name-only", "--full-tree", tree])?;
-        let manifest = self
-            .local(&["cat-file", "blob", &format!("{tree}:Cargo.toml")])
-            .ok();
-        let layout = aterm_census::no_reach::Layout::new(
-            manifest.as_deref(),
-            listing
-                .iter()
-                .filter_map(|path| std::str::from_utf8(path).ok()),
-        );
-        if let Some(path) = paths
-            .iter()
-            .find(|path| !aterm_census::no_reach::class(path, &layout))
-        {
-            return Ok(Err(format!(
-                "{path} is not Markdown no build, include or test reads"
-            )));
-        }
-        for commit in [checked, main, tree] {
+        for commit in sides.iter().copied() {
             let mut args = vec![
                 "--literal-pathspecs",
                 "ls-tree",
@@ -1625,10 +2116,10 @@ impl Git<'_> {
                     regular.insert(path.to_owned());
                 }
             }
-            if let Some(path) = paths.iter().find(|path| !regular.contains(*path)) {
+            if let Some(path) = paths.iter().find(|path| !regular.contains(path.as_str())) {
                 return Ok(Err(format!(
-                    "{path} is not one regular file in {commit}, the branch's and main's tips \
-                     and their merge"
+                    "{path} is not one regular file in {commit}, one of the branch's and main's \
+                     tips and their merge"
                 )));
             }
         }
@@ -1644,7 +2135,61 @@ impl Git<'_> {
                 )));
             }
         }
-        Ok(Ok(paths))
+        Ok(Ok(owned))
+    }
+
+    /// `paths` split by the no-reach class over `tree`'s own layout
+    /// ([`aterm_census::no_reach::class`]): those in it, which no crate's cone holds, and those
+    /// outside it, which a crate may own.
+    fn classed(&self, paths: &[String], tree: &str) -> Result<(Vec<String>, Vec<String>), String> {
+        let listing = self.paths(&["ls-tree", "-r", "-z", "--name-only", "--full-tree", tree])?;
+        let manifest = self
+            .local(&["cat-file", "blob", &format!("{tree}:Cargo.toml")])
+            .ok();
+        let layout = aterm_census::no_reach::Layout::new(
+            manifest.as_deref(),
+            listing
+                .iter()
+                .filter_map(|path| std::str::from_utf8(path).ok()),
+        );
+        Ok(paths
+            .iter()
+            .cloned()
+            .partition(|path| aterm_census::no_reach::class(path, &layout)))
+    }
+
+    /// The first of `paths` that is a submodule's entry (a gitlink) in one of `commits`.
+    fn gitlink(&self, paths: &[String], commits: &[&str]) -> Result<Option<String>, String> {
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        for commit in commits {
+            let mut args = vec![
+                "--literal-pathspecs",
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                commit,
+                "--",
+            ];
+            args.extend(paths.iter().map(String::as_str));
+            let out = self.complete(&args, LOCAL)?;
+            if !out.status.success() {
+                return Err(format!(
+                    "git ls-tree {commit}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            for entry in out.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+                let entry = String::from_utf8_lossy(entry);
+                if let Some((meta, path)) = entry.split_once('\t')
+                    && meta.starts_with("160000 ")
+                {
+                    return Ok(Some(path.to_owned()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The first file of `tree` that may read no-reach `path` ([`aterm_census::no_reach::may_read`]:
@@ -1835,12 +2380,47 @@ impl Git<'_> {
         })
     }
 
-    /// Main's tip read through `run`, then written to its remote-tracking ref.
+    /// Main's tip read through `run`, then cached without overwriting another writer's
+    /// observation made during that read. An absent tracking ref is created conditionally.
     fn fetch_through(&self, run: &crate::remote::Runner<'_>) -> Result<String, String> {
+        let reference = format!("refs/remotes/{REMOTE}/{MAIN}");
+        let before = self.complete(&["rev-parse", "--quiet", "--verify", &reference], LOCAL)?;
+        let expected = if before.status.success() {
+            String::from_utf8(before.stdout)
+                .map_err(|_| "main's tracking ref is not UTF-8")?
+                .trim()
+                .to_owned()
+        } else if before.status.code() == Some(1) && before.stdout.is_empty() {
+            String::new()
+        } else {
+            return Err(format!(
+                "cannot read main's tracking ref: {}",
+                String::from_utf8_lossy(&before.stderr).trim()
+            ));
+        };
         let remote = crate::remote::Remote::open(self.root, REMOTE, run)?;
         let tip = remote.refresh_main()?;
-        self.local(&["update-ref", &format!("refs/remotes/{REMOTE}/{MAIN}"), &tip])?;
+        if let Err(why) = self.local(&["update-ref", "--no-deref", &reference, &tip, &expected]) {
+            // Git's local transport may have recorded this same observation itself.
+            if self.local(&["rev-parse", "--verify", &reference])? != tip {
+                return Err(why);
+            }
+        }
         Ok(tip)
+    }
+
+    /// Record a known successful landing where the tracking ref still names its expected
+    /// parent. Git's local transport may already have updated it; agh does not. Another
+    /// writer's newer observation is preserved, including one made between this read and CAS.
+    /// Only the tracking ref itself is written: a symbolic alias never redirects the write
+    /// into its target branch, even if introduced after the read.
+    fn track_landing(&self, landing: &str, onto: &str) -> Result<(), String> {
+        let reference = format!("refs/remotes/{REMOTE}/{MAIN}");
+        let current = self.local(&["rev-parse", "--verify", &reference])?;
+        if current == onto {
+            self.local(&["update-ref", "--no-deref", &reference, landing, onto])?;
+        }
+        Ok(())
     }
 
     fn is_ancestor(&self, ancestor: &str, of: &str) -> Result<bool, String> {
@@ -1903,20 +2483,31 @@ impl Git<'_> {
     }
 
     /// The tree composing `checked` onto moving `main` makes ([`Compose::Tree`]), or a Git
-    /// conflict, which requires an ordinary worktree merge.
+    /// conflict with the paths it names conflicted, which requires an ordinary worktree merge.
+    /// Git writes the tree and then each conflicted path once, each ended by a NUL.
     fn merge_tree(&self, main: &str, checked: &str) -> Result<Compose, String> {
         let out = self.complete(
-            &["merge-tree", "--write-tree", "--no-messages", main, checked],
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "--name-only",
+                "-z",
+                main,
+                checked,
+            ],
             LOCAL,
         )?;
-        let first = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned();
+        let mut fields = out.stdout.split(|b| *b == 0);
+        let first = String::from_utf8_lossy(fields.next().unwrap_or_default()).into_owned();
         match out.status.code() {
             Some(0) if aterm_types::land_trailer::object_id(&first) => Ok(Compose::Tree(first)),
-            Some(1) => Ok(Compose::Conflict),
+            Some(1) => Ok(Compose::Conflict(
+                fields
+                    .filter(|path| !path.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect(),
+            )),
             _ => Err(format!(
                 "git merge-tree {main} {checked}: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
@@ -2013,7 +2604,9 @@ impl Git<'_> {
     /// Merge main commit `main` into the checkout and update its submodules. The merge is held
     /// before its commit, so a commit git refuses (a signing failure, a held `index.lock`) is
     /// aborted back to the clean branch tip ([`Self::abort_own_merge`]) rather than left as a
-    /// staged merge the next run cannot start from.
+    /// staged merge the next run cannot start from. A conflict whose every path a mechanical
+    /// rule resolves ([`resolve::plan`]) is resolved and committed with the rules named in its
+    /// message; any other is left as git left it ([`Merge::Conflict`]).
     fn merge(&self, main: &str, subject: &str) -> Result<Merge, String> {
         let tip = self.head()?;
         let out = self
@@ -2063,28 +2656,261 @@ impl Git<'_> {
                 format!("HEAD moved from {tip} to {after} during its uncommitted merge"),
             ));
         }
-        if !conflicted.is_empty() {
-            return Ok(Merge::Conflict(conflicted.into_iter().collect()));
-        }
         // A commit's stdout is diagnostic, not a data protocol. Its owning exit decides
         // success; complete capture remains necessary for the repository reads above.
-        const COMMIT: &[&str] = &["commit", "--quiet", "--no-verify", "--no-edit"];
-        let committed = self
-            .status(COMMIT, LOCAL)
+        let commit = |args: &[&str], shown: &str| -> Result<(), String> {
+            let committed = self
+                .status(args, LOCAL)
+                .map_err(|why| self.abort_own_merge(&tip, main, why))?;
+            if !committed.status.success() {
+                return Err(self.abort_own_merge(
+                    &tip,
+                    main,
+                    format!(
+                        "git {shown}: {}",
+                        String::from_utf8_lossy(&committed.stderr).trim()
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        if conflicted.is_empty() {
+            const COMMIT: &[&str] = &["commit", "--quiet", "--no-verify", "--no-edit"];
+            commit(COMMIT, &COMMIT.join(" "))?;
+            self.update_submodules()?;
+            return Ok(Merge::Clean {
+                resolved: Vec::new(),
+            });
+        }
+        // Every conflicted path's rule is asked before anything is written: one path no rule
+        // resolves leaves the whole conflict as git left it.
+        let resolution = match resolve::plan(self, &conflicted) {
+            Ok(resolution) => resolution,
+            Err(refusals) => {
+                return Ok(Merge::Conflict {
+                    paths: conflicted.into_iter().collect(),
+                    refusals,
+                });
+            }
+        };
+        resolve::apply(self, &resolution).map_err(|why| self.abort_own_merge(&tip, main, why))?;
+        let left = self
+            .paths(&["diff", "-z", "--name-only", "--diff-filter=U"])
             .map_err(|why| self.abort_own_merge(&tip, main, why))?;
-        if !committed.status.success() {
+        if !left.is_empty() {
+            let named = left
+                .iter()
+                .map(|path| display_git_path(path))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(self.abort_own_merge(
                 &tip,
                 main,
-                format!(
-                    "git {}: {}",
-                    COMMIT.join(" "),
-                    String::from_utf8_lossy(&committed.stderr).trim()
-                ),
+                format!("the rules left {named} unmerged"),
             ));
         }
+        // An explicit message, not git's MERGE_MSG: under `--no-edit` its cleanup is
+        // whitespace, which would keep its commented `# Conflicts:` lines.
+        let message = format!("{subject}\n\n{}", resolution.note());
+        commit(
+            &["commit", "--quiet", "--no-verify", "-m", message.as_str()],
+            "commit --quiet --no-verify -m <the resolved merge's message>",
+        )?;
         self.update_submodules()?;
-        Ok(Merge::Clean)
+        Ok(Merge::Clean {
+            resolved: resolution.said,
+        })
+    }
+
+    /// Every unmerged path's stages, read from the index (`ls-files -u`): the merge base, ours
+    /// and theirs ([`resolve::Stages`]).
+    fn unmerged(&self) -> Result<BTreeMap<Vec<u8>, resolve::Stages>, String> {
+        const ARGS: &[&str] = &["ls-files", "-u", "-z"];
+        let out = self.complete(ARGS, LOCAL)?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {}: {}",
+                ARGS.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let mut found: BTreeMap<Vec<u8>, resolve::Stages> = BTreeMap::new();
+        for record in out.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let malformed = || {
+                format!(
+                    "git {} wrote a record that is not `<mode> <object> <stage>\\t<path>`: {:?}",
+                    ARGS.join(" "),
+                    String::from_utf8_lossy(record)
+                )
+            };
+            let tab = record
+                .iter()
+                .position(|b| *b == b'\t')
+                .ok_or_else(malformed)?;
+            let meta = std::str::from_utf8(&record[..tab]).map_err(|_| malformed())?;
+            let mut parts = meta.split(' ');
+            let (Some(mode), Some(oid), Some(stage), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Err(malformed());
+            };
+            let slot = match stage {
+                "1" => 0,
+                "2" => 1,
+                "3" => 2,
+                _ => return Err(malformed()),
+            };
+            let stages = found
+                .entry(record[tab + 1..].to_vec())
+                .or_insert_with(|| [None, None, None]);
+            stages[slot] = Some(resolve::Stage {
+                mode: mode.to_owned(),
+                oid: oid.to_owned(),
+            });
+        }
+        Ok(found)
+    }
+
+    /// The bytes of blob `oid`.
+    fn blob(&self, oid: &str) -> Result<Vec<u8>, String> {
+        let args = ["cat-file", "blob", oid];
+        let out = self.complete(&args, LOCAL)?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(out.stdout)
+    }
+
+    /// Whether the checkout can hold a file at repository path `path` with no write outside it,
+    /// reading only: refused where a part is empty, `.` or `..`, or where one of its existing
+    /// parts (itself included) is a symbolic link or cannot be read.
+    fn writable(&self, path: &str) -> Result<(), String> {
+        let mut at = self.root.to_path_buf();
+        for part in path.split('/') {
+            if matches!(part, "" | "." | "..") {
+                return Err(format!("{path:?} is not a plain repository path"));
+            }
+            at.push(part);
+            match std::fs::symlink_metadata(&at) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(format!("{} is a symbolic link", at.display()));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(format!("{}: {error}", at.display())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` at repository path `path` in the checkout and stage it. A path
+    /// [`Self::writable`] refuses is refused again here, before anything is written, so no
+    /// write lands outside the checkout even where the checkout changed since the rules read it.
+    /// A file that does not exist is created only where nothing appeared at its path meanwhile
+    /// (never overwriting one), and is added to `created` as soon as it exists, so the caller
+    /// can remove it whatever fails after.
+    fn put(&self, path: &str, bytes: &[u8], created: &mut Vec<PathBuf>) -> Result<(), String> {
+        use std::io::Write as _;
+        self.writable(path)?;
+        let file = self.root.join(path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+        let written = if std::fs::symlink_metadata(&file).is_err() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file)
+                .and_then(|mut out| {
+                    created.push(file.clone());
+                    out.write_all(bytes)
+                })
+        } else {
+            std::fs::write(&file, bytes)
+        };
+        written.map_err(|error| format!("{}: {error}", file.display()))?;
+        self.local(&["--literal-pathspecs", "add", "--", path])
+            .map(drop)
+    }
+
+    /// The rule lines of every merge of main this tool resolved by rule
+    /// ([`resolve::Resolution::note`]) on the first-parent line from `onto` to `at`, oldest
+    /// first, each without its `- `. Only a merge whose subject is this tool's
+    /// ([`merge_subject`]) and whose second paragraph opens with [`resolve::NOTE_HEAD`] counts,
+    /// so no branch commit that mentions the words is copied into a landing message. Nor does
+    /// one `onto` already holds restated ([`Self::restated`]): its rules ran for that earlier
+    /// landing, not this one.
+    fn resolutions(&self, onto: &str, at: &str) -> Result<Vec<String>, String> {
+        let range = format!("{onto}..{at}");
+        let args = [
+            "log",
+            "--first-parent",
+            "--merges",
+            "--format=%x00%T %P%n%B",
+            range.as_str(),
+        ];
+        let out = self.complete(&args, LOCAL)?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let ours = format!("Merge {REMOTE}/{MAIN} into ");
+        let mut lines = Vec::new();
+        for record in text.split('\0').rev() {
+            let Some((identity, message)) = record.split_once('\n') else {
+                continue;
+            };
+            let mut paragraphs = message.trim_start_matches('\n').split("\n\n");
+            let (Some(subject), Some(note)) = (paragraphs.next(), paragraphs.next()) else {
+                continue;
+            };
+            if subject.contains('\n') || !subject.starts_with(&ours) {
+                continue;
+            }
+            let Some(rest) = note.strip_prefix(resolve::NOTE_HEAD) else {
+                continue;
+            };
+            if !rest.starts_with('\n') || self.restated(identity, onto)? {
+                continue;
+            }
+            lines.extend(
+                rest.lines()
+                    .filter_map(|line| line.strip_prefix("- "))
+                    .map(str::to_owned),
+            );
+        }
+        Ok(lines)
+    }
+
+    /// Whether `onto` holds a merge with the tree and parents `identity` names
+    /// (`<tree> <first parent> <main parent>`, as `%T %P` writes them): the landing that
+    /// restated that merge, on main already, as where the checkout was not moved to that
+    /// landing ([`Self::adopt`]). Such a landing is a child of the merged main
+    /// commit and an ancestor of `onto`, so only that ancestry path is read.
+    fn restated(&self, identity: &str, onto: &str) -> Result<bool, String> {
+        let Some(main) = identity.split(' ').nth(2) else {
+            return Ok(false);
+        };
+        let range = format!("{main}..{onto}");
+        Ok(self
+            .local(&[
+                "log",
+                "--merges",
+                "--ancestry-path",
+                "--format=%T %P",
+                range.as_str(),
+            ])?
+            .lines()
+            .any(|line| line == identity))
     }
 
     /// Check out the commits the index records for this checkout's submodules. A recorded
@@ -2250,14 +3076,11 @@ impl Git<'_> {
         Ok(tree)
     }
 
-    /// The judgment kept at [`KEPT`], where it holds for the checkout at `head`: `None` where
-    /// none is kept, else the judgment or why this run does not resume it. It holds only where
-    /// its record is whole (the judged commit and the main commit it merged; a receipt whose
-    /// last judgment or recheck names the record's own tree and that main commit, composed onto
-    /// nothing), `head` is the judged commit and holds the judged tree, and `head` holds that
-    /// main commit: a judgment passes only on the tree it ran on, over the cone it was computed
-    /// from.
-    fn kept(&self, head: &str) -> Result<Option<Result<Kept, String>>, String> {
+    /// The record kept at [`KEPT`]: `None` where none is kept, else the commit it judged with
+    /// the judgment, or why the record is not whole. It is whole where it names a judged commit
+    /// and the main commit that merged, and carries a receipt whose last judgment or round names
+    /// the record's own tree and that main commit, composed onto nothing.
+    fn kept_record(&self) -> Result<Option<KeptRecord>, String> {
         let spec = format!("{KEPT}^{{commit}}");
         let found = self.complete(&["rev-parse", "-q", "--verify", &spec], LOCAL)?;
         let record = match found.status.code() {
@@ -2297,33 +3120,95 @@ impl Git<'_> {
                  since {merged}"
             ))));
         };
+        Ok(Some(Ok((
+            judged_at.clone(),
+            Kept {
+                tree: judged,
+                merged: merged.clone(),
+                stated,
+            },
+        ))))
+    }
+
+    /// The judgment kept at [`KEPT`], where it holds for the checkout at `head`: `None` where
+    /// none is kept, else the judgment or why this run does not resume it. It holds only where
+    /// its record is whole ([`Self::kept_record`]), `head` is the judged commit and holds the
+    /// judged tree, and `head` holds the main commit it merged: a judgment passes only on the
+    /// tree it ran on, over the cone it was computed from.
+    fn kept(&self, head: &str) -> Result<Option<Result<Kept, String>>, String> {
+        let (judged_at, kept) = match self.kept_record()? {
+            None => return Ok(None),
+            Some(Err(why)) => return Ok(Some(Err(why))),
+            Some(Ok(record)) => record,
+        };
         if judged_at != head {
             return Ok(Some(Err(format!(
                 "it judged {judged_at}, and HEAD is {head}"
             ))));
         }
         let tree = self.tree(head)?;
-        if tree != judged {
+        if tree != kept.tree {
             return Ok(Some(Err(format!(
-                "it judged {judged}, and HEAD holds {tree}"
+                "it judged {}, and HEAD holds {tree}",
+                kept.tree
             ))));
         }
-        if !self.is_ancestor(merged, head)? {
+        if !self.is_ancestor(&kept.merged, head)? {
             return Ok(Some(Err(format!(
-                "HEAD does not hold {merged}, the main commit it merged"
+                "HEAD does not hold {}, the main commit it merged",
+                kept.merged
             ))));
         }
-        Ok(Some(Ok(Kept {
-            tree,
-            merged: merged.clone(),
-            stated,
-        })))
+        Ok(Some(Ok(kept)))
     }
 
-    /// Forget the kept judgment ([`KEPT`]): its landing is on main. One that does not delete
-    /// holds for no checkout whose head is not already on main.
-    fn forget(&self) {
-        let _ = self.local(&["update-ref", "-d", KEPT]);
+    /// The judgment kept at [`KEPT`], where the checkout at `head` is a merge of a main commit
+    /// into the commit it judged: the judgment and that main commit. It holds only where the
+    /// record is whole ([`Self::kept_record`]), `head` has exactly two parents, the first the
+    /// judged commit, holding the judged tree, and the second a commit that descends from the
+    /// main the judgment merged and that `fetched`, main's tip, holds. Such a merge is judged
+    /// as a round ([`recheck`]), whoever made it: a person, after a conflict stopped the
+    /// landing or by merging main themselves, or this tool, in a run that ended before its
+    /// round of the merge passed. A merge the tool began to judge in full is not found here:
+    /// that judgment dropped the record before it ran, so a red or killed full judgment is
+    /// never followed by a round. Nothing here says the merge is one a round answers for:
+    /// [`round_delta`] decides that.
+    fn kept_merge(&self, head: &str, fetched: &str) -> Result<Option<(Kept, String)>, String> {
+        let Some(Ok((judged_at, kept))) = self.kept_record()? else {
+            return Ok(None);
+        };
+        let parents = self.parents(head)?;
+        let [first, onto] = parents.as_slice() else {
+            return Ok(None);
+        };
+        if *first != judged_at
+            || self.tree(first)? != kept.tree
+            || !self.is_ancestor(&kept.merged, onto)?
+            || !self.is_ancestor(onto, fetched)?
+        {
+            return Ok(None);
+        }
+        Ok(Some((kept, onto.clone())))
+    }
+
+    /// The tree of the judgment kept at [`KEPT`], where HEAD is a merge whose first parent is
+    /// the commit it judged: a round of that merge that went red is run again as a round while
+    /// the merge keeps those parents (amended, never built upon). `None` where nothing is kept
+    /// for HEAD's first parent.
+    fn kept_parent(&self) -> Result<Option<String>, String> {
+        let Some(Ok((judged_at, kept))) = self.kept_record()? else {
+            return Ok(None);
+        };
+        let parents = self.parents(&self.head()?)?;
+        Ok(matches!(parents.as_slice(), [first, _] if *first == judged_at).then_some(kept.tree))
+    }
+
+    /// Forget the kept judgment ([`KEPT`]): its landing is on main, or a whole judgment is
+    /// about to answer for the checkout instead. After a landing a record that does not
+    /// delete holds for no checkout whose head is not already on main; before a whole
+    /// judgment it must be gone, so that caller stops on the error.
+    fn forget(&self) -> Result<(), String> {
+        self.local(&["update-ref", "-d", KEPT]).map(drop)
     }
 
     /// Move the checkout's branch from `judged` to the landing: a fast-forward where the landing
@@ -2375,24 +3260,43 @@ pub fn usage() -> String {
          the dev set over the cone since M1, push, and where {MAIN} moved meanwhile compose onto\n\
          it (a clean merge and disjoint or exactly convergent entries, except a sole remaining\n\
          shared Cargo.lock whose isolated local product version alone moved) or merge it and\n\
-         judge the branch's delta from that main tip, at most {REJUDGES} times. A {MAIN} that\n\
-         moves again is composed onto again, at most {COMPOSES} times in a row. Where the\n\
-         shared paths are only Markdown no build, include or test reads (root *.md,\n\
-         docs/**/*.md, a workspace member's SPECS.md; census's no-reach-read guard\n\
-         holds that set), it merges that tip and reruns only fmt, census and export-scan on the\n\
-         merge with the merged tree's own verifier, over the cone since the tip, and states an\n\
-         Aterm-Rechecked line; any red there counts. A red main's lane already named at the\n\
-         main commit merged (M1, or the moved main a re-judge merged), in a crate outside the\n\
+         judge the branch's delta from that main tip. A {MAIN} that moves again is composed\n\
+         onto again, at most {COMPOSES} times in a row. No count of re-judges ends a landing:\n\
+         a red, a conflict, a checkout that moved, that push bound, a remote that stays down\n\
+         or a hang detector does. Where the endpoints share any other path and the merge is\n\
+         clean, the judgment stands for the tree it ran on and a ROUND judges the merge: it\n\
+         merges that tip and runs, with the merged tree's own verifier, the dev set since\n\
+         the tip over the crates of the branch's cone that {MAIN}'s change reaches: of the\n\
+         crates a judgment of the merge would select, those in the cone of the shared paths\n\
+         and those in the cone of what {MAIN} changed since the judged commit, shared or\n\
+         not. A crate left out builds from the judged tree's own files. fmt, census and\n\
+         export-scan read the branch's whole change and must each pass. The round states an\n\
+         Aterm-Rechecked line and renews the push bound; a red there counts as a judgment's\n\
+         does. Shared Markdown no build, include or test reads (root *.md, docs/**/*.md, a\n\
+         workspace member's SPECS.md; census's no-reach-read guard holds that set) is in no\n\
+         cone, and a round of a clean merge that shares only such Markdown judges no crate. Where\n\
+         code names it, where the round would judge every crate the branch's change reaches\n\
+         ({MAIN}'s change reaches them all, or the branch's reaches every crate) or where\n\
+         {MAIN} was rewritten, the tip is merged and the branch judged in full. Where the\n\
+         merge CONFLICTS the judgment is kept: the merge stops on the conflict, and once a\n\
+         person commits it (first parent the judged commit, second a commit of {MAIN}) the\n\
+         next run judges it by a round, in which no shared path's crate is judged alone; a\n\
+         hand merge that shares a lock, a root manifest, a toolchain or lint file or a\n\
+         submodule entry, or Markdown a file may read, is judged in full, and a conflict in\n\
+         such a path keeps nothing.\n\
+         A red main's lane already named at the\n\
+         main commit merged (M1, or the moved main a re-judge or round merged), in a crate outside the\n\
          branch's own, is INHERITED: named, not counted. The landing merge carries\n\
          Aterm-Checked, Aterm-Interrupted, Aterm-Rechecked, Aterm-Composed-Onto and\n\
          Aterm-Inherited trailers.\n\n\
          While a judgment runs, {REMOTE}/{MAIN} is read at each stage boundary the run reports\n\
-         and at least every {poll} minutes. The first tip that does not compose by the same\n\
-         rule INTERRUPTS the run: its process group is ended, and what that started outside\n\
+         and at least every {poll} minutes. The first tip a full judgment must answer by the\n\
+         same rule (a conflicting one only where the merge to come leaves nothing of the\n\
+         judgment standing) INTERRUPTS the run: its process group is ended, and what that started outside\n\
          it is awaited as it ends by its own parent-death watch. The interrupted run is no\n\
-         verdict, and states an Aterm-Interrupted line, never an Aterm-Checked one. While\n\
-         re-judges remain, that tip is merged and judged at once, as one of the {REJUDGES}. A tip\n\
-         that composes by either rule changes nothing, and a run that already reported a red (FAIL or NOT RUN:\n\
+         verdict, and states an Aterm-Interrupted line, never an Aterm-Checked one. That tip\n\
+         is merged and judged at once. A tip\n\
+         that composes or that a round answers changes nothing, and a run that already reported a red (FAIL or NOT RUN:\n\
          a check, a stage or a test binary), even one later INHERITED, is not interrupted: its\n\
          end decides.\n\n\
          Convergence requires identical mode, type and object (or all absent) in checked, new\n\
@@ -2415,7 +3319,11 @@ pub fn usage() -> String {
          ({KEPT}) until its landing is on {MAIN}: a run that\n\
          ends before then (stopped at a bound, a remote that stayed down, a kill) is run again,\n\
          and while HEAD is still the judged commit it goes straight to the push with the same\n\
-         receipt, judging again only where the moved {MAIN} does not compose.\n\n\
+         receipt, judging again only where the moved {MAIN} does not compose. While HEAD is a\n\
+         merge of a {MAIN} commit into the judged commit, it starts at that merge's round: a\n\
+         red round is fixed by amending the merge, since a commit on top of it is judged in\n\
+         full. A full judgment of a merge drops what was kept before it runs, so one that\n\
+         went red or was killed is run again in full.\n\n\
          GitHub reads and writes use agh (expected refs, durable write intents; one write, with\n\
          no rehearsal that would repeat agh's re-verification of the pushed history while\n\
          {MAIN} moves); local remotes use git's file protocol only. Required submodules must\n\
@@ -2425,9 +3333,19 @@ pub fn usage() -> String {
          Each judgment and recheck runs as the verifier built from the tree it judges: where that\n\
          build is not the running landing, the landing hands itself to it in place and goes on\n\
          ({resume} <file> is that handoff's own word, never a person's).\n\n\
-         Exit: 0 landed (or nothing to land), 1 a red or a conflict (nothing pushed), 2 usage,\n\
-         3 could not run, {STOPPED} stopped while {MAIN} kept moving (merged and judged, or its\n\
-         judgment interrupted; not pushed).\n",
+         A merge of {MAIN} (M1, or a re-judge's) that conflicts is resolved only where every\n\
+         conflicted path has a mechanical rule that resolves it: CHANGELOG.md takes {MAIN}'s file\n\
+         and each [Unreleased] entry the branch added becomes its own changes/<kind>/ file;\n\
+         docs/PLAN.md and docs/STATUS.md, which the lab tracker regenerates, take {MAIN}'s side;\n\
+         a SPECS.md table takes each row from the side that changed it (a row both sides\n\
+         changed differently has no rule). The resolved merge names the rules that ran and is\n\
+         judged in full as any other, and the landing message names them too. One path no rule\n\
+         resolves resolves none, and the merge is left for the person.\n\n\
+         Exit: 0 landed (or nothing to land), 1 a red (nothing pushed), 2 usage, 3 could not\n\
+         run, {conflict} a conflict no rule resolves (nothing pushed; the merge is left for the\n\
+         person), {STOPPED} stopped after {COMPOSES} push races while {MAIN} kept moving\n\
+         (merged and judged, its judgment kept; not pushed).\n",
+        conflict = exit::CONFLICT,
         resume = handoff::RESUME,
         poll = POLL.as_secs() / 60,
         pause = RETRY_PAUSE.as_secs(),
@@ -2674,7 +3592,10 @@ fn with_live_seams<R>(options: &LandResources, f: impl FnOnce(&mut Seams<'_>) ->
         judge: &mut |root, verifier, base, poll| live_judge(root, verifier, base, options, poll),
         branch: &mut live_branch,
         lane: &mut live_lane,
-        recheck: &mut |root, verifier, base| live_recheck(root, verifier, base, options),
+        reach: &live_reach,
+        recheck: &mut |root, verifier, base, delta| {
+            live_recheck(root, verifier, base, delta, options)
+        },
         hand_over: &mut handoff::hand_over,
         say: &mut say,
         remote: &crate::remote::run,
@@ -2709,15 +3630,22 @@ fn live_judge(
     resources: &LandResources,
     poll: Poll<'_>,
 ) -> Ran {
-    nested(root, verifier, base, &[], resources, poll)
+    nested(root, verifier, base, None, resources, poll)
 }
 
-/// The source readers ([`RECHECKS`]) over the cone since `base`, run as [`live_judge`] runs the
-/// dev set: as `verifier`, the checkout's own verifier built from the merge it rechecks and the
-/// landing's own image, so the merged tree's rules judge it and nothing an earlier build left
-/// is reused. Nothing interrupts it.
-fn live_recheck(root: &Path, verifier: &Path, base: &str, resources: &LandResources) -> Judged {
-    match nested(root, verifier, base, &RECHECKS, resources, &mut |_| false) {
+/// A round: the dev set since `base` over the crates of that cone that `delta`'s shared paths
+/// or main's change since its judged commit reach (`crate::changed::resolve_round`), run as
+/// [`live_judge`] runs a judgment: as `verifier`, the checkout's own verifier
+/// built from the merge it judges and the landing's own image, so the merged tree's rules
+/// judge it and nothing an earlier build left is reused. Nothing interrupts it.
+fn live_recheck(
+    root: &Path,
+    verifier: &Path,
+    base: &str,
+    delta: &Delta,
+    resources: &LandResources,
+) -> Judged {
+    match nested(root, verifier, base, Some(delta), resources, &mut |_| false) {
         Ran::Ended(judged) => judged,
         Ran::Interrupted { secs } => Judged {
             code: exit::COULD_NOT_RUN,
@@ -2727,13 +3655,15 @@ fn live_recheck(root: &Path, verifier: &Path, base: &str, resources: &LandResour
     }
 }
 
-/// `checks` (the dev set where empty) over the cone since `base`, as `verifier`, the
-/// checkout's freshly built verifier.
+/// The dev set since `base`, as `verifier`, the checkout's freshly built verifier: over the
+/// cone since `base`, or, for a round, over what is left of it to judge beside `delta`'s kept
+/// judgment, whose shared paths it writes NUL-terminated beside the run's events for the child
+/// to read ([`Round`]).
 fn nested(
     root: &Path,
     verifier: &Path,
     base: &str,
-    checks: &[&str],
+    delta: Option<&Delta>,
     resources: &LandResources,
     poll: Poll<'_>,
 ) -> Ran {
@@ -2751,7 +3681,23 @@ fn nested(
         Err(e) => return not_run(format!("cannot make a scratch directory: {e}")),
     };
     let events = dir.path().join("verify.events");
-    let command = judgment_command(verifier, root, base, checks, &events, resources, &env);
+    let shared = dir.path().join("verify.shared");
+    if let Some(delta) = delta {
+        let mut bytes = Vec::new();
+        for path in &delta.shared {
+            bytes.extend_from_slice(path.as_bytes());
+            bytes.push(0);
+        }
+        if let Err(e) = std::fs::write(&shared, bytes) {
+            return not_run(format!("cannot write the round's shared paths: {e}"));
+        }
+    }
+    let round = delta.map(|delta| Round {
+        judged: &delta.judged,
+        shared: &shared,
+        mechanical: delta.mechanical,
+    });
+    let command = judgment_command(verifier, root, base, round, &events, resources, &env);
     let mut cmd = match command {
         Ok(cmd) => cmd,
         Err(error) => return not_run(format!("cannot own the nested verifier: {error}")),
@@ -3153,14 +4099,26 @@ fn beyond(rows: &[aterm_uds::process::Lineage], group: u32, known: &[Started]) -
     found
 }
 
+/// A round's selection as its child's words name it: `--judged <commit> --shared <file>`
+/// ([`crate::cli::Args::judged`]), with `--by-hand` for a merge Git did not make.
+#[derive(Clone, Copy, Debug)]
+pub struct Round<'a> {
+    /// The judged commit ([`Delta::judged`]).
+    pub judged: &'a str,
+    /// The file that holds the shared paths ([`Delta::shared`]), each ended by a NUL.
+    pub shared: &'a Path,
+    /// Whether the merge is the one Git makes ([`Delta::mechanical`]): where it is not, the
+    /// child is told so ([`crate::cli::BY_HAND`]) and judges no shared path's member alone.
+    pub mechanical: bool,
+}
+
 /// Run the checkout's freshly built verifier directly, owned by the calling land process, on
-/// `checks` (the dev set where empty: a judgment; [`RECHECKS`]: a recheck). Its test check
-/// brackets each test binary's executable and declared runtime inputs
+/// the dev set since `base`: over the cone since it (a judgment), or, with `round`, over what
+/// is left of that cone to judge beside the round's kept judgment (`crate::changed::resolve_round`;
+/// [`verifier_command`] with a judgment's words). Its test
+/// check brackets each test binary's executable and declared runtime inputs
 /// ([`crate::cli::INPUT_DRIFT`]): a successful binary whose inputs changed while it ran makes it
 /// NOT RUN, and nothing is carried between judgments.
-/// The explicit trampoline uses the caller's current executable, whose `main` must serve
-/// [`aterm_uds::tether::entry`]. It does not depend on the image recorded before a rebuild.
-/// Linux runs its loaded image through `/proc/self/exe`, which a replaced pathname cannot change.
 /// Its words are composed and parsed by one build: a landing whose image is not the checkout's
 /// build hands itself over to that build first ([`handoff`]), so these flags are the landing's
 /// own, internal, and may change with any main.
@@ -3170,9 +4128,43 @@ pub fn judgment_command(
     verifier: &Path,
     root: &Path,
     base: &str,
-    checks: &[&str],
+    round: Option<Round<'_>>,
     events: &Path,
     resources: &LandResources,
+    env: &crate::EnvSnapshot,
+) -> std::io::Result<Command> {
+    let mut cmd = verifier_command(verifier, root, env)?;
+    cmd.args(["--base", base]);
+    if let Some(round) = round {
+        cmd.args([crate::cli::JUDGED, round.judged, crate::cli::SHARED])
+            .arg(round.shared);
+        if !round.mechanical {
+            cmd.arg(crate::cli::BY_HAND);
+        }
+    }
+    cmd.arg("--events")
+        .arg(events)
+        .args([aterm_capacity::Admit::FLAG, resources.admit.word()])
+        .arg(crate::cli::INPUT_DRIFT);
+    if let Some(timeout) = resources.timeout.as_deref() {
+        cmd.args(["--timeout", timeout]);
+    }
+    if let Some(cores) = resources.test_cores {
+        cmd.args(["--test-cores", &cores.to_string()]);
+    }
+    Ok(cmd)
+}
+
+/// The checkout's freshly built verifier as a judgment runs it, before its words: in the
+/// checkout's root, leading its own process group, tethered to the calling land process.
+/// The explicit trampoline uses the caller's current executable, whose `main` must serve
+/// [`aterm_uds::tether::entry`]. It does not depend on the image recorded before a rebuild.
+/// Linux runs its loaded image through `/proc/self/exe`, which a replaced pathname cannot change.
+/// # Errors
+/// This process's executable path could not be read.
+pub fn verifier_command(
+    verifier: &Path,
+    root: &Path,
     env: &crate::EnvSnapshot,
 ) -> std::io::Result<Command> {
     #[cfg(unix)]
@@ -3195,20 +4187,88 @@ pub fn judgment_command(
     cmd.process_group(0);
     cmd.current_dir(root);
     crate::native_verifier::configure_runtime(&mut cmd, root, env);
-    cmd.args(checks)
-        .args(["--base", base, "--events"])
-        .arg(events)
-        .args([aterm_capacity::Admit::FLAG, resources.admit.word()]);
-    if checks.is_empty() || checks.contains(&"test") {
-        cmd.arg(crate::cli::INPUT_DRIFT);
-    }
-    if let Some(timeout) = resources.timeout.as_deref() {
-        cmd.args(["--timeout", timeout]);
-    }
-    if let Some(cores) = resources.test_cores {
-        cmd.args(["--test-cores", &cores.to_string()]);
-    }
     Ok(cmd)
+}
+
+/// The hang detector on one reach read ([`live_reach`]): its graph reads are `targo tree`
+/// calls and Git reads with no bound of their own, and a poll that waited on one would hold a
+/// landing whose judgment has ended.
+const REACH: Duration = Duration::from_secs(120);
+
+/// [`read_reach`] on a thread of its own, awaited at most [`REACH`]: a read that does not end
+/// (a toolchain or package-cache lock another process holds) is left behind and answers
+/// [`Reach::Unread`], said once here, which cuts no judgment.
+fn live_reach(root: &Path, from: &str, paths: Option<&[String]>) -> Reach {
+    let (done, read) = std::sync::mpsc::channel();
+    let asked = (
+        root.to_owned(),
+        from.to_owned(),
+        paths.map(<[String]>::to_vec),
+    );
+    let started = std::thread::Builder::new()
+        .name("land-reach".to_owned())
+        .spawn(move || {
+            let (root, from, paths) = asked;
+            let _ = done.send(read_reach(&root, &from, paths.as_deref()));
+        });
+    let found = match started {
+        Err(error) => Reach::Unread(format!("its read did not start: {error}")),
+        Ok(_) => match read.recv_timeout(REACH) {
+            Ok(found) => found,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Reach::Unread(format!("its read did not end within {}s", REACH.as_secs()))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Reach::Unread("its read ended with no answer".to_owned())
+            }
+        },
+    };
+    if let Reach::Unread(why) = &found {
+        println!(
+            "verify land: what {} since {from} reaches was not read ({why}): it interrupts no \
+             judgment",
+            if paths.is_some() {
+                "main's change"
+            } else {
+                "the branch's change"
+            }
+        );
+    }
+    found
+}
+
+/// What `paths`, as changed since `from`, reach in the checkout at `root`, or, with none, what
+/// the change since `from` does: the crates of the cone [`crate::changed`] selects (seeds,
+/// dependents, readers and namers), with no member judged alone for a path list. A toolchain
+/// that does not resolve leaves it unread.
+fn read_reach(root: &Path, from: &str, paths: Option<&[String]>) -> Reach {
+    let env = crate::EnvSnapshot::capture();
+    let tools = match crate::preflight(&env, root) {
+        Ok(tools) => tools,
+        Err(why) => return Reach::Unread(format!("the toolchain did not resolve: {why}")),
+    };
+    let path_env = tools.path_with_stage2_first(&env.path);
+    let selection = match paths {
+        None => crate::changed::resolve(root, &tools, &path_env, from),
+        Some(_) if !tools.have_targo() => {
+            return Reach::Unread(
+                "targo is absent, so the dependency graph cannot be read".to_owned(),
+            );
+        }
+        Some(paths) => {
+            crate::changed::resolve_paths(root, &tools, &path_env, from, paths.to_vec(), None)
+        }
+    };
+    match selection {
+        crate::changed::Selection::Widened(why) => Reach::Everything(why),
+        crate::changed::Selection::Narrowed { crates, .. } => Reach::Crates(
+            crates
+                .iter()
+                .filter_map(|spec| crate::scope::spec_name(spec))
+                .map(str::to_owned)
+                .collect(),
+        ),
+    }
 }
 
 /// The seeds of the cone since `base`, as [`crate::changed::resolve`] reads them for the run.

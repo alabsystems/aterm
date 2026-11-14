@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE JUDGES of `lab harness-proof` ([`crate::harness_proof`]): each leg of
-//! `docs/DESIGN-harness-repos-2026-10-24.md` §9 step 2 judged from what aterm showed, as plain
+//! `docs/DESIGN-harness-repos-2026-10-24.md` §9 judged from what aterm showed, as plain
 //! data, so a leg that must fail on a broken harness is checked here without one
 //! (`harness_proof_judge_tests.rs`).
 //!

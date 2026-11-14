@@ -894,7 +894,8 @@ pub fn judge_r4(ev: &Ev, leg: &Leg) -> Judged {
 pub struct Listed {
     /// `auth`: `ok`, `signed-out` or `unseen`.
     pub auth: String,
-    /// `login`: `ok`, `idle`, `due` or `expired` (`accounts::LoginState`).
+    /// `login`: `signed-out` for a row with no login to run on here, `signing-in` while its
+    /// sign-in runs, else `ok`, `idle` or `due` (`accounts::LoginState`).
     pub login: String,
     /// `condition`: `usable`, `limited`, `signed-out`, `not-enrolled`, …
     pub condition: String,
@@ -950,7 +951,8 @@ fn failing(outcome: &str) -> bool {
 /// out, its `auth` row back to `ok`; no automatic sign-in of `d.to` after the displacement
 /// through this leg's end (a later leg can displace that account again); no
 /// account restart in the window (the default login moved, not the session); the listing after
-/// (`leg.listing`) shows `d.to` with auth `ok`, its login not `expired` and no failed sign-in on
+/// (`leg.listing`) shows `d.to` with auth `ok`, a login here (its `login` neither `signed-out`
+/// nor `signing-in`) and no failed sign-in on
 /// record; and the first turn served after the lab's prompt (`leg.asked`) carried `d.auth`, its
 /// history holding `d.prompts`. Unproven where all that holds but the listing before showed
 /// nothing stale against `d.to` (no sign-out, no failed sign-in), which a sync with no fix would
@@ -999,8 +1001,8 @@ pub fn judge_r5(ev: &Ev, leg: &Leg, d: Displacement<'_>) -> Judged {
             if row.auth != "ok" {
                 missing.push(format!("{} listed auth {}", d.to, row.auth));
             }
-            if row.login == "expired" {
-                missing.push(format!("{} listed login expired", d.to));
+            if matches!(row.login.as_str(), "signed-out" | "signing-in") {
+                missing.push(format!("{} listed login {}", d.to, row.login));
             }
             if failing(&row.sign_in) {
                 missing.push(format!(

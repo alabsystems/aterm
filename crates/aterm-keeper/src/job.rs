@@ -158,7 +158,9 @@ pub fn submit(label: &str, program: &str, args: &[&str], stderr: &Path) -> io::R
     run_launchctl(&submit_argv(label, program, args, stderr))
 }
 
-/// End a submitted job (launchd sends it SIGTERM) and forget it.
+/// Ask launchd to end a submitted job (by SIGTERM) and forget it.
+/// Success acknowledges the request; callers requiring completed removal must
+/// observe [`JobState::Absent`].
 ///
 /// # Errors
 /// `launchctl` failing to run or refusing (a label it does not know).
@@ -196,14 +198,32 @@ fn launchctl_io_error(err: aterm_uds::deadline::RunError) -> io::Error {
 /// Read a job's state with `launchctl print gui/<uid>/<label>` (read-only).
 ///
 /// # Errors
-/// `launchctl` failing to run at all.
+/// `launchctl` failing to run or refusing without an explicit missing-service
+/// receipt for the requested label and GUI domain.
 #[cfg(unix)]
 pub fn state(label: &str) -> io::Result<JobState> {
+    let domain = gui_domain();
     let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
-    cmd.arg("print").arg(format!("{}/{label}", gui_domain()));
+    cmd.arg("print").arg(format!("{domain}/{label}"));
     let out = launchctl_output(&mut cmd, std::time::Instant::now()).map_err(launchctl_io_error)?;
+    state_output(&domain, label, &out)
+}
+
+#[cfg(unix)]
+fn state_output(domain: &str, label: &str, out: &std::process::Output) -> io::Result<JobState> {
     if !out.status.success() {
-        return Ok(JobState::Absent);
+        let absent = format!(
+            "Bad request.\nCould not find service \"{label}\" in domain for user {}\n",
+            domain.replace('/', ": ")
+        );
+        if out.status.code().is_some() && out.stdout.is_empty() && out.stderr == absent.as_bytes() {
+            return Ok(JobState::Absent);
+        }
+        return Err(io::Error::other(format!(
+            "launchctl print {domain}/{label}: {}{}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        )));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let pid = text.lines().find_map(|l| {

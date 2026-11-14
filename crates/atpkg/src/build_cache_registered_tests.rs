@@ -2034,7 +2034,7 @@ fn equivalent_inherited_placement_preserves_owners_through_nested_and_rust_calls
         format!("--target-dir={}", target.display()),
     ];
     assert_eq!(
-        super::super::explicit_cache(&typed, super::super::Tool::Targo, &machine, &|_| {
+        super::super::selected_outputs(&typed, super::super::Tool::Targo, &machine, &|_| {
             super::super::UserAlias::None
         })
         .expect("the fixture exposes its explicit target and owning manifest")
@@ -2198,7 +2198,7 @@ fn quiet_physical_target_inherited_by_verify_prepares_the_owned_target() {
 }
 
 #[test]
-fn custom_or_overridden_inherited_placement_keeps_conservative_custody() {
+fn inherited_placement_keeps_known_choices_and_protects_unknown_ones() {
     for choice in [
         "mismatch",
         "opaque",
@@ -2256,7 +2256,7 @@ fn custom_or_overridden_inherited_placement_keeps_conservative_custody() {
         }
         assert_eq!(
             read(&world.path()).unwrap().owners_unknown,
-            choice != "unmarked",
+            matches!(choice, "opaque" | "file" | "unknown-template"),
             "{choice}"
         );
         if choice == "unmarked" {
@@ -3722,9 +3722,10 @@ fn a_short_manifest_and_targo_twins_name_what_their_long_spellings_name() {
     let paired = world.home.join("paired-final.noindex");
     let into_paired = [format!("--target-dir={}", paired.display())];
     for var in [super::super::BUILD_DIR_ENV, super::super::BUILD_DIR_TWIN] {
-        assert!(produce(var, &inside, Tool::Targo, &[]).is_err(), "{var}");
-        assert!(!produce(var, &outside, Tool::Targo, &[]).unwrap(), "{var}");
-        // With a known target too, both output roots must be admitted.
+        assert!(produce(var, &inside, Tool::Targo, &[]).unwrap(), "{var}");
+        assert!(world.owner.join("target").is_dir(), "{var}");
+        assert!(produce(var, &outside, Tool::Targo, &[]).is_err(), "{var}");
+        // Both the workspace default and an explicit final target require paired custody.
         assert!(
             produce(var, &inside, Tool::Targo, &into_paired).unwrap(),
             "{var}"
@@ -7549,6 +7550,269 @@ fn quiet_front_prepares_foreign_manifest_targets_without_claiming_custody() {
                     assert_eq!(std::fs::metadata(&quiet).unwrap().mode() & 0o777, 0o777);
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn a_default_final_target_requires_agreement_even_with_foreign_intermediates() {
+    for tool in [super::super::Tool::CargoCompat, super::super::Tool::Tippy] {
+        let world = World::new();
+        let member = world.owner.join("member");
+        std::fs::create_dir(&member).unwrap();
+        std::fs::write(
+            world.owner.join("Cargo.toml"),
+            "[workspace]\nmembers=['member']\nresolver='3'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='compat'\nversion='0.0.0'\nworkspace='..'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("Targo.toml"),
+            "[package]\nname='native'\nversion='0.0.0'\n[workspace]\n",
+        )
+        .unwrap();
+        let intermediate = world
+            .home
+            .parent()
+            .unwrap()
+            .join("foreign-intermediate.noindex");
+        let environment = |name: &str| {
+            (name == super::super::BUILD_DIR_ENV).then(|| intermediate.as_os_str().to_owned())
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&member),
+            env: &environment,
+            read: &super::super::read_config,
+            read_manifest: &super::super::read_manifest,
+            writable: &|_| Some(true),
+        };
+        let words = if tool == super::super::Tool::Tippy {
+            Vec::new()
+        } else {
+            vec!["build".into()]
+        };
+        let choice =
+            selected_call_outputs(&words, tool, &machine, &|_| super::super::UserAlias::None)
+                .expect("the output graph is known even though manifest readings disagree");
+        assert_eq!(choice.target, super::super::FinalTarget::WorkspaceDefault);
+        assert!(
+            observe_for_producer(&words, tool, &world.home, &machine, true).is_err(),
+            "{tool:?}"
+        );
+        assert!(roots(&world.home).is_empty());
+        assert!(!world.owner.join("target").exists());
+        assert!(!member.join("target").exists());
+        assert!(!intermediate.exists());
+    }
+}
+
+#[test]
+fn a_foreign_manifest_default_target_preserves_unrelated_managed_receipts() {
+    let world = World::new();
+    world.build();
+    let foreign = world.home.parent().unwrap().join("foreign-source");
+    std::fs::create_dir(&foreign).unwrap();
+    let manifest = foreign.join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        "[package]\nname='foreign'\nversion='0.0.0'\n[workspace]\n",
+    )
+    .unwrap();
+    let logical_manifest = world.owner.join("Cargo.toml");
+    std::fs::remove_file(&logical_manifest).unwrap();
+    std::os::unix::fs::symlink(&manifest, &logical_manifest).unwrap();
+    let intermediate = foreign.join("intermediate.noindex");
+    let environment = |name: &str| {
+        (name == super::super::BUILD_DIR_ENV).then(|| intermediate.as_os_str().to_owned())
+    };
+    let machine = super::super::Machine {
+        home: Some(&world.home),
+        root: None,
+        cwd: Some(&world.owner),
+        env: &environment,
+        read: &super::super::read_config,
+        read_manifest: &super::super::read_manifest,
+        writable: &|_| Some(true),
+    };
+    let words = vec!["--unverified".into(), "build".into()];
+    let before = std::fs::read(world.path()).unwrap();
+    assert!(
+        !observe_for_producer(
+            &words,
+            super::super::Tool::Targo,
+            &world.home,
+            &machine,
+            true,
+        )
+        .unwrap()
+    );
+    assert_eq!(std::fs::read(world.path()).unwrap(), before);
+    assert_eq!(roots(&world.home).len(), 1);
+    assert!(!foreign.join("target").exists());
+    assert!(!intermediate.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_default_final_target_cannot_escape_custody_through_a_foreign_intermediate() {
+    let world = World::new();
+    let intermediate = world.home.parent().unwrap().join("foreign-build.noindex");
+    let words = vec!["--unverified".into(), "build".into()];
+    let out = through_placed_front(
+        &world,
+        &world.owner,
+        Path::new("/bin/echo"),
+        &words,
+        None,
+        "-",
+        Some(intermediate.to_str().unwrap()),
+    );
+    assert_eq!(out.status.code(), Some(75), "{out:?}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("--unverified build"));
+    assert!(!world.owner.join("target").exists());
+    assert!(!intermediate.exists());
+    assert!(roots(&world.home).is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_default_final_target_refuses_existing_unowned_outputs() {
+    let world = World::new();
+    let target = world.owner.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("keep"), b"caller output").unwrap();
+    let intermediate = world.home.join("intermediate.noindex");
+    let words = vec![
+        "--unverified".into(),
+        "build".into(),
+        "--config".into(),
+        format!("build.build-dir='{}'", intermediate.display()),
+    ];
+    let out = through_placed_front(
+        &world,
+        &world.owner,
+        Path::new("/bin/echo"),
+        &words,
+        None,
+        "-",
+        None,
+    );
+    assert_eq!(out.status.code(), Some(75), "{out:?}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("--unverified build"));
+    assert_eq!(
+        std::fs::read(target.join("keep")).unwrap(),
+        b"caller output"
+    );
+    assert!(!target.join(MARKER).exists());
+    // Pair admission may keep a fresh empty owned first root, but never adopts the
+    // existing final output or starts the producer before both outputs have custody.
+    for receipt in roots(&world.home) {
+        assert_eq!(receipt.root, intermediate);
+        assert_eq!(receipt.owners, vec![world.owner.clone()]);
+        assert!(!receipt.owners_unknown);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_intermediate_only_build_claims_the_workspace_default_target() {
+    for (member, nested, explicit_manifest, effective_cwd) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (true, true, false, false),
+        (true, false, true, false),
+        (true, false, false, true),
+    ] {
+        let world = World::new();
+        let package = if member {
+            std::fs::write(
+                world.owner.join("Cargo.toml"),
+                "[workspace]\nmembers=['member']\nresolver='3'\n",
+            )
+            .unwrap();
+            let package = world.owner.join("member");
+            std::fs::create_dir(&package).unwrap();
+            std::fs::write(
+                package.join("Cargo.toml"),
+                "[package]\nname='member'\nversion='0.0.0'\nedition='2024'\n",
+            )
+            .unwrap();
+            package
+        } else {
+            std::fs::write(
+                world.owner.join("Cargo.toml"),
+                "[package]\nname='standalone'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
+            )
+            .unwrap();
+            world.owner.clone()
+        };
+        let target = world.owner.join("target");
+        let intermediate = if nested {
+            super::super::target_build_path(&target)
+        } else {
+            world.home.join("intermediate.noindex")
+        };
+        let launcher = world.home.join("launcher");
+        std::fs::create_dir(&launcher).unwrap();
+        let mut words = vec!["--unverified".into()];
+        if effective_cwd {
+            words.extend([
+                "-Zunstable-options".into(),
+                "-C".into(),
+                package.display().to_string(),
+            ]);
+        }
+        words.extend([
+            "build".into(),
+            "--config".into(),
+            format!("build.build-dir='{}'", intermediate.display()),
+        ]);
+        if explicit_manifest {
+            words.push(format!(
+                "--manifest-path={}",
+                package.join("Cargo.toml").display()
+            ));
+        }
+        let out = through_placed_front(
+            &world,
+            if explicit_manifest || effective_cwd {
+                &launcher
+            } else {
+                &package
+            },
+            Path::new("/bin/echo"),
+            &words,
+            None,
+            "-",
+            None,
+        );
+        assert!(out.status.success(), "member={member}: {out:?}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("--target-dir="));
+        let registered = roots(&world.home);
+        assert!(target.is_dir() && intermediate.is_dir());
+        assert_eq!(
+            registered.len(),
+            if nested { 1 } else { 2 },
+            "member={member}"
+        );
+        let expected_roots = if nested {
+            vec![&target]
+        } else {
+            vec![&target, &intermediate]
+        };
+        for path in expected_roots {
+            let receipt = registered
+                .iter()
+                .find(|receipt| receipt.root.as_path() == path.as_path())
+                .unwrap();
+            assert_eq!(receipt.owners, vec![world.owner.clone()]);
+            assert!(!receipt.owners_unknown);
         }
     }
 }

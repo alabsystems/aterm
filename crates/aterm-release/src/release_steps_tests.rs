@@ -8422,3 +8422,54 @@ fn a_nested_lock_follows_the_bump_in_its_path_crates_only() {
             .replacen("\"leaf 0.147.0\"", "\"leaf 0.148.0\"", 1)
     );
 }
+
+/// Step 1 asks the released-shim judgment of a tree exactly while its `test` check has no
+/// passing record: none yet, a FAIL, or records nobody can read.
+/// NEGATIVE CONTROLS: a tree whose `test` record passed is not asked again, whatever else it
+/// still owes or failed, so a release that qualified is not refused over a later public release.
+#[test]
+fn the_early_released_shim_ask_is_owed_until_the_trees_test_record_passes() {
+    use crate::check_record::{Checks, Failed};
+    let failed = |check: &str| Failed {
+        check: check.to_owned(),
+        log: String::new(),
+        unrecorded: false,
+    };
+    assert!(super::shim_owed(&Err("the records cannot be read".into())));
+    assert!(super::shim_owed(&Ok(Checks::no("no record stands"))));
+    let mut red = Checks::default();
+    red.failed.push(failed("test"));
+    assert!(super::shim_owed(&Ok(red)));
+
+    assert!(!super::shim_owed(&Ok(Checks::default())));
+    let mut other = Checks::default();
+    other.missing.push("measure".to_owned());
+    other.failed.push(failed("doc"));
+    assert!(!super::shim_owed(&Ok(other)));
+}
+
+/// Step 1 keeps the judgment's own row and reads its verdict as a pass, as R's red or as a
+/// judgment this Mac could not make. NEGATIVE CONTROL: an undecided judgment is never a pass
+/// and never R's red.
+#[test]
+fn step_one_reads_the_released_shim_verdict_as_a_pass_a_red_or_unanswered() {
+    use aterm_verify::released_shim::{Judged, Verdict};
+    let row = "released-shim: the row";
+    let found = |verdict| {
+        super::shim_finding(Judged {
+            verdict,
+            row: row.to_owned(),
+            output: String::new(),
+        })
+    };
+    assert_eq!(found(Verdict::Accepted), Ok(row.to_owned()));
+    assert_eq!(found(Verdict::NotThisHost), Ok(row.to_owned()));
+    assert_eq!(
+        found(Verdict::Refused),
+        Err(super::InputFinding::Failed(row.to_owned()))
+    );
+    assert_eq!(
+        found(Verdict::Undecided),
+        Err(super::InputFinding::Unanswered(row.to_owned()))
+    );
+}

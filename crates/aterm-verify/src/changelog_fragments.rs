@@ -441,7 +441,7 @@ pub fn unreleased_findings(changelog: &str) -> Vec<(usize, String)> {
         .position(|l| l.starts_with("## "))
         .map_or(lines.len(), |p| start + 1 + p);
     let mut lined = Vec::new();
-    raw_entries_lined(&lines, start, end, &mut lined);
+    raw_entries_lined(&lines, start, end, &mut lined, &mut Vec::new());
     lined
 }
 
@@ -463,10 +463,82 @@ pub fn unreleased_entries(changelog: &str) -> Vec<String> {
         .position(|l| l.starts_with("## "))
         .map_or(lines.len(), |p| start + 1 + p);
     let mut lined = Vec::new();
-    raw_entries_lined(&lines, start, end, &mut lined)
+    raw_entries_lined(&lines, start, end, &mut lined, &mut Vec::new())
         .into_iter()
         .map(|raw| raw.text)
         .collect()
+}
+
+/// `[Unreleased]`'s raw body as `verify land`'s changelog rule reads it
+/// ([`unreleased_by_kind`]): what taking another side's `CHANGELOG.md` would drop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnreleasedBody {
+    /// Each entry, in file order, with its kind (`Added`, …; `None` under no `### ` heading),
+    /// a harness-versions entry aside, as [`unreleased_entries`] reads it.
+    pub entries: Vec<(Option<&'static str>, String)>,
+    /// The lines of each closed HTML comment the body holds outside its entries, in file order:
+    /// the one text besides entries, `### ` headings and blank lines a body may hold.
+    pub comments: Vec<String>,
+}
+
+/// `changelog`'s `[Unreleased]` body, each entry with its kind ([`UnreleasedBody`]); an empty
+/// body where the file has no `## [Unreleased]`.
+/// Serves the drain of entries written before fragments; it goes once `[Unreleased]` holds none.
+///
+/// # Errors
+/// Every finding [`unreleased_findings`] names, in its words: a body that holds anything but
+/// `### <kind>` headings, entries, blank lines and closed HTML comments.
+pub fn unreleased_by_kind(changelog: &str) -> Result<UnreleasedBody, Vec<String>> {
+    let lines: Vec<&str> = changelog.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|l| is_section_header(l, "Unreleased"))
+    else {
+        return Ok(UnreleasedBody::default());
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("## "))
+        .map_or(lines.len(), |p| start + 1 + p);
+    let mut lined = Vec::new();
+    let mut comments = Vec::new();
+    let raws = raw_entries_lined(&lines, start, end, &mut lined, &mut comments);
+    if !lined.is_empty() {
+        return Err(lined.into_iter().map(|(_, message)| message).collect());
+    }
+    Ok(UnreleasedBody {
+        entries: raws
+            .into_iter()
+            .map(|raw| (raw.kind.map(|rank| KINDS[rank]), raw.text))
+            .collect(),
+        comments,
+    })
+}
+
+/// The fragment one `[Unreleased]` entry of `kind` (`Added`, …) becomes at
+/// `changes/<kind>/<name>.md`: a leading `* ` written `- `, trailing blank lines dropped and one
+/// final newline, as [`fragment_findings`] holds a file to.
+///
+/// # Errors
+/// What [`fragment_findings`] finds in that file, so the writer and the checker hold one rule:
+/// an unindented continuation line, for one.
+pub fn fragment(kind: &str, name: &str, entry: &str) -> Result<Fragment, Vec<String>> {
+    let path = format!("{FRAGMENT_DIR}/{}/{name}.md", kind.to_ascii_lowercase());
+    let entry = match entry.strip_prefix("* ") {
+        Some(rest) => format!("- {rest}"),
+        None => entry.to_owned(),
+    };
+    let mut lines: Vec<&str> = entry.split('\n').collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let text = format!("{}\n", lines.join("\n"));
+    let found = fragment_findings(&path, &text);
+    if found.is_empty() {
+        Ok(Fragment { path, text })
+    } else {
+        Err(found)
+    }
 }
 
 /// The entries `[Unreleased]` (lines `start+1..end`) holds, in file order, each with its kind
@@ -475,17 +547,19 @@ pub fn unreleased_entries(changelog: &str) -> Vec<String> {
 /// is then refused outright, once `[Unreleased]` holds none.
 fn raw_entries(lines: &[&str], start: usize, end: usize, found: &mut Vec<String>) -> Vec<Raw> {
     let mut lined = Vec::new();
-    let out = raw_entries_lined(lines, start, end, &mut lined);
+    let out = raw_entries_lined(lines, start, end, &mut lined, &mut Vec::new());
     found.extend(lined.into_iter().map(|(_, message)| message));
     out
 }
 
-/// [`raw_entries`], its findings in `lined` by line as well as in words.
+/// [`raw_entries`], its findings in `lined` by line as well as in words, and the lines of each
+/// closed HTML comment outside an entry in `comments`.
 fn raw_entries_lined(
     lines: &[&str],
     start: usize,
     end: usize,
     lined: &mut Vec<(usize, String)>,
+    comments: &mut Vec<String>,
 ) -> Vec<Raw> {
     let mut out = Vec::new();
     let mut kind: Option<usize> = None;
@@ -509,6 +583,7 @@ fn raw_entries_lined(
                 ));
                 return out;
             };
+            comments.extend(lines[at..=at + close].iter().map(|l| (*l).to_owned()));
             at += close + 1;
             continue;
         }

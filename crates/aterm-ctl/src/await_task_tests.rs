@@ -1007,6 +1007,8 @@ fn peer(_: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefus
         }),
         label: "lab-mini".to_owned(),
         node: None,
+        asked_by: None,
+        unnamed: None,
     })
 }
 
@@ -1033,7 +1035,96 @@ fn answers(line: &str) -> crate::DriveLink {
         stream: Box::new(Answers(io::Cursor::new(format!("{line}\n").into_bytes()))),
         label: "lab-mini".to_owned(),
         node: None,
+        asked_by: None,
+        unnamed: None,
     }
+}
+
+/// A WAIT IS ONE READ OF EACH MAC IT ASKS, HOWEVER MANY LEGS IT TAKES. Until a Mac answers,
+/// each leg names the session that waits and nothing is noted; the first leg it answers is the
+/// wait's one row; every leg after dials naming no session (the driven Mac counts none) and
+/// notes nothing. NEGATIVE CONTROL: noting each answered leg, or dialling each leg named,
+/// fails the counts below.
+#[test]
+fn a_wait_of_many_legs_is_one_read_of_each_mac() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    const NODE: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+    const ASKER: &str = "s-0123456789abcdef0123";
+    static NAMED: AtomicUsize = AtomicUsize::new(0);
+    static UNNAMED: AtomicUsize = AtomicUsize::new(0);
+    fn unnamed(_: &str, _: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+        UNNAMED.fetch_add(1, SeqCst);
+        Ok(crate::DriveLink {
+            node: Some(NODE.to_owned()),
+            ..answers(&format!("OK 1\n{NEEDS_YOU}"))
+        })
+    }
+    fn named(host: &str, _: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
+        // The first dial of `lab-mini` reaches nothing: the wait asks again.
+        if NAMED.fetch_add(1, SeqCst) == 0 && host == "lab-mini" {
+            return Err(crate::DriveRefused {
+                again: true,
+                ..crate::DriveRefused::once("lab-mini took no connection".to_owned())
+            });
+        }
+        Ok(crate::DriveLink {
+            node: Some(NODE.to_owned()),
+            asked_by: Some(ASKER.to_owned()),
+            unnamed: Some(unnamed),
+            ..answers(&format!("OK 1\n{NEEDS_YOU}"))
+        })
+    }
+    let noted = || {
+        crate::fleet_activity::NOTED
+            .with(|noted| std::mem::take(&mut *noted.borrow_mut()))
+            .into_iter()
+            .map(|row| (row.what, row.way, row.by, row.n))
+            .collect::<Vec<_>>()
+    };
+    let one_read = [(
+        aterm_types::fleet_activity::Plain::Read,
+        aterm_types::fleet_activity::Way::Out,
+        Some(ASKER.to_owned()),
+        1,
+    )];
+    drop(noted());
+    let asking = Asking::by(named);
+    let leg = |host: &str| {
+        driven_leg(
+            &asking,
+            (host, "await task @s-a1 since=0 timeout=1000\n"),
+            Duration::from_secs(1),
+            (None, None),
+        )
+    };
+    assert!(matches!(leg("lab-mini"), Leg::Again(_)), "no answer yet");
+    assert_eq!(noted(), [], "a leg nothing answered is no read");
+    assert!(matches!(leg("lab-mini"), Leg::Answered(_)));
+    assert_eq!(noted(), one_read, "the first answered leg");
+    for _ in 0..3 {
+        assert!(matches!(leg("lab-mini"), Leg::Answered(_)));
+    }
+    assert_eq!(noted(), [], "the later legs are the same wait");
+    assert_eq!(
+        (NAMED.load(SeqCst), UNNAMED.load(SeqCst)),
+        (2, 3),
+        "the later legs name no session"
+    );
+    // Another Mac of the same wait is its own read, once.
+    assert!(matches!(leg("lab-studio"), Leg::Answered(_)));
+    assert!(matches!(leg("lab-studio"), Leg::Answered(_)));
+    assert_eq!(noted(), one_read);
+    assert_eq!((NAMED.load(SeqCst), UNNAMED.load(SeqCst)), (3, 4));
+    // Another wait asks, and is counted, afresh.
+    let again = Asking::by(named);
+    let leg = driven_leg(
+        &again,
+        ("lab-mini", "await task @s-a1 since=0 timeout=1000\n"),
+        Duration::from_secs(1),
+        (None, None),
+    );
+    assert!(matches!(leg, Leg::Answered(_)));
+    assert_eq!(noted(), one_read);
 }
 
 #[test]
@@ -1208,6 +1299,8 @@ fn a_driven_wait_whose_peer_went_away_or_fell_silent_ends_at_its_timeout_with_it
                 }),
                 label: "lab-mini".to_owned(),
                 node: None,
+                asked_by: None,
+                unnamed: None,
             })
         })
     }
@@ -1427,6 +1520,8 @@ fn a_driven_wait_ctls_timeout_cuts_ends_as_unanswered_where_its_peer_froze_past_
             stream: Box::new(Frozen(Instant::now() + within)),
             label: "lab-mini".to_owned(),
             node: None,
+            asked_by: None,
+            unnamed: None,
         })
     }
     fn frozen(host: &str, within: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {

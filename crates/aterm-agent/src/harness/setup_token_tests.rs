@@ -729,6 +729,7 @@ impl World {
                 store: &self.store,
                 sign_in_as: EMAIL,
                 env: &env,
+                window: None,
                 deadline,
             },
             person,
@@ -939,6 +940,170 @@ fn the_pasted_code_reaches_the_stand_in() {
     ended_and_swept(&world, &stub);
 }
 
+/// A capture whose page opens in aterm's sign-in window: the stub proves the stand-in and keeps
+/// what was said, and the window's waiter answers the paste and says whether the opener failed.
+struct Windowed<'a> {
+    stub: &'a Stub<'a>,
+    waiter: WindowWaiter<'a>,
+    /// Written to the route's outcome file once the capture says the window opened.
+    fails_with: Option<(&'a Path, &'a str)>,
+}
+
+impl Person for Windowed<'_> {
+    fn say(&self, line: &str) {
+        if line.contains("sign-in window opened")
+            && let Some((outcome, record)) = self.fails_with
+        {
+            std::fs::write(outcome, record).expect("the opener's record");
+        }
+        self.stub.say(line);
+    }
+    fn paste(
+        &self,
+        prompt: &str,
+        cancelled: &AtomicBool,
+    ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+        self.waiter.paste(prompt, cancelled)
+    }
+    fn stopped(&self) -> bool {
+        self.stub.stopped()
+    }
+    fn failed(&self) -> Option<String> {
+        self.waiter.failed()
+    }
+}
+
+fn window_route(world: &World) -> WindowRoute {
+    WindowRoute {
+        opener: PathBuf::from("/nonexistent/aterm-open-url"),
+        outcome: world.home().join("outcome"),
+        code: world.home().join("outcome.code"),
+    }
+}
+
+/// IN THE SIGN-IN WINDOW NOBODY IS ASKED FOR THE CODE: a hosted flow's code, which the window's
+/// opener hands over in the capture's own file, is taken once and typed at the stand-in's
+/// paste prompt, and the token follows. The child is told its page opens through aterm's
+/// opener with the window's grant and the account to sign in as; a capture with no window
+/// hands it none of that.
+#[test]
+fn a_window_capture_types_the_code_its_opener_handed_over() {
+    let world = World::new("paste", false);
+    let stub = Stub::new(&world, false);
+    let route = window_route(&world);
+    std::fs::write(&route.code, "the-code#the-state").expect("the opener's code");
+    let person = Windowed {
+        stub: &stub,
+        waiter: WindowWaiter::new(&route),
+        fails_with: None,
+    };
+    let program = World::program();
+    let env = world.env(&[]);
+    let minted = capture(
+        &Capture {
+            program: &program,
+            store: &world.store,
+            sign_in_as: EMAIL,
+            env: &env,
+            window: Some(&route),
+            deadline: WakeDeadline::after(super::super::login_drive::HANG),
+        },
+        &person,
+    )
+    .expect("a token");
+    assert_eq!(minted.token.as_slice(), token().as_bytes());
+    assert_eq!(
+        std::fs::read_to_string(world.home().join("pasted")).expect("what it read"),
+        "the-code#the-state"
+    );
+    assert!(!route.code.exists(), "the code is taken once");
+    assert!(
+        stub.said().iter().any(
+            |line| line.contains("aterm's sign-in window opened") && line.contains("by itself")
+        ),
+        "{:?}",
+        stub.said()
+    );
+    ended_and_swept(&world, &stub);
+
+    let trace = |name: &str| (name == "ATERM_SIGN_IN_TRACE").then(|| OsString::from("/t/trace"));
+    let held: Vec<(&str, OsString)> = window_env(&route, EMAIL, &trace);
+    let value = |name: &str| {
+        held.iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    };
+    assert_eq!(
+        value("BROWSER").as_deref(),
+        Some("/nonexistent/aterm-open-url")
+    );
+    assert_eq!(
+        value(super::super::open_url::WINDOW_ENV).as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        value(super::super::open_url::EMAIL_ENV).as_deref(),
+        Some(EMAIL)
+    );
+    assert_eq!(
+        value(super::super::open_url::CODE_ENV),
+        Some(route.code.to_string_lossy().into_owned())
+    );
+    assert_eq!(
+        value(super::super::open_url::OUTCOME_ENV),
+        Some(route.outcome.to_string_lossy().into_owned())
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(value("ATERM_SIGN_IN_TRACE").as_deref(), Some("/t/trace"));
+    // CONTROL: the child of a capture with no window is handed no opener and no grant.
+    let plain = child_env(&|_| None, Path::new("/scratch"));
+    assert!(
+        !plain
+            .iter()
+            .any(|(key, _)| *key == "BROWSER" || *key == super::super::open_url::WINDOW_ENV)
+    );
+}
+
+/// A SIGN-IN THE WINDOW'S OPENER ENDED WITHOUT AUTHORIZING ENDS THE CAPTURE WITH WHAT IT MET:
+/// the stand-in, which would wait for ever, is ended, and the error is the opener's own closed
+/// words, never a byte the child wrote.
+#[test]
+fn a_window_capture_ends_with_what_its_opener_met() {
+    let world = World::new("wait", true);
+    let stub = Stub::new(&world, true);
+    let route = window_route(&world);
+    let person = Windowed {
+        stub: &stub,
+        waiter: WindowWaiter::new(&route),
+        fails_with: Some((
+            &route.outcome,
+            "opener-outcome=1\nphase=failed\nmet=window-bot-check claude.ai\n",
+        )),
+    };
+    let program = World::program();
+    let env = world.env(&[]);
+    let error = capture(
+        &Capture {
+            program: &program,
+            store: &world.store,
+            sign_in_as: EMAIL,
+            env: &env,
+            window: Some(&route),
+            deadline: WakeDeadline::after(super::super::login_drive::HANG),
+        },
+        &person,
+    )
+    .expect_err("no token");
+    let Error::Window(why) = &error else {
+        panic!("{error:?}");
+    };
+    assert!(why.contains("Cloudflare's check on claude.ai"), "{why}");
+    assert!(error.to_string().contains("nothing was made"));
+    ended_and_swept(&world, &stub);
+    // A person's browser says no such thing.
+    assert_eq!(stub.failed(), None);
+}
+
 /// A FAILURE ENDS THE GROUP AND HOLDS NO CHILD BYTE: the stand-in's exchange failure (with a
 /// sentinel in it) is `Exchange`, whose words lack the sentinel; the stand-in and its group's
 /// `sleep` are gone.
@@ -1042,6 +1207,7 @@ fn a_route_is_refused_before_any_spawn() {
                 store: &world.store,
                 sign_in_as: EMAIL,
                 env: &env,
+                window: None,
                 deadline: WakeDeadline::after(super::super::login_drive::HANG),
             },
             &stub,
@@ -1093,6 +1259,7 @@ fn verb_stand_in() {
             store: &home.join("store"),
             sign_in_as: EMAIL,
             env: &env,
+            window: None,
             deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
         },
         &Waits,

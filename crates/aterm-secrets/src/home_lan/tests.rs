@@ -346,6 +346,48 @@ fn only_another_host_on_the_home_subnet_is_held() {
     assert!(home_net.holds(ip("192.168.1.99")));
 }
 
+/// A Mac with two interfaces on the home subnet (Wi-Fi at the default route, Ethernet beside it)
+/// holds neither of its own addresses as another host: a process on this Mac that dials its own
+/// member service leaves by either, and a proof from the second is its own, which no home-LAN
+/// rule may count as another Mac's. Its neighbours are held as before, and an address it holds
+/// on another subnet changes nothing.
+///
+/// NEGATIVE CONTROL: `HomeNet::holds` without its `also` clause holds `192.168.1.21`
+/// (`this Mac's Ethernet address`); `HomeNet::of` keeping every held address instead of those on
+/// the subnet makes the last `assert_eq!` fail.
+#[test]
+fn a_second_own_address_on_the_home_subnet_is_not_held() {
+    let both = on(
+        ("en0", "192.168.1.20", 24),
+        ("192.168.1.1", Some(&HOME_HW)),
+        &["192.168.1.21", "::ffff:192.168.1.22", "10.1.0.5", "fe80::2"],
+        members_at_home(),
+    );
+    let home_net = on_evidence(&both).unwrap();
+    for (own, what) in [
+        ("192.168.1.20", "this Mac's Wi-Fi address"),
+        ("192.168.1.21", "this Mac's Ethernet address"),
+        ("::ffff:192.168.1.21", "that address, IPv4-mapped"),
+        ("192.168.1.22", "an address this Mac holds IPv4-mapped"),
+    ] {
+        assert!(!home_net.holds(ip(own)), "{what}");
+    }
+    // CONTROL: its neighbours on the subnet, the members among them.
+    for other in ["192.168.1.23", "192.168.1.31", "192.168.1.99"] {
+        assert!(home_net.holds(ip(other)), "{other}");
+    }
+    // An address on another subnet is no part of the home network's value: this Mac at one
+    // address there reads as the same home whatever else it holds.
+    let wired_elsewhere = on(
+        ("en0", "192.168.1.20", 24),
+        ("192.168.1.1", Some(&HOME_HW)),
+        &["10.1.0.5", "fe80::2"],
+        members_at_home(),
+    );
+    assert_ne!(on_evidence(&both), Ok(HomeNet::test()));
+    assert_eq!(on_evidence(&wired_elsewhere), Ok(HomeNet::test()));
+}
+
 /// Only the default route's Ethernet or Wi-Fi network can be home: three member VMs answering on
 /// a VM bridge, members heard through a VPN's tunnel or a point-to-point link, a Mac with no
 /// default route, a full-tunnel VPN beside the home Wi-Fi, and evidence heard on another

@@ -285,7 +285,8 @@ pub struct Preflight {
     pub found: Vec<Refusal>,
 }
 
-/// What the release-input judgment ([`Backend::input_checks`]) found against a candidate. It
+/// What a step-1 judgment of a candidate found against it: the release-input judgment
+/// ([`Backend::input_checks`]) or the released-shim early ask ([`Backend::released_shim`]). It
 /// names no remedy: which command fixes it depends on the candidate's state, which only
 /// [`Run::remedy`] reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +374,12 @@ pub struct ReleaseOptions {
     /// unpublished line as hops ([`crate::line`]).
     pub fix: Vec<String>,
     pub linux: LinuxDecl,
+    /// `--windows-artifacts <dir>`: the Windows handoff directory the cut admits the zip from
+    /// (docs/RELEASING.md § Windows release handoff); optional, independent of `linux`.
+    pub windows: Option<PathBuf>,
+    /// `--windows-sha256 <hex>`: the Windows zip's SHA-256 as `release-build` printed it on the
+    /// Windows host, lowercase; journaled like `windows`, so it may come on a later run.
+    pub windows_sha256: Option<String>,
     /// `--release-credentials <path>`; default `~/.aterm/release-ring/release-credentials.toml`.
     pub release_credentials: Option<PathBuf>,
     /// `--engine <path>`; default `$PUBLICATION_ENGINE`, else `~/publication`: the engine whose
@@ -390,7 +397,11 @@ pub struct ReleaseOptions {
     pub abandon: Option<String>,
 }
 
-const PATH_FLAGS: [&str; 2] = ["--release-credentials", "--linux-artifacts"];
+const PATH_FLAGS: [&str; 3] = [
+    "--release-credentials",
+    "--linux-artifacts",
+    "--windows-artifacts",
+];
 
 /// `path` as the directory `cwd` reads it: an absolute path as given; a relative one joined to `cwd`, and canonical when it exists.
 #[must_use]
@@ -403,7 +414,7 @@ pub fn anchor(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 impl ReleaseOptions {
-    /// Anchor `--engine`, `--release-credentials` and `--linux-artifacts` once, where the release was started (`cwd`).
+    /// Anchor `--engine`, `--release-credentials`, `--linux-artifacts` and `--windows-artifacts` once, where the release was started (`cwd`).
     #[must_use]
     pub fn anchored(&self, cwd: &Path) -> Self {
         let at = |p: &Option<PathBuf>| p.as_deref().map(|p| anchor(p, cwd));
@@ -411,6 +422,7 @@ impl ReleaseOptions {
         opts.engine = at(&self.engine);
         opts.release_credentials = at(&self.release_credentials);
         opts.linux.artifacts = at(&self.linux.artifacts);
+        opts.windows = at(&self.windows);
         opts
     }
 
@@ -427,6 +439,7 @@ impl ReleaseOptions {
     pub fn exec_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         let value = |flag: &str| match flag {
             "--release-credentials" => self.release_credentials.as_ref(),
+            "--windows-artifacts" => self.windows.as_ref(),
             _ => self.linux.artifacts.as_ref(),
         };
         let mut out = Vec::with_capacity(args.len());
@@ -492,6 +505,14 @@ pub struct Journal {
     pub started: u64,
     #[serde(default)]
     pub linux: LinuxDecl,
+    /// The Windows handoff directory (`--windows-artifacts`), when the release declared one.
+    /// Absent from a journal that declared none, so such a journal's bytes are as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<PathBuf>,
+    /// The Windows zip's SHA-256 the person named (`--windows-sha256`), when they named one;
+    /// absent otherwise, as `windows`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_sha256: Option<String>,
     /// Facts only this journal holds for R: [`COMMIT_GATES`], [`FIXTURES_STAGED`], `after-cut`, `tap-aligned`, `site-deferred`, `check`.
     #[serde(default)]
     pub done: Vec<String>,
@@ -950,7 +971,7 @@ pub struct EngineRows {
 /// The publication engine as a PREPARED release's visible half finds it, against the engine that staged R ([`Backend::engine_now`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineNow {
-    /// At its origin/main, with the code that staged: what moved since is only its records (the ledger, the audit log, handoff records, which every stage and publish append to), its Rust port or its prose, which the engine's own stage guard sets aside too (`engine_code_drift`).
+    /// At its origin/main, with the code that staged: what moved since is only its records (the ledger and the audit log, which every stage and publish append to), its prose or its lab tracker (`goals/`), which the engine's own stage guard sets aside too (`engine_code_drift`).
     Same(String),
     /// At its origin/main, and its code moved since it staged R.
     Moved(String),
@@ -1657,6 +1678,14 @@ pub trait Backend {
     ) -> Result<String, InputFinding> {
         Ok("release input checked".into())
     }
+    /// THE EARLY ASK: the released-shim judgment of `c`'s tree, which this Mac's installed
+    /// public release makes ([`aterm_verify::released_shim::judge`], the function `verify
+    /// released-shim` runs), before anything of `c` is qualified. Its answer depends on which
+    /// release is public as well as on the tree, so a tree nobody changed can turn red: step 1
+    /// asks it while the tree still owes its `test` check, and the tree's own tests of the same
+    /// rig still run in step 4. What it found is the row's own words, whose remedy the caller
+    /// names ([`InputFinding`]).
+    fn released_shim(&mut self, c: &Candidate) -> Result<String, InputFinding>;
     fn ledger_versions(&mut self, rev: &str) -> Vec<String>;
     fn engine_rows(&mut self, commit: Option<&str>) -> EngineRows;
     fn engine_now(&mut self, staged: &str) -> Result<EngineNow, String>;
@@ -1790,6 +1819,14 @@ pub trait Backend {
     /// so its test signature runs before the publish. An explicitly selected credentials
     /// profile is the one audited and authorized against the current roster.
     fn audit(&mut self, machine_id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding>;
+    /// What this machine lacks to make the writes of the publish, cut and after-cut steps
+    /// ([`crate::provision::distribution`]): the site checkout, its deployer key and push, and
+    /// the push rights on the repositories and the tap, each proved by a read or a dry run.
+    /// A real run asks the lab's vault for a deployer key it lacks; a dry run writes nothing.
+    /// Never asked of a private qualification, which makes none of those writes.
+    fn distribution(&mut self, _dry: bool) -> Vec<Finding> {
+        Vec::new()
+    }
     fn ask(&mut self, words: &AskWords) -> Result<String, String>;
     fn resolve(&mut self, key: &str) -> Result<String, String>;
     fn withdraw(&mut self, key: &str) -> Result<String, String>;
@@ -1949,6 +1986,8 @@ struct Run<'b> {
     tip: String,
     facts: Facts,
     linux: LinuxDecl,
+    windows: Option<PathBuf>,
+    windows_sha256: Option<String>,
     planned: Vec<Step>,
     est: BTreeMap<String, u64>,
     plan_secs: u64,
@@ -2010,6 +2049,8 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         tip: String::new(),
         facts: Facts::default(),
         linux: LinuxDecl::default(),
+        windows: None,
+        windows_sha256: None,
         planned: Vec::new(),
         est: BTreeMap::new(),
         plan_secs: 0,
@@ -4004,6 +4045,32 @@ impl Run<'_> {
                  a --linux-worker per native host",
             ))?;
         }
+        self.windows = self.opts.windows.clone();
+        self.windows_sha256 = self.opts.windows_sha256.clone();
+        if let Some(j) = self.journal.as_ref().filter(|j| j.commit == r) {
+            if self.windows.is_none() {
+                self.windows = j.windows.clone();
+            }
+            if self.windows_sha256.is_none() {
+                self.windows_sha256 = j.windows_sha256.clone();
+            }
+        }
+        if self.windows_sha256.is_some() && self.windows.is_none() {
+            self.refuse(Refusal::new(
+                "--windows-sha256 names a Windows zip, and no --windows-artifacts declares one",
+                "add --windows-artifacts <dir> (docs/RELEASING.md § Windows release handoff), \
+                 or drop --windows-sha256",
+            ))?;
+        }
+        if let Some(dir) = self.windows.clone()
+            && !self.b.is_dir(&dir)
+        {
+            self.refuse(Refusal::new(
+                format!("--windows-artifacts {} is not a directory", dir.display()),
+                "create the handoff directory (docs/RELEASING.md § Windows release handoff), \
+                 or drop --windows-artifacts to ship no Windows zip",
+            ))?;
+        }
 
         let v = self.version();
         if let Some(cut) = self.b.cut_journal()
@@ -4039,6 +4106,13 @@ impl Run<'_> {
                 ))?;
             }
         }
+        // What the newest public release says of R's tree costs one small offline build, and
+        // step 4's tree would say it hours later: ask it before the input judgment's compile.
+        if !self.claimed()
+            && let Some(c) = self.cand.clone()
+        {
+            notes.push(self.released_shim(&c)?);
+        }
         if let Some(note) = self.check_source_inputs()? {
             notes.push(note);
         }
@@ -4059,6 +4133,33 @@ impl Run<'_> {
             note = "nothing to refuse".to_string();
         }
         Ok(note)
+    }
+
+    /// Step 1's early ask of R's tree ([`Backend::released_shim`]). A refusal by the public
+    /// release is R's red, fixed the source's way ([`Run::remedy`]: `--fix` on this clone's
+    /// line), and a judgment that could not be made is this machine's: both stop the release
+    /// here, with nothing of R staged, built or verified.
+    fn released_shim(&mut self, c: &Candidate) -> Result<String, Halt> {
+        match self.b.released_shim(c) {
+            Ok(note) => Ok(note),
+            Err(found) => {
+                let remedy = self.remedy(c);
+                self.refuse(match found {
+                    InputFinding::Failed(why) => {
+                        Refusal::new(why, remedy.source).failing("verify released-shim")
+                    }
+                    InputFinding::Unanswered(why) => Refusal::new(
+                        why,
+                        format!(
+                            "remove the cause it names on this Mac, then {}",
+                            remedy.again
+                        ),
+                    )
+                    .could_not_run(),
+                })?;
+                Ok("the released-shim judgment of R is noted above".to_string())
+            }
+        }
     }
 
     /// Judge source readers under the backend's currently selected engine policy.
@@ -4280,6 +4381,8 @@ impl Run<'_> {
             trustc: current.map_or_else(String::new, |journal| journal.trustc.clone()),
             started: line.started,
             linux: current.map_or_else(LinuxDecl::default, |journal| journal.linux.clone()),
+            windows: current.and_then(|journal| journal.windows.clone()),
+            windows_sha256: current.and_then(|journal| journal.windows_sha256.clone()),
             asks: current.map_or_else(Vec::new, |journal| journal.asks.clone()),
             line: Some(line.clone()),
             ..Journal::default()
@@ -5983,6 +6086,8 @@ impl Run<'_> {
             trustc: prover.commit.clone(),
             started: self.b.now(),
             linux: self.linux.clone(),
+            windows: self.windows.clone(),
+            windows_sha256: self.windows_sha256.clone(),
             done: vec![PENDING_LINE.into()],
             asks,
             line: Some(line),
@@ -6144,6 +6249,8 @@ impl Run<'_> {
                 bumped,
                 started,
                 linux: self.linux.clone(),
+                windows: self.windows.clone(),
+                windows_sha256: self.windows_sha256.clone(),
                 done: if selecting && !line.hops.is_empty() {
                     vec![PENDING_LINE.into()]
                 } else {
@@ -6163,6 +6270,12 @@ impl Run<'_> {
             j.trustc = prover.commit.clone();
             if self.linux.declared() {
                 j.linux = self.linux.clone();
+            }
+            if self.windows.is_some() {
+                j.windows.clone_from(&self.windows);
+            }
+            if self.windows_sha256.is_some() {
+                j.windows_sha256.clone_from(&self.windows_sha256);
             }
             if selecting {
                 j.supersede = self.supersede.clone();
@@ -7812,9 +7925,12 @@ impl Run<'_> {
             let found = match (&self.dry_audit, self.dry) {
                 (Some(found), true) => found.clone(),
                 _ => {
-                    let found =
+                    let mut found =
                         self.b
                             .audit(&id, self.opts.release_credentials.as_deref(), self.dry);
+                    if !self.opts.qualify {
+                        found.extend(self.b.distribution(self.dry));
+                    }
                     if self.dry {
                         self.dry_audit = Some(found.clone());
                     }
@@ -8224,6 +8340,20 @@ impl Run<'_> {
             self.creds.display().to_string(),
         ];
         args.extend(self.linux.cut_args());
+        args.extend(self.windows_args());
+        args
+    }
+
+    /// The `ship cut` flags of the Windows declaration: none when the release made none, and
+    /// the zip's digest when the person named it.
+    fn windows_args(&self) -> Vec<String> {
+        let Some(dir) = &self.windows else {
+            return Vec::new();
+        };
+        let mut args = vec!["--windows-artifacts".to_string(), dir.display().to_string()];
+        if let Some(sha256) = &self.windows_sha256 {
+            args.extend(["--windows-sha256".to_string(), sha256.clone()]);
+        }
         args
     }
 
@@ -8576,7 +8706,10 @@ impl Run<'_> {
         ];
         match mode {
             CutMode::Resume(_) => args.push("--resume".to_string()),
-            _ => args.extend(self.linux.cut_args()),
+            _ => {
+                args.extend(self.linux.cut_args());
+                args.extend(self.windows_args());
+            }
         }
         args
     }
@@ -9297,15 +9430,21 @@ fn run_graph(
                     }
                     let pushing =
                         stop_of(Branch::Export).pushing() && !done.contains(&Branch::Export);
+                    let earlier: Vec<(Branch, Ended, u64)> = graph
+                        .ended
+                        .iter()
+                        .filter(|(b, ..)| *b != branch)
+                        .copied()
+                        .collect();
                     br.say(&format!(
                         "        {}: RED at {at} — {why}; rerun: {}; stopping {}{}",
                         branch.name(),
                         rerun_of(branch, plan, c),
-                        if halted.is_empty() {
-                            "nothing".to_string()
-                        } else {
-                            halted.join(", ")
-                        },
+                        red_stops(
+                            &halted,
+                            &earlier,
+                            keep_build && !done.contains(&Branch::Build)
+                        ),
                         if pushing {
                             " (the export's staging push began, so it finishes)"
                         } else {
@@ -9332,6 +9471,41 @@ fn run_graph(
         }
     });
     graph
+}
+
+/// What a red branch's line says it stops: the branches its red stopped (`halted`), else
+/// `nothing`; then the branches that had `ended` before it, each with how and after how long,
+/// which is why a red that comes last stops nothing; then a build left running on purpose
+/// (`kept`: [`Branches::keep_build_on_test_red`]). Every branch the plan runs is in one of the
+/// three, or is the export whose staging push began, so no red leaves a branch running that
+/// its line does not name.
+fn red_stops(halted: &[&str], ended: &[(Branch, Ended, u64)], kept: bool) -> String {
+    let mut says = if halted.is_empty() {
+        "nothing".to_string()
+    } else {
+        halted.join(", ")
+    };
+    if !ended.is_empty() {
+        let each: Vec<String> = ended
+            .iter()
+            .map(|(branch, how, secs)| {
+                format!(
+                    "{} {} after {}",
+                    branch.name(),
+                    how.word().replace('-', " "),
+                    fmt_dur(*secs)
+                )
+            })
+            .collect();
+        says.push_str(&format!(" (ended before it: {})", each.join(", ")));
+    }
+    if kept {
+        says.push_str(
+            "; the build goes on, its product kept for the next hop (the tree's only red is a \
+             test that ran)",
+        );
+    }
+    says
 }
 
 /// Start `branch`'s thread in `s`: unstarted when a red stopped it first or a person's signal

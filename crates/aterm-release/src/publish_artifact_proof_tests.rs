@@ -57,6 +57,7 @@ fn fixture(label: &str) -> (aterm_tempfile::TempDir, CutCtx) {
         },
         None,
         None,
+        None,
     )
     .unwrap();
     fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
@@ -98,6 +99,7 @@ fn fixture(label: &str) -> (aterm_tempfile::TempDir, CutCtx) {
         journal: None,
         adopted: false,
         linux: None,
+        windows: None,
     };
     (dir, ctx)
 }

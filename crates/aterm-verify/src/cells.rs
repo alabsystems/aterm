@@ -14,7 +14,7 @@ use aterm_uds::output::CommandOutput as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aterm_forge::model::{Cell, Graph, PkgId};
 
@@ -481,12 +481,14 @@ impl PreparedRun {
                     }
                     validate_members(ctx, &mut inputs.members)?;
                     let started = Instant::now();
+                    // This walk reaches no compiler command, so it has no call to note.
                     let outcome = check_cell(
                         ctx,
                         &inputs.stock,
                         cell,
                         &inputs.policy,
                         &mut inputs.members,
+                        &mut Vec::new(),
                     );
                     inputs
                         .cached
@@ -578,7 +580,13 @@ pub(crate) fn run_prepared(ctx: &Ctx, r: &mut Report, prepared: Option<PreparedR
         } else if let Some((_, outcome, _)) = cached.iter().find(|(known, _, _)| known == cell) {
             outcome.clone()
         } else {
-            check_cell(ctx, stock, cell, policy, members)
+            let mut calls = Vec::new();
+            let outcome = check_cell(ctx, stock, cell, policy, members, &mut calls);
+            crate::event_log::emit(
+                ctx.events.as_ref(),
+                &cell_event(cell, started.elapsed(), &calls),
+            );
+            outcome
         };
         let prepared = cached
             .iter()
@@ -1168,6 +1176,7 @@ fn check_cell(
     cell: &Cell,
     policy: &[Shim],
     members: &mut Option<Result<Members, String>>,
+    calls: &mut Vec<CargoCall>,
 ) -> CellOutcome {
     let failed = |status: &str, detail: Vec<String>| CellOutcome::Failed {
         status: status.to_string(),
@@ -1310,7 +1319,9 @@ fn check_cell(
     } else {
         lint_packages(cell, &extra)
     };
-    let lint = exec::run(&cargo.lint(&packages), ctx.exec_env());
+    let lint = noted(calls, LINT_CALL, || {
+        exec::run(&cargo.lint(&packages), ctx.exec_env())
+    });
     let mut red = Red {
         leaves_test_warnings: leaves_test_warnings(ctx.cells_pulled, &cell.triple),
         ..Red::default()
@@ -1400,7 +1411,9 @@ fn check_cell(
         } else {
             test_cargo.all_targets(&tests.excluded)
         };
-        let run = exec::run(&check, ctx.exec_env());
+        let run = noted(calls, ALL_TARGETS_CALL, || {
+            exec::run(&check, ctx.exec_env())
+        });
         let read = match read_cargo_run_with_discovery(
             &run,
             &cell.triple,
@@ -1478,6 +1491,69 @@ fn check_cell(
             detail: red.detail,
         },
     }
+}
+
+/// The lint pass's name in a cell's event ([`CargoCall::call`]).
+const LINT_CALL: &str = "lint";
+
+/// The all-targets pass's name in a cell's event ([`CargoCall::call`]).
+const ALL_TARGETS_CALL: &str = "all-targets";
+
+/// One compiling cargo call a cell made ([`check_cell`]): its lint or its all-targets check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CargoCall {
+    /// Which pass: [`LINT_CALL`] or [`ALL_TARGETS_CALL`].
+    call: &'static str,
+    /// From before its spawn to its end.
+    wall: Duration,
+    /// What its process tree used ([`exec::Run::usage`]); `None` where no read found it.
+    usage: Option<exec::TreeUsage>,
+}
+
+/// Run one of a cell's compiling cargo calls and note it in `calls`, as `call`.
+fn noted(
+    calls: &mut Vec<CargoCall>,
+    call: &'static str,
+    run: impl FnOnce() -> exec::Run,
+) -> exec::Run {
+    let started = Instant::now();
+    let run = run();
+    calls.push(CargoCall {
+        call,
+        wall: started.elapsed(),
+        usage: run.usage,
+    });
+    run
+}
+
+/// The `cell-finished` event of a cell this run checked: its name and triple, its whole wall
+/// (resolving its graphs included) and each compiling cargo call it made, in order, with that
+/// call's wall, CPU and peak memory, `null` where its tree was not read. A cell that reached no
+/// such call (nothing selected in its graph, no toolchain) has none. An observation only: the
+/// stage holds one memory claim over every cell, and this says what each call of each cell took
+/// of it; the cell's row is its verdict.
+fn cell_event(cell: &Cell, wall: Duration, calls: &[CargoCall]) -> String {
+    let calls: Vec<aterm_json::Value> = calls
+        .iter()
+        .map(|c| {
+            aterm_json::json!({
+                "call": c.call,
+                "wall_s": c.wall.as_secs_f64(),
+                "cpu_s": c.usage.map(|u| u.cpu.as_secs_f64()),
+                "peak_bytes": c.usage.map(|u| u.peak_bytes),
+            })
+        })
+        .collect();
+    format!(
+        "verify-event: {}",
+        crate::event_log::event_value(
+            crate::event_log::EventKind::CellFinished,
+            aterm_json::json!({
+                "cell": cell.name, "triple": cell.triple,
+                "wall_s": wall.as_secs_f64(), "calls": calls,
+            })
+        )
+    )
 }
 
 /// A cell's failures as they are found: the first cause names the row.

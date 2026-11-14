@@ -2516,8 +2516,8 @@ impl Log {
     /// carry, the op it carries) another Mac signed while `member` was out (outside the cutoff of
     /// some `Remove` of `member` that counts, with no counting `Admit` of it after that `Remove`
     /// in its past), sealed under an epoch `member` minted or one a `Wrap` hands one of its
-    /// recipients. Resealing them does not take back what `member` read, so a person rotates
-    /// those values where they came from. Each is its audience and name, never a value; empty
+    /// recipients. Resealing them does not take back what `member` read. Each is its audience
+    /// and name, never a value; empty
     /// where `member` is not out or `identity` opens nothing.
     ///
     /// # Errors

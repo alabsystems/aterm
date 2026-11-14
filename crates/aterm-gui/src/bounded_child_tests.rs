@@ -12,25 +12,18 @@ fn a_bounded_child_is_read_or_killed_at_its_cap() {
             let mut starts = Vec::new();
             let refused = std::thread::scope(|scope| {
                 let mut workers = Vec::new();
-                let ran = run_with_readers(
-                    &absent,
-                    &[],
-                    cap,
-                    |which, work| {
-                        starts.push(which.to_string());
-                        if starts.len() == refuse {
-                            return Err(io::Error::other("injected reader refusal"));
-                        }
-                        workers.push(
-                            std::thread::Builder::new()
-                                .name("bounded-reader-setup-control".to_string())
-                                .spawn_scoped(scope, work)?,
-                        );
-                        Ok(())
-                    },
-                    Instant::now,
-                    || {},
-                );
+                let ran = run_with_readers(&absent, &[], cap, |which, work| {
+                    starts.push(which.to_string());
+                    if starts.len() == refuse {
+                        return Err(io::Error::other("injected reader refusal"));
+                    }
+                    workers.push(
+                        std::thread::Builder::new()
+                            .name("bounded-reader-setup-control".to_string())
+                            .spawn_scoped(scope, work)?,
+                    );
+                    Ok(())
+                });
                 for worker in workers {
                     assert!(worker.join().is_ok(), "the cancelled idle reader ended");
                 }

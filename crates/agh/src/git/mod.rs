@@ -106,8 +106,10 @@ pub const GRANT_MAX: std::time::Duration = std::time::Duration::from_secs(900);
 /// `whoami --git`): one spelling on both sides of the handshake.
 pub(crate) const GRANT_VAR: &str = "AGH_GIT_GRANT";
 /// The variable that tells the helper its profile's token file may be loose (`1`), as the
-/// runner's router read it (`legacy_loose`).
-pub(crate) const LOOSE_VAR: &str = "AGH_GIT_LOOSE";
+/// runner's router read it (`legacy_loose`). A caller that mounts the helper on a git it runs
+/// itself ([`HelperCommand`]) and routes as a library host does (`routing::adopt_for_host`)
+/// sets it for such a profile too, and checks with `credential::require_answer`'s `loose`.
+pub const LOOSE_VAR: &str = "AGH_GIT_LOOSE";
 /// The variables that carry the runner's `Dirs` to the helper: its config, state and home.
 pub(crate) const CONFIG_DIR_VAR: &str = "AGH_GIT_CONFIG_DIR";
 /// See [`CONFIG_DIR_VAR`].

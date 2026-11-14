@@ -2152,11 +2152,7 @@ fn empty_batches_recheck_authority_without_reopening_unrequested_data() {
         .send_batch(
             &mut Cursor::new(&mut output),
             peer,
-            |session| {
-                round.prepare_batch(session, table, &[] as &[Digest], |_, _, _| {
-                    panic!("an empty batch encodes no table records")
-                })
-            },
+            |session| round.prepare_operations(session, table, &[]),
             BatchKind::Operation,
             &mut Report::default(),
         )
@@ -2168,11 +2164,7 @@ fn empty_batches_recheck_authority_without_reopening_unrequested_data() {
             .send_batch(
                 &mut Cursor::new(&mut output),
                 peer,
-                |session| {
-                    round.prepare_batch(session, table, &[record], |_, _, _| {
-                        panic!("unavailable table data cannot supply a requested record")
-                    })
-                },
+                |session| round.prepare_operations(session, table, &[record]),
                 BatchKind::Operation,
                 &mut Report::default(),
             )

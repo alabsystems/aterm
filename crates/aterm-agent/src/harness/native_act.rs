@@ -1031,8 +1031,11 @@ pub struct Prepare {
     /// Private Restart's sequence from the same fresh status whose person policy passed.
     /// OwnImage carries none and acquires no quiet/person gate.
     pub expected_human_seq: Option<u64>,
-    /// One absolute CLOCK_MONOTONIC deadline in microseconds, fixed before prepare.
-    /// Polling, exec, recovery and rollback never extend it.
+    /// One absolute CLOCK_MONOTONIC deadline in microseconds, fixed before prepare. It bounds
+    /// every effect: a Signal, a Resume, the first input write and an Execute delivery. A
+    /// restart's close ([`Self::close_us`]), and an own-image move's deadline itself, bound every
+    /// request that can change the outcome: Recover, Precommit, Commit and Reconcile. Polling,
+    /// exec, recovery and rollback never extend either.
     pub deadline_us: u64,
     /// Explicit native semantic duty, Upgrade or Relaunch only.
     pub duty: Scope,
@@ -1125,7 +1128,26 @@ pub enum Recorded {
     Sealed { may_execute: bool },
 }
 
+/// How long past its deadline a restart may still reach its outcome, in microseconds: its close
+/// is [`Prepare::deadline_us`] plus this. A grant delivered just before the deadline still has
+/// this long to be observed and committed, longer than a constructor waits for its new agent
+/// ([`super::Timings::PRODUCTION`]'s `held`, 90 s). Past the close no host epoch commits,
+/// precommits, recovers or reconciles the restart; it reads [`Decision::Closed`] instead. An
+/// own-image move has no grace: one still open at its deadline reads [`Decision::Unknown`]. It is
+/// a protocol constant: the wire and the journal carry only the deadline, from which every host
+/// and constructor derives the same close.
+pub const COMPLETION_US: u64 = 120_000_000;
+
 impl Prepare {
+    /// The absolute CLOCK_MONOTONIC microsecond at which this operation closes if it is a
+    /// restart: [`Self::deadline_us`] plus [`COMPLETION_US`], saturating. From it on nothing
+    /// changes a restart's outcome in any host epoch ([`Decision::Closed`]). An own-image move
+    /// has no close: one still open at its deadline reads [`Decision::Unknown`].
+    #[must_use]
+    pub const fn close_us(&self) -> u64 {
+        self.deadline_us.saturating_add(COMPLETION_US)
+    }
+
     /// Supported asked Restart shape only. This does not qualify its predecessor,
     /// current source, person sequence or producer, and grants no execution authority.
     #[must_use]
@@ -1214,6 +1236,11 @@ pub enum Decision {
     /// The failed plan is terminal: no future vendor effect can be admitted under its cap.
     /// Ungranted helpers may still exit later; this is never a successful image completion.
     Retired(Retirement),
+    /// The operation reached its close ([`Prepare::close_us`]) uncommitted: no host epoch will
+    /// commit, roll back or recover it. An exec grant may have been delivered and its process may
+    /// still run; this never says whether the grant took effect, so a constructor learns what
+    /// runs by observing it, never from this decision.
+    Closed,
 }
 
 /// Why a failed native plan can release custody after its exact input prefix drains.
@@ -1888,8 +1915,10 @@ pub enum Reply {
     /// No mutation committed and no future original Prepare can admit this exact plan.
     /// The echoed original request binds all fields, including its unchanged deadline.
     Cancelled(Box<CancelPrepare>),
-    /// This host supports native-act=1, blocks app handoff through unresolved native work,
-    /// and uses absolute CLOCK_MONOTONIC microseconds. It carries no action permission.
+    /// This host supports native-act=1, blocks app handoff through unresolved native work until
+    /// each operation's close ([`Prepare::close_us`]), and uses absolute CLOCK_MONOTONIC
+    /// microseconds. It carries no action permission. A host that spells its handoff `blocked`
+    /// held a granted operation's hold with no bound; it is refused.
     Info {
         /// The fresh process epoch required by Prepare.
         epoch: String,
@@ -1957,6 +1986,10 @@ pub enum Reply {
     /// its clock passed the deadline, or across a reboot, or read a seal that never recorded
     /// possible execution. It claims nothing about the old operation's other resources.
     Lapsed(String),
+    /// The operation `id` reached its close uncommitted ([`Decision::Closed`]): its old host
+    /// sealed it so, or a later host epoch of the same boot read its possible execution after
+    /// the close. It claims nothing about whether that execution happened.
+    Closed(String),
 }
 
 /// The host's [`Reply::Unadmitted`] line for operation `id`, or `None` for a malformed id.
@@ -1969,6 +2002,12 @@ pub fn unadmitted_reply(id: &str) -> Option<String> {
 #[must_use]
 pub fn lapsed_reply(id: &str) -> Option<String> {
     aterm_codec::hex::is_lower(id, 32).then(|| format!("OK native-act state=lapsed id={id}\n"))
+}
+
+/// The host's [`Reply::Closed`] line for operation `id`, or `None` for a malformed id.
+#[must_use]
+pub fn closed_reply(id: &str) -> Option<String> {
+    aterm_codec::hex::is_lower(id, 32).then(|| format!("OK native-act state=closed id={id}\n"))
 }
 
 impl Reply {
@@ -2040,7 +2079,7 @@ impl Reply {
                 let epoch = words.next()?.strip_prefix("epoch=")?;
                 if !aterm_codec::hex::is_lower(epoch, 32)
                     || words.next()? != "native-act=1"
-                    || words.next()? != "handoff=blocked"
+                    || words.next()? != "handoff=close"
                     || words.next()? != "clock=monotonic-us"
                 {
                     return None;
@@ -2188,15 +2227,15 @@ impl Reply {
                 },
             )),
             "unwritten" => Self::Unwritten,
-            "unadmitted" | "lapsed" => {
+            "unadmitted" | "lapsed" | "closed" => {
                 let id = words.next()?.strip_prefix("id=")?;
                 if !aterm_codec::hex::is_lower(id, 32) {
                     return None;
                 }
-                if state == "lapsed" {
-                    Self::Lapsed(id.to_string())
-                } else {
-                    Self::Unadmitted(id.to_string())
+                match state {
+                    "lapsed" => Self::Lapsed(id.to_string()),
+                    "closed" => Self::Closed(id.to_string()),
+                    _ => Self::Unadmitted(id.to_string()),
                 }
             }
             "unissued" => Self::Unissued(match words.next()?.strip_prefix("phase=")? {
@@ -2280,6 +2319,7 @@ pub fn commit<S: std::io::Read + std::io::Write>(
             Reply::Committed(_) | Reply::RestartCommitted(_) | Reply::ColdRestartCommitted { .. },
         ) => Decision::Committed,
         Ok(Reply::Decision(decision)) => decision,
+        Ok(Reply::Closed(id)) if id == binding.id => Decision::Closed,
         Ok(_) | Err(_) => Decision::Unknown,
     }
 }

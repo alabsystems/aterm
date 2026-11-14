@@ -14,7 +14,7 @@ use aterm_control::wire::{json_ok, json_str_field, pct_encode};
 
 use crate::App;
 use crate::consent_state::{
-    ConsentPolicy, ConsentState, DebuggerRow, DevToolsRow, SlotFacts, session_attribution,
+    AxProbe, ConsentPolicy, ConsentState, DebuggerRow, DevToolsRow, SlotFacts, session_attribution,
     session_posture,
 };
 use crate::control::{Scope, cross_session_authorized};
@@ -161,6 +161,10 @@ pub(crate) struct PrivacySnapshot {
     /// for this bundle id from tccd's log, the switch's row in the system
     /// TCC.db, and the two joined (`grant=`).
     devtools: DevToolsRow,
+    /// aterm's own Accessibility grant (`accessibility` row), read once for this report by the
+    /// consent arm that wraps the permission walk's live read ([`ConsentState::accessibility`]).
+    /// It joins no coverage bucket and never feeds `prompt_possible`.
+    accessibility: AxProbe,
     /// This user's programs macOS's program check holds now: how many, the longest held to now,
     /// ms, and how many are stranded ([`crate::sys_host::Shared::program_check_now`]); `None` off
     /// macOS or with no view that speaks for now.
@@ -294,11 +298,12 @@ const NOTE: &str =
 const NOTE_NO_OS_CONSENT: &str = "this platform has no OS consent layer: nothing prompts, and an \
      Operation not permitted is an ordinary file permission";
 
-const REMEDIATE: [&str; 4] = [
+const REMEDIATE: [&str; 5] = [
     "settings:Privacy_AllFiles",
     "settings:Privacy_FilesAndFolders",
     DEBUGGER_REMEDIATE,
     DEVTOOLS_REMEDIATE,
+    ACCESSIBILITY_REMEDIATE,
 ];
 
 const TASKPORT_WATCH: &str = "off";
@@ -306,6 +311,9 @@ const TASKPORT_WATCH: &str = "off";
 const DEBUGGER_REMEDIATE: &str = "aterm-settings:security";
 
 const DEVTOOLS_REMEDIATE: &str = "settings:Privacy_DevTools";
+
+/// The pane the walk's Accessibility page opens (`system_state_access::live_open_access_pane`).
+const ACCESSIBILITY_REMEDIATE: &str = "settings:Privacy_Accessibility";
 
 impl PrivacySnapshot {
     fn claimant_lines(&self) -> Vec<String> {
@@ -381,7 +389,7 @@ impl PrivacySnapshot {
         self.platform == "macos"
     }
 
-    fn remediate(&self) -> [Option<&'static str>; 4] {
+    fn remediate(&self) -> [Option<&'static str>; 5] {
         REMEDIATE.map(|place| self.os_consent().then_some(place))
     }
 
@@ -561,15 +569,21 @@ impl PrivacySnapshot {
             num(stranded),
         ));
         out.push(format!(
+            "accessibility grant={} probe={}",
+            self.accessibility.grant(),
+            self.accessibility.label(),
+        ));
+        out.push(format!(
             "observer fda={} responsible={} log={} taskport={TASKPORT_WATCH}",
             self.observer_fda, self.observer_responsible, self.observer_log,
         ));
         out.push(self.access_card.line());
-        let [fda, files, debugger, devtools] = self
+        let [fda, files, debugger, devtools, accessibility] = self
             .remediate()
             .map(|place| place.map_or_else(|| "-".to_string(), pct_encode));
         out.push(format!(
-            "remediate fda={fda} files={files} debugger={debugger} devtools={devtools}"
+            "remediate fda={fda} files={files} debugger={debugger} devtools={devtools} \
+             accessibility={accessibility}"
         ));
         if self.anchor.grant_unverifiable() {
             let gone = if self.anchor == aterm_containment::ImageAnchor::Deleted {
@@ -837,6 +851,12 @@ pub(crate) fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         num(oldest),
         num(stranded),
     );
+    let _ = write!(
+        body,
+        "\"accessibility\":{{{},{}}},",
+        json_str_field("grant", snapshot.accessibility.grant()),
+        json_str_field("probe", snapshot.accessibility.label()),
+    );
     let _ = write!(body, "\"access_card\":{},", snapshot.access_card.json());
     let _ = write!(
         body,
@@ -846,11 +866,11 @@ pub(crate) fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         json_str_field("log", snapshot.observer_log),
         json_str_field("taskport", TASKPORT_WATCH),
     );
-    let [fda, files, debugger, devtools] = snapshot.remediate().map(json_opt);
+    let [fda, files, debugger, devtools, accessibility] = snapshot.remediate().map(json_opt);
     let _ = write!(
         body,
         "\"remediate\":{{\"fda\":{fda},\"files\":{files},\"debugger\":{debugger},\
-         \"devtools\":{devtools}}},",
+         \"devtools\":{devtools},\"accessibility\":{accessibility}}},",
     );
     let _ = write!(body, "{}}}", json_str_field("note", snapshot.note()));
     json_ok(&body)
@@ -979,6 +999,7 @@ impl PrivacySnapshot {
     ) -> Self {
         debug_assert_eq!(facts.sessions.len(), responsible.len());
         let policy = &facts.policy;
+        let accessibility = facts.consent.accessibility(policy.gate);
         let (probe, age) = slots.fda;
         let self_pid = i32::try_from(std::process::id()).unwrap_or(-1);
         let sessions = facts
@@ -1035,6 +1056,7 @@ impl PrivacySnapshot {
             warmup_last_ms: facts.warmup_last_ms,
             debugger: slots.debugger,
             devtools: slots.devtools,
+            accessibility,
             program_check: facts.program_check,
             folders,
             folder_source,

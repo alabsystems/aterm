@@ -30,7 +30,7 @@ fn quota_rows_survive_fleet_parsing_and_both_renderers() {
 }
 
 fn render_text(replies: &[HostReply], budget: usize, own: Option<&str>) -> String {
-    render_within(&blocks_of(replies, own), budget, budget).text
+    render_within(&blocks_of(replies, own, false), budget, budget).text
 }
 
 fn wire_row(fields: &[(&str, &str)]) -> String {
@@ -253,19 +253,21 @@ fn one_hundred_eighty_sessions_render_within_the_budget() {
 }
 
 fn fill_reads(replies: &[HostReply]) -> Vec<String> {
-    let blocks = blocks_of(replies, None);
+    let blocks = blocks_of(replies, None, false);
     let order = fill_order(&blocks);
     (0..=order.len())
         .map(|n| render(&blocks, &Shown::filled(&blocks, &order, n)))
         .collect()
 }
 
+/// Whether `text` is the fill of the most units whose read fits `room`: no read past it fits,
+/// though a read can be shorter than the one before it (showing a kind's last line drops the
+/// clause or line that counted it).
 fn used_to_the_unit(reads: &[String], room: usize, text: &str) -> bool {
     reads
         .iter()
         .position(|read| read == text)
-        .and_then(|n| reads.get(n + 1))
-        .is_some_and(|next| chars(next) > room)
+        .is_some_and(|n| n + 1 < reads.len() && reads[n + 1..].iter().all(|r| chars(r) > room))
 }
 
 #[test]
@@ -520,6 +522,224 @@ fn thirty_macs_home_lines_fold_before_an_agent_loses_its_words() {
     );
 }
 
+/// Machine `h` of a `lab fleet-sim` fleet as its reply reads: a home with no checkouts, both
+/// hourly quota rows a fresh instance sends (`github_rate … status=unrecorded`), its boot shell,
+/// a `build-loop`, a `claude` busy, at a question, at a box or idle by turns, and two more
+/// `claude` idle seconds ago (newly done), each asked and saying words near the 400-byte record
+/// and reporting its model, effort, context and plan windows as the fixture's statusLine does.
+fn sim_mac(h: usize) -> HostReply {
+    let claude = |n: usize, agent: &str, ms: &str| {
+        wire_row(&[
+            ("sid", &format!("s-{h:04x}{n:016x}")),
+            ("program", "claude"),
+            ("program_kind", "agent"),
+            ("agent", agent),
+            ("agent_ms", ms),
+            ("doing", "Bash"),
+            ("model", "Opus 5.5"),
+            ("effort", "xhigh"),
+            ("ctx_left_pct", "62"),
+            ("usage_5h_pct", "38"),
+            ("usage_7d_pct", "21"),
+            (
+                "cwd",
+                &format!("~/Developer/aterm-mesh-wt-{h:02}-{n}/crates/aterm-net"),
+            ),
+            ("prompt", &excerpt400(&"audit the dial loop ".repeat(30))),
+            ("said", &excerpt400(&"the timers reset now ".repeat(30))),
+        ])
+    };
+    let mode = ["busy", "question", "prompt", "idle"][h % 4];
+    let rows = vec![
+        lab_shell(h, 0, false),
+        lab_shell(h, 1, true),
+        claude(2, mode, if mode == "idle" { "6000" } else { "4000" }),
+        claude(3, "idle", "5000"),
+        claude(4, "idle", "4000"),
+    ];
+    let mut lines = vec![format!(
+        "instance pid={} host=Lab-Mac-{h:02}.local version=0.160.0 sessions=5 level=content \
+         cut=0 at_ms=1793129880000 home=/Users//lab-{h:02} home_free_mb=111616 repos=0 \
+         repos_at=1793129874000 repos_cut=0",
+        2000 + h
+    )];
+    lines.extend(["github_rate hour=498091 status=unrecorded".to_owned()]);
+    lines.extend(["github_rate hour=498092 status=unrecorded".to_owned()]);
+    lines.extend(rows);
+    HostReply {
+        reason: None,
+        label: format!("127.0.0.1:{}", 7200 + h),
+        remote: true,
+        unproven: false,
+        node: None,
+        answer: parse_reply(&lines),
+    }
+}
+
+/// The machines of a [`sim_mac`] fleet whose most pressing agent (its `claude` 2, first in its
+/// block at every mode) shows no excerpt line.
+fn wordless_firsts(text: &str, n: usize) -> Vec<usize> {
+    (0..n)
+        .filter(|&h| words_of(text, &format!("s-{h:04x}{:016x}", 2)).is_empty())
+        .collect()
+}
+
+/// ATERM-KI-1112-102: thirty `lab fleet-sim` machines under the default budget. Every machine's
+/// most pressing agent keeps at least its leading excerpt line, whatever its class, and the
+/// quota rows each machine sends fold, counted on a closing line of their own, rather than ride
+/// with every header (at thirty machines their sixty lines, with the asking agents' second lines
+/// ranked before them, had cost the most pressing idle agents their words).
+#[test]
+fn thirty_sim_macs_keep_every_most_pressing_agents_words() {
+    let replies: Vec<HostReply> = (0..30).map(sim_mac).collect();
+    let text = render_text(&replies, DEFAULT_BUDGET, None);
+    assert!(chars(&text) <= DEFAULT_BUDGET, "{}", chars(&text));
+    assert_line_caps(&text);
+    assert_eq!(wordless_firsts(&text, 30), Vec::<usize>::new(), "{text}");
+    for h in (0..30).filter(|h| matches!(h % 4, 1 | 2)) {
+        assert_eq!(
+            words_of(&text, &format!("s-{h:04x}{:016x}", 2)).len(),
+            2,
+            "m{h}'s asking agent keeps both its lines: {text}"
+        );
+    }
+    let rates = text
+        .lines()
+        .filter(|l| l.starts_with("  github_rate "))
+        .count();
+    assert!(rates < 60, "the quota rows fold: {text}");
+    assert!(
+        text.ends_with(&format!(
+            "{LEFT_OUT_LEAD}{} quota rows; --fleet with --budget, --sid <s> or --json for more\n",
+            60 - rates
+        )),
+        "a closing line of their own counts them: {text}"
+    );
+    let reads = fill_reads(&replies);
+    assert!(used_to_the_unit(&reads, DEFAULT_BUDGET, &text), "{text}");
+}
+
+/// Every machine's most pressing agent's leading excerpt line comes before any machine's second
+/// line of words, so a budget that holds every header, every agent's line and one line of words
+/// for each machine's first agent shows that line for every machine, an idle one last in its
+/// round included. NEGATIVE CONTROL: with the leading line ranked with the rest of its agent's
+/// words ([`FIRST_WORDS_UNLED`]), as before, the asking machines' second lines take the room of
+/// the idle machines' only line.
+#[test]
+fn every_machines_first_agent_speaks_before_any_second_line() {
+    let replies: Vec<HostReply> = (0..30).map(sim_mac).collect();
+    let blocks = blocks_of(&replies, None, false);
+    let order = fill_order(&blocks);
+    // The fill that holds the agent lines and every machine's first line of words, and no more.
+    let agents = order
+        .iter()
+        .take_while(|unit| matches!(unit, Unit::Line(..)))
+        .count();
+    let led = render(&blocks, &Shown::filled(&blocks, &order, agents + 30));
+    assert_eq!(wordless_firsts(&led, 30), Vec::<usize>::new(), "{led}");
+    assert_eq!(excerpt_rows(&led).len(), 30, "{led}");
+    let budget = chars(&led) + EXCERPT_CHARS;
+    let text = render_text(&replies, budget, None);
+    assert!(chars(&text) <= budget, "{}", chars(&text));
+    assert_eq!(wordless_firsts(&text, 30), Vec::<usize>::new(), "{text}");
+
+    FIRST_WORDS_UNLED.with(|on| on.set(true));
+    let before = render_text(&replies, budget, None);
+    FIRST_WORDS_UNLED.with(|on| on.set(false));
+    assert!(
+        !wordless_firsts(&before, 30).is_empty(),
+        "the control: a machine's most pressing agent loses every word: {before}"
+    );
+}
+
+/// A machine's second agent waiting on a person says its `attention:` line before any machine's
+/// most pressing agent that waits on no one says a word: one machine with two asking agents,
+/// each raising attention, beside twenty-nine whose first agent is idle, under a budget that
+/// holds every header, every agent line and one line of words for each of those thirty-one
+/// agents. Both asking agents show their `attention:` line, and every idle first its line.
+#[test]
+fn every_asking_agent_says_its_attention_before_an_idle_first() {
+    let claude = |h: usize, n: usize, agent: &str, attention: Option<&str>| {
+        let sid = format!("s-{h:04x}{n:016x}");
+        let mut fields = vec![
+            ("sid", sid.as_str()),
+            ("program", "claude"),
+            ("program_kind", "agent"),
+            ("agent", agent),
+            ("agent_ms", "4000"),
+            ("cwd", "~/Developer/aterm"),
+        ];
+        fields.extend(attention.map(|words| ("attention", words)));
+        let (prompt, said) = (
+            excerpt400(&"audit the dial loop ".repeat(30)),
+            excerpt400(&"the timers reset now ".repeat(30)),
+        );
+        fields.extend([("prompt", prompt.as_str()), ("said", said.as_str())]);
+        wire_row(&fields)
+    };
+    let mut replies = vec![reply(
+        0,
+        vec![
+            claude(0, 0, "question", Some("pick a port for the relay")),
+            claude(0, 1, "question", Some("approve the schema migration")),
+        ],
+    )];
+    replies.extend((1..30).map(|h| reply(h, vec![claude(h, 0, "idle", None)])));
+    let blocks = blocks_of(&replies, None, false);
+    let order = fill_order(&blocks);
+    let agents = order
+        .iter()
+        .take_while(|unit| matches!(unit, Unit::Line(..)))
+        .count();
+    let led = render(&blocks, &Shown::filled(&blocks, &order, agents + 31));
+    let budget = chars(&led) + EXCERPT_CHARS;
+    let text = render_text(&replies, budget, None);
+    assert!(chars(&text) <= budget, "{}", chars(&text));
+    for n in 0..2 {
+        let words = words_of(&text, &format!("s-{:04x}{n:016x}", 0));
+        assert!(
+            words
+                .first()
+                .is_some_and(|l| l.starts_with("    attention: ")),
+            "asking agent {n} keeps its attention line: {text}"
+        );
+    }
+    for h in 1..30 {
+        assert!(
+            !words_of(&text, &format!("s-{h:04x}{:016x}", 0)).is_empty(),
+            "m{h}'s idle first keeps a line: {text}"
+        );
+    }
+}
+
+/// The fill is the most units whose read fits, though the read does not grow with every unit:
+/// the unit that shows a fleet's last quota row drops the closing line that counted the quota
+/// rows, a longer line than the row. Under every budget between the read with that last row and
+/// the one before it, the fill reaches past that row, to the shells after it where they fit
+/// (a bisection over the units, which assumes the read grows, can settle short of the row).
+#[test]
+fn the_fill_reaches_past_a_read_that_shrinks() {
+    let replies: Vec<HostReply> = (0..3).map(sim_mac).collect();
+    let reads = fill_reads(&replies);
+    // Short of the whole read, which a budget that holds it shows wider than any fill.
+    let whole = reads.len() - 1;
+    let shrinks = (1..whole)
+        .filter(|&n| chars(&reads[n]) < chars(&reads[n - 1]))
+        .collect::<Vec<_>>();
+    assert!(!shrinks.is_empty(), "some unit shortens the read");
+    for &n in &shrinks {
+        let below_whole = chars(&reads[n - 1]).min(chars(&reads[whole]));
+        for budget in chars(&reads[n])..below_whole {
+            let text = render_text(&replies, budget, None);
+            assert!(chars(&text) <= budget, "{}", chars(&text));
+            assert!(
+                used_to_the_unit(&reads, budget, &text),
+                "budget {budget}: {text}"
+            );
+        }
+    }
+}
+
 /// Ten Macs whose homes each list sixteen checkouts, under a budget their home lines overrun:
 /// each home line is a unit of its own, so the read leaves less than a line unused, every home
 /// line shows before any checkout line, and the closing line counts the homes it cut (one-mesh
@@ -564,7 +784,7 @@ fn checkout_lines_fold_a_line_at_a_time() {
     let rows = |text: &str| text.lines().filter(|l| l.starts_with("    repo-")).count();
     // Every line at the excerpt width the fill uses; a budget half its checkout lines short of
     // that leaves the fill to choose.
-    let blocks = blocks_of(&replies, None);
+    let blocks = blocks_of(&replies, None, false);
     let all = render(&blocks, &Shown::all(&blocks, Class::Agent, EXCERPT_CHARS));
     assert_eq!((heads(&all), rows(&all)), (10, 160), "{all}");
     let row_room: usize = all
@@ -1439,7 +1659,7 @@ fn the_read_leads_with_its_data_line_within_the_budget() {
         .map(|h| reply(h, (0..10).map(|n| busy_agent(h, n)).collect()))
         .collect();
     let head = chars(DATA_LINE) + 1;
-    let blocks = blocks_of(&replies, None);
+    let blocks = blocks_of(&replies, None, false);
     let least = render(&blocks, &Shown::filled(&blocks, &[], 0))
         .lines()
         .count();
@@ -1587,7 +1807,7 @@ fn an_agent_idle_for_hours_keeps_its_excerpts_until_the_budget_is_tight() {
 }
 
 fn narrowest(replies: &[HostReply]) -> String {
-    let blocks = blocks_of(replies, None);
+    let blocks = blocks_of(replies, None, false);
     render(&blocks, &Shown::all(&blocks, Class::Agent, EXCERPT_CHARS))
 }
 
@@ -1668,7 +1888,7 @@ fn excerpts_narrow_alike_then_go_least_needed_first() {
     let replies: Vec<HostReply> = (0..3)
         .map(|h| reply(h, vec![resting.clone(), busy_agent(h, 1), busy_agent(h, 2)]))
         .collect();
-    let blocks = blocks_of(&replies, None);
+    let blocks = blocks_of(&replies, None, false);
     let whole = chars(&render_text(&replies, usize::MAX, None));
     let narrowest = chars(&narrowest(&replies));
     let all = excerpt_rows(&render_text(&replies, usize::MAX, None)).len();
@@ -3045,6 +3265,86 @@ fn an_instances_account_rows_parse_and_print_on_one_line() {
     assert!(!render_full(&[none], None).contains("accounts:"));
 }
 
+/// SURVEY UPDATE LINE (ATERM-KI-1111-23): an instance that says where its updater stands prints it
+/// under its header on `--host` (`  update held: 0.199.0 is held for 3 h more (crash-loop, try 2)
+/// · checked 10 min ago`, its ages on its own Mac's clock), within the line caps, and `--json`
+/// carries every `update*=` word in its instance object. An older aterm's header says nothing of
+/// it and prints no line; the digest leaves out a routine (`current`, checks on) standing and
+/// keeps one a reader cannot pass by. A header with no `at_ms=` has no clock to tell the hold's
+/// time left or the check's age on, and tells neither.
+/// NEGATIVE CONTROL: an `update_line` that prints `update -` for a header with no `update=` fails
+/// "an older aterm says nothing"; one that ignores `whole` fails "the digest leaves out current";
+/// one that tells a hold with no clock as of the epoch fails "no clock, no time left".
+#[test]
+fn an_instances_updater_prints_under_its_header() {
+    // 1793130000 is the reply's own clock.
+    let held = " update=held update_at=1793129400 update_to=0.199.0 update_until=1793140800 \
+                update_why=crash-loop update_tries=2 update_checks=on";
+    let reply = accounts_reply(true, held, Vec::new());
+    let text = render_full(std::slice::from_ref(&reply), None);
+    assert!(
+        text.contains(
+            "\n  update held: 0.199.0 is held for 3 h more (crash-loop, try 2) \u{b7} checked 10 \
+             min ago\n"
+        ),
+        "{text}"
+    );
+    assert_line_caps(&text);
+    let json = render_json(std::slice::from_ref(&reply));
+    for said in [
+        "\"update\":\"held\"",
+        "\"update_to\":\"0.199.0\"",
+        "\"update_why\":\"crash-loop\"",
+        "\"update_tries\":\"2\"",
+    ] {
+        assert!(json.contains(said), "{said}: {json}");
+    }
+    assert!(
+        render_text(std::slice::from_ref(&reply), 10_000, None).contains("\n  update held: "),
+        "the digest keeps a hold"
+    );
+
+    let older = accounts_reply(true, "", Vec::new());
+    assert!(
+        !render_full(std::slice::from_ref(&older), None).contains("  update"),
+        "an older aterm says nothing"
+    );
+    let escaped = accounts_reply(true, " update=%1B%5B2J", Vec::new());
+    assert!(!render_full(&[escaped], None).contains("  update"));
+
+    let current = accounts_reply(
+        true,
+        " update=current update_at=1793126400 update_checks=on",
+        Vec::new(),
+    );
+    assert!(
+        render_full(std::slice::from_ref(&current), None)
+            .contains("\n  update current: up to date \u{b7} checked 1 h ago\n"),
+        "--host says every standing"
+    );
+    assert!(
+        !render_text(std::slice::from_ref(&current), 10_000, None).contains("  update"),
+        "the digest leaves out current"
+    );
+    let off = accounts_reply(true, " update=current update_checks=off", Vec::new());
+    assert!(
+        render_text(&[off], 10_000, None)
+            .contains("\n  update current: up to date \u{b7} automatic checks off\n"),
+        "the digest keeps checks said off"
+    );
+    let unclocked = HostReply {
+        answer: parse_reply(&[format!(
+            "instance pid=1 host=m7.local version=0.146.0 sessions=0 level=facts{held}"
+        )]),
+        ..accounts_reply(true, "", Vec::new())
+    };
+    assert!(
+        render_full(&[unclocked], None)
+            .contains("\n  update held: 0.199.0 is held (crash-loop, try 2)\n"),
+        "no clock, no time left"
+    );
+}
+
 /// An instance that says where its home is prints it with its free space and when it read its
 /// checkouts, then each checkout on a line of its own; `--json` carries every row. Rows that did
 /// not all come, a read not made yet and an older aterm say nothing of its checkouts: `null`,
@@ -3397,4 +3697,59 @@ fn session_line_shows_request_from_and_why_beside_typed_by() {
         ("request_why", "-"),
     ]);
     assert!(!person.contains(" request"), "{person}");
+}
+
+/// A SESSION'S FLEET SURVEY IS ONE OUTGOING READ OF EACH MAC THAT ANSWERED IT, in the fleet
+/// activity record; a survey no session asked for (the menu-bar item's read, a placement's) is
+/// a poll and leaves no row, and neither does a Mac that did not answer or proved no node.
+#[test]
+fn a_sessions_fleet_survey_is_a_read_of_each_mac_that_answered() {
+    use aterm_types::fleet_activity::{Outcome, Plain, Way};
+    const SID: &str = "s-0123456789abcdef0123";
+    let (a, b) = ("0a".repeat(16), "0b".repeat(16));
+    let peer = |label: &str, node: Option<&str>, proved: Option<&str>, answered: bool| PeerSurvey {
+        authenticated: proved.map(|node| AuthenticatedPeer {
+            node: node.to_owned(),
+            key: [7; 32],
+        }),
+        label: label.to_owned(),
+        answer: if answered {
+            Ok(vec!["instance pid=1".to_owned()])
+        } else {
+            Err("timed out".to_owned())
+        },
+        fault: PeerFault::Other,
+        unproven: proved.is_none() && node.is_none(),
+        node: node.map(str::to_owned),
+        addr: None,
+        reason: None,
+    };
+    let peers = [
+        peer("m18", Some(&a), Some(&a), true),
+        // The connection's proof names the node, whatever the book asked for.
+        peer("m85", Some(&a), Some(&b), true),
+        peer("m3", Some(&b), None, false),
+        peer("stranger", None, None, true),
+    ];
+    let noted =
+        || crate::fleet_activity::NOTED.with(|noted| std::mem::take(&mut *noted.borrow_mut()));
+    drop(noted());
+    note_fleet_reads(&peers, None);
+    assert_eq!(noted(), [], "a poll");
+    note_fleet_reads(&peers, Some(SID));
+    let rows: Vec<_> = noted()
+        .into_iter()
+        .map(|row| {
+            assert_eq!(
+                (row.way, row.what, row.outcome),
+                (Way::Out, Plain::Read, Outcome::Admitted)
+            );
+            assert_eq!(row.by.as_deref(), Some(SID));
+            (row.node, row.host)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [(a, Some("m18".to_owned())), (b, Some("m85".to_owned()))]
+    );
 }

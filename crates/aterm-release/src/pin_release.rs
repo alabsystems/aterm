@@ -45,6 +45,12 @@
 //! The `<record>` path ([`super::pin_verifier`]) trusts the cutting machine's `dist/` record
 //! instead: the receipts its own sign step froze from the files it then uploaded, with no
 //! signature over them.
+//!
+//! `--windows --from-release vX.Y.Z` ([`windows_pin_from_release`]) reads get-aterm.ps1's pin
+//! by the same steps 1 to 4, from the `windows_verifier_*` fields the release's appcast signs
+//! ([`crate::windows_pin::stamp`]), and holds the served Windows verifier to them and to an
+//! x86-64 console executable in step 5. It is the only way that pin is written: no unsigned
+//! record writes it ([`crate::windows_pin`] says why).
 
 use std::path::Path;
 
@@ -104,6 +110,134 @@ pub fn pin_from_release(root: &Path, tag: &str) -> Result<Pin, String> {
 /// appcast that signs no verifier; a verifier asset the release lacks, lists at another size,
 /// or serves as other bytes; or a verifier that is not its architecture's static executable.
 pub fn read_record(root: &Path, git: &dyn GitRunner, ask: &Ask<'_>) -> Result<pin::Record, String> {
+    let Signed {
+        ledger,
+        build,
+        commit,
+        release,
+        manifest,
+    } = signed_release(root, git, ask)?;
+    let Some((receipts, interface)) = super::signed_verifiers(&manifest)? else {
+        return Err(format!(
+            "{}'s signed appcast names no bootstrap verifier, so nothing the release signer \
+             signed binds a verifier asset to it (a release cut before the appcast carried \
+             the verifier fields, or one cut without them). Pin from a release that signs \
+             them, or from its cut's dist/{}",
+            ask.tag,
+            super::PIN_RECORD
+        ));
+    };
+    let scratch = download_directory(ask)?;
+    for receipt in &receipts {
+        let at = fetch(ask, &release, scratch.path(), receipt)?;
+        let target = super::TARGETS
+            .into_iter()
+            .find(|target| target.arch() == receipt.arch)
+            .ok_or_else(|| format!("no Linux target is named {:?}", receipt.arch))?;
+        super::static_verifier_file(&at, target, receipt.size, &receipt.sha256)?;
+    }
+    let record = pin::Record {
+        repo: ask.slug.to_string(),
+        tag: ask.tag.to_string(),
+        build_number: build,
+        commit,
+        interface,
+        verifiers: receipts,
+    };
+    record.validate()?;
+    record.claimed_in(&ledger)?;
+    drop(scratch);
+    Ok(record)
+}
+
+/// `targo --unverified ship pin-verifier --windows --from-release <tag>`: read `tag`'s Windows
+/// verifier from the public channel this checkout's Cargo.toml names, as
+/// [`read_windows_record`] does, and write get-aterm.ps1's pin and its record into the
+/// checkout at `root` ([`crate::windows_pin::write_windows_pin`]). The pin it wrote.
+///
+/// # Errors
+/// As [`read_windows_record`] and [`crate::windows_pin::write_windows_pin`]: nothing is
+/// written.
+pub fn windows_pin_from_release(root: &Path, tag: &str) -> Result<pin::WindowsPin, String> {
+    let slug = crate::publish::workspace_channel_slug(root).map_err(|e| e.to_string())?;
+    let ask = Ask {
+        slug: &slug,
+        tag,
+        masters: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        now_unix: aterm_update_core::roster::now_unix(),
+        scratch: &std::env::temp_dir(),
+    };
+    let record = read_windows_record(root, &crate::ledger::GitCli::new(root), &ask)?;
+    crate::windows_pin::write_windows_pin(root, &record)
+}
+
+/// The [`pin::WindowsRecord`] of `ask.tag`'s Windows verifier, admitted as [`read_record`]
+/// admits the Linux ones (the module's list says what is trusted), from the
+/// `windows_verifier_*` fields the release's appcast signs
+/// ([`crate::windows_pin::signed_windows_verifiers`]), the served file held to them and to an
+/// x86-64 console executable ([`crate::windows_pin::windows_verifier_file`]). This is the only
+/// way get-aterm.ps1's pin is written: no unsigned record writes it.
+///
+/// # Errors
+/// As [`read_record`], for the Windows verifier: among them a release whose appcast signs no
+/// Windows verifier.
+pub fn read_windows_record(
+    root: &Path,
+    git: &dyn GitRunner,
+    ask: &Ask<'_>,
+) -> Result<pin::WindowsRecord, String> {
+    let Signed {
+        ledger,
+        build,
+        commit,
+        release,
+        manifest,
+    } = signed_release(root, git, ask)?;
+    let Some((receipts, interface)) = crate::windows_pin::signed_windows_verifiers(&manifest)?
+    else {
+        return Err(format!(
+            "{}'s signed appcast names no Windows bootstrap verifier, so nothing the release \
+             signer signed binds one to it (a release cut before the appcast carried the \
+             windows_verifier fields, or one cut without a Windows verifier). Pin from a \
+             release that signs one",
+            ask.tag
+        ));
+    };
+    let scratch = download_directory(ask)?;
+    for receipt in &receipts {
+        let at = fetch(ask, &release, scratch.path(), receipt)?;
+        crate::windows_pin::windows_verifier_file(&at, receipt.size, &receipt.sha256)?;
+    }
+    let record = pin::WindowsRecord(pin::Record {
+        repo: ask.slug.to_string(),
+        tag: ask.tag.to_string(),
+        build_number: build,
+        commit,
+        interface,
+        verifiers: receipts,
+    });
+    record.validate()?;
+    record.0.claimed_in(&ledger)?;
+    drop(scratch);
+    Ok(record)
+}
+
+/// What a public release signs, once admitted: this checkout's claim (its RELEASES.ledger text,
+/// build and tag commit), the release as GitHub lists it, and its appcast.
+struct Signed {
+    ledger: String,
+    build: u64,
+    commit: String,
+    release: Release,
+    manifest: Manifest,
+}
+
+/// `ask.tag`'s release and its appcast, admitted by the module's list of trust (1 to 4): a
+/// canonical tag this checkout claims and has, a published release no newer than the channel
+/// head, the head's roster under the paper master, the head's and the release's appcasts under
+/// that roster, the release at or above the head's apply floor, and the appcast's version,
+/// build and commit the claim's.
+fn signed_release(root: &Path, git: &dyn GitRunner, ask: &Ask<'_>) -> Result<Signed, String> {
     let version = crate::publish::canonical_channel_tag_version(ask.tag)
         .map_err(|_| format!("{:?} is not a release tag (vMAJOR.MINOR.PATCH)", ask.tag))?;
     let ledger_path = root.join("RELEASES.ledger");
@@ -148,78 +282,72 @@ pub fn read_record(root: &Path, git: &dyn GitRunner, ask: &Ask<'_>) -> Result<pi
             ask.tag, manifest.version, manifest.build_number, manifest.commit, ask.tag
         ));
     }
-    let Some((receipts, interface)) = super::signed_verifiers(&manifest)? else {
-        return Err(format!(
-            "{}'s signed appcast names no bootstrap verifier, so nothing the release signer \
-             signed binds a verifier asset to it (a release cut before the appcast carried \
-             the verifier fields, or one cut without them). Pin from a release that signs \
-             them, or from its cut's dist/{}",
-            ask.tag,
-            super::PIN_RECORD
-        ));
-    };
-    let scratch = aterm_tempfile::Builder::new()
+    Ok(Signed {
+        ledger,
+        build,
+        commit,
+        release,
+        manifest,
+    })
+}
+
+/// A fresh private directory under `ask.scratch` for the verifiers' downloads, removed when
+/// dropped.
+fn download_directory(ask: &Ask<'_>) -> Result<aterm_tempfile::TempDir, String> {
+    aterm_tempfile::Builder::new()
         .prefix("aterm-pin-verifier-")
         .suffix(".noindex")
         .tempdir_in(ask.scratch)
-        .map_err(|e| format!("make a private download directory: {e}"))?;
-    for receipt in &receipts {
-        let listed = release.assets.iter().find(|a| a.name == receipt.asset);
-        match listed {
-            None => {
-                return Err(format!(
-                    "{} lacks its {} bootstrap verifier asset {} (the signed appcast names it)",
-                    ask.tag, receipt.arch, receipt.asset
-                ));
-            }
-            Some(asset) if asset.size != receipt.size => {
-                return Err(format!(
-                    "{} lists {} at {} bytes, and its signed appcast says {}",
-                    ask.tag, receipt.asset, asset.size, receipt.size
-                ));
-            }
-            Some(_) => {}
-        }
-        let at = scratch.path().join(&receipt.asset);
-        let fetched = crate::publish::verify_release_asset_digest_for_release_id_to(
-            ask.slug,
-            release.id,
-            ask.tag,
-            &receipt.asset,
-            &receipt.sha256,
-            &at,
-        )
-        .map_err(|e| {
-            format!(
-                "{}'s {} is not the file its signed appcast names: {e}",
-                ask.tag, receipt.asset
-            )
-        })?;
-        if fetched.size != receipt.size || fetched.sha256 != receipt.sha256 {
+        .map_err(|e| format!("make a private download directory: {e}"))
+}
+
+/// `receipt`'s asset of `release` downloaded into `scratch` by its exact asset id, and held to
+/// the signed size and digest: where it is.
+fn fetch(
+    ask: &Ask<'_>,
+    release: &Release,
+    scratch: &Path,
+    receipt: &pin::Receipt,
+) -> Result<std::path::PathBuf, String> {
+    let listed = release.assets.iter().find(|a| a.name == receipt.asset);
+    match listed {
+        None => {
             return Err(format!(
-                "{}'s {} downloaded as {} bytes of SHA-256 {}, and its signed appcast says {} \
-                 bytes of {}",
-                ask.tag, receipt.asset, fetched.size, fetched.sha256, receipt.size, receipt.sha256
+                "{} lacks its {} bootstrap verifier asset {} (the signed appcast names it)",
+                ask.tag, receipt.arch, receipt.asset
             ));
         }
-        let target = super::TARGETS
-            .into_iter()
-            .find(|target| target.arch() == receipt.arch)
-            .ok_or_else(|| format!("no Linux target is named {:?}", receipt.arch))?;
-        super::static_verifier_file(&at, target, receipt.size, &receipt.sha256)?;
+        Some(asset) if asset.size != receipt.size => {
+            return Err(format!(
+                "{} lists {} at {} bytes, and its signed appcast says {}",
+                ask.tag, receipt.asset, asset.size, receipt.size
+            ));
+        }
+        Some(_) => {}
     }
-    let record = pin::Record {
-        repo: ask.slug.to_string(),
-        tag: ask.tag.to_string(),
-        build_number: build,
-        commit,
-        interface,
-        verifiers: receipts,
-    };
-    record.validate()?;
-    record.claimed_in(&ledger)?;
-    drop(scratch);
-    Ok(record)
+    let at = scratch.join(&receipt.asset);
+    let fetched = crate::publish::verify_release_asset_digest_for_release_id_to(
+        ask.slug,
+        release.id,
+        ask.tag,
+        &receipt.asset,
+        &receipt.sha256,
+        &at,
+    )
+    .map_err(|e| {
+        format!(
+            "{}'s {} is not the file its signed appcast names: {e}",
+            ask.tag, receipt.asset
+        )
+    })?;
+    if fetched.size != receipt.size || fetched.sha256 != receipt.sha256 {
+        return Err(format!(
+            "{}'s {} downloaded as {} bytes of SHA-256 {}, and its signed appcast says {} \
+             bytes of {}",
+            ask.tag, receipt.asset, fetched.size, fetched.sha256, receipt.size, receipt.sha256
+        ));
+    }
+    Ok(at)
 }
 
 /// The one build RELEASES.ledger (`ledger`, its text) claims for `version`.

@@ -298,6 +298,27 @@ crate::att_collection!(
     }
 );
 
+/// The machine a `machine-facts` row says its Mac is: the one its own `merged_into` names (an
+/// owner merge it acknowledged, or its fold of a successor's birth, lab model §6), else the one
+/// its `mac` binds. Every reader that asks which machine an enrollment is asks this.
+pub fn bound_machine(facts: &Value) -> Option<&str> {
+    facts
+        .get("merged_into")
+        .and_then(Value::as_str)
+        .or_else(|| facts.get("mac").and_then(Value::as_str))
+}
+
+/// Every machine a `machine-facts` row holds, each once: the one it is ([`bound_machine`]) and
+/// the `mac` it was bound to before a merge, so neither looks free to another Mac's adoption.
+pub fn held_machines(facts: &Value) -> Vec<&str> {
+    let mut held: Vec<&str> = ["merged_into", "mac"]
+        .into_iter()
+        .filter_map(|column| facts.get(column).and_then(Value::as_str))
+        .collect();
+    held.dedup();
+    held
+}
+
 crate::att_collection!(
     /// A login or mail address, keyed `ad-<16hex>` from the address it was born with, which is
     /// the one value typed `email` in the registry. A rename keeps the key, so a row is found

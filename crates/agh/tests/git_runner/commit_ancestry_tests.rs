@@ -55,6 +55,422 @@ fn answer(
     Ok(aterm_json::from_str(&out.stdout).unwrap())
 }
 
+#[test]
+fn complete_linear_negative_batches_local_commit_reads() {
+    let world = World::canonical("commit-ancestry-linear-batches");
+    let store = bare_repo(world.path(), "source");
+    let root = host_git(&store, &["rev-parse", "main"]);
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let unrelated = host_git(&store, &["commit-tree", &tree, "-m", "unrelated"]);
+    let mut tip = root.clone();
+    for index in 0..256 {
+        tip = host_git(
+            &store,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &tip,
+                "-m",
+                &format!("step {index}"),
+            ],
+        );
+    }
+    let gh = world.client(git_env()).build();
+    let result = answer(&gh, &store, &unrelated, &tip).unwrap();
+    assert_eq!(result["queries"][0]["contained"], json!(false));
+    assert_eq!(result["acquired_commits"], json!(0));
+    assert_eq!(result["api_body_bytes"], json!(0));
+    assert!(world.fake.seen().is_empty(), "the complete DAG is local");
+    let reads = gh
+        .fx()
+        .children_run()
+        .iter()
+        .filter(|child| child.args.iter().any(|arg| arg == "cat-file"))
+        .count();
+    eprintln!("257-commit original negative: {reads} cat-file children; 0 acquisitions/API bytes");
+    assert!(
+        reads <= 32,
+        "a complete 257-commit linear negative used {reads} cat-file children"
+    );
+    assert_eq!(
+        answer(&gh, &store, &root, &tip).unwrap()["queries"][0]["contained"],
+        json!(true)
+    );
+}
+
+#[test]
+fn corrupt_intermediate_commit_cannot_supply_a_positive_parent_path() {
+    let world = World::canonical("commit-ancestry-corrupt-intermediate");
+    let store = bare_repo(world.path(), "source");
+    let root = host_git(&store, &["rev-parse", "main"]);
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let unrelated = host_git(&store, &["commit-tree", &tree, "-m", "unrelated"]);
+    let middle = host_git(
+        &store,
+        &["commit-tree", &tree, "-p", &unrelated, "-m", "middle"],
+    );
+    let tip = host_git(&store, &["commit-tree", &tree, "-p", &middle, "-m", "tip"]);
+    let gh = world.client(git_env()).build();
+    assert_eq!(
+        answer(&gh, &store, &root, &tip).unwrap()["queries"][0]["contained"],
+        json!(false)
+    );
+    let forged = host_git(&store, &["commit-tree", &tree, "-p", &root, "-m", "middle"]);
+    let object = |id: &str| store.join("objects").join(&id[..2]).join(&id[2..]);
+    std::fs::remove_file(object(&middle)).unwrap();
+    std::fs::copy(object(&forged), object(&middle)).unwrap();
+    assert_eq!(host_git(&store, &["merge-base", &root, &tip]), root);
+    let gh = world.client(git_env()).build();
+    let result = answer(&gh, &store, &root, &tip);
+    assert!(
+        result.is_err(),
+        "a corrupt intermediate object supplied {result:?}"
+    );
+    assert!(
+        world.fake.seen().is_empty(),
+        "a corrupt held object is not repaired remotely"
+    );
+}
+
+#[test]
+fn lookahead_corruption_older_than_the_requested_ancestor_is_not_required() {
+    let world = World::canonical("commit-ancestry-irrelevant-older-corruption");
+    let store = bare_repo(world.path(), "source");
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let older = host_git(&store, &["commit-tree", &tree, "-m", "older"]);
+    let ancestor = host_git(
+        &store,
+        &["commit-tree", &tree, "-p", &older, "-m", "ancestor"],
+    );
+    let middle = host_git(
+        &store,
+        &["commit-tree", &tree, "-p", &ancestor, "-m", "middle"],
+    );
+    let tip = host_git(&store, &["commit-tree", &tree, "-p", &middle, "-m", "tip"]);
+    let gh = world.client(git_env()).build();
+    assert_eq!(
+        answer(&gh, &store, &ancestor, &tip).unwrap()["queries"][0]["contained"],
+        json!(true)
+    );
+    let forged = host_git(&store, &["commit-tree", &tree, "-m", "different older"]);
+    let object = |id: &str| store.join("objects").join(&id[..2]).join(&id[2..]);
+    std::fs::remove_file(object(&older)).unwrap();
+    std::fs::copy(object(&forged), object(&older)).unwrap();
+    let gh = world.client(git_env()).build();
+    assert_eq!(
+        answer(&gh, &store, &ancestor, &tip).unwrap()["queries"][0]["contained"],
+        json!(true),
+        "only the exact ancestor, middle and tip form the required path"
+    );
+    assert!(world.fake.seen().is_empty());
+}
+
+#[test]
+fn lookahead_advice_cannot_add_an_edge_or_erase_a_required_parent() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let world = World::canonical("commit-ancestry-hostile-advice");
+    let store = bare_repo(world.path(), "source");
+    let root = host_git(&store, &["rev-parse", "main"]);
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let unrelated = host_git(&store, &["commit-tree", &tree, "-m", "unrelated"]);
+    let right_root = host_git(&store, &["commit-tree", &tree, "-m", "right root"]);
+    let middle = host_git(&store, &["commit-tree", &tree, "-p", &root, "-m", "middle"]);
+    let right = host_git(
+        &store,
+        &["commit-tree", &tree, "-p", &right_root, "-m", "right"],
+    );
+    let tip = host_git(
+        &store,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &middle,
+            "-p",
+            &right,
+            "-m",
+            "tip",
+        ],
+    );
+    let body_file = world.path().join("advice-body");
+    std::fs::write(&body_file, b"a blob is not commit metadata").unwrap();
+    let wrong_type = host_git(&store, &["hash-object", "-w", body_file.to_str().unwrap()]);
+    let mut oversized_body = format!(
+        "tree {tree}\nauthor fixture <fixture> 1700000000 +0000\ncommitter fixture <fixture> 1700000000 +0000\n\n"
+    );
+    oversized_body.extend(std::iter::repeat_n('x', 256 * 1024 + 1));
+    std::fs::write(&body_file, oversized_body).unwrap();
+    let oversized = host_git(
+        &store,
+        &[
+            "hash-object",
+            "-w",
+            "-t",
+            "commit",
+            body_file.to_str().unwrap(),
+        ],
+    );
+    for (ancestor, expected) in [(&root, true), (&right_root, true), (&unrelated, false)] {
+        let control = world.client(git_env()).build();
+        assert_eq!(
+            answer(&control, &store, ancestor, &tip).unwrap()["queries"][0]["contained"],
+            json!(expected)
+        );
+        let spec = control
+            .fx()
+            .children_run()
+            .into_iter()
+            .find(|child| child.args.iter().any(|arg| arg == "rev-list"))
+            .unwrap();
+        for mode in [
+            "empty",
+            "omitted",
+            "reordered",
+            "forged-present",
+            "forged-missing",
+            "wrong-type",
+            "oversized",
+            "malformed",
+            "duplicate",
+            "truncated",
+            "partial",
+        ] {
+            let fired = Arc::new(AtomicBool::new(false));
+            let observed = fired.clone();
+            let current_tip = tip.clone();
+            let unrelated = unrelated.clone();
+            let wrong_type = wrong_type.clone();
+            let oversized = oversized.clone();
+            let fx = Fx::simulated(live_start()).with_git_intercept_once_for_tests(
+                spec.program.clone(),
+                spec.args.clone(),
+                || {},
+                move |result| {
+                    let output = result.as_mut().unwrap();
+                    output.stdout = match mode {
+                        "empty" => Vec::new(),
+                        "reordered" => format!("{unrelated}\n{current_tip}\n").into_bytes(),
+                        "forged-present" => format!("{current_tip}\n{unrelated}\n").into_bytes(),
+                        "forged-missing" => {
+                            format!("{current_tip}\n{}\n", "a".repeat(40)).into_bytes()
+                        }
+                        "wrong-type" => format!("{current_tip}\n{wrong_type}\n").into_bytes(),
+                        "oversized" => format!("{current_tip}\n{oversized}\n").into_bytes(),
+                        "malformed" => b"not an object id\n".to_vec(),
+                        "duplicate" => format!("{current_tip}\n{current_tip}\n").into_bytes(),
+                        "truncated" => vec![b'x'; aterm_uds::deadline::OUTPUT_KEEP],
+                        _ => format!("{current_tip}\n").into_bytes(),
+                    };
+                    if mode == "partial" {
+                        output.code = Some(128);
+                    }
+                    observed.store(true, Ordering::SeqCst);
+                },
+            );
+            let gh = world.client(git_env()).fx(Arc::new(fx)).build();
+            let result = answer(&gh, &store, ancestor, &tip).unwrap();
+            assert!(
+                fired.load(Ordering::SeqCst),
+                "the {mode} mutation was exercised"
+            );
+            assert_eq!(result["queries"][0]["contained"], json!(expected), "{mode}");
+            assert_eq!(result["acquired_commits"], json!(0), "{mode}");
+        }
+    }
+    assert!(
+        world.fake.seen().is_empty(),
+        "advice never requests missing or unrelated objects"
+    );
+}
+
+#[test]
+fn large_local_commit_frames_stay_complete_when_packed() {
+    let world = World::canonical("commit-ancestry-large-frames");
+    let store = bare_repo(world.path(), "source");
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let mut commits = Vec::new();
+    for index in 0..4 {
+        let mut body = format!(
+            "tree {tree}\nauthor fixture <fixture> 1700000000 +0000\ncommitter fixture <fixture> 1700000000 +0000\n\n{index}"
+        );
+        body.extend(std::iter::repeat_n('x', 256 * 1024 - body.len()));
+        let file = world.path().join(format!("large-{index}"));
+        std::fs::write(&file, body).unwrap();
+        commits.push(host_git(
+            &store,
+            &["hash-object", "-w", "-t", "commit", file.to_str().unwrap()],
+        ));
+    }
+    let request = CommitRead::new(CommitReadInput {
+        commits: commits.clone(),
+        queries: Vec::new(),
+    })
+    .unwrap();
+    let gh = world.client(git_env()).build();
+    let out = gh
+        .run_git(&GitRun::commit_read(
+            &common::slug("fixture-dev/app"),
+            &store,
+            request,
+            true,
+        ))
+        .unwrap();
+    let result: Value = aterm_json::from_str(&out.stdout).unwrap();
+    assert_eq!(result["commits"], json!(commits));
+    assert_eq!(result["acquired_commits"], json!(0));
+    assert!(world.fake.seen().is_empty());
+}
+
+#[test]
+fn local_commit_capture_faults_never_supply_an_observation() {
+    let world = World::canonical("commit-ancestry-capture-faults");
+    let store = bare_repo(world.path(), "source");
+    let root = host_git(&store, &["rev-parse", "main"]);
+    let request = CommitRead::new(CommitReadInput {
+        commits: vec![root],
+        queries: Vec::new(),
+    })
+    .unwrap();
+    let control = world.client(git_env()).build();
+    control
+        .run_git(&GitRun::commit_read(
+            &common::slug("fixture-dev/app"),
+            &store,
+            request.clone(),
+            true,
+        ))
+        .unwrap();
+    let spec = control
+        .fx()
+        .children_run()
+        .into_iter()
+        .find(|child| child.args.iter().any(|arg| arg == "--batch"))
+        .unwrap();
+    for mode in [
+        "header-size",
+        "type",
+        "hash",
+        "trailing",
+        "truncated",
+        "capture-full",
+    ] {
+        let fx = Fx::simulated(live_start()).with_git_intercept_once_for_tests(
+            spec.program.clone(),
+            spec.args.clone(),
+            || {},
+            move |result| {
+                let output = result.as_mut().unwrap();
+                let end = output
+                    .stdout
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .unwrap();
+                match mode {
+                    "header-size" | "type" => {
+                        let header = std::str::from_utf8(&output.stdout[..end]).unwrap();
+                        let fields = header.split(' ').collect::<Vec<_>>();
+                        let size = fields[2].parse::<usize>().unwrap()
+                            + usize::from(mode == "header-size");
+                        let kind = if mode == "type" { "blob" } else { "commit" };
+                        output.stdout = [
+                            format!("{} {kind} {size}\n", fields[0]).into_bytes(),
+                            output.stdout[end + 1..].to_vec(),
+                        ]
+                        .concat();
+                    }
+                    "hash" => output.stdout[end + 1] ^= 1,
+                    "trailing" => output.stdout.extend_from_slice(b"extra\n"),
+                    "truncated" => {
+                        output.stdout.pop();
+                    }
+                    "capture-full" => output.stdout = vec![b'x'; aterm_uds::deadline::OUTPUT_KEEP],
+                    _ => unreachable!(),
+                }
+            },
+        );
+        let gh = world.client(git_env()).fx(Arc::new(fx)).build();
+        gh.run_git(&GitRun::commit_read(
+            &common::slug("fixture-dev/app"),
+            &store,
+            request.clone(),
+            true,
+        ))
+        .expect_err(mode);
+    }
+    assert!(world.fake.seen().is_empty());
+}
+
+#[test]
+fn a_late_parent_header_cannot_mint_an_original_git_edge() {
+    let world = World::canonical("commit-ancestry-late-parent");
+    let store = bare_repo(world.path(), "source");
+    let root = host_git(&store, &["rev-parse", "main"]);
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let file = world.path().join("late-parent");
+    std::fs::write(&file, format!("tree {tree}\nauthor fixture <fixture> 1700000000 +0000\ncommitter fixture <fixture> 1700000000 +0000\nparent {root}\n\nlate parent\n")).unwrap();
+    let late = host_git(
+        &store,
+        &[
+            "hash-object",
+            "--literally",
+            "-w",
+            "-t",
+            "commit",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        host_git(&store, &["rev-list", "--parents", "--max-count=1", &late]),
+        late
+    );
+    let gh = world.client(git_env()).build();
+    let result = answer(&gh, &store, &root, &late);
+    assert!(
+        result.is_err(),
+        "a header outside Git's parent block supplied {result:?}"
+    );
+    assert!(answer(&gh, &store, &late, &late).is_err());
+    assert!(world.fake.seen().is_empty());
+}
+
+#[test]
+fn malformed_equal_and_direct_parent_endpoints_are_refused() {
+    let world = World::canonical("commit-ancestry-malformed-endpoint");
+    let store = bare_repo(world.path(), "source");
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let file = world.path().join("malformed-commit");
+    std::fs::write(&file, b"not commit metadata\n").unwrap();
+    let malformed = host_git(
+        &store,
+        &[
+            "hash-object",
+            "--literally",
+            "-w",
+            "-t",
+            "commit",
+            file.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(&file, format!("tree {tree}\nparent {malformed}\nauthor fixture <fixture> 1700000000 +0000\ncommitter fixture <fixture> 1700000000 +0000\n\nchild\n")).unwrap();
+    let child = host_git(
+        &store,
+        &[
+            "hash-object",
+            "--literally",
+            "-w",
+            "-t",
+            "commit",
+            file.to_str().unwrap(),
+        ],
+    );
+    let gh = world.client(git_env()).build();
+    assert!(answer(&gh, &store, &malformed, &malformed).is_err());
+    assert!(answer(&gh, &store, &malformed, &child).is_err());
+    assert!(world.fake.seen().is_empty());
+}
+
 /// The explicit-public commit reader owns the same bounded retry policy as every other
 /// anonymous API read. NEGATIVE CONTROL: restoring `RetryPolicy::NONE` in the ancestry reader
 /// refuses on the first injected 504, so neither the three calls nor the two retry records exist.

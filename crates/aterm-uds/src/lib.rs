@@ -355,6 +355,10 @@ pub fn kept_out<T, E>(create: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
 /// `pipe(2)`'s errno, or the mark's `fcntl(2)` errno (both ends are then closed).
 #[cfg(unix)]
 pub fn pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one sanctioned pipe constructor: std's pipe, made and marked under the spawn lock"
+    )]
     kept_out(std::io::pipe)
 }
 
@@ -365,6 +369,10 @@ pub fn pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
 /// `std::io::pipe`'s error (`Unsupported` where the platform has no pipe).
 #[cfg(not(unix))]
 pub fn pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one sanctioned pipe constructor: off Unix no handle std makes is inheritable"
+    )]
     std::io::pipe()
 }
 
@@ -574,6 +582,9 @@ pub mod sudo;
 pub mod test_binary;
 /// A child that ends with the process that started it, killed outright included: Linux's parent-death signal, and this executable's [`tether::VERB`] (every tethered spawn on Darwin, a group leader's on Linux), which leaves a watcher behind as it execs the child ([`spawnfd::Tether`]).
 pub mod tether;
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+mod retained_image_store;
 /// A zone's offset from UTC at an instant, read in this process: the local clock's by
 /// `localtime_r`, a named zone's from its TZif file, never `date +%z`. See [`zone`].
 pub mod zone;

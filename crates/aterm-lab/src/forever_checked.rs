@@ -12,10 +12,8 @@
 //!   9c prints no `landed_head=`, which fails it.
 //! * the leg each chain's folder makes ([`leg_of`]): `on-main` over the lab's pushed
 //!   repositories, `no-remote` over land-n's (L18), `no-repo` over land-o's plain folder (L19).
-//! * L16 and L17: the Done for you row's tip, what aterm checked and what the agent said
-//!   ([`done_tip`]), naming the head on `origin/main`.
 //! * L15: the spawned worker's `checked=` on the manager's `await task` row and `result`'s
-//!   header, and its row's tip under its manager ([`worker_checked`]).
+//!   header ([`worker_checked`]).
 //! * L1, L7, L16–L19: the landed chip's title, read in front, says its own receipt's words in
 //!   brief ([`title_checked`]).
 
@@ -75,10 +73,8 @@ pub fn with_checked(chain: Chain, s: Scenario, seen: &Seen, t0: i64, verdict: Ve
         return verdict;
     }
     let mut wants = vec![status_agrees(chain, seen, t0)];
-    match s {
-        Scenario::L16 | Scenario::L17 => wants.push(done_tip(seen, t0)),
-        Scenario::L15 => wants.push(worker_checked(seen, t0)),
-        _ => {}
+    if s == Scenario::L15 {
+        wants.push(worker_checked(seen, t0));
     }
     if titled(s) {
         wants.push(title_checked(seen, t0));
@@ -254,45 +250,6 @@ pub fn status_agrees(chain: Chain, seen: &Seen, t0: i64) -> Verdict {
     }
 }
 
-/// THE DONE FOR YOU ROW'S TIP (L16, L17): some read of the tab's Done for you row's tip after
-/// `t0` is what aterm checked and what the agent said of the journal's receipt
-/// ([`mode_words::landed_tip`]), naming the head on `origin/main`. A run that read no window
-/// (`--no-surfaces`) skips it by name, keeping the word, as the window's wants do.
-#[must_use]
-pub fn done_tip(seen: &Seen, t0: i64) -> Verdict {
-    if !seen.window.read {
-        return Verdict::Pass("the Done for you row's tip SKIPPED (--no-surfaces)".into());
-    }
-    let Some(r) = receipt_of(seen, t0) else {
-        return Verdict::Unobserved("no RECEIPT journaled".into());
-    };
-    let want = mode_words::landed_tip(Some(&r));
-    let tips: Vec<&(i64, String)> = seen
-        .window
-        .done_tip
-        .iter()
-        .filter(|(t, tip)| *t > t0 && tip != "-")
-        .collect();
-    match tips.iter().find(|(_, tip)| *tip == want) {
-        Some((t, tip)) if tip.contains(&format!("{} on origin/main", r.head)) => {
-            Verdict::Pass(format!("its row's tip at +{}: {tip}", at(t0, *t)))
-        }
-        Some((t, tip)) => Verdict::Fail(format!(
-            "its row's tip at +{} names no {} on origin/main: {tip}",
-            at(t0, *t),
-            r.head
-        )),
-        None if tips.is_empty() => Verdict::Fail(format!(
-            "no Done for you row's tip read to +{} (wanted {want:?})",
-            at(t0, seen.end_ms)
-        )),
-        None => Verdict::Fail(format!(
-            "its row's tips {:?}, never {want:?}",
-            tips.iter().map(|(_, tip)| tip).collect::<Vec<_>>()
-        )),
-    }
-}
-
 /// Whether scenario `s` holds its landed chip's title to its receipt ([`title_checked`]): the
 /// land chains whose tab the run reads in front once landed (L1, L7, L16, L17, L18, L19).
 #[must_use]
@@ -369,9 +326,7 @@ pub fn title_checked(seen: &Seen, t0: i64) -> Verdict {
 }
 
 /// THE WORKER'S `checked=` (L15): the manager's `await task` names the worker's receipt's
-/// `checked=` word on its row, `result`'s header ends with it, and the worker's row under its
-/// manager says what aterm checked in its tip once landed ([`mode_words::checked_words`]); a run
-/// that read no window (`--no-surfaces`) skips the row by name.
+/// `checked=` word on its row, and `result`'s header ends with it.
 #[must_use]
 pub fn worker_checked(seen: &Seen, t0: i64) -> Verdict {
     let Some(r) = receipt_of(seen, t0) else {
@@ -397,27 +352,6 @@ pub fn worker_checked(seen: &Seen, t0: i64) -> Verdict {
         }
         Some(head) => bad.push(format!("result's header ends no {field}: {head}")),
         None => bad.push("no result header read".into()),
-    }
-    let want = mode_words::checked_words(Some(&r));
-    if !seen.window.read {
-        said.push("its row's tip SKIPPED (--no-surfaces)".into());
-        return if bad.is_empty() {
-            Verdict::Pass(said.join("; "))
-        } else {
-            Verdict::Fail(format!("{}: {}", said.join("; "), bad.join("; ")))
-        };
-    }
-    let tips: Vec<&str> = seen
-        .window
-        .worker
-        .iter()
-        .filter(|(t, _)| *t > t0)
-        .filter_map(|(_, e)| e.lines().find_map(|l| l.strip_prefix("tip|")))
-        .collect();
-    if tips.contains(&want.as_str()) {
-        said.push(format!("its row's tip {want:?}"));
-    } else {
-        bad.push(format!("its row's tips {tips:?}, never {want:?}"));
     }
     if bad.is_empty() {
         Verdict::Pass(said.join("; "))

@@ -1463,6 +1463,73 @@ fn the_patch_table_is_read_from_the_root_manifest() {
     assert_eq!(renamed_package(r#" { path = "crates/x" }"#), None);
 }
 
+/// A CELL'S EVENT NAMES BOTH OF ITS CARGO CALLS, in the order it made them, each with its own
+/// wall, CPU and peak memory, so a stage that claims memory once for every cell can be read
+/// call by call; a call whose tree no read found says `null`, never zero; and every reader of
+/// the events file knows the kind. NEGATIVE CONTROL: a cell that reached no cargo call names
+/// none.
+#[test]
+fn a_cells_event_names_both_of_its_cargo_calls() {
+    let cell = Cell {
+        name: "linux-arm".into(),
+        triple: "aarch64-unknown-linux-gnu".into(),
+        package: "aterm".into(),
+    };
+    let ran = |usage| exec::Run {
+        ok: true,
+        code: Some(0),
+        usage,
+        ..exec::Run::default()
+    };
+    let used = exec::TreeUsage {
+        cpu: Duration::from_secs(90),
+        peak_bytes: 5 << 30,
+        ..exec::TreeUsage::default()
+    };
+    let mut calls = Vec::new();
+    assert!(noted(&mut calls, LINT_CALL, || ran(Some(used))).ok);
+    assert!(noted(&mut calls, ALL_TARGETS_CALL, || ran(None)).ok);
+    let read = |line: String| {
+        let json = line.strip_prefix("verify-event: ").expect("an event line");
+        let crate::event_log::Observation::Known { kind, value } =
+            crate::event_log::observation(json)
+        else {
+            panic!("{json} is no event its readers know");
+        };
+        assert_eq!(kind, crate::event_log::EventKind::CellFinished);
+        value
+    };
+    let event = read(cell_event(&cell, Duration::from_secs(120), &calls));
+    assert_eq!(event["event"].as_str(), Some("cell-finished"));
+    assert_eq!(event["cell"].as_str(), Some("linux-arm"));
+    assert_eq!(event["triple"].as_str(), Some("aarch64-unknown-linux-gnu"));
+    assert_eq!(event["wall_s"].as_f64(), Some(120.0));
+    let named: Vec<_> = event["calls"]
+        .as_array()
+        .expect("its calls")
+        .iter()
+        .map(|call| {
+            (
+                call["call"].as_str().expect("a name"),
+                call["cpu_s"].as_f64(),
+                call["peak_bytes"].as_u64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("lint", Some(90.0), Some(5 << 30)),
+            ("all-targets", None, None),
+        ]
+    );
+    for (call, noted) in event["calls"].as_array().unwrap().iter().zip(&calls) {
+        assert_eq!(call["wall_s"].as_f64(), Some(noted.wall.as_secs_f64()));
+    }
+    let idle = read(cell_event(&cell, Duration::ZERO, &[]));
+    assert_eq!(idle["calls"].as_array().map(Vec::len), Some(0));
+}
+
 /// A cell's cargo builds in its own directory of the cells lane, capped at
 /// the lane's jobs and never above the caller's own `CARGO_BUILD_JOBS`, and
 /// keeps no incremental state.

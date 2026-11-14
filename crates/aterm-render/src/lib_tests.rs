@@ -1078,6 +1078,49 @@ fn a_stationary_cursor_restyle_ungates_its_row() {
         assert!(!d.is_gate_hit(), "{name}: a restyle must not gate-hit");
         assert!(dirty[cur.cursor_row], "{name}: the cursor row repaints");
     }
+
+    // Converse (`dirty-rows-exact`): a stationary visible cursor on row 0 stays clean when row 3
+    // changes, and a block cursor over an upward-overshooting glyph (`A\u{0302}`) stays exact on
+    // CPU when the row above it changes.
+    let mut stat_term = Terminal::new(4, 8);
+    stat_term.process(b"\x1b[2 q\x1b[1;1H");
+    let stat_prev = stat_term.cell_frame(4, 8);
+    stat_term.process(b"\x1b[4;1HX\x1b[1;1H");
+    let stat_cur = stat_term.cell_frame(4, 8);
+    let mut stat_dirty = Vec::new();
+    let DirtyDecision::Rows(sd) = compute_dirty_rows(
+        &stat_prev,
+        &stat_cur,
+        true,
+        None,
+        true,
+        None,
+        RowBands::new(0, 16),
+        &mut stat_dirty,
+    ) else {
+        panic!("single-row edit with stationary cursor must take row-damage path");
+    };
+    assert!(!sd.cursor_changed, "stationary cursor did not change");
+    assert_eq!(
+        stat_dirty,
+        vec![false, false, false, true],
+        "stationary visible cursor row 0 must not be marked dirty when only row 3 changed"
+    );
+
+    let mut r = renderer();
+    let mut wc = WindowCpu::new();
+    let mut over_term = Terminal::new(4, 12);
+    over_term.process("\x1b[2 q\x1b[3;2HA\u{0302}\x1b[3;2H".as_bytes());
+    let f0 = over_term.cell_frame(4, 12);
+    let _ = r.render_input_cached(&mut wc, &f0);
+    over_term.process(b"\x1b[2;1HMW\x1b[3;2H");
+    let f1 = over_term.cell_frame(4, 12);
+    let cached_px = r.render_input_cached(&mut wc, &f1).pixels().to_vec();
+    let fresh_px = r.render_input(&f1).pixels;
+    assert_eq!(
+        cached_px, fresh_px,
+        "block cursor cutout over upward-overshooting glyph must match fresh render after row-above edit"
+    );
 }
 
 #[test]
@@ -4688,6 +4731,30 @@ fn retiring_a_fallback_entry_clears_the_memos_that_outlived_it() {
         !r.retire_unparsable_fallback(&doomed),
         "retiring an absent face must report that it removed nothing"
     );
+
+    // Negative fallback-miss and symbol-pick memos cache repeated chain probes and auto-invalidate
+    // when either chain mutates.
+    r.runtime_discovery = false;
+    let missing = '\u{10FFFF}';
+    assert!(!r.fallback_has(missing));
+    assert!(
+        r.fallback_miss.chars.contains(&missing),
+        "uncovered code point must record a fallback miss"
+    );
+    assert!(!r.fallback_has(missing));
+    r.symbol_chain = vec![
+        FallbackFace::from_bytes(embedded_symbols_font(), Some("sym".into()))
+            .expect("bundled symbols face is admissible"),
+    ];
+    assert_eq!(r.symbol_chain_pick(missing), None);
+    assert_eq!(r.symbol_pick.entries.get(&missing).copied(), Some(None));
+    let sym_hit = r.symbol_chain_pick('\u{E0A0}');
+    assert_eq!(
+        r.symbol_pick.entries.get(&'\u{E0A0}').copied(),
+        Some(sym_hit)
+    );
+    r.symbol_chain.clear();
+    assert_eq!(r.symbol_chain_pick('\u{E0A0}'), None);
 }
 
 #[test]
@@ -6893,12 +6960,23 @@ fn row_glyph_plan_reuses_segment_plans_for_distinct_streamed_tokens() {
     renderer.row_glyph_plan(&input, 1, &[], &mut plan);
     assert_eq!(
         ligature_shaping::take_shape_plan_builds(),
-        3,
-        "Latin, common-only and Greek require distinct plans"
+        2,
+        "Latin is reused across rows while common-only and Greek build distinct plans"
     );
     assert!(
         plan.iter().any(|g| !matches!(g, ColumnGlyph::PerCell)),
         "the operator must still ligate"
+    );
+
+    let mut toggled = renderer.shaping.clone();
+    toggled.ligature_mode = aterm_types::text_shaping::LigatureMode::Disabled;
+    renderer.set_text_shaping(toggled);
+    renderer.set_text_shaping(aterm_types::text_shaping::TextShapingConfig::default());
+    renderer.row_glyph_plan(&input, 1, &[], &mut plan);
+    assert_eq!(
+        ligature_shaping::take_shape_plan_builds(),
+        3,
+        "a feature change clears the persistent plan memo so Latin, common-only and Greek rebuild"
     );
 }
 

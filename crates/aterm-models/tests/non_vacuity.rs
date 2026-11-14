@@ -47,6 +47,28 @@ fn every_liveness_obligation_is_proven_minimal_and_caught() {
     );
 }
 
+/// The release's `spec` and `checkers` checks reach every Aos model: each is
+/// in the registry this binary links, as in spec-check's, where a model whose module did not link
+/// would go unchecked with nothing said.
+#[test]
+fn every_aos_model_is_registered() {
+    let _domains = aterm_models::link_all();
+    let registered: std::collections::BTreeSet<&str> = aterm_spec::xref::model_registry()
+        .iter()
+        .map(|m| m.name)
+        .collect();
+    for model in [
+        "AosBoundaryPublication",
+        "AosKeyHold",
+        "AosPaneFaithfulReplay",
+    ] {
+        assert!(
+            registered.contains(model),
+            "{model} is not registered: its module did not link"
+        );
+    }
+}
+
 /// The shared-file model (docs/DESIGN-shared-files-2026-11-11.md §8) is registered, holds with no
 /// mutant on while every action fires, and each of its laws falls to exactly the one mutant
 /// `SHARED_FILE_LAWS` names for it, which breaks no other law and neither bound.

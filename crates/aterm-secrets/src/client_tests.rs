@@ -2280,6 +2280,7 @@ fn an_unmarked_identity_is_a_lab_identity_in_a_virtual_machine_and_under_no_debu
         debug_build: true,
         lab_lane: true,
         virtual_machine: false,
+        foreign_home: true,
     };
     refuse_lab_identity_as(&paths, debug).expect("a release identity keeps its seat");
     let in_vm = crate::Making {
@@ -2360,12 +2361,12 @@ fn a_release_build_holding_a_debug_made_identity_is_told_how_the_mac_rejoins() {
 /// not refused.
 #[test]
 fn the_virtual_machine_probe_marks_a_guest_outside_a_test_binary_only() {
-    let guest = crate::Making::reading(false, || Some(true));
+    let guest = crate::Making::reading(false, || Some(true), || None);
     assert!(guest.virtual_machine, "{guest:?}");
     for hardware in [
-        crate::Making::reading(false, || Some(false)),
-        crate::Making::reading(false, || None),
-        crate::Making::reading(true, || Some(true)),
+        crate::Making::reading(false, || Some(false), || None),
+        crate::Making::reading(false, || None, || None),
+        crate::Making::reading(true, || Some(true), || None),
     ] {
         assert!(!hardware.virtual_machine, "{hardware:?}");
     }
@@ -2374,8 +2375,112 @@ fn the_virtual_machine_probe_marks_a_guest_outside_a_test_binary_only() {
     machine_identity_as(&paths, crate::Making::default()).expect("made by a release build");
     let refused = refuse_lab_identity_as(&paths, guest).expect_err("a guest");
     assert_eq!(refused.kind(), crate::ErrorKind::LabIdentity, "{refused}");
-    refuse_lab_identity_as(&paths, crate::Making::reading(false, || None))
+    refuse_lab_identity_as(&paths, crate::Making::reading(false, || None, || None))
         .expect("hardware keeps its seat");
+}
+
+/// A release app handed a scratch `HOME` on a Mac's own hardware makes a lab identity: its vault
+/// key, fleet node key and node id are all new there, so a member on the home LAN would seat it
+/// as one more Mac under this Mac's name (m11 held 25 seats on 2026-11-12). The mark is the
+/// file's, so the identity is refused whatever process reads it later, and a process in a
+/// foreign home that holds no identity yet is refused before it makes one. An identity made in
+/// the login's own home stays unmarked, and a process in a foreign home that reads it (a root
+/// shell that kept the person's `HOME`) keeps its seat.
+///
+/// NEGATIVE CONTROL: `lab_identity` not reading `foreign_home`: the process that holds no key
+/// yet is not refused (`before a key is made`).
+#[test]
+fn an_identity_made_in_a_foreign_home_is_a_lab_identity() {
+    let foreign = crate::Making {
+        foreign_home: true,
+        ..crate::Making::default()
+    };
+    let scratch = aterm_tempfile::tempdir().expect("owned home");
+    let paths = Paths::for_home(scratch.path());
+    let refused = refuse_lab_identity_as(&paths, foreign).expect_err("before a key is made");
+    assert_eq!(refused.kind(), crate::ErrorKind::LabIdentity, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("this process's HOME is not its login's own home"),
+        "{refused}"
+    );
+    machine_identity_as(&paths, foreign).expect("made");
+    let mark = |paths: &Paths, making| {
+        lab_standing(paths, making)
+            .expect("read")
+            .map(|(mark, _)| mark)
+    };
+    assert_eq!(
+        mark(&paths, crate::Making::default()),
+        Some(crate::LabMark::ForeignHome)
+    );
+    let refused = refuse_lab_identity_as(&paths, crate::Making::default())
+        .expect_err("refused whatever process reads it");
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "this Mac's vault identity is a lab identity (foreign-home): {LAB_IDENTITY_REFUSAL}; \
+             this build makes no lab identity, so with this Mac's vault folder ({}) set aside (a \
+             release app's start does that to its own) it makes a new one that can join ALab",
+            paths.dir.display()
+        )
+    );
+    assert!(refuse_lab_member_browse_as(&paths, None, foreign).is_err());
+
+    let own = aterm_tempfile::tempdir().expect("owned home");
+    let paths = Paths::for_home(own.path());
+    machine_identity_as(&paths, crate::Making::default()).expect("made");
+    assert_eq!(mark(&paths, foreign), None);
+    refuse_lab_identity_as(&paths, foreign).expect("an identity of the login's own home");
+}
+
+/// The home probe decides `Making::now`'s fact outside a test binary: a home that is another
+/// folder than the account database's is foreign, the same folder by another spelling is not,
+/// and an unresolved home on either side is not, so no Mac makes a lab identity because a probe
+/// failed. A test binary reads no probe.
+///
+/// NEGATIVE CONTROL: `foreign_home_of` comparing the two paths as text: the symlinked home
+/// reads foreign (`left: Some(true) right: Some(false)`). `Making::reading` ignoring
+/// `foreign_home`: the first `assert!` fails.
+#[test]
+fn the_foreign_home_probe_reads_folders_not_spellings() {
+    let scratch = crate::Making::reading(false, || None, || Some(true));
+    assert!(scratch.foreign_home, "{scratch:?}");
+    assert_eq!(
+        crate::lab_identity(crate::Making {
+            foreign_home: scratch.foreign_home,
+            ..crate::Making::default()
+        }),
+        Some(crate::LabMark::ForeignHome)
+    );
+    for own in [
+        crate::Making::reading(false, || None, || Some(false)),
+        crate::Making::reading(false, || None, || None),
+        crate::Making::reading(true, || None, || Some(true)),
+    ] {
+        assert!(!own.foreign_home, "{own:?}");
+    }
+
+    let root = aterm_tempfile::tempdir().expect("owned root");
+    let (account, other) = (root.path().join("account"), root.path().join("other"));
+    std::fs::create_dir(&account).expect("account home");
+    std::fs::create_dir(&other).expect("another home");
+    let of = crate::Making::foreign_home_of;
+    assert_eq!(of(Some(&account), Some(&account)), Some(false));
+    assert_eq!(of(Some(&other), Some(&account)), Some(true));
+    assert_eq!(
+        of(Some(&root.path().join("not-made-yet")), Some(&account)),
+        Some(true)
+    );
+    assert_eq!(of(None, Some(&account)), None);
+    assert_eq!(of(Some(&other), None), None);
+    #[cfg(unix)]
+    {
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&account, &link).expect("a symlinked home");
+        assert_eq!(of(Some(&link), Some(&account)), Some(false));
+    }
 }
 
 /// A12: a joiner's lines carry its identity file's mark, or, for an identity an older build

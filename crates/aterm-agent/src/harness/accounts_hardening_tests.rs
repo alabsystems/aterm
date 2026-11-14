@@ -138,7 +138,7 @@ fn a_renewal_reads_the_machine_only_through_its_guard() {
     let named = Arc::new(Mutex::new(AutoRenewGuard {
         reads: MachineReads {
             var: mailbox_named_by_env,
-            system_browsers: false,
+            ..MachineReads::default()
         },
         ..AutoRenewGuard::default()
     }));

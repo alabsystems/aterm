@@ -7,10 +7,11 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The Linux installer's bootstrap verifier: tools/install.sh's signed-release chain (paper master, live machine, appcast, durable floors, store ancestry, ELF) as a static executable install.sh pins by sha256"
+description = "The installers' bootstrap verifier: tools/install.sh's signed-release chain (paper master, live machine, appcast, durable floors, store ancestry, ELF) as a static executable install.sh pins by sha256, and on Windows the same chain for apps/aterm-win/get-aterm.ps1's portable zip"
 
 # The one executable besides `aterm` that ships: install.sh fetches a release's static
-# build of it (`pin::asset_name`) and runs it before anything it downloaded runs.
+# build of it (`pin::asset_name`) and runs it before anything it downloaded runs, and
+# get-aterm.ps1 its Windows build (`pin::windows_asset_name`).
 [[bin]]
 name = "aterm-bootstrap-verify"
 path = "src/main.rs"

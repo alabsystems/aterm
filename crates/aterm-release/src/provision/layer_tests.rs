@@ -15,6 +15,12 @@ struct Fake {
     source_signing_calls: std::sync::atomic::AtomicUsize,
     unreached: Vec<&'static str>,
     needs: std::sync::Mutex<Vec<NeedStep>>,
+    site_access_error: Option<String>,
+    site_push_error: Option<String>,
+    push_gaps: Vec<(&'static str, PushGap)>,
+    asked: std::sync::Mutex<Vec<String>>,
+    posted: std::sync::atomic::AtomicUsize,
+    post_error: Option<String>,
 }
 
 impl ReleaseHost for Fake {
@@ -74,6 +80,35 @@ impl ReleaseHost for Fake {
         } else {
             Ok(())
         }
+    }
+    fn site_access(&self, key: &Path) -> Result<String, String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(format!("access {}", key.display()));
+        self.site_access_error.clone().map_or_else(
+            || Ok("Hosting site s in project p reports firebasehosting.sites.update".into()),
+            Err,
+        )
+    }
+    fn site_push(&self, site: &Path) -> Result<(), String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(format!("push {}", site.display()));
+        self.site_push_error.clone().map_or(Ok(()), Err)
+    }
+    fn can_push(&self, slug: &str) -> Result<(), PushGap> {
+        self.asked.lock().unwrap().push(format!("can {slug}"));
+        self.push_gaps
+            .iter()
+            .find(|(gap, _)| *gap == slug)
+            .map_or(Ok(()), |(_, gap)| Err(gap.clone()))
+    }
+    fn post_site_key_need(&self) -> Result<(), String> {
+        self.posted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.post_error.clone().map_or(Ok(()), Err)
     }
 }
 
@@ -245,7 +280,254 @@ fn whole_keeping(home: &Path) -> Fake {
         source_signing_calls: std::sync::atomic::AtomicUsize::new(0),
         unreached: Vec::new(),
         needs: std::sync::Mutex::new(Vec::new()),
+        site_access_error: None,
+        site_push_error: None,
+        push_gaps: Vec::new(),
+        asked: std::sync::Mutex::new(Vec::new()),
+        posted: std::sync::atomic::AtomicUsize::new(0),
+        post_error: None,
     }
+}
+
+fn row<'r>(rows: &'r [(&'static str, Check)], id: &str) -> &'r Check {
+    &rows.iter().find(|(row, _)| *row == id).unwrap().1
+}
+
+/// A DEPLOYER KEY MISSING WHERE THE VAULT DELIVERS IT IS ASKED OF THE VAULT BY THE RELEASE'S
+/// STEP 1, and its row says so with the remedy: the 0.199.0 release met this gap at step 9 and
+/// a person raised the need by hand. A dry run raises and posts nothing and says a real run
+/// would.
+/// NEGATIVE CONTROLS: a key that is there raises nothing and passes; a key named somewhere
+/// the vault does not deliver to is not asked for, and says why.
+#[test]
+fn step_one_asks_the_vault_for_a_missing_deployer_key() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let missing = || {
+        let fake = whole(home);
+        std::fs::remove_file(home.join("deployer.json")).unwrap();
+        Arc::new(fake)
+    };
+    let posted = |fake: &Fake| fake.posted.load(std::sync::atomic::Ordering::SeqCst);
+
+    let fake = missing();
+    let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), false);
+    match row(&rows, "release.site-key") {
+        Check::Fail { what, fix } => {
+            assert!(what.contains("service-account key is unusable"), "{what}");
+            assert!(
+                what.contains("asked of the lab's vault now (posted to the lab)"),
+                "{what}"
+            );
+            assert!(
+                fix.contains("wait for the vault to deliver the key to")
+                    && fix.contains("deployer.json")
+                    && fix.contains("aterm secrets need ls"),
+                "{fix}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fake.needs.lock().unwrap().contains(&NeedStep::Raise));
+    assert_eq!(posted(&fake), 1);
+    assert!(
+        matches!(row(&rows, "release.site-access"), Check::Fail { what, .. } if what.contains("not asked of Google")),
+        "Google is not asked about a key that is not there: {rows:#?}"
+    );
+    assert!(
+        !fake
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a.starts_with("access")),
+        "{:?}",
+        fake.asked.lock().unwrap()
+    );
+
+    // A pass that cannot be run now leaves the need on file and says so.
+    let mut fake = whole(home);
+    std::fs::remove_file(home.join("deployer.json")).unwrap();
+    fake.post_error = Some("no installed aterm".into());
+    let rows = distribution(&(Arc::new(fake) as Arc<dyn ReleaseHost>), false);
+    assert!(
+        matches!(row(&rows, "release.site-key"), Check::Fail { what, .. }
+            if what.contains("asked of the lab's vault now")
+                && what.contains("posted at this Mac's next pass (no installed aterm)")),
+        "{rows:#?}"
+    );
+
+    let fake = missing();
+    let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), true);
+    match row(&rows, "release.site-key") {
+        Check::Fail { what, fix } => {
+            assert!(
+                what.contains("a real run asks the lab's vault for it (no need is on file yet)"),
+                "{what}"
+            );
+            assert!(
+                fix.contains("wait for the vault to deliver the key"),
+                "{fix}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        !fake.needs.lock().unwrap().contains(&NeedStep::Raise),
+        "a dry run raises nothing"
+    );
+    assert_eq!(posted(&fake), 0, "a dry run posts nothing");
+
+    let fake = Arc::new(whole(home));
+    let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), false);
+    assert!(
+        rows.iter()
+            .all(|(_, check)| matches!(check, Check::Pass(_))),
+        "{rows:#?}"
+    );
+    assert!(!fake.needs.lock().unwrap().contains(&NeedStep::Raise));
+    assert_eq!(posted(&fake), 0);
+
+    let mut fake = whole(home);
+    fake.site_key = Some(home.join("elsewhere/deployer.json"));
+    let fake = Arc::new(fake);
+    let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), false);
+    assert!(
+        matches!(row(&rows, "release.site-key"), Check::Fail { what, .. }
+            if what.contains("the lab is not asked")),
+        "{rows:#?}"
+    );
+    assert!(!fake.needs.lock().unwrap().contains(&NeedStep::Raise));
+    assert_eq!(posted(&fake), 0);
+}
+
+/// EACH WRITE THE LAST STEPS MAKE IS PROVED AT STEP 1 BY A READ OR A DRY RUN: Google's grant
+/// to the deployer's key, the site checkout's push, and the routed identities' push to the
+/// repositories a publish writes and to the tap. A denial is a gap that names the repository;
+/// a question GitHub could not be asked is no verdict, never a pass; and a key Google
+/// accepted marks its need met on a real run only.
+/// NEGATIVE CONTROL: the whole host passes every row, asking exactly these.
+#[test]
+fn step_one_proves_each_distribution_write_by_a_read() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let fake = Arc::new(whole(home));
+    let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), false);
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [
+            "release.site",
+            "release.site-key",
+            "release.site-access",
+            "release.site-push",
+            "release.writes",
+            "release.tap"
+        ]
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, check)| matches!(check, Check::Pass(_))),
+        "{rows:#?}"
+    );
+    let mut asked = fake.asked.lock().unwrap().clone();
+    asked.sort();
+    assert_eq!(
+        asked,
+        [
+            "access ".to_owned() + home.join("deployer.json").to_str().unwrap(),
+            "can alabsystems/homebrew-tap".into(),
+            "can owner/aterm".into(),
+            "can owner/aterm-staging".into(),
+            "can public/aterm".into(),
+            "push ".to_owned() + home.join("site").to_str().unwrap(),
+        ]
+    );
+    assert!(
+        fake.needs.lock().unwrap().contains(&NeedStep::Satisfied),
+        "a key Google accepted meets its need"
+    );
+    let dry = Arc::new(whole(home));
+    distribution(&(Arc::clone(&dry) as Arc<dyn ReleaseHost>), true);
+    assert!(
+        !dry.needs.lock().unwrap().contains(&NeedStep::Satisfied),
+        "a dry run moves no need"
+    );
+
+    let mut fake = whole(home);
+    fake.site_access_error = Some("403 PERMISSION_DENIED".into());
+    fake.site_push_error = Some("remote: Permission to o/site.git denied".into());
+    fake.push_gaps = vec![
+        (
+            "alabsystems/homebrew-tap",
+            PushGap::Denied("as release, push is not granted".into()),
+        ),
+        (
+            "owner/aterm-staging",
+            PushGap::Unasked("no route to host".into()),
+        ),
+    ];
+    let fake = Arc::new(fake);
+    let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), false);
+    match row(&rows, "release.site-access") {
+        Check::Fail { what, fix } => {
+            assert!(what.contains("403 PERMISSION_DENIED"), "{what}");
+            assert!(fix.contains("ship site --check-access"), "{fix}");
+        }
+        other => panic!("{other:?}"),
+    }
+    match row(&rows, "release.site-push") {
+        Check::Fail { what, fix } => {
+            assert!(what.contains("Permission to o/site.git denied"), "{what}");
+            assert!(fix.contains("git push --dry-run origin HEAD:"), "{fix}");
+        }
+        other => panic!("{other:?}"),
+    }
+    match row(&rows, "release.tap") {
+        Check::Fail { what, fix } => {
+            assert!(
+                what.contains("alabsystems/homebrew-tap (as release, push is not granted)"),
+                "{what}"
+            );
+            assert!(fix.contains("agh can OWNER/REPO push"), "{fix}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        matches!(row(&rows, "release.writes"), Check::CouldNotRun(why)
+            if why.contains("aterm's staging owner/aterm-staging (no route to host)")
+                && !why.contains("owner/aterm ")),
+        "an unanswered question is no verdict, and names only its repository: {rows:#?}"
+    );
+    assert!(
+        !fake.needs.lock().unwrap().contains(&NeedStep::Satisfied),
+        "a key Google refused meets no need"
+    );
+
+    let mut fake = whole(home);
+    fake.push_gaps = vec![
+        ("owner/aterm", PushGap::Denied("no writer is routed".into())),
+        (
+            "owner/aterm-staging",
+            PushGap::Unasked("no route to host".into()),
+        ),
+    ];
+    assert!(
+        matches!(line_of_distribution(fake, "release.writes"), Check::Fail { what, .. }
+            if what.contains("aterm's dev owner/aterm (no writer is routed)")),
+        "a denial is a gap whatever else went unanswered"
+    );
+
+    assert_eq!(address_slug(DEV).as_deref(), Some("owner/aterm"));
+    assert_eq!(
+        address_slug("https://github.com/public/aterm.git/").as_deref(),
+        Some("public/aterm")
+    );
+    assert_eq!(address_slug("aterm"), None);
+}
+
+fn line_of_distribution(fake: Fake, id: &str) -> Check {
+    let rows = distribution(&(Arc::new(fake) as Arc<dyn ReleaseHost>), false);
+    rows.into_iter().find(|(row, _)| *row == id).unwrap().1
 }
 
 #[test]

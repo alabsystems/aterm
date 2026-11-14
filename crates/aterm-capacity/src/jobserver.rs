@@ -845,28 +845,28 @@ impl Jobserver {
     }
 
     /// Take a token only if one is currently available.
+    /// Interrupted reads are retried; only `WouldBlock` reports an empty FIFO.
     /// # Errors
     /// FIFO IO fails.
     pub fn try_acquire(&self) -> io::Result<Option<Token<'_>>> {
-        let mut byte = [0];
-        match (&self.file).read(&mut byte) {
-            Ok(1) => Ok(Some(Token {
-                pool: self,
-                byte: byte[0],
-            })),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                Ok(None)
+        read_token(&mut &self.file).map(|byte| byte.map(|byte| Token { pool: self, byte }))
+    }
+}
+
+fn read_token(input: &mut impl Read) -> io::Result<Option<u8>> {
+    let mut byte = [0];
+    loop {
+        match input.read(&mut byte) {
+            Ok(1) => return Ok(Some(byte[0])),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "jobserver FIFO closed",
+                ));
             }
-            Err(error) => Err(error),
-            _ => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "jobserver FIFO closed",
-            )),
         }
     }
 }

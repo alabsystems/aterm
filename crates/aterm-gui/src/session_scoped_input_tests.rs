@@ -530,6 +530,72 @@ fn guarded_and_ordered_batches_cannot_extend_each_others_kernel_spill_drain() {
     drop(ordered);
 }
 
+/// A renewal in place supersedes nothing: the claimant's write admitted under the revision it keeps
+/// goes on with its grant intact, and its ACK owes no drain, since one of the revision it keeps
+/// would wait on that write and on every later one that joins it. The same claim renewed on
+/// another connection moves the binding: the grant ends and its ACK waits for the write.
+#[test]
+fn a_renewal_in_place_keeps_admitted_input_and_acknowledges_without_a_drain() {
+    let h = crate::session_store::test_handle_on(7641, -1);
+    let ctx = Arc::clone(&h.ctx);
+    install(&ctx, CONN, &[Scope::Approvals]);
+    let kept = revision(&ctx);
+    let grant = SupervisorInputFence::authorize(
+        &ctx,
+        request(&ctx, false, Scope::Approvals),
+        &caller(false, CONN),
+        crate::metrics::now_us(),
+    )
+    .unwrap();
+    let renew = |conn: u64| {
+        publish_claim_supervisor_scoped(
+            &ctx,
+            "grok-alab@4242",
+            Some(conn),
+            scoped(&[Scope::Approvals]),
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .unwrap()
+    };
+    let acknowledged = |transition: SupervisorTransition<Claimed>| {
+        let (tx, rx) = mpsc::channel();
+        let barrier = Arc::new(Barrier::new(2));
+        let at = Arc::clone(&barrier);
+        let ack = std::thread::spawn(move || {
+            at.wait();
+            tx.send(transition.acknowledge().revision).unwrap();
+        });
+        barrier.wait();
+        (rx, ack)
+    };
+    let writing = FencedWrite::enter_fence(&ctx, &grant, crate::metrics::now_us()).unwrap();
+    let (ack, acker) = acknowledged(renew(CONN));
+    assert_eq!(
+        ack.recv_timeout(PATIENCE)
+            .expect("hang: a renewal in place waited on the write its revision keeps"),
+        kept
+    );
+    acker.join().unwrap();
+    assert!(grant.check(&ctx, crate::metrics::now_us()).is_ok());
+    drop(writing);
+
+    let writing = FencedWrite::enter_fence(&ctx, &grant, crate::metrics::now_us()).unwrap();
+    let (ack, acker) = acknowledged(renew(CONN + 1));
+    assert!(grant.check(&ctx, crate::metrics::now_us()).is_err());
+    assert!(
+        ack.try_recv().is_err(),
+        "NEGATIVE CONTROL: a moved claim's ACK waits for the superseded write"
+    );
+    drop(writing);
+    assert_ne!(
+        ack.recv_timeout(PATIENCE)
+            .expect("hang: the moved claim's ACK outlived the superseded write"),
+        kept
+    );
+    acker.join().unwrap();
+}
+
 #[test]
 fn scope_renewal_drains_started_batches_and_does_not_wait_for_new_revision_work() {
     for rebind in [false, true] {

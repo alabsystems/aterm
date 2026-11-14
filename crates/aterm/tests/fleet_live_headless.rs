@@ -4573,6 +4573,105 @@ fn a_granted_member_does_only_what_the_driven_macs_fleet_access_admits() {
     let worker = spawned.split_whitespace().nth(1).expect("its sid");
     drive_ok(&driver.tmp, &target, &[&format!("@{worker}"), "status"]);
     assert_eq!(sessions(), before + 1, "a drop closes nothing");
+
+    // A session of the driver reads the driven Mac twice: its `status` over a drive, which
+    // names it on the requester line, and its fleet survey, which names it on the survey line.
+    let as_session = ("ATERM_PARENT_SESSION_ID", driver_sid.as_str());
+    let read = ctl_with(
+        &driver.tmp,
+        &["--host", &target, &at, "status"],
+        None,
+        &[as_session],
+    );
+    assert!(read.status.success(), "a session's read: {read:?}");
+    let twice = (2 * HANG).as_millis().to_string();
+    let surveyed = ctl_with(
+        &driver.tmp,
+        &["survey", "--fleet"],
+        None,
+        &[(SURVEY_WITHIN_SEAM, &twice), as_session],
+    );
+    assert!(
+        surveyed.status.success(),
+        "a session's survey: {surveyed:?}"
+    );
+
+    // Each Mac's fleet activity record holds what the other asked of it and what its lock
+    // decided, oldest first: incoming on the driven Mac, outgoing on the driver, the same
+    // requests under the same types, and the two reads the driver's session asked for. No
+    // session asked for the other reads above (the wire's surveys, each plain `status`), so
+    // they are polls and neither record counts one.
+    let asked = |root: &Path, way: &str, other: &str| -> (Vec<(String, String)>, u64) {
+        let text = fleet_ok(root, &["activity", "--json", "--since", "1d"], None);
+        let json: aterm_json::Value =
+            aterm_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+        let aterm_json::Value::Array(rows) = &json["rows"] else {
+            panic!("no rows: {text}");
+        };
+        let word =
+            |row: &aterm_json::Value, key: &str| row[key].as_str().unwrap_or_default().to_owned();
+        let (mut acts, mut reads) = (Vec::new(), 0);
+        for row in rows.iter().rev() {
+            assert_eq!(
+                (word(row, "way").as_str(), word(row, "node").as_str()),
+                (way, other),
+                "{text}"
+            );
+            if word(row, "type") == "read" {
+                assert_eq!(
+                    (word(row, "outcome").as_str(), word(row, "by")),
+                    ("admitted", driver_sid.to_string()),
+                    "a read is counted for the session that asked: {text}"
+                );
+                reads += row["n"]
+                    .as_i64()
+                    .and_then(|n| u64::try_from(n).ok())
+                    .unwrap_or_default();
+                continue;
+            }
+            assert_eq!(row["by"], aterm_json::Value::Null, "{text}");
+            let outcome = match word(row, "outcome").as_str() {
+                "blocked" => format!("{}<{}", word(row, "level"), word(row, "needs")),
+                outcome => outcome.to_owned(),
+            };
+            acts.push((word(row, "type"), outcome));
+        }
+        (acts, reads)
+    };
+    let pair = |what: &str, outcome: &str| (what.to_owned(), outcome.to_owned());
+    let want = (
+        vec![
+            pair("hold", "read<write"),
+            pair("typed", "read<write"),
+            pair("typed", "read<write"),
+            pair("message", "read<write"),
+            pair("new-job", "read<full"),
+            pair("hold", "admitted"),
+            pair("new-job", "write<full"),
+            pair("hold", "read<write"),
+            pair("new-job", "admitted"),
+        ],
+        2,
+    );
+    let held_node = std::fs::read_to_string(held.tmp.join("state/fleet-node")).expect("a node id");
+    assert_eq!(
+        asked(&driver.tmp, "out", held_node.trim()),
+        want,
+        "what the driver's record says it asked"
+    );
+    // The driven Mac's rows are written behind its answers, by its writer thread.
+    let mut seen = (Vec::new(), 0);
+    let recorded = aterm_spec::wait::within(HANG, POLL_GAP, || {
+        seen = asked(&held.tmp, "in", node.trim());
+        (seen.0.len() >= want.0.len() && seen.1 >= want.1).then_some(())
+    });
+    assert!(recorded.is_some(), "the driven Mac's record: {seen:?}");
+    assert_eq!(seen, want, "what the driven Mac's record says it was asked");
+    let text = fleet_ok(&held.tmp, &["activity", "--since", "1d"], None);
+    assert!(
+        text.starts_with("Last 1d \u{b7} in from 1 Mac \u{b7} out to 0 \u{b7} 7 blocked\n"),
+        "{text}"
+    );
 }
 
 #[test]

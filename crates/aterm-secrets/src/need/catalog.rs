@@ -39,6 +39,9 @@ pub enum Want {
     SiteDeployerKey,
     /// `notary`: the notary credential (`~/.secrets/release-notary`).
     Notary,
+    /// `developer-id:<stem>`: a Developer ID Application certificate and its key, the vault's
+    /// `~/.aterm/apple/devid-<stem>.cer` and `.key`.
+    DeveloperId(String),
     /// `mailbox:<label>`: one AI account's mailbox password (and TOTP seed).
     Mailbox(String),
     /// One credential of a registered mailbox, bound to its authority and login.
@@ -114,7 +117,7 @@ impl Want {
     pub fn parse(word: &str) -> Result<Self, String> {
         let bad = |what: &str| {
             Err(format!(
-                "{word:?}: {what} (wants: site-deployer-key, notary, mailbox:<label>, mailbox-field:<identity>/<component>, gh:dev, \
+                "{word:?}: {what} (wants: site-deployer-key, notary, developer-id:<stem>, mailbox:<label>, mailbox-field:<identity>/<component>, gh:dev, \
                  gh:release, entry:<name>, paper-master, login:<provider>/<label>, \
                  browser-profile:<label>, refresh-token:<provider>/<label>, vault-identity, \
                  commons-device-key, commons-control)"
@@ -140,6 +143,7 @@ impl Want {
                         })?,
                     ),
                     "mailbox" if valid_label(rest) => Self::Mailbox(rest.to_owned()),
+                    "developer-id" if valid_label(rest) => Self::DeveloperId(rest.to_owned()),
                     "entry"
                         if crate::text::valid_entry_name(rest) && !crate::reserved_name(rest) =>
                     {
@@ -150,7 +154,7 @@ impl Want {
                         Self::RefreshToken(rest.to_owned())
                     }
                     "browser-profile" if valid_label(rest) => Self::BrowserProfile(rest.to_owned()),
-                    "mailbox" | "login" | "refresh-token" | "browser-profile" => {
+                    "mailbox" | "developer-id" | "login" | "refresh-token" | "browser-profile" => {
                         return bad("not a valid label");
                     }
                     "entry" => return bad("not a valid vault entry name"),
@@ -168,6 +172,7 @@ impl Want {
         match self {
             Self::SiteDeployerKey => "site-deployer-key".to_owned(),
             Self::Notary => "notary".to_owned(),
+            Self::DeveloperId(stem) => format!("developer-id:{stem}"),
             Self::Mailbox(label) => format!("mailbox:{label}"),
             Self::MailboxComponent(component) => component.key(),
             Self::Gh(GhProfile::Dev) => "gh:dev".to_owned(),
@@ -188,9 +193,11 @@ impl Want {
     pub const fn class(&self) -> Class {
         match self {
             Self::SiteDeployerKey | Self::Notary => Class::Copyable,
-            Self::Mailbox(_) | Self::MailboxComponent(_) | Self::Gh(_) | Self::Entry(_) => {
-                Class::VaultOnly
-            }
+            Self::DeveloperId(_)
+            | Self::Mailbox(_)
+            | Self::MailboxComponent(_)
+            | Self::Gh(_)
+            | Self::Entry(_) => Class::VaultOnly,
             Self::PaperMaster => Class::Nowhere,
             Self::Login(_)
             | Self::BrowserProfile(_)
@@ -202,13 +209,14 @@ impl Want {
     }
 
     /// Whether a request for it is ever posted to the lab: copyable wants and the vault-only
-    /// `mailbox:*` and `gh:*`. `entry:<name>` is answered from this Mac's own envelope.
+    /// `developer-id:*`, `mailbox:*` and `gh:*`. `entry:<name>` is answered from this Mac's own envelope.
     #[must_use]
     pub const fn posted(&self) -> bool {
         matches!(
             self,
             Self::SiteDeployerKey
                 | Self::Notary
+                | Self::DeveloperId(_)
                 | Self::Mailbox(_)
                 | Self::MailboxComponent(_)
                 | Self::Gh(_)
@@ -221,9 +229,12 @@ impl Want {
         match self {
             Self::SiteDeployerKey => vec![SITE_DEPLOYER_KEY_ENTRY.to_owned()],
             Self::Notary => vec![NOTARY_ENTRY.to_owned()],
+            Self::DeveloperId(stem) => [".cer", ".key"]
+                .map(|leaf| format!("{}{stem}{leaf}", crate::entry_class::APPLE_PREFIX))
+                .to_vec(),
             Self::Mailbox(label) => vec![format!("{label}_password"), format!("{label}_totp")],
             Self::MailboxComponent(component) => vec![component.entry()],
-            Self::Gh(GhProfile::Dev) => vec!["gh_access_token".to_owned()],
+            Self::Gh(GhProfile::Dev) => vec![crate::entry_class::DEV_GH_TOKEN.to_owned()],
             Self::Gh(GhProfile::Release) => vec![crate::entry_class::RELEASE_GH_TOKEN.to_owned()],
             Self::Entry(name) => vec![name.clone()],
             Self::CommonsControl => vec![crate::commons::ENTRY.to_owned()],
@@ -245,7 +256,10 @@ impl Want {
     /// Whether a delivery writes it only where the Mac has no file of its own (`if-absent`).
     #[must_use]
     pub const fn if_absent(&self) -> bool {
-        matches!(self, Self::SiteDeployerKey | Self::Notary)
+        matches!(
+            self,
+            Self::SiteDeployerKey | Self::Notary | Self::DeveloperId(_)
+        )
     }
 
     /// What it is, in a sentence's words.
@@ -254,6 +268,7 @@ impl Want {
         match self {
             Self::SiteDeployerKey => "the site deployer's service-account key".to_owned(),
             Self::Notary => "the notary credential".to_owned(),
+            Self::DeveloperId(stem) => format!("the Developer ID identity devid-{stem}"),
             Self::Mailbox(label) => format!("{label}'s mailbox password"),
             Self::MailboxComponent(component) => format!("the {}", component.part().description()),
             Self::Gh(GhProfile::Dev) => "the dev GitHub token".to_owned(),
@@ -326,6 +341,8 @@ pub enum Purpose {
     ReleaseSiteKey,
     /// `ship provision`'s notary row.
     ReleaseNotary,
+    /// `ship provision`'s Apple Developer ID row.
+    ReleaseDeveloperId,
     /// An AI account's unattended email-code sign-in route.
     HarnessSignIn,
     /// The default repository consumer's development GitHub identity.
@@ -336,18 +353,25 @@ pub enum Purpose {
     Commons,
     /// A person or an agent at `aterm secrets need <want>`.
     ByHand,
+    /// An entry a stolen Mac could read, filed for a new value by `revoke --stolen` or
+    /// `members remove --stolen` ([`super::raise_rotations`]). Never posted: a holder's offer
+    /// would be another copy of the value that left; an `aterm secrets set` of the entry on
+    /// this Mac in each section the Mac read it in closes it ([`super::rotated`]).
+    StolenRotation,
 }
 
 impl Purpose {
     /// Every purpose.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::ReleaseSiteKey,
         Self::ReleaseNotary,
+        Self::ReleaseDeveloperId,
         Self::HarnessSignIn,
         Self::AghDev,
         Self::AghRelease,
         Self::Commons,
         Self::ByHand,
+        Self::StolenRotation,
     ];
 
     /// Its compiled id.
@@ -356,11 +380,13 @@ impl Purpose {
         match self {
             Self::ReleaseSiteKey => "release.site-key",
             Self::ReleaseNotary => "release.notary",
+            Self::ReleaseDeveloperId => "release.developer-id",
             Self::HarnessSignIn => "harness.sign-in",
             Self::AghDev => "agh.dev",
             Self::AghRelease => "agh.release",
             Self::Commons => "commons.control",
             Self::ByHand => "by-hand",
+            Self::StolenRotation => "revoke.stolen",
         }
     }
 
@@ -371,16 +397,26 @@ impl Purpose {
     }
 
     /// Whether a consumer in this build runs its own check and reports it
-    /// ([`super::satisfied`]): `ship provision`'s deployer-key and notary rows, the sign-in ladder,
-    /// and the default repository consumer. Any
-    /// other need (one raised by hand, or for a consumer not wired yet) has no check of its own,
+    /// ([`super::satisfied`]): `ship provision`'s deployer-key, notary and Developer ID rows, the
+    /// sign-in ladder, and the default repository consumer. Any other need (one raised by hand, or for a consumer not wired yet) has no check of its own,
     /// so the vault version that gives this Mac the want's entry is what fulfils it; without
     /// that it would stay published for good.
     #[must_use]
     pub const fn checks_itself(self) -> bool {
         matches!(
             self,
-            Self::ReleaseSiteKey | Self::ReleaseNotary | Self::HarnessSignIn | Self::AghDev
+            Self::ReleaseSiteKey
+                | Self::ReleaseNotary
+                | Self::ReleaseDeveloperId
+                | Self::HarnessSignIn
+                | Self::AghDev
         )
+    }
+
+    /// Whether its needs are ever posted to the lab: every purpose's but a stolen Mac's
+    /// rotations, which want a new value, not a copy of the one that left.
+    #[must_use]
+    pub const fn asks_the_lab(self) -> bool {
+        !matches!(self, Self::StolenRotation)
     }
 }

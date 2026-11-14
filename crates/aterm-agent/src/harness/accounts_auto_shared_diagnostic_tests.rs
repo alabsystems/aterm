@@ -294,7 +294,7 @@ fn shared_guard_keeps_typed_provider_facts_even_when_publication_is_deferred() {
                 if stop {
                     Vec::new()
                 } else {
-                    vec![("shared".into(), accounts::SignInAction::Login)]
+                    vec![("shared".into(), accounts::SignInAction::Renew)]
                 }
             );
             let again = fixture.background();
@@ -313,6 +313,7 @@ fn a_host_cannot_put_a_raw_url_or_path_in_a_retained_browser_outcome() {
     let untrusted = Met {
         word: MetWord::BotCheck,
         host: Some(PRIVATE_FAILURE.into()),
+        why: Some(PRIVATE_FAILURE.into()),
     };
     let fixture = Fixture::new(Reply::Exit(1, Some(untrusted)));
     let report = fixture.background();

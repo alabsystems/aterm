@@ -56,6 +56,7 @@ pub mod service_image;
 pub mod settings;
 pub mod tag;
 pub mod update_record;
+pub mod windows;
 
 mod durable;
 mod hash;

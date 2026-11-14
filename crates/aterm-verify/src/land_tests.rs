@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! `verify land`'s rules over scratch repositories with a bare origin: the inheritance rule, the
-//! compose rule and its re-judge, the re-judge bound, and the stated receipt, each beside the
-//! control that shows the rule bites.
+//! compose rule and its re-judge, and the stated receipt, each beside the control that shows
+//! the rule bites.
 
 use super::*;
 use aterm_types::land_trailer::{Interrupted, KEYS};
@@ -24,6 +24,9 @@ mod push;
 
 #[path = "land_skew_tests.rs"]
 mod skew;
+
+#[path = "land_resolve_tests.rs"]
+mod resolving;
 
 /// This image's digest in the scripted landings, whose every checkout's verifier is this image,
 /// so nothing hands over.
@@ -350,7 +353,7 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
         Path::new("/verifier"),
         Path::new("/checkout"),
         "main-sha",
-        &[],
+        None,
         Path::new("/events"),
         &LandResources {
             admit: aterm_capacity::Admit::Now,
@@ -392,12 +395,17 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
     .map(str::to_owned)
     .collect();
     assert_eq!(words, expected);
-    // A recheck names its checks first and brackets no test inputs, since it runs no test.
+    // A round runs the dev set as a judgment does, since the tip it merged, and names the judged
+    // commit and the file of its shared paths: the child selects its crates from those alone.
     let cmd = judgment_command(
         Path::new("/verifier"),
         Path::new("/checkout"),
         "tip-sha",
-        &RECHECKS,
+        Some(Round {
+            judged: "judged-sha",
+            shared: Path::new("/shared"),
+            mechanical: true,
+        }),
         Path::new("/events"),
         &LandResources {
             admit: aterm_capacity::Admit::Wait,
@@ -415,26 +423,79 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
     assert_eq!(
         words,
         [
-            "fmt",
-            "census",
-            "export-scan",
             "--base",
             "tip-sha",
+            "--judged",
+            "judged-sha",
+            "--shared",
+            "/shared",
             "--events",
             "/events",
             "--admit",
             "wait",
+            crate::cli::INPUT_DRIFT,
         ]
     );
-    let parsed = crate::cli::parse(words).expect("the recheck's command parses");
+    let parsed = crate::cli::parse(words).expect("the round's command parses");
     assert_eq!(
         parsed.checks,
+        crate::cli::parse(["--base", "tip-sha"]).unwrap().checks
+    );
+    assert!(parsed.checks.contains(&crate::checks::Check::Test) && parsed.input_drift);
+    assert_eq!(
+        (
+            parsed.base.as_deref(),
+            parsed.judged.as_deref(),
+            parsed.shared,
+            parsed.by_hand
+        ),
+        (
+            Some("tip-sha"),
+            Some("judged-sha"),
+            Some(PathBuf::from("/shared")),
+            false
+        )
+    );
+    // The round of a merge Git did not make says so, after its shared paths: the child then
+    // judges no shared path's member alone. NEGATIVE CONTROL: the round above, of Git's own merge, does not.
+    let cmd = judgment_command(
+        Path::new("/verifier"),
+        Path::new("/checkout"),
+        "tip-sha",
+        Some(Round {
+            judged: "judged-sha",
+            shared: Path::new("/shared"),
+            mechanical: false,
+        }),
+        Path::new("/events"),
+        &LandResources {
+            admit: aterm_capacity::Admit::Wait,
+            timeout: None,
+            test_cores: None,
+        },
+        &crate::EnvSnapshot::default(),
+    )
+    .unwrap();
+    let by_hand: Vec<_> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let by_hand = &by_hand[if cfg!(unix) { 4 } else { 0 }..];
+    assert_eq!(
+        by_hand[..7],
         [
-            crate::checks::Check::Fmt,
-            crate::checks::Check::Census,
-            crate::checks::Check::ExportScan
+            "--base",
+            "tip-sha",
+            "--judged",
+            "judged-sha",
+            "--shared",
+            "/shared",
+            crate::cli::BY_HAND,
         ]
     );
+    assert_eq!(by_hand[7..], words[6..]);
+    assert!(!words.iter().any(|word| word == crate::cli::BY_HAND));
+    assert!(crate::cli::parse(by_hand).expect("it parses").by_hand);
 }
 
 fn git_cmd(dir: &Path) -> Command {
@@ -728,11 +789,31 @@ fn land_through(
 }
 
 /// A landing through [`land_rechecking`]: the exit, what it said, each judged base, and each
-/// recheck's base and the HEAD it ran on.
+/// round's base and the HEAD it ran on.
 type Landed = (i32, Vec<String>, Vec<String>, Vec<(String, String)>);
 
-/// [`land_through`], whose `recheck` stands for each recheck's run: it sees the base. Also each
-/// recheck's base and the HEAD it ran on.
+/// Why the scripted landings' shared paths reach every crate ([`whole_reach`]).
+const WHOLE: &str = "the scripted reach of a shared path";
+
+/// The reach of a scripted landing whose shared paths reach every crate, so a main that moves
+/// into a file a crate may own dooms the judgment, and the branch's own reach is `branch`'s
+/// crates.
+fn whole_reach(branch: &Branch) -> impl Fn(Option<&[String]>) -> Reach + '_ {
+    move |paths| match (paths, branch) {
+        (Some(_), _) => Reach::Everything(WHOLE.into()),
+        (None, Branch::Crates(crates)) => Reach::Crates(crates.clone()),
+        (None, Branch::Everything(why)) => Reach::Everything(why.clone()),
+    }
+}
+
+/// A reach of `names`.
+fn reaches(names: &[&str]) -> Reach {
+    Reach::Crates(names.iter().map(|name| (*name).to_owned()).collect())
+}
+
+/// [`land_through`], whose `recheck` stands for each round's run: it sees the base. Also each
+/// round's base and the HEAD it ran on. The shared paths reach every crate ([`whole_reach`]), so
+/// only shared Markdown no code reads is answered by a round.
 fn land_rechecking(
     world: &World,
     git: &dyn Fn(&Path) -> Command,
@@ -770,8 +851,62 @@ fn land_wired(
     pause: &dyn Fn(Duration),
     branch: Branch,
     lane: Lane,
-    mut judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
+    judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
     mut recheck: impl FnMut(&str) -> Judged,
+) -> Landed {
+    let reach = whole_reach(&branch);
+    land_seamed(
+        world,
+        git,
+        remote,
+        pause,
+        branch.clone(),
+        lane,
+        &reach,
+        judge,
+        |base, _| recheck(base),
+    )
+}
+
+/// A landing whose shared paths reach what `reach` says (its argument the paths, or `None` for
+/// the branch's own change), and whose `recheck` stands for each round's run: it sees the base
+/// and the round's delta.
+fn land_reaching(
+    world: &World,
+    branch: Branch,
+    lane: Lane,
+    reach: &dyn Fn(Option<&[String]>) -> Reach,
+    judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
+    recheck: impl FnMut(&str, &Delta) -> Judged,
+) -> Landed {
+    land_seamed(
+        world,
+        &git_cmd,
+        &crate::remote::run,
+        &no_retry,
+        branch,
+        lane,
+        reach,
+        judge,
+        recheck,
+    )
+}
+
+/// [`land_wired`] with the reach seam `reach` and a `recheck` that sees each round's delta.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one seam of the landing under test"
+)]
+fn land_seamed(
+    world: &World,
+    git: &dyn Fn(&Path) -> Command,
+    remote: &RemoteStep<'_>,
+    pause: &dyn Fn(Duration),
+    branch: Branch,
+    lane: Lane,
+    reach: &dyn Fn(Option<&[String]>) -> Reach,
+    mut judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
+    mut recheck: impl FnMut(&str, &Delta) -> Judged,
 ) -> Landed {
     let said = RefCell::new(Vec::new());
     let bases = RefCell::new(Vec::new());
@@ -791,12 +926,21 @@ fn land_wired(
             },
             branch: &mut |_: &Path, _: &str| branch.clone(),
             lane: &mut |_: &Path, _: &str| lane.clone(),
-            recheck: &mut |root: &Path, verifier: &Path, base: &str| {
+            reach: &|root: &Path, _: &str, paths: Option<&[String]>| {
+                assert_eq!(root, world.work);
+                reach(paths)
+            },
+            recheck: &mut |root: &Path, verifier: &Path, base: &str, delta: &Delta| {
                 assert_eq!(root, world.work);
                 assert_eq!(verifier, own_image().path);
                 let head = self::git(root, &["rev-parse", "HEAD"]);
+                assert_eq!(
+                    self::git(root, &["rev-parse", "HEAD^1"]),
+                    delta.judged,
+                    "a round's judged commit is its merge's first parent"
+                );
                 rechecks.borrow_mut().push((base.to_owned(), head));
-                recheck(base)
+                recheck(base, delta)
             },
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
@@ -1064,6 +1208,22 @@ fn a_green_branch_lands_as_one_merge_stating_its_judgment() {
         git(&world.work, &["log", "-1", "--format=%s", &landing]),
         "Merge origin/main into feature"
     );
+}
+
+/// With no fetch refspec, Git itself does not update origin/main after a push, as with agh.
+#[test]
+fn a_green_branch_refreshes_main_without_a_fetch_refspec() {
+    let world = world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    git(
+        &world.work,
+        &["config", "--unset-all", "remote.origin.fetch"],
+    );
+    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    let landing = origin_main(&world);
+    assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landing);
+    assert_eq!(git(&world.work, &["rev-parse", "origin/main"]), landing);
 }
 
 /// A BRANCH THAT ALREADY MERGED MAIN LANDS AS THAT MERGE, RESTATED: its parents and its own
@@ -1503,7 +1663,8 @@ fn an_already_landed_checkout_resumes_without_absorbing_main_or_losing_new_work(
                 judge: &mut |_, _, _, _| panic!("an already-landed checkout needs no judgment"),
                 branch: &mut |_, _| panic!("an already-landed checkout needs no branch scope"),
                 lane: &mut |_, _| panic!("an already-landed checkout needs no lane verdict"),
-                recheck: &mut |_, _, _| panic!("an already-landed checkout needs no recheck"),
+                reach: &|_, _, _| panic!("an already-landed checkout needs no reach"),
+                recheck: &mut |_, _, _, _| panic!("an already-landed checkout needs no recheck"),
                 hand_over: &mut |_, _, _| panic!("an already-landed checkout hands nothing over"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
                 remote: &crate::remote::run,
@@ -1624,7 +1785,10 @@ fn a_lane_verdict_given_during_the_run_is_inherited() {
                         Lane::Unjudged("not yet".into())
                     }
                 },
-                recheck: &mut |_: &Path, _: &Path, _: &str| panic!("no recheck was expected"),
+                reach: &|_: &Path, _: &str, _: Option<&[String]>| panic!("no reach was expected"),
+                recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| {
+                    panic!("no recheck was expected")
+                },
                 hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
                 remote: &crate::remote::run,
@@ -1963,10 +2127,14 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
             ),
             refused => {
                 assert_eq!(mode, "120000", "the regular mode change merges cleanly");
-                assert_eq!(
-                    refused,
-                    Compose::Conflict,
-                    "a type change is Git's conflict"
+                let Compose::Conflict(conflicted) = refused else {
+                    panic!("a type change is Git's conflict");
+                };
+                assert!(
+                    conflicted
+                        .iter()
+                        .any(|path| path.starts_with(b"shared.txt")),
+                    "the conflict names the path: {conflicted:?}"
                 );
             }
         }
@@ -2370,7 +2538,8 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
             assert!(
                 refused.ends_with(&format!(
                     "touch the branch's \"Cargo.lock\", where the checked tree's entry differs \
-                     from new main's or the merge's{lock}"
+                     from new main's or the merge's{lock}; what it changed, with the paths it \
+                     shares with the branch, reaches every crate ({WHOLE})"
                 )),
                 "{change}: a refused lock says what its version exception decided: {refused}"
             );
@@ -2582,7 +2751,7 @@ fn a_whitespace_only_conflict_path_is_not_erased() {
         commit(&world.work, file, "ours\n");
         let moved = rival_moves(&world, file, "theirs\n");
         let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
-        assert_eq!(code, exit::FAILED, "{said:#?}");
+        assert_eq!(code, exit::CONFLICT, "{said:#?}");
         assert!(bases.is_empty(), "a conflict starts no checks");
         assert!(said.iter().any(|line| line.contains(shown)), "{said:#?}");
         assert!(
@@ -2593,75 +2762,13 @@ fn a_whitespace_only_conflict_path_is_not_erased() {
     }
 }
 
-/// A moved main that does not merge cleanly stops on the conflict, left for the person; nothing
-/// is pushed.
-#[test]
-fn a_conflicting_moved_main_stops_on_the_conflict() {
-    let world = world();
-    commit(&world.work, "shared.txt", &SHARED.replacen('4', "mine", 1));
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| {
-        rival_moves(&world, "shared.txt", &SHARED.replacen('4', "theirs", 1));
-        green()
-    });
-    assert_eq!((code, bases.len()), (exit::FAILED, 1), "{said:#?}");
-    assert!(
-        said.iter()
-            .any(|l| l.contains("conflicts") && l.contains("\"shared.txt\"")),
-        "{said:#?}"
-    );
-    assert!(git(&world.work, &["status", "--porcelain"]).contains("UU shared.txt"));
-    assert_ne!(
-        git(&world.work, &["log", "-1", "--format=%s", "origin/main"]),
-        "Merge origin/main into feature"
-    );
-}
-
-/// After three re-judges a main still moving over the branch's files stops the landing: the
-/// branch merged with the last main and judged, nothing pushed, exit 75. NEGATIVE CONTROL: the
-/// same main moving only twice lands on the third judgment.
-#[test]
-fn it_stops_after_three_rejudges_merged_and_judged() {
-    let moving = |world: &World, times: usize| {
-        let mut tips = Vec::new();
-        let (code, said, bases) = land_with(world, crates(&["a"]), Lane::Pass, |_, n| {
-            if n < times {
-                tips.push(rival_moves_line(world, 4 + n, &format!("moved{n}")));
-            }
-            green()
-        });
-        (code, said, bases, tips)
-    };
-    let world = world();
-    commit(&world.work, "shared.txt", &SHARED.replacen('1', "one", 1));
-    let (code, said, bases, tips) = moving(&world, usize::MAX);
-    assert_eq!(code, STOPPED, "{said:#?}");
-    assert_eq!(bases.len(), 1 + REJUDGES, "{said:#?}");
-    let last = tips.last().expect("main moved");
-    assert_eq!(origin_main(&world), *last, "nothing was pushed");
-    let head = git(&world.work, &["rev-parse", "HEAD"]);
-    let previous = &tips[tips.len() - 2];
-    assert_eq!(
-        git(&world.work, &["rev-parse", &format!("{head}^2")]),
-        *previous,
-        "merged with the main it judged last"
-    );
-    assert_eq!(git(&world.work, &["status", "--porcelain"]), "");
-
-    let control = self::world();
-    commit(&control.work, "shared.txt", &SHARED.replacen('1', "one", 1));
-    let (code, said, bases, _) = moving(&control, 2);
-    assert_eq!((code, bases.len()), (exit::PASS, 3), "{said:#?}");
-    assert_eq!(
-        stated(&control, &origin_main(&control))
-            .expect("stated")
-            .rejudges(),
-        2
-    );
-}
-
 /// SLICE 0's exit test (`docs/DESIGN-landing-economy.md` §2.0, §5): main gains a commit that
-/// touches the branch's file while the judgment runs, and the first poll after it interrupts
-/// the run, naming the tip and the shared file. The interrupted run is no verdict: the receipt
+/// touches the branch's file while the judgment runs, a file whose reach is every crate, and the
+/// first poll after it interrupts the run, naming the tip, the shared file and that reach (a
+/// narrower reach interrupts nothing:
+/// [`a_tip_whose_shared_paths_reach_less_than_the_branch_does_not_interrupt`]). So does a tip
+/// that does not descend from the main the branch merged, though it shares no path with the
+/// branch. The interrupted run is no verdict: the receipt
 /// states it as interrupted, never as checked, beside the judgment of the moved main, which is
 /// merged and judged at once and counts as one re-judge. A poll before main moved interrupts
 /// nothing. NEGATIVE CONTROL: a disjoint move mid-run interrupts nothing, a second poll of the
@@ -2695,7 +2802,8 @@ fn a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll() {
     let line = format!(
         "verify land: INTERRUPTED the judgment of {judged_tree}: origin/main moved to {moved}, \
          which does not compose: its new commits touch the branch's \"shared.txt\", where the \
-         checked tree's entry differs from new main's or the merge's"
+         checked tree's entry differs from new main's or the merge's; what it changed, with \
+         the paths it shares with the branch, reaches every crate ({WHOLE})"
     );
     assert_eq!(
         said.iter().filter(|said| **said == line).count(),
@@ -2773,17 +2881,226 @@ fn a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll() {
     let receipt = stated(&control, &origin_main(&control)).expect("stated");
     assert_eq!(receipt.composed_onto.as_deref(), Some(moved.as_str()));
     assert!(receipt.interrupted.is_empty());
+
+    // Main is rewritten while the judgment runs: its new tip holds none of the main the branch
+    // merged, and shares no path with the branch.
+    let rewritten = self::world();
+    let seed = origin_main(&rewritten);
+    let merged = rival_moves(&rewritten, "b/y.txt", "b2\n");
+    commit(&rewritten.work, "a/x.txt", "a2\n");
+    let mut moved = String::new();
+    let (code, said, bases) =
+        land_watching(&rewritten, crates(&["a"]), Lane::Pass, |_, n, poll| {
+            if n == 0 {
+                git(&rewritten.rival, &["checkout", "-q", "-B", "main", &seed]);
+                moved = commit(&rewritten.rival, "c/z.txt", "c\n");
+                git(
+                    &rewritten.rival,
+                    &["push", "-q", "--force", "origin", "main"],
+                );
+                assert!(poll(&mut || false), "a tip off the merged main interrupts");
+                return Ran::Interrupted { secs: 3 };
+            }
+            Ran::Ended(green())
+        });
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    assert_eq!(bases, [merged.clone(), moved.clone()], "{said:#?}");
+    assert!(
+        said.iter().any(|said| said.contains("INTERRUPTED")
+            && said.contains(&format!(
+                "it does not descend from {merged}, the main the branch merged"
+            ))),
+        "{said:#?}"
+    );
 }
 
-/// Each interrupt counts toward [`REJUDGES`]: a main that keeps moving into the branch's file
-/// interrupts every judgment, and once the re-judges are spent the tool stops with the branch
-/// merged with the main it judged last, that judgment interrupted, and nothing pushed.
+/// THE CUT RULE: a tip that shares a path with the branch interrupts the running judgment only
+/// where nothing it would produce can stand, that is, where the round of the merge would judge
+/// every crate the branch's change reaches: what main changed (the paths it shares with the
+/// branch and the ones it does not, asked together) reaches all of them, or the branch's change
+/// reaches every crate, whose round is the whole workspace. A narrower reach interrupts
+/// nothing: the judgment finishes and stands for the tree it ran on, and the merge is judged by
+/// one round. The reach is the cone's crates, dependents included, never its seeds alone: a
+/// change of one seed whose cone holds the branch's every crate cuts. A reach that was not read
+/// interrupts nothing either: nothing is then known to be lost by letting the judgment finish.
+/// NEGATIVE CONTROLS: the same move under a reach that holds the branch's whole reach, or more,
+/// interrupts at the first poll and is judged in full, with no round.
 #[test]
-fn interrupted_judgments_count_toward_the_rejudge_bound() {
+fn a_tip_whose_shared_paths_reach_less_than_the_branch_does_not_interrupt() {
+    // The branch's seeds; its cone adds their dependent, `lab`.
+    let seeds = ["types", "ctl", "gui"];
+    let cone = reaches(&["types", "ctl", "gui", "lab"]);
+    let every = Reach::Everything("a root manifest changed".to_owned());
+    let unread = Reach::Unread("the cone was not read".to_owned());
+    // Main's reach, the branch's, and what the first poll's line says where it interrupts.
+    let cases: [(Reach, Reach, Option<&str>); 8] = [
+        (reaches(&["gui", "lab"]), cone.clone(), None),
+        (reaches(&[]), cone.clone(), None),
+        (unread.clone(), cone.clone(), None),
+        (reaches(&["types", "ctl", "gui", "lab"]), unread, None),
+        (
+            reaches(&["types", "ctl", "gui", "lab"]),
+            cone.clone(),
+            Some("reaches every crate the branch's change reaches (ctl, gui, lab, types)"),
+        ),
+        (
+            reaches(&["types", "ctl", "gui", "lab", "other"]),
+            cone.clone(),
+            Some("reaches every crate the branch's change reaches (ctl, gui, lab, types)"),
+        ),
+        (
+            every.clone(),
+            cone,
+            Some(
+                "what it changed, with the paths it shares with the branch, reaches every crate \
+                 (a root manifest changed)",
+            ),
+        ),
+        (
+            reaches(&["gui"]),
+            every,
+            Some(
+                "the branch's change reaches every crate (a root manifest changed), so a round \
+                 would judge all of it again",
+            ),
+        ),
+    ];
+    for (main, branch, cuts) in cases {
+        let case = format!("main {main:?}, the branch {branch:?}");
+        let world = world();
+        commit(&world.work, "shared.txt", &SHARED.replacen('1', "one", 1));
+        let judged_at = git(&world.work, &["rev-parse", "HEAD"]);
+        let asked = RefCell::new(Vec::new());
+        let reach = |paths: Option<&[String]>| {
+            asked.borrow_mut().push(paths.map(<[String]>::to_vec));
+            match paths {
+                None => branch.clone(),
+                Some(_) => main.clone(),
+            }
+        };
+        let mut polls = Vec::new();
+        let moved = RefCell::new(String::new());
+        let (code, said, bases, rounds) = land_reaching(
+            &world,
+            crates(&seeds),
+            Lane::Pass,
+            &reach,
+            |_, n, poll| {
+                if n == 0 {
+                    // Main changes a file of its own, then the branch's.
+                    rival_moves(&world, "b/y.txt", "main's own\n");
+                    *moved.borrow_mut() =
+                        rival_moves(&world, "shared.txt", &SHARED.replacen('8', "eight", 1));
+                    polls.push(poll(&mut || false));
+                    polls.push(poll(&mut || false));
+                    if polls[0] {
+                        return Ran::Interrupted { secs: 1 };
+                    }
+                }
+                Ran::Ended(green())
+            },
+            |base, delta| {
+                assert_eq!(
+                    base,
+                    *moved.borrow(),
+                    "{case}: the round judges since the tip it merged"
+                );
+                assert_eq!(
+                    (delta.judged.as_str(), delta.shared.as_slice()),
+                    (judged_at.as_str(), &["shared.txt".to_owned()][..]),
+                    "{case}"
+                );
+                ran(
+                    exit::PASS,
+                    vec![
+                        row("fmt", "ok"),
+                        row("census", "ok"),
+                        row("export-scan", "ok"),
+                        row("lint", "ok"),
+                        row("test", "ok"),
+                    ],
+                    5,
+                )
+            },
+        );
+        assert_eq!(code, exit::PASS, "{case}: {said:#?}");
+        assert_eq!(polls, [cuts.is_some(), cuts.is_some()], "{case}: {said:#?}");
+        let moved = moved.into_inner();
+        let asked = asked.into_inner();
+        assert!(
+            asked.contains(&Some(vec!["b/y.txt".to_owned(), "shared.txt".to_owned()])),
+            "{case}: the reach asked is of main's own change with the shared path: {asked:?}"
+        );
+        if !matches!(branch, Reach::Unread(_)) {
+            assert_eq!(
+                asked.iter().filter(|paths| paths.is_none()).count(),
+                1,
+                "{case}: the branch's reach is read once for the main it merged: {asked:?}"
+            );
+        }
+        let went_on = format!(
+            "verify land: origin/main moved to {moved}, which shares shared.txt with the \
+             branch: the judgment goes on and stands for the tree it runs on, and a round judges \
+             the merge once it has passed"
+        );
+        let receipt = stated(&world, &origin_main(&world)).expect("stated");
+        if let Some(why) = cuts {
+            assert_eq!((bases.len(), rounds.len()), (2, 0), "{case}: {said:#?}");
+            assert!(
+                said.iter()
+                    .any(|said| said.contains("INTERRUPTED") && said.ends_with(why)),
+                "{case}: {said:#?}"
+            );
+            assert!(!said.contains(&went_on), "{case}: {said:#?}");
+            assert_eq!(
+                (receipt.interrupted.len(), receipt.rechecked.len()),
+                (1, 0),
+                "{case}"
+            );
+        } else {
+            assert_eq!((bases.len(), rounds.len()), (1, 1), "{case}: {said:#?}");
+            assert!(
+                !said.iter().any(|said| said.contains("INTERRUPTED")),
+                "{case}: {said:#?}"
+            );
+            // The person hears of the round to come when the tip is read, once, though it is
+            // polled twice.
+            assert_eq!(
+                said.iter().filter(|said| **said == went_on).count(),
+                1,
+                "{case}: {said:#?}"
+            );
+            assert_eq!(
+                (receipt.interrupted.len(), receipt.rejudges()),
+                (0, 0),
+                "{case}"
+            );
+            assert_eq!(receipt.rechecked.len(), 1, "{case}");
+            assert_eq!(receipt.rechecked[0].rows.len(), 5, "{case}");
+            assert_eq!(
+                (&receipt.rechecked[0].base, &receipt.rechecked[0].onto),
+                (&moved, &moved),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// No count of re-judges ends a landing: a main that moves into the branch's file during each of
+/// the first four judgments interrupts each, and each tip is merged and judged at once; the
+/// fifth judgment, which nothing interrupts, lands, its receipt stating the four interrupted
+/// judgments and the one that passed. The fourth tip is the one the removed bound of three
+/// re-judges stopped at, with the branch merged, its judgment interrupted and nothing pushed.
+#[test]
+fn a_fourth_tip_that_cannot_compose_is_merged_and_judged() {
+    const TIPS: usize = 4;
     let world = world();
     commit(&world.work, "shared.txt", &SHARED.replacen('1', "one", 1));
     let mut tips = Vec::new();
     let (code, said, bases) = land_watching(&world, crates(&["a"]), Lane::Pass, |_, n, poll| {
+        if n == TIPS {
+            return Ran::Ended(green());
+        }
         tips.push(rival_moves_line(&world, 4 + n, &format!("moved{n}")));
         assert!(
             poll(&mut || false),
@@ -2791,29 +3108,34 @@ fn interrupted_judgments_count_toward_the_rejudge_bound() {
         );
         Ran::Interrupted { secs: 1 }
     });
-    assert_eq!(code, STOPPED, "{said:#?}");
-    assert_eq!(bases.len(), 1 + REJUDGES, "{said:#?}");
-    let last = tips.last().expect("main moved");
-    assert_eq!(origin_main(&world), *last, "nothing was pushed");
-    let previous = &tips[tips.len() - 2];
-    let head = git(&world.work, &["rev-parse", "HEAD"]);
-    assert_eq!(
-        git(&world.work, &["rev-parse", &format!("{head}^2")]),
-        *previous,
-        "merged with the main it judged last"
-    );
-    let stop = format!(
-        "verify land: STOPPED after {REJUDGES} re-judges — the branch is merged with {previous}, \
-         its judgment there interrupted, and nothing was pushed. Run it again"
-    );
-    assert!(said.contains(&stop), "{said:#?}");
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    assert_eq!(bases.len(), TIPS + 1, "{said:#?}");
+    assert_eq!(bases[1..], tips[..], "each tip is merged and judged");
     assert_eq!(
         said.iter()
             .filter(|said| said.starts_with("verify land: INTERRUPTED"))
             .count(),
-        1 + REJUDGES,
+        TIPS,
         "{said:#?}"
     );
+    assert!(
+        !said.iter().any(|said| said.contains("STOPPED")),
+        "{said:#?}"
+    );
+    let landing = origin_main(&world);
+    let last = tips.last().expect("main moved");
+    assert_eq!(
+        git(&world.work, &["rev-parse", &format!("{landing}^2")]),
+        *last,
+        "the landing merges the last tip"
+    );
+    let receipt = stated(&world, &landing).expect("stated");
+    assert_eq!(
+        (receipt.interrupted.len(), receipt.checked.len()),
+        (TIPS, 1)
+    );
+    assert_eq!(receipt.checked[0].base, *last);
+    assert_eq!(receipt.rejudges(), TIPS);
     assert_eq!(git(&world.work, &["status", "--porcelain"]), "");
 }
 
@@ -3467,7 +3789,10 @@ fn a_refused_merge_commit_aborts_the_merge_cleanly() {
             },
             branch: &mut |_: &Path, _: &str| crates(&["a"]),
             lane: &mut |_: &Path, _: &str| Lane::Pass,
-            recheck: &mut |_: &Path, _: &Path, _: &str| {
+            reach: &|_: &Path, _: &str, _: Option<&[String]>| {
+                panic!("a refused merge reads no reach")
+            },
+            recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| {
                 panic!("a refused merge is never rechecked")
             },
             hand_over: &mut |_: &Image, _: &Path, _: &Path| {
@@ -3542,8 +3867,8 @@ exit "$b4_status""#,
     }
     .merge(&main, "merge with diagnostic stdout");
     match merged {
-        Ok(Merge::Clean) => {}
-        Ok(Merge::Conflict(paths)) => panic!("unexpected conflicts: {paths:?}"),
+        Ok(Merge::Clean { resolved }) => assert!(resolved.is_empty(), "{resolved:?}"),
+        Ok(Merge::Conflict { paths, .. }) => panic!("unexpected conflicts: {paths:?}"),
         Err(why) => panic!("{why}"),
     }
     let parents = git(&world.work, &["show", "-s", "--format=%P", "HEAD"]);

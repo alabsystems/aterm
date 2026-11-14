@@ -249,3 +249,64 @@ fn retarget_and_restart_preserve_the_entire_unresolved_native_operation() {
         assert_eq!(carried, prior);
     }
 }
+
+/// A closed restart's watch rides on the next move's own record: a retarget, a retry and a
+/// restart each keep that move's cause, versions, source and line, bring no line of the earlier
+/// move's over, and carry the watch (with the coordination) for the new record's plan to settle.
+/// The fixture's closed restart names a Unix shell, as every closed fixture does.
+#[cfg(unix)]
+#[test]
+fn a_closed_watch_rides_on_the_next_moves_own_record() {
+    let mut prior = crate::harness::native_restart::closed_tests::closed_record();
+    assert!(prior.native_closed.is_some() && prior.native_prepare.is_empty());
+    prior.cause = "relaunch".into();
+    prior.from = "1.0.0".into();
+    prior.to = "2.0.0".into();
+    prior.source = "earlier".into();
+    prior.line = "earlier line".into();
+    prior.back_line = "earlier back line".into();
+    let candidate = Candidate {
+        exe: PathBuf::from("/different/current"),
+        version: Version::parse("3.0.0").unwrap(),
+        source: Source::Managed,
+    };
+    let (retargeted, how) = St::retarget(
+        Some(prior.clone()),
+        &Version::parse("2.0.0").unwrap(),
+        &candidate,
+        Proc::default(),
+        900,
+    );
+    assert_ne!(how, Retarget::Kept);
+    assert_eq!(retargeted.to, "3.0.0");
+    assert_ne!(retargeted.source, prior.source);
+    let own = St {
+        cause: "upgrade".into(),
+        from: "2.0.0".into(),
+        to: "3.0.0".into(),
+        source: "managed".into(),
+        line: "this move's line".into(),
+        ..St::default()
+    };
+    let mut retried = own.clone();
+    prior.retried_by(&mut retried);
+    let mut restarted = own.clone();
+    prior.kept_by_restart("s-new", &mut restarted);
+    for (how, st, own) in [
+        ("retarget", &retargeted, None),
+        ("retry", &retried, Some(&own)),
+        ("restart", &restarted, Some(&own)),
+    ] {
+        assert_eq!(st.native_closed, prior.native_closed, "{how}");
+        assert!(st.native_coordination, "{how}");
+        assert!(st.back_line.is_empty(), "{how}");
+        assert_ne!(st.line, prior.line, "{how}");
+        if let Some(own) = own {
+            assert_eq!(
+                (&st.cause, &st.from, &st.to, &st.source, &st.line),
+                (&own.cause, &own.from, &own.to, &own.source, &own.line),
+                "{how}"
+            );
+        }
+    }
+}

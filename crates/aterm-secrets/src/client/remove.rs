@@ -13,8 +13,9 @@
 //!   was in that this Mac opens (`[everyone]`, Commons, and each host list whose newest epoch
 //!   wraps it), wraps each to the members who remain and reseals the current entries under it.
 //!   The `[everyone]` reseal carries the revoke cascade (the Mac's roster row and pool slots, a new
-//!   fleet code, and on `--stolen` the roster's deny-lists). It returns the entries the Mac could read, for rotation
-//!   at the provider, and on `--stolen` the one `NEEDS YOU:` line (C25). It refuses up front,
+//!   fleet code, and on `--stolen` the roster's deny-lists). It returns the entries the Mac could
+//!   read, and on `--stolen` files each credential among them for rotation in this Mac's need
+//!   ledger once its records are committed (C25, [`super::Exposure::file`]). It refuses up front,
 //!   signing nothing, where its batch and every re-key owed after it (its own, and those earlier
 //!   removals made due that some Mac can still sign) would pass the log's keyed budget or its
 //!   byte bound ([`RemovalFill`]).
@@ -42,8 +43,8 @@ use super::log_entries::{self, AuthorCtx, Rotation};
 use super::*;
 use crate::commons::bootstrap::Device;
 use crate::membership_log::{
-    Body, EpochAudience, Kind, Log, MemberId, Record, RecordId, RekeyDue, Store, Turn, Undo,
-    audience_tag, entries::OpenedAudienceEntries,
+    Body, EpochAudience, Evidence, Kind, Log, MemberId, Record, RecordId, RekeyDue, Store, Turn,
+    Undo, audience_tag, entries::OpenedAudienceEntries,
 };
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
@@ -58,14 +59,16 @@ pub struct MemberRemoval {
     pub signed: usize,
     /// The audiences it minted a new epoch for: `everyone`, `commons`, or a host list's header.
     pub rotated: Vec<String>,
-    /// The entries the removed Mac could read, as this Mac opens them: each to rotate at the
-    /// provider where it was lost.
+    /// The entries the removed Mac could read, as this Mac opens them.
     pub could_read: Vec<String>,
     /// `aterm-fleet-code` was rotated: on every removal where `[everyone]` holds one (a plain one
     /// too, since 0.148, so the removed Mac's copy proves nothing to the fleet or the vault).
     pub fleet_code_rotated: bool,
-    /// The one `NEEDS YOU:` line for the provider rotations, on `--stolen` alone (C25).
-    pub needs_you: Option<String>,
+    /// On `--stolen` alone (C25), what the Mac took, which the removal files for rotation in
+    /// this Mac's need ledger once its records are committed ([`super::Exposure::file`]).
+    pub exposure: Option<super::Exposure>,
+    /// The one line naming what was filed for rotation, on `--stolen` alone.
+    pub rotation: Option<String>,
     /// What the vault's envelope, which 0.145 Macs read, still says, where this Mac opens the
     /// admin locker and so keeps it in step: the removed Mac was one of its admins and keeps the
     /// envelope's signing key ([`vault_admin_named`]), or the mirror failed. Empty on a member's
@@ -131,12 +134,12 @@ impl RemovedNote {
 }
 
 /// What the Mac `label` could read while it was out (F21 rule 8), `names` as `[audience] name`,
-/// as a line a person reads: "m40 could read [everyone] deploy-key, [everyone] shared: written
-/// while it was out; rotate them where they came from". `None` where it could read nothing new.
+/// as a line: "m40 could read [everyone] deploy-key, [everyone] shared: written while it was
+/// out". `None` where it could read nothing new.
 fn could_read_line(label: &str, names: &[String]) -> Option<String> {
     (!names.is_empty()).then(|| {
         format!(
-            "{label} could read {}: written while it was out; rotate them where they came from",
+            "{label} could read {}: written while it was out",
             names.join(", ")
         )
     })
@@ -678,8 +681,8 @@ fn other_vault_admin(paths: &Paths, doc: &Document, name: String) -> Option<Stri
 /// by a person's act (`aterm members remove`, F16): sign its `Remove`, mint a new epoch for every
 /// audience it was in that this Mac opens, wrap each to the members who remain, reseal the
 /// current entries with the revoke cascade, keep the records, and post them to every server this
-/// Mac reaches. The fleet code rotates too; with `stolen` the result carries the `NEEDS YOU:`
-/// line (C25). It runs under this Mac's state lock, never inside the `ask` exchange.
+/// Mac reaches. The fleet code rotates too; with `stolen` each credential it could read is filed
+/// for rotation in this Mac's need ledger (C25). It runs under this Mac's state lock, never inside the `ask` exchange.
 ///
 /// # Errors
 /// This Mac's vault has no trusted log or this Mac no secrets identity; the log seats no device
@@ -749,6 +752,10 @@ fn remove_person(paths: &Paths, target: Target<'_>, stolen: bool) -> crate::Resu
         draft_removal(paths, store, &identity, target, stolen)
     })?;
     let report = report?;
+    let rotation = report
+        .exposure
+        .as_ref()
+        .map(|exposure| exposure.file(paths));
     let mut envelope_notes = Vec::new();
     if !minted.is_empty() {
         let _ = post_records_to_servers(paths);
@@ -771,6 +778,7 @@ fn remove_person(paths: &Paths, target: Target<'_>, stolen: bool) -> crate::Resu
     Ok(MemberRemoval {
         signed: minted.len(),
         envelope_notes,
+        rotation,
         ..report
     })
 }
@@ -1260,22 +1268,17 @@ fn draft_removal(
         &node_keys,
         stolen,
     )?;
-    let needs_you = stolen.then(|| {
-        let names: Vec<String> = could_read
+    let exposure = stolen.then(|| {
+        // A host list keeps its header on the log: its new epoch wraps the members who remain.
+        let read: Vec<(String, Option<String>)> = could_read
             .iter()
             .filter(|name| !name.starts_with("every entry of "))
-            .map(|name| name.split(' ').next().unwrap_or_default().to_owned())
+            .map(|name| match name.split_once(' ') {
+                Some((name, header)) => (name.to_owned(), Some(header.to_owned())),
+                None => (name.clone(), Some(Audience::Everyone.header())),
+            })
             .collect();
-        let line = super::retirement::stolen_needs_you_line(&names, &label, &cascade.warm_accounts);
-        if unopened.is_empty() {
-            line
-        } else {
-            format!(
-                "{line}; and whatever {} holds (gh tokens, release ring, Developer ID, notary, \
-                 mailbox), which this Mac cannot read",
-                unopened.join(", ")
-            )
-        }
+        super::Exposure::of(&label, &read, &cascade.warm_accounts, unopened)
     });
 
     // The batch rotates `[everyone]` and Commons where this Mac opens their newest epochs, and
@@ -1380,7 +1383,8 @@ fn draft_removal(
             rotated,
             could_read,
             fleet_code_rotated: cascade.fleet_code_rotated,
-            needs_you,
+            exposure,
+            rotation: None,
             envelope_notes: Vec::new(),
         }),
     ))
@@ -1975,9 +1979,9 @@ fn record_read_after_cutoff(paths: &Paths, log: &Log, identity: &Identity) -> cr
     }
 }
 
-/// F21 rule 8's journal record on this Mac ([`read_after_cutoff_file`]), as lines a person reads:
-/// "m40 could read [everyone] shared: written while it was out; rotate them where they came
-/// from". Empty where no reseal here found anything to name.
+/// F21 rule 8's journal record on this Mac ([`read_after_cutoff_file`]), as lines: "m40 could
+/// read [everyone] shared: written while it was out". Empty where no reseal here found anything
+/// to name.
 ///
 /// # Errors
 /// The record exists and cannot be read.
@@ -3563,7 +3567,7 @@ fn tend_ready_epochs_by(
     };
     if !minted.is_empty() {
         // F21 rule 8: a reseal of an uncovered keyed epoch records what each removed Mac could
-        // read while it was out, for a person to rotate at its provider.
+        // read while it was out.
         if resealed
             && let Some(store) = trusted_store(paths)?
             && let Some(log) = store.log()
@@ -3806,10 +3810,44 @@ pub struct ListedMac {
     pub admitted_by: Option<String>,
     /// When its entry was signed (UTC milliseconds, as its signer stamped).
     pub admitted_ms: u64,
+    /// How the member that let it in knew to (its `Admit`'s evidence); `None` for a founder and
+    /// a removed Mac. A person's Allow is [`Evidence::Phrase`]; a Mac that proved itself (its node
+    /// key, or its device key from the home ALab LAN), a person's `aterm secrets approve` and a
+    /// writer successor are [`Evidence::Manual`]; a Mac the genesis listed is
+    /// [`Evidence::Listed`].
+    pub how: Option<Evidence>,
+    /// Whether the log holds a fleet node key for its seat, proven or not: an `Admit` names the
+    /// key its ask named whoever let it in (a person's Allow included), and a seat's own `Node`
+    /// record binds one. A writer successor, a vault-listed machine the log enrolled and a
+    /// founder the genesis names with none hold none.
+    pub node: bool,
     /// Its join code.
     pub code: String,
     /// Why it is out, where it is.
     pub removed: Option<RemovedNote>,
+}
+
+/// A standing member `m` of `log` as `aterm members list` prints it: who let it in, when, how,
+/// and whether the log holds a node key for its seat.
+pub(super) fn listed(
+    log: &Log,
+    membership: &crate::membership_log::Membership,
+    m: &crate::membership_log::Member,
+) -> ListedMac {
+    let entry = log.get(&m.entry);
+    ListedMac {
+        label: m.label.clone(),
+        name: m.name.clone(),
+        admitted_by: m.admitted_by.map(|by| label_of(log, membership, &by)),
+        admitted_ms: entry.map_or(0, Record::authored_ms),
+        how: entry.and_then(|record| match record.body() {
+            Body::Admit { evidence, .. } => Some(*evidence),
+            _ => None,
+        }),
+        node: m.node_key.is_some_and(|node| node != [0; 32]),
+        code: join_code(&m.binding.recipient()),
+        removed: None,
+    }
 }
 
 /// Membership as this Mac's trusted log evaluates it, members first by label, then the Macs it
@@ -3839,14 +3877,7 @@ pub fn member_list(paths: &Paths) -> crate::Result<Option<Vec<ListedMac>>> {
                     .as_ref()
                     .is_some_and(|r| log_entries::member_denied_by_roster(r, m))
         })
-        .map(|(_, m)| ListedMac {
-            label: m.label.clone(),
-            name: m.name.clone(),
-            admitted_by: m.admitted_by.map(|by| label_of(log, &membership, &by)),
-            admitted_ms: log.get(&m.entry).map_or(0, Record::authored_ms),
-            code: join_code(&m.binding.recipient()),
-            removed: None,
-        })
+        .map(|(_, m)| listed(log, &membership, m))
         .collect();
     out.sort_by(|a, b| a.label.cmp(&b.label));
     let notes = notes_of(log);
@@ -3871,6 +3902,8 @@ pub fn member_list(paths: &Paths) -> crate::Result<Option<Vec<ListedMac>>> {
                 name,
                 admitted_by: None,
                 admitted_ms: 0,
+                how: None,
+                node: node != [0; 32],
                 code: join_code(&recipient),
                 removed: Some(removed),
             })

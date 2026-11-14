@@ -777,6 +777,7 @@ fn an_account_ask_is_refused_in_the_order_of_its_fences() {
         pid,
         start: start.to_string(),
         copied,
+        home: None,
         refusal,
     };
     let stamp = |wanted: Option<Wanted>| Stamp {
@@ -892,4 +893,27 @@ fn an_account_judgement_is_waited_for_only_so_long() {
         bounded_among(&RUNNING, long, || 7)
     });
     assert_eq!(answered, Some(7), "CONTROL: a freed slot is taken again");
+}
+
+/// A MOVE WAITS FOR ITS SESSION'S RECORD NO LONGER THAN 1 S, NEVER THE POOL'S 5 S: the read is
+/// made under the act's lock, so its bound is how long a home that does not answer holds every
+/// other tab's restart; a test build's timing keeps it at its floor or above. CONTROL: a test's
+/// own read replaces it until its guard drops.
+#[test]
+fn a_moves_rest_read_waits_no_longer_than_account_rest() {
+    assert_eq!(
+        rest_wait(aterm_gui_timing::Timing::PRODUCTION),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        rest_wait(aterm_gui_timing::Timing::FAST),
+        ACCOUNT_REST_TEST_FLOOR
+    );
+    let (_, wait) = rest_read();
+    assert_eq!(wait, rest_wait(aterm_gui_timing::current()));
+    {
+        let _rest = rest_for_test(Arc::new(|_, _, _| None), Duration::from_millis(3));
+        assert_eq!(rest_read().1, Duration::from_millis(3), "CONTROL");
+    }
+    assert_eq!(rest_read().1, wait, "CONTROL: the guard dropped");
 }

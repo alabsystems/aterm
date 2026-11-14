@@ -30,7 +30,7 @@ fn placeholder_identity() -> DevIdIdentity {
 fn active_tier() -> AppleTier {
     AppleTier::Active {
         identity: placeholder_identity(),
-        auth: NotaryAuth::KeychainProfile("placeholder-profile".into()),
+        auth: NotaryAuth::keychain_profile("placeholder-profile"),
     }
 }
 
@@ -343,69 +343,13 @@ fn a_failed_dmg_signature_fails_the_release() {
 
 #[test]
 fn the_keychain_profile_spelling_puts_no_secret_on_the_command_line() {
-    let auth = NotaryAuth::KeychainProfile("placeholder-profile".into());
+    let auth = NotaryAuth::keychain_profile("placeholder-profile");
     assert_eq!(
         auth.args(),
         vec!["--keychain-profile", "placeholder-profile"],
         "notarytool takes the profile NAME, and nothing else"
     );
     assert_eq!(auth.args().len(), 2, "no third argument can carry a secret");
-}
-
-#[test]
-fn the_apple_id_spelling_produces_the_full_notarytool_triple() {
-    let auth = NotaryAuth::AppleId {
-        apple_id: "placeholder@example.invalid".into(),
-        team_id: String::new(),
-        password: "placeholder-app-specific-password".into(),
-    }
-    .with_team_id(FAKE_TEAM);
-    assert_eq!(
-        auth.args(),
-        vec![
-            "--apple-id",
-            "placeholder@example.invalid",
-            "--team-id",
-            FAKE_TEAM,
-            "--password",
-            "placeholder-app-specific-password",
-        ],
-        "notarytool needs all three, in this order"
-    );
-}
-
-#[test]
-fn the_team_id_notarytool_sees_comes_from_the_anchor_not_the_profile() {
-    let profile = "signing_key = \"AA==\"\n\
-                   notary_apple_id = \"placeholder@example.invalid\"\n\
-                   notary_password = \"placeholder-app-specific-password\"\n\
-                   team_id = \"OTHERTEAM1\"\n";
-    let auth = sign::credentials_notary_auth(profile)
-        .expect("the stray team_id line is inert, not a parse error")
-        .expect("the Apple stanza is present");
-    let args = auth.clone().with_team_id(FAKE_TEAM).args();
-    assert!(
-        args.contains(&FAKE_TEAM.to_string()),
-        "the anchor's team must be the one submitted: {args:?}"
-    );
-    assert!(
-        !args.contains(&OTHER_TEAM.to_string()),
-        "a team id in the profile must never reach notarytool: {args:?}"
-    );
-}
-
-#[test]
-fn a_password_never_reaches_a_debug_line() {
-    let auth = NotaryAuth::AppleId {
-        apple_id: "placeholder@example.invalid".into(),
-        team_id: FAKE_TEAM.into(),
-        password: "placeholder-app-specific-password".into(),
-    };
-    let rendered = format!("{auth:?}");
-    assert!(
-        !rendered.contains("placeholder-app-specific-password"),
-        "the password must never render: {rendered}"
-    );
 }
 
 #[test]
@@ -450,24 +394,18 @@ fn a_profile_with_no_apple_stanza_yields_no_auth() {
     );
 }
 
+/// The vault's release-notary entry, set as a keychain profile, is the one notary source: an
+/// Apple ID and password written into a profile are no credential and are never read.
 #[test]
-fn a_profile_naming_both_spellings_is_refused() {
-    sign::credentials_notary_auth(
-        "notary_profile = \"placeholder-profile\"\n\
-         notary_apple_id = \"placeholder@example.invalid\"\n\
-         notary_password = \"placeholder-app-specific-password\"\n",
-    )
-    .expect_err("two credentials means the file cannot say which one signed");
-}
-
-#[test]
-fn a_half_written_headless_stanza_is_refused() {
-    for body in [
-        "notary_apple_id = \"placeholder@example.invalid\"\n",
-        "notary_password = \"placeholder-app-specific-password\"\n",
-    ] {
-        sign::credentials_notary_auth(body).expect_err("half a credential is not one");
-    }
+fn a_plaintext_apple_id_and_password_are_no_notary_credential() {
+    let body = "notary_apple_id = \"placeholder@example.invalid\"\n\
+                notary_password = \"placeholder-app-specific-password\"\n";
+    assert_eq!(sign::credentials_notary_auth(body), Ok(None));
+    let with_profile = format!("notary_profile = \"placeholder-profile\"\n{body}");
+    let auth = sign::credentials_notary_auth(&with_profile)
+        .expect("the profile parses")
+        .expect("notary_profile names the credential");
+    assert_eq!(auth.args(), ["--keychain-profile", "placeholder-profile"]);
 }
 
 #[test]
@@ -874,6 +812,7 @@ fn journal_with(done: &[&str]) -> Journal {
         artifact: Some("aa".repeat(32)),
         macho_sha256: Some("bb".repeat(32)),
         linux: None,
+        windows: None,
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,

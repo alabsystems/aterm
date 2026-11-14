@@ -1703,6 +1703,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
         home: None,
         home_free_mb: None,
         repos: None,
+        update: None,
     };
     let listing = Here {
         facts: Some(facts),
@@ -2186,6 +2187,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
         home: None,
         home_free_mb: None,
         repos: None,
+        update: None,
     };
     let non_drive = Here {
         host: Some("m22.local".to_owned()),
@@ -2254,6 +2256,7 @@ fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
         session_accounts: std::collections::BTreeMap::new(),
         moves: None,
         server_heard: Vec::new(),
+        update: None,
     };
     let here = Here {
         host: Some("m22.local".to_owned()),
@@ -2281,6 +2284,88 @@ fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
         (parsed.home, parsed.home_free_mb, parsed.repos),
         (None, Some(812_345), None)
     );
+}
+
+/// Where this Mac's updater stands is a resource fact: a window's survey says its `update*=` words
+/// on the `instance` header at facts as at content, and a reader takes them back whole; facts that
+/// read no updater say none.
+/// NEGATIVE CONTROL: a header whose facts tokens drop the `update*=` words fails "the header says
+/// the updater".
+#[test]
+fn a_survey_says_where_the_updater_stands_at_either_level() {
+    use aterm_agent::survey_facts::SwarmSurveyFacts;
+    use aterm_types::update_standing::{UpdateFact, UpdateStanding};
+
+    let store = crate::session_store::new_store();
+    let held = UpdateFact {
+        checked_at: Some(1_793_159_400),
+        to: Some("0.199.0".to_owned()),
+        until: Some(1_793_170_000),
+        why: Some("crash-loop"),
+        tries: Some(2),
+        checks: Some(false),
+        ..UpdateFact::of(UpdateStanding::Held)
+    };
+    let facts = SwarmSurveyFacts {
+        version: "0.198.0".to_owned(),
+        operation_lines: Vec::new(),
+        node: None,
+        label: Some("m221".to_owned()),
+        roster_unread: false,
+        window: true,
+        window_last: Some(1_793_159_000),
+        sessions: 0,
+        ssh_host_key: None,
+        accounts: Vec::new(),
+        accounts_unread: Vec::new(),
+        session_accounts: std::collections::BTreeMap::new(),
+        moves: None,
+        server_heard: Vec::new(),
+        home: None,
+        home_free_mb: None,
+        repos: None,
+        update: Some(held.clone()),
+    };
+    let here = Here {
+        host: Some("m221.local".to_owned()),
+        instances: 1,
+        access: aterm_types::fleet_access::FleetAccess::ReadOnly,
+        drive: false,
+        facts: Some(facts.clone()),
+    };
+    for level in [SurveyLevel::Facts, SurveyLevel::Content] {
+        let reply = survey_rows(&store, level, usize::MAX, &here);
+        let header = reply.lines().nth(1).expect("an instance header");
+        assert!(
+            header.contains(" version=0.198.0 ")
+                && header.contains(" update=held update_at=1793159400 update_to=0.199.0 ")
+                && header.contains(" update_checks=off "),
+            "the header says the updater ({level:?}): {header}"
+        );
+        let parsed = SwarmSurveyFacts::from_survey_reply(&reply).expect("a survey reply");
+        let said_at = parsed.update.as_ref().and_then(|update| update.said_at);
+        assert!(
+            said_at.is_some(),
+            "with the clock it was said on ({level:?})"
+        );
+        assert_eq!(
+            parsed.update,
+            Some(UpdateFact {
+                said_at,
+                ..held.clone()
+            }),
+            "{level:?}"
+        );
+    }
+    let unread = Here {
+        facts: Some(SwarmSurveyFacts {
+            update: None,
+            ..facts
+        }),
+        ..here
+    };
+    let reply = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &unread);
+    assert!(!reply.contains(" update="), "{reply}");
 }
 
 /// A test binary's survey reads no checkout of the person's home: its `$HOME` is theirs, so
@@ -2446,6 +2531,7 @@ fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
         home: None,
         home_free_mb: None,
         repos: None,
+        update: None,
     };
     let at = std::time::Instant::now();
     let soon = at + std::time::Duration::from_secs(1);
@@ -2651,11 +2737,40 @@ fn a_holder_query_adds_a_counted_kernel_judgement_of_exactly_that_identity() {
         [Some(false)]
     );
     assert!(judged("facts", &me).is_empty());
+    // The word that names the session that asked changes no answer, wherever it stands.
+    let by = "by=s-0123456789abcdef0123";
+    // The header's clock (`at_ms=`) moves between two asks; nothing else may.
+    let plain = |rest: &str| {
+        cmd_survey(&store, rest, SurveyLevel::Content, usize::MAX, &here())
+            .lines()
+            .map(|line| {
+                line.split(' ')
+                    .map(|word| {
+                        if word.starts_with("at_ms=") {
+                            "at_ms=-"
+                        } else {
+                            word
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(plain(&format!("facts {by}")), plain("facts"));
+    assert_eq!(plain(by), plain(""));
+    assert_eq!(
+        judged(&format!("{by} facts {}", me.arg()), &me),
+        [Some(true)]
+    );
     for bad in [
         "holder=1.ab".to_owned(),
         "facts content".to_owned(),
         format!("{} {}", me.arg(), me.arg()),
         format!("{} everything", me.arg()),
+        format!("{by} {by}"),
+        "by=someone".to_owned(),
+        "by=".to_owned(),
     ] {
         assert!(
             cmd_survey(&store, &bad, SurveyLevel::Content, usize::MAX, &here())

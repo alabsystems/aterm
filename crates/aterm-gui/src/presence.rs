@@ -79,12 +79,12 @@ impl aterm_messages::presence::Host for Native {
 
     /// A wall that reads `limited` ([`aterm_phase::WallKind::reads_limited`]) keeps that word;
     /// an API error the network caused says what went wrong ([`api_cause_words`]); any other
-    /// wall is the state it leaves the session in (`status_item::wall_words`).
+    /// wall is the state it leaves the session in (`needs::wall_words`).
     fn wall_band(kind: aterm_phase::WallKind) -> &'static str {
         if kind.reads_limited() {
             return "limited";
         }
-        api_cause_words(kind).unwrap_or_else(|| crate::status_item::wall_words(kind.name()))
+        api_cause_words(kind).unwrap_or_else(|| crate::needs::wall_words(kind.name()))
     }
 
     fn is_aterms_holder(holder: &str, pid: Option<u32>) -> bool {
@@ -707,7 +707,7 @@ pub(crate) fn classify(
                 subject = r
                     .prompt
                     .as_ref()
-                    .map(|p| crate::status_item::fold_clip(&p.command, 96))
+                    .map(|p| crate::needs::fold_clip(&p.command, 96))
                     .filter(|s| !s.is_empty());
                 AgentPhase::Prompt {
                     detail: r.prompt.as_ref().map(prompt_detail),

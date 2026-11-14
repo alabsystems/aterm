@@ -1242,6 +1242,10 @@ pub struct YankOptions {
     pub linux_targets: Vec<String>,
     pub linux_workers: Vec<String>,
     pub mac_only: bool,
+    /// The successor cut's Windows handoff directory, forwarded verbatim.
+    pub windows_artifacts: Option<PathBuf>,
+    /// The successor cut's `--windows-sha256`, forwarded verbatim.
+    pub windows_sha256: Option<String>,
 }
 
 fn successor_cut_options(required_floor: u64, opts: &YankOptions) -> publish::CutOptions {
@@ -1252,6 +1256,8 @@ fn successor_cut_options(required_floor: u64, opts: &YankOptions) -> publish::Cu
         linux_targets: opts.linux_targets.clone(),
         linux_workers: opts.linux_workers.clone(),
         mac_only: opts.mac_only,
+        windows_artifacts: opts.windows_artifacts.clone(),
+        windows_sha256: opts.windows_sha256.clone(),
         ..Default::default()
     }
 }

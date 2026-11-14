@@ -53,6 +53,10 @@ pub mod ai;
 pub mod drive_cli;
 /// This machine's stored fleet access level: what the other machines of its fleet may do here.
 pub mod fleet_access;
+/// `aterm fleet activity`, and the menu-bar item's read of the same record: the agent requests
+/// that crossed between this Mac and the others of its fleet.
+#[cfg(unix)]
+pub mod fleet_activity;
 /// Swarm census (`aterm fleet census`, `FleetOp::Census`, and `/monitor`'s single-steward read).
 #[cfg(unix)]
 pub mod fleet_census;

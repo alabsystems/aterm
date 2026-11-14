@@ -559,6 +559,460 @@ fn a_background_test_run_claims_memory_and_cores_once() {
     SCRATCH.set(None);
 }
 
+/// A 12-core machine whose 5-minute load is 24, none of it claimed in the ledger: what a run's
+/// own test compile, which holds no core claim, leaves as its test stage starts.
+fn after_its_compile() -> aterm_capacity::Reading {
+    aterm_capacity::Reading {
+        load1: Some(24.0),
+        load5: Some(24.0),
+        ..aterm_capacity::Reading::of_gib(48, 40, 12)
+    }
+}
+
+/// [`scratch_admit`]'s ledger on the machine [`after_its_compile`].
+fn admit_after_its_compile(
+    need: aterm_capacity::Need,
+    mode: aterm_capacity::Admit,
+) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
+    SCRATCH.with_borrow_mut(|scratch| {
+        let (ledger, _) = scratch.as_mut().expect("a scratch ledger");
+        crate::admit_in(
+            ledger,
+            &crate::timing_test_machine::Measured::new(&aterm_capacity::Fixed::new(
+                after_its_compile(),
+            )),
+            aterm_capacity::Pace::default(),
+            need,
+            mode,
+            &mut |_| {},
+        )
+    })
+}
+
+/// One second of one test on one thread, kept for each of `bins`: a binary planned one thread
+/// wide and charged one core.
+fn one_core_history(bins: &[Binary]) -> crate::test_history::History {
+    let mut history = crate::test_history::History::default();
+    for binary in bins {
+        history.push(
+            &binary.spec,
+            crate::test_history::Sample {
+                partition: None,
+                exe_sha256: None,
+                at_ms: 1,
+                outcome: "ok".into(),
+                wall_ms: 1000,
+                cpu_ms: Some(100),
+                starved_ms: Some(0),
+                peak_bytes: Some(64 << 20),
+                width: 1,
+                cores: None,
+                tests: Some(1),
+            },
+        );
+    }
+    history
+}
+
+/// A RUN'S BINARIES TOGETHER HOLD THE SHARE ONE CLAIM WOULD BE GRANTED, READ AGAIN AT EACH
+/// START. A run that asks for 12 cores as its own test compile ends is granted 4: the ledger
+/// shares the machine with the 5-minute load that compile left, which no claim holds. Twelve
+/// binaries of one core each are then dispatched within the 12 asked, each claiming its own
+/// core in that ledger, on the run's live share: four run at once while the load stands, and
+/// all twelve once it has gone. NEGATIVE CONTROL: with no live share the ledger grants each of
+/// the twelve claims its core at that same load, and twelve run at once on a machine whose
+/// share for the run is four.
+#[test]
+fn a_runs_binaries_together_hold_the_share_one_claim_would_be_granted() {
+    let tmp = aterm_tempfile::tempdir().expect("scratch");
+    let at = tmp.path().join("ledger");
+    SCRATCH.set(Some((aterm_capacity::Ledger::at(at.clone()), Vec::new())));
+    let mut ctx = crate::Ctx::new(
+        tmp.path().to_path_buf(),
+        crate::Scope::workspace(),
+        crate::EnvSnapshot::default(),
+        tmp.path().join("scratch"),
+    );
+    ctx.memory = Some(crate::memory::Book::at(
+        None,
+        Some(48 << 30),
+        Some(40 << 30),
+    ));
+    let claims = claim_both(
+        &ctx,
+        "t",
+        None,
+        1 << 30,
+        "for the recording pass",
+        12,
+        admit_after_its_compile,
+    )
+    .expect("admitted");
+    assert_eq!(
+        claims.granted, 4,
+        "12 cores shared with a 5-minute load of two machines' worth"
+    );
+    let cores = Cores {
+        asked: 12,
+        granted: claims.granted,
+    };
+    // The recording claim goes back before the dispatch, as `run_planned_observed` drops it.
+    drop(claims);
+    SCRATCH.set(None);
+
+    let bins: Vec<Binary> = (0..12)
+        .map(|i| Binary {
+            harness: false,
+            header: format!("t{i}"),
+            spec: format!("-p x --test t{i}"),
+            record: rec(&format!("/r/t{i}"), "x"),
+        })
+        .collect();
+    let history = one_core_history(&bins);
+    let fallback = fallback_peak(&history, &[], Some(48 << 30));
+    let plan = dispatch_plan(&history, &bins, cores, None, fallback);
+    assert_eq!(plan.share, 12, "dispatched within the cores asked");
+    assert!(plan.order.iter().all(|b| b.charge == 1), "{plan:?}");
+    let machine = aterm_capacity::Fixed::new(after_its_compile());
+    // The most binaries that held a core of the ledger at once, each waiting, while it holds
+    // its core, for `together` of them to have started.
+    let most_at_once = |share: Option<&crate::test_share::Live>, together: usize| {
+        let admitting = Mutex::new(());
+        let running = Mutex::new((0_usize, 0_usize));
+        let started = (Mutex::new(0_usize), Condvar::new());
+        let ran = dispatch_resources(
+            &bins,
+            &plan,
+            None,
+            None,
+            None,
+            share,
+            &|| 0.0,
+            &|| false,
+            &|| false,
+            |b, planned, _| {
+                let permit = {
+                    let _one_at_a_time = admitting.lock().unwrap();
+                    binary_permit_with(Some(&ctx), None, planned, &mut |need, mode| {
+                        assert_eq!(mode, None, "the ledger keeps its authority");
+                        aterm_capacity::admit::try_admit_with(
+                            &aterm_capacity::Ledger::at(at.clone()),
+                            &machine,
+                            need,
+                        )
+                    })
+                }
+                .unwrap_or_else(|| panic!("{}: the ledger held its claim back", b.spec))
+                .expect("the ledger admits");
+                assert_eq!(
+                    permit.claim.as_ref().expect("a ledger claim").cores(),
+                    1,
+                    "{} runs on a core of its own claim",
+                    b.spec
+                );
+                {
+                    let mut running = running.lock().unwrap();
+                    running.0 += 1;
+                    running.1 = running.1.max(running.0);
+                }
+                *started.0.lock().unwrap() += 1;
+                started.1.notify_all();
+                let (count, waited) = started
+                    .1
+                    .wait_timeout_while(
+                        started.0.lock().unwrap(),
+                        aterm_spec::wait::MUST_HAPPEN,
+                        |n| *n < together,
+                    )
+                    .unwrap();
+                assert!(
+                    *count >= together && !waited.timed_out(),
+                    "{together} binaries never ran together"
+                );
+                drop(count);
+                running.lock().unwrap().0 -= 1;
+                drop(permit);
+                Some(Run {
+                    ok: true,
+                    code: Some(0),
+                    ..Run::default()
+                })
+            },
+            |_, _, _| {},
+        );
+        assert!(ran.iter().all(Option::is_some), "every binary ran");
+        running.lock().unwrap().1
+    };
+    // The run's share, read from that ledger on that machine: its own binaries are the claim.
+    let live = || {
+        let asker = crate::test_share::Asker {
+            pid: std::process::id(),
+            ancestors: Vec::new(),
+            rank: aterm_capacity::Rank::Ordinary,
+            since_ms: 0,
+        };
+        let (at, machine) = (at.clone(), &machine);
+        let reading = aterm_capacity::Machine::read(machine, None);
+        crate::test_share::Live::new(
+            cores.asked,
+            cores.granted,
+            Box::new(move || {
+                Some(crate::test_share::Look {
+                    machine: reading.clone(),
+                    others: crate::test_share::Others::of(
+                        &aterm_capacity::Ledger::at(at.clone()).list().ok()?,
+                        &asker,
+                        0,
+                    ),
+                })
+            }),
+            None,
+        )
+    };
+    let loaded = live();
+    assert_eq!(
+        most_at_once(Some(&loaded), 4),
+        4,
+        "the share one claim of 12 is granted at that load"
+    );
+    assert_eq!(loaded.range(), Some((4, 4)));
+    assert_eq!(
+        most_at_once(None, 12),
+        12,
+        "the ledger grants each of twelve claims its core whatever the load"
+    );
+    machine.set(aterm_capacity::Reading::of_gib(48, 40, 12));
+    assert_eq!(
+        most_at_once(Some(&live()), 12),
+        12,
+        "the load gone, the run has the cores it asked"
+    );
+    assert!(
+        aterm_capacity::Ledger::at(at)
+            .of_pid(std::process::id())
+            .unwrap()
+            .is_empty(),
+        "every claim went back"
+    );
+}
+
+/// THE PLAN A RUN DISPATCHES IS PLANNED ON ITS RECORDING GRANT AND DISPATCHED WITHIN ITS ASK.
+/// A run granted 4 of the 12 cores it asked plans a binary of twelve one-second tests no wider
+/// than 4 threads and charges it no more than 4 cores, as its kept runs measured it, and the
+/// plan's share is the 12 asked, so three such binaries fit side by side. NEGATIVE CONTROL:
+/// planned on the 12 asked, the same binary is 12 threads wide, a width none of its kept runs
+/// measured its memory or its subprocess slots at.
+#[test]
+fn a_runs_plan_keeps_the_recording_grants_widths_within_the_share_asked() {
+    let bins = vec![Binary {
+        harness: false,
+        header: "t".into(),
+        spec: "-p x --test t".into(),
+        record: rec("/r/t", "x"),
+    }];
+    let mut history = crate::test_history::History::default();
+    history.push(
+        "-p x --test t",
+        crate::test_history::Sample {
+            partition: None,
+            exe_sha256: None,
+            at_ms: 1,
+            outcome: "ok".into(),
+            wall_ms: 12_000,
+            cpu_ms: Some(48_000),
+            starved_ms: Some(0),
+            peak_bytes: Some(64 << 20),
+            width: 4,
+            cores: None,
+            tests: Some(12),
+        },
+    );
+    let cores = Cores {
+        asked: 12,
+        granted: 4,
+    };
+    assert_eq!((cores.planned_on(), cores.dispatch_share()), (4, 12));
+    assert!(cores.held_back());
+    assert_eq!(
+        cores.subprocess_slots(),
+        subprocess_slots_for_cores(12),
+        "the pool is made for the cores asked"
+    );
+    let plan = dispatch_plan(&history, &bins, cores, None, 1 << 30);
+    assert_eq!(plan.share, 12);
+    assert_eq!(
+        (plan.order[0].width, plan.order[0].charge),
+        (4, 4),
+        "{plan:?}"
+    );
+    let on_the_ask = plan_from_history(&history, &bins, cores.dispatch_share(), None, 1 << 30);
+    assert_eq!(on_the_ask.order[0].width, 12, "{on_the_ask:?}");
+    let alone = Cores {
+        asked: 12,
+        granted: 12,
+    };
+    assert_eq!(
+        dispatch_plan(&history, &bins, alone, None, 1 << 30),
+        on_the_ask,
+        "granted all it asked, a run plans as it always did"
+    );
+}
+
+/// A FAILED TEST'S RERUN NAMES THE WIDTH AND CHARGE ITS BINARY RAN AT. A binary planned four
+/// threads wide on 8 cores whose claim was granted 2 ran two threads wide on 2, and its rerun
+/// says so; one the run never started, and every binary of a run that keys content on the
+/// planned command, has the plan's. NEGATIVE CONTROL: the plan's own width for the first.
+#[test]
+fn a_rerun_names_the_width_and_charge_a_binary_ran_at() {
+    let bins: Vec<Binary> = ["a", "b"]
+        .iter()
+        .map(|name| Binary {
+            harness: false,
+            header: (*name).into(),
+            spec: format!("-p x --test {name}"),
+            record: rec(&format!("/r/{name}"), "x"),
+        })
+        .collect();
+    let planned = |index| Planned {
+        index,
+        width: 4,
+        charge: 8,
+        peak: 0,
+        predicted: None,
+    };
+    let plan = Plan {
+        share: 12,
+        target: Duration::ZERO,
+        order: vec![planned(0), planned(1)],
+    };
+    let granted = Ran {
+        planned: Planned {
+            width: 2,
+            charge: 2,
+            ..planned(0)
+        },
+        ..Ran::of(Run::default(), Duration::ZERO, Duration::from_secs(1))
+    };
+    let left = Ran {
+        started: false,
+        planned: planned(1),
+        ..Ran::of(Run::default(), Duration::ZERO, Duration::ZERO)
+    };
+    let ran = [Some(granted), Some(left)];
+    assert_eq!(
+        ran_widths(&bins, &plan, &ran, false),
+        [
+            ("-p x --test a".to_owned(), 2, 2),
+            ("-p x --test b".to_owned(), 4, 8)
+        ]
+    );
+    assert_eq!(
+        ran_widths(&bins, &plan, &ran, true),
+        [
+            ("-p x --test a".to_owned(), 4, 8),
+            ("-p x --test b".to_owned(), 4, 8)
+        ],
+        "a content-keyed command keeps the plan's width whatever was granted"
+    );
+}
+
+/// THE CORE-GRANT EVENT says what a claim asked and was granted, who granted it, the load it
+/// was granted under and, for the recording pass, the subprocess slots open under it; the
+/// dispatch's live share says the same of itself at a look that moved it, with what that look
+/// read; and every reader of the events file knows its kind.
+#[test]
+fn a_core_grant_event_names_the_ask_the_grant_and_the_load() {
+    let machine = after_its_compile();
+    let standing = crate::test_share::Standing {
+        share: 4,
+        look: Some(crate::test_share::Look {
+            machine: machine.clone(),
+            others: crate::test_share::Others {
+                held: 2,
+                in_load: 1.5,
+                waiting: 1,
+                reserved: 0,
+            },
+        }),
+        own_load: 0.25,
+        slots: Some([2, 1]),
+    };
+    let line = share_event(12, &standing);
+    let json = line.strip_prefix("verify-event: ").expect("an event line");
+    let crate::event_log::Observation::Known { kind, value } = crate::event_log::observation(json)
+    else {
+        panic!("{json} is no event its readers know");
+    };
+    assert_eq!(kind, crate::event_log::EventKind::TestCoreGrant);
+    assert_eq!(
+        (value["scope"].as_str(), value["source"].as_str()),
+        (Some("dispatch"), Some("live share"))
+    );
+    assert_eq!(
+        (
+            value["asked"].as_u64(),
+            value["granted"].as_u64(),
+            value["subprocess_slots"].as_u64(),
+            value["machine_cores"].as_u64(),
+            value["held_by_others"].as_u64(),
+            value["waiting_ahead"].as_u64(),
+        ),
+        (Some(12), Some(4), Some(2), Some(12), Some(2), Some(1)),
+        "{json}"
+    );
+    assert_eq!(
+        (
+            value["load5"].as_f64(),
+            value["others_in_load"].as_f64(),
+            value["own_load"].as_f64()
+        ),
+        (Some(24.0), Some(1.5), Some(0.25)),
+        "{json}"
+    );
+    let unread = share_event(
+        12,
+        &crate::test_share::Standing {
+            look: None,
+            ..standing
+        },
+    );
+    assert!(unread.contains(r#""source":"recording grant""#), "{unread}");
+    for (scope, test, slots) in [
+        ("recording", None, Some(2_usize)),
+        ("binary", Some("-p x --test t0"), None),
+    ] {
+        let line = core_grant_event(scope, test, (12, 4), "capacity ledger", slots, &machine);
+        let json = line.strip_prefix("verify-event: ").expect("an event line");
+        let crate::event_log::Observation::Known { kind, value } =
+            crate::event_log::observation(json)
+        else {
+            panic!("{json} is no event its readers know");
+        };
+        assert_eq!(kind, crate::event_log::EventKind::TestCoreGrant);
+        assert_eq!(value["event"].as_str(), Some("test-core-grant"));
+        assert_eq!(value["scope"].as_str(), Some(scope));
+        assert_eq!(value["test"].as_str(), test);
+        assert_eq!(
+            (value["asked"].as_u64(), value["granted"].as_u64()),
+            (Some(12), Some(4))
+        );
+        assert_eq!(value["source"].as_str(), Some("capacity ledger"));
+        assert_eq!(
+            value["subprocess_slots"].as_u64(),
+            slots.map(|n| n as u64),
+            "{json}"
+        );
+        assert_eq!(
+            (
+                value["load1"].as_f64(),
+                value["load5"].as_f64(),
+                value["machine_cores"].as_u64()
+            ),
+            (Some(24.0), Some(24.0), Some(12))
+        );
+    }
+}
+
 /// A background dispatch retains cancellation authority even with no binary running,
 /// without reserving a single byte or core. The ordinary control retains no such claim.
 #[test]
@@ -2349,6 +2803,7 @@ fn a_lone_binary_starts_on_the_tokens_a_pool_that_lost_some_still_holds() {
         None,
         Some(&pool),
         None,
+        None,
         &|| 0.0,
         &|| false,
         &|| true,
@@ -2403,6 +2858,7 @@ fn a_lone_binary_starts_on_the_tokens_a_pool_that_lost_some_still_holds() {
             &plan,
             None,
             Some(&pool),
+            None,
             None,
             &|| 0.0,
             &|| stopped.load(Ordering::SeqCst),

@@ -154,6 +154,18 @@ impl Lineages {
             .map(|(_, successor)| successor)
     }
 
+    /// The members that admitted `successor` as their own successor (one, as the log's own
+    /// rules sign it; every one a log holds is read).
+    pub(super) fn above<'a>(
+        &'a self,
+        successor: &'a MemberId,
+    ) -> impl Iterator<Item = &'a MemberId> {
+        self.links
+            .iter()
+            .filter(move |(_, seat)| seat == successor)
+            .map(|(by, _)| by)
+    }
+
     /// Every seat below one of `seats` in a succession: each one's successors, theirs, and so
     /// on. A seat of `seats` is among them only where another of `seats` leads to it.
     pub(super) fn under(&self, seats: &BTreeSet<MemberId>) -> BTreeSet<MemberId> {

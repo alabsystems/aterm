@@ -266,3 +266,40 @@
 //!     }
 //! };
 //! ```
+//!
+//! Model declarations cannot shadow the generated TLA operators, regardless of declaration kind.
+//!
+//! ```compile_fail
+//! let _ = aterm_spec::ty_model! { Collision {
+//!     var n = 0;
+//!     action Next { n = 1; }
+//! } };
+//! ```
+//!
+//! ```compile_fail
+//! let _ = aterm_spec::ty_model! { Collision {
+//!     const Init = 1;
+//!     var n = 0;
+//! } };
+//! ```
+//!
+//! ```compile_fail
+//! let _ = aterm_spec::ty_model! { Collision {
+//!     var vars = 0;
+//! } };
+//! ```
+//!
+//! ```compile_fail
+//! let _ = aterm_spec::ty_model! { Collision {
+//!     var n = 0;
+//!     invariant Spec: n <= 1;
+//! } };
+//! ```
+//!
+//! ```
+//! let m = aterm_spec::ty_model! { Distinct {
+//!     var n = 0;
+//!     action NextGroup { n = 1; }
+//! } };
+//! assert!(m.fire("NextGroup", &mut m.init_state()));
+//! ```

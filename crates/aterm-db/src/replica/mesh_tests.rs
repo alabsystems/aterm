@@ -24,6 +24,215 @@ use aterm_secrets::{
 };
 use std::{cell::RefCell, rc::Rc};
 
+#[test]
+fn reused_mesh_access_refreshes_historical_eligibility_without_a_control_change() {
+    for competing in [false, true] {
+        reused_mesh_access_history(competing);
+    }
+}
+
+fn reused_mesh_access_history(competing: bool) {
+    let lab = Lab::with_enrolled(&[Role::Writer, Role::Reader, Role::Writer], 1);
+    let a = lab.bootstrap(0);
+    let scope = {
+        let session = Session::open(&a).unwrap();
+        let directory = Directory::new(&lab.paths[0], a.trust());
+        let scope = directory
+            .open_application(&session, "mesh-history", "rows", 1)
+            .unwrap();
+        directory
+            .open_store(&session, scope)
+            .unwrap()
+            .commit_catalog(&session, b"historical")
+            .unwrap();
+        scope
+    };
+    let old = held(&lab, 0, scope).into_iter().next().unwrap();
+    lab.admit(&[Role::Writer, Role::Reader, Role::Writer]);
+    let b = lab.bootstrap(1);
+    let c = lab.bootstrap(2);
+    {
+        let session = Session::open(&c).unwrap();
+        let directory = Directory::new(&lab.paths[2], c.trust());
+        assert_eq!(
+            directory
+                .open_application(&session, "mesh-history", "rows", 1)
+                .unwrap(),
+            scope
+        );
+        directory
+            .open_store(&session, scope)
+            .unwrap()
+            .commit_catalog(&session, b"known")
+            .unwrap();
+    }
+    let known = if competing {
+        let signer = Session::open(&a).unwrap();
+        let wire = crate::table::tests::seal(
+            &signer,
+            scope,
+            crate::crypto::Causal {
+                sequence: 1,
+                previous: None,
+                parents: &[],
+            },
+            b"known",
+        )
+        .unwrap();
+        (Sha256::digest(&wire), wire)
+    } else {
+        held(&lab, 2, scope).into_iter().next().unwrap()
+    };
+    let handoff = {
+        let journal = Journal::open_existing(a.journal_dir(), a.trust()).unwrap();
+        let access = a.access_in(&journal).unwrap().unwrap();
+        a.history_handoff(
+            &journal,
+            &access,
+            a.trust().genesis,
+            b.request().unwrap().binding(),
+        )
+        .unwrap()
+    };
+    {
+        let journal = Journal::open_existing(b.journal_dir(), b.trust()).unwrap();
+        let access = b.access_in(&journal).unwrap().unwrap();
+        b.import_history(&journal, &access, handoff.bytes())
+            .unwrap();
+    }
+    // This is the same reusable entry the real VaultStores delegates to.
+    let access = MeshAccess::new(
+        lab.paths[1].clone(),
+        lab.paths[1].home.join("config.toml"),
+        aterm_spec::wait::MUST_HAPPEN,
+    );
+    // Selection relies only on a current declaration. Missing old data history
+    // must not be confused with an unavailable catalog declaration.
+    let catalog = Directory::new(&lab.paths[2], c.trust()).catalog_scope();
+    let descriptors: Vec<_> = held(&lab, 2, catalog).into_values().collect();
+    let outcomes = access
+        .ingest_table(catalog.digest(), Kind::Operation, &descriptors)
+        .unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .all(|verdict| matches!(verdict, Verdict::Applied(_)))
+    );
+    let delivered = [known.1.clone(), old.1.clone()];
+    let verdicts = access
+        .ingest_table(scope.digest(), Kind::Operation, &delivered)
+        .unwrap();
+    assert!(
+        verdicts
+            .iter()
+            .all(|verdict| matches!(verdict, Verdict::Applied(_)))
+    );
+    let ids = [old.0, known.0];
+    let fully_available = if competing {
+        Vec::new()
+    } else {
+        vec![old.1.clone(), known.1.clone()]
+    };
+    assert_eq!(
+        access.table_wires(scope.digest(), &ids).unwrap(),
+        fully_available
+    );
+    let control = || match Journal::read_existing(b.journal_dir(), b.trust())
+        .unwrap()
+        .state()
+    {
+        aterm_secrets::commons::journal::State::Ready { head, basis } => (head, basis),
+        state => panic!("control must remain ready: {state:?}"),
+    };
+    let before = control();
+    let aside = lab._home.path().join("mesh-held-history");
+    std::fs::create_dir(&aside).unwrap();
+    let moved: Vec<_> = std::fs::read_dir(lab.paths[1].dir.join("commons/history"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.path(), aside.join(entry.file_name()))
+        })
+        .collect();
+    assert!(!moved.is_empty(), "a real historical handoff is required");
+    for (from, to) in &moved {
+        std::fs::rename(from, to).unwrap();
+    }
+    assert_eq!(control(), before);
+    // Exercise production access before the independent control opens any new
+    // session, so it cannot refresh shared observations on the adapter's behalf.
+    let physical = access.table_inventory(scope.digest()).unwrap();
+    let outgoing = access.table_wires(scope.digest(), &ids).unwrap();
+    {
+        let session = Session::observe(&b).unwrap();
+        let error = session
+            .authenticate(scope, &old.1)
+            .err()
+            .expect("the removed historical key must actually be required");
+        assert!(error.is_awaiting_membership(), "{error}");
+    }
+    assert_eq!(
+        physical,
+        Some(BTreeSet::from(ids)),
+        "unavailable history cannot erase independently witnessed physical records"
+    );
+    assert_eq!(
+        outgoing,
+        std::slice::from_ref(&known.1),
+        "the same adapter must recheck historical payload eligibility"
+    );
+    {
+        let direct = replica(&lab, 1);
+        let round = direct.mesh_round(scope.digest()).unwrap().unwrap();
+        let refused = round
+            .local(None, |session| {
+                round.prepare_operations(session, scope.digest(), &ids)
+            })
+            .unwrap_err();
+        assert!(refused.is_snapshot_changed(), "{refused}");
+        assert_eq!(
+            round
+                .local(None, |session| {
+                    round.prepare_operations(session, scope.digest(), &[known.0])
+                })
+                .unwrap(),
+            std::slice::from_ref(&known.1),
+            "an unavailable selection must restart, not masquerade as a drained legacy batch"
+        );
+    }
+    {
+        let session = Session::observe(&b).unwrap();
+        let store = Directory::new(&lab.paths[1], b.trust())
+            .observe_table(&session, scope)
+            .unwrap();
+        assert_eq!(
+            store
+                .replication_inventory(&session)
+                .unwrap()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([known.0]),
+            "pending historical headers cannot enter the eligible projection"
+        );
+        assert!(
+            store
+                .metadata_evidence(&session)
+                .err()
+                .expect("pending historical metadata must not become authority")
+                .is_awaiting_membership()
+        );
+    }
+    assert_eq!(control(), before);
+    for (from, to) in &moved {
+        std::fs::rename(to, from).unwrap();
+    }
+    assert_eq!(
+        access.table_wires(scope.digest(), &ids).unwrap(),
+        fully_available
+    );
+    assert_eq!(control(), before);
+}
+
 fn replica(lab: &Lab, n: usize) -> Replica {
     Replica::commons_until(
         lab.paths[n].clone(),

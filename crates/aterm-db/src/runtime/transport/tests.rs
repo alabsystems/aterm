@@ -1796,6 +1796,7 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         .local(
             super::super::machine_identity(bootstrap.request().unwrap().binding()),
             bootstrap.trust(),
+            Vec::new,
         )
         .unwrap();
     super::super::observe_contacts(

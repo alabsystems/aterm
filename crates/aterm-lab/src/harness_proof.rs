@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `harness-proof <id> --repo DIR`: THE HARNESS PROOF of `docs/DESIGN-harness-repos-2026-10-24.md`
-//! §9 step 2, modelled on `codex-alab-proof`. A rostered harness (`<id>`, one of [`SUBJECTS`]),
+//! §9, modelled on `codex-alab-proof`. A rostered harness (`<id>`, one of [`SUBJECTS`]),
 //! built from its repository's checkout with the Trust toolchain that runs the lab (the toolchain
 //! every harness repo pins), runs in a private headless aterm against a stand-in vendor
 //! (`aterm-lab-standin`, this package's other binary) laid into a scratch atpkg store as two
@@ -76,7 +76,7 @@ pub(crate) struct Subject {
     pub tool: &'static str,
     /// The vendor's atpkg program and command: the stand-in's name.
     pub vendor: &'static str,
-    /// The scope its claim names in §9 step 2 and 3.
+    /// The scope its claim names (§9).
     pub scope: &'static str,
     /// Whether aterm has a built-in crash-relaunch lane for this vendor.
     pub builtin_relaunch: bool,
@@ -84,7 +84,7 @@ pub(crate) struct Subject {
     pub play: Option<Play>,
 }
 
-/// The harnesses `harness-proof` names: Muse first (§9 step 2); the others are named so the verb
+/// The harnesses `harness-proof` names: Muse first (§9); the others are named so the verb
 /// says what it lacks for them.
 pub(crate) static SUBJECTS: [Subject; 5] = [
     Subject {

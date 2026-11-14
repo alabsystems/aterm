@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows: the build a local build loop staged, read from its pointer file.
+//! Windows: the build staged on this machine, by the local build loop or from the signed release
+//! channel, and its install.
 //!
-//! Windows has no network updater ([`crate::enabled`] is false there). What it has is a build
-//! loop on the same machine (`aterm-winship update`) that leaves a self-installing dist folder
-//! and one pointer to the newest of them, `%LOCALAPPDATA%\aterm\dist\latest.json`:
+//! Windows runs none of the macOS and Linux in-process updater ([`crate::enabled`] is false
+//! there). A build reaches it two ways, and each leaves a self-installing dist folder and a
+//! pointer to it:
+//!
+//! - the signed release channel ([`crate::windows_channel`]): the newest release's portable zip,
+//!   checked through the paper master, the machine roster and the appcast's SHA-256, unpacked
+//!   and staged under `%LOCALAPPDATA%\aterm\update\channel`. A window's watch checks it every
+//!   [`crate::windows_channel::CHECK_EVERY`] while `[update] enabled` is on, and
+//!   `aterm update check` checks it at once;
+//! - a build loop on the same machine (`aterm-winship update`), whose pointer to the newest dist
+//!   it staged is `%LOCALAPPDATA%\aterm\dist\latest.json`:
 //!
 //! ```json
 //! {"schema":1,"version":"0.199.0","commit":"<12 hex>","commit_full":"<40 hex>",
@@ -13,22 +22,30 @@
 //!  "smoke":"pass"|"fail"|"not-run"}
 //! ```
 //!
-//! This module reads that pointer and the record of what is installed beside the running
-//! executable (`BUILD.json`, which every dist carries and its installer lays), says where the
-//! copy on disk stands against the staged build, and applies it by running the dist's own
+//! This module reads both pointers and the record of what is installed beside the running
+//! executable (`BUILD.json`, which every dist carries and its installer lays), weighs the two
+//! staged builds ([`pick`]: the higher build number, the local one on a tie), says where the
+//! copy on disk stands against the one it picked, and applies it by running the dist's own
 //! `install.ps1 -Staged`, which replaces the installed images without stopping a running
-//! window. A build is offered only while it is not what is installed: a window that keeps
-//! running an old image after the files under it were replaced is told to restart, not to
-//! install again. Nothing here reads the network.
+//! window; a channel dist is read back against its verification receipt first. A build is
+//! offered only while it is not what is installed: a window that keeps running an old image
+//! after the files under it were replaced is told to restart, not to install again. Nothing
+//! installs unasked: a person's `aterm update apply` (or the window's Apply row) runs the
+//! installer, and only `--restart` stops the open windows.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use aterm_types::update_standing::{UpdateFact, UpdateStanding};
 
 /// The only pointer schema this build reads.
 pub const POINTER_SCHEMA: u64 = 1;
 
 /// The command that builds and stages a newer build.
 pub const STAGE_COMMAND: &str = "aterm-winship update";
+
+/// The command that checks the release channel now ([`check_channel_now`]).
+pub const CHECK_COMMAND: &str = "aterm update check";
 
 /// How often a running window reads the pointer again.
 pub const WATCH_EVERY: Duration = Duration::from_secs(15 * 60);
@@ -378,18 +395,79 @@ pub fn read_pointer(path: &Path) -> Result<Option<StagedBuild>, String> {
     Ok(Some(staged))
 }
 
+/// Which lane staged a build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The local build loop (`aterm-winship update`), through `%LOCALAPPDATA%\aterm\dist`.
+    Local,
+    /// The signed release channel ([`crate::windows_channel`]).
+    Channel,
+}
+
+impl Origin {
+    /// The lane's one word (`origin=` on the control wire).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Channel => "channel",
+        }
+    }
+}
+
+/// The release channel's last check, as the status lines name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelNote {
+    /// Whether this copy checks the channel by itself (`[update] enabled`).
+    pub automatic: bool,
+    /// When the last check ended (RFC3339); empty before the first.
+    pub checked_at: String,
+    /// What it came to, in one line; empty before the first.
+    pub outcome: String,
+}
+
+/// The staged build a copy weighs, of the local build loop's (`local`, as [`read_pointer`] read
+/// it) and the release channel's (`channel`), and which lane it came from.
+///
+/// The higher build number wins: both lanes number a build by its commit's time, so the newer
+/// source wins whichever lane carries it. On a tie the local build stands: it is one commit's
+/// build either way, and the local one passed its smoke test on this machine. A local build
+/// that failed its smoke test does not hide a channel build. Without a channel build the local
+/// pointer stands as read, its absence and its faults included.
+pub fn pick(
+    local: Result<Option<StagedBuild>, String>,
+    channel: Option<StagedBuild>,
+) -> (Result<Option<StagedBuild>, String>, Origin) {
+    let Some(channel) = channel else {
+        return (local, Origin::Local);
+    };
+    match &local {
+        Ok(Some(staged))
+            if staged.smoke != Smoke::Fail && staged.build_number >= channel.build_number =>
+        {
+            (local, Origin::Local)
+        }
+        _ => (Ok(Some(channel)), Origin::Channel),
+    }
+}
+
 /// What this copy knows of the staged build: its standing, and what was read to judge it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Here {
     /// Where the copy on disk stands against the staged build.
     pub standing: Standing,
-    /// The pointer file read.
+    /// The pointer file read: the local build loop's, or the channel's when its build was
+    /// picked.
     pub pointer: PathBuf,
     /// The record beside the running executable, when there is one.
     pub installed: Option<InstalledBuild>,
     /// Why the offered build cannot be installed over this copy ([`install_dest`]'s refusal,
     /// or a dist whose installer is gone); `None` when it can, or nothing is offered.
     pub blocked: Option<String>,
+    /// The lane the standing's build came from ([`pick`]).
+    pub origin: Origin,
+    /// The release channel's last check, where this copy has a channel lane.
+    pub channel: Option<ChannelNote>,
 }
 
 /// What a window says about the staged build.
@@ -442,14 +520,68 @@ impl Here {
         let staged = apply_refusal(&self.standing)?;
         self.blocked.clone().map_or(Ok(staged), Err)
     }
+
+    /// What this copy's updater tells its fleet ([`UpdateFact`]), decided by the standing
+    /// [`status_lines`] says its lines by, so a fleet survey and `aterm update status` on this
+    /// machine say one thing. A newer staged build `apply` installs is downloaded; one it will not
+    /// install (its smoke test failed, or [`Self::blocked`]) is not installing; a staged build
+    /// installed under this copy's window is installed; the newest staged build or an older one is
+    /// current; an unstamped copy cannot update itself; no pointer is unchecked, as nothing has
+    /// been staged here yet; a pointer that cannot be read is unread. Each names the staged build
+    /// where its standing has one, by its version, and nothing else: no path, commit or reason
+    /// leaves the machine.
+    #[must_use]
+    pub fn fleet_fact(&self) -> UpdateFact {
+        let to = |staged: &StagedBuild| {
+            aterm_types::update_standing::build_name(staged.build_number, Some(&staged.version))
+        };
+        let (standing, named) = match &self.standing {
+            Standing::Newer(staged) | Standing::Differs(staged)
+                if staged.smoke == Smoke::Fail || self.blocked.is_some() =>
+            {
+                (UpdateStanding::NotInstalling, Some(to(staged)))
+            }
+            Standing::Newer(staged) | Standing::Differs(staged) => {
+                (UpdateStanding::Downloaded, Some(to(staged)))
+            }
+            Standing::Installed(staged) => (UpdateStanding::Installed, Some(to(staged))),
+            Standing::Same(_) | Standing::Older(_) => (UpdateStanding::Current, None),
+            Standing::Unstamped(_) => (UpdateStanding::Cannot, None),
+            Standing::Absent => (UpdateStanding::Unchecked, None),
+            Standing::Unreadable(_) => (UpdateStanding::Unread, None),
+        };
+        let mut fact = UpdateFact::of(standing);
+        fact.to = named;
+        fact
+    }
 }
 
 /// Look at the pointer at `pointer` from the copy `running_exe` belongs to (`None`: this
 /// executable could not be located, so the running image speaks for the install).
 #[must_use]
 pub fn look(running: Running<'_>, running_exe: Option<&Path>, pointer: &Path) -> Here {
+    look_with(running, running_exe, pointer, None)
+}
+
+/// [`look`], weighing the local build loop's pointer at `pointer` against the build the release
+/// channel's `lane` staged ([`pick`]). `automatic` is whether this copy checks the channel by
+/// itself, for the note it carries.
+#[must_use]
+pub fn look_with(
+    running: Running<'_>,
+    running_exe: Option<&Path>,
+    pointer: &Path,
+    channel: Option<(&crate::windows_channel::Lane, bool)>,
+) -> Here {
     let installed = running_exe.and_then(Path::parent).and_then(read_installed);
-    let standing = classify(running, installed.as_ref(), read_pointer(pointer));
+    let staged = channel.and_then(|(lane, _)| {
+        lane.read_pointer()
+            .map_err(|why| aterm_log::warn!("aterm-update: release channel stage: {why}"))
+            .ok()
+            .flatten()
+    });
+    let (read, origin) = pick(read_pointer(pointer), staged);
+    let standing = classify(running, installed.as_ref(), read);
     let blocked = standing.offered().and_then(|staged| {
         running_exe
             .and_then(|exe| install_dest(exe, staged).err())
@@ -457,9 +589,14 @@ pub fn look(running: Running<'_>, running_exe: Option<&Path>, pointer: &Path) ->
     });
     Here {
         standing,
-        pointer: pointer.to_path_buf(),
+        pointer: match (origin, channel) {
+            (Origin::Channel, Some((lane, _))) => lane.pointer(),
+            _ => pointer.to_path_buf(),
+        },
         installed,
         blocked,
+        origin,
+        channel: channel.map(|(lane, automatic)| lane.note(automatic)),
     }
 }
 
@@ -499,6 +636,18 @@ fn staged_when(staged: &StagedBuild) -> String {
     }
 }
 
+/// The line that says the installed copy is another build of the staged build's number.
+fn differs_line(here: &Here) -> String {
+    format!(
+        "{} carries the same build number and is not that build (a changed tree, or another \
+         commit)",
+        here.installed.as_ref().map_or_else(
+            || "this copy".to_string(),
+            |installed| format!("the installed copy, {},", installed.name()),
+        ),
+    )
+}
+
 /// The line that says how to install an offered build, or why this copy cannot.
 fn apply_line(blocked: Option<&str>) -> String {
     blocked.map_or_else(
@@ -512,12 +661,62 @@ fn apply_line(blocked: Option<&str>) -> String {
     )
 }
 
+/// What brings a newer build than one `origin` staged.
+fn newer_from(origin: Origin) -> String {
+    match origin {
+        Origin::Local => format!("`{STAGE_COMMAND}` builds a newer one"),
+        Origin::Channel => format!("`{CHECK_COMMAND}` looks for a newer release"),
+    }
+}
+
+/// The channel's last check, as the status lines end with it.
+fn channel_line(note: &ChannelNote) -> String {
+    if note.outcome.is_empty() {
+        let every = crate::windows_channel::CHECK_EVERY.as_secs() / 60;
+        let pace = if note.automatic {
+            format!("this copy checks it every {every} minutes")
+        } else {
+            "this copy does not check it by itself ([update] enabled is off)".to_string()
+        };
+        format!("release channel: not checked yet \u{2014} {pace}; `{CHECK_COMMAND}` checks it now")
+    } else {
+        format!(
+            "release channel, checked {}: {}",
+            note.checked_at, note.outcome
+        )
+    }
+}
+
 /// What `aterm update status` and `aterm update check` print on Windows: the running build,
-/// then where the copy on disk stands against the staged one and what to do about it.
+/// then where the copy on disk stands against the staged one and what to do about it, then the
+/// release channel's last check.
 #[must_use]
 pub fn status_lines(running: Running<'_>, here: &Here) -> Vec<String> {
+    let mut lines = standing_lines(running, here);
+    if let Some(note) = &here.channel {
+        lines.push(channel_line(note));
+    }
+    lines
+}
+
+fn standing_lines(running: Running<'_>, here: &Here) -> Vec<String> {
     let mut lines = vec![format!("{} is running", running.name())];
     let blocked = here.blocked.as_deref();
+    if here.origin == Origin::Channel
+        && let Some(staged) = here.standing.offered()
+    {
+        lines.push(format!(
+            "{} came from the release channel, verified, and is staged at {}{}",
+            staged.name(),
+            staged.dir.display(),
+            staged_when(staged),
+        ));
+        if matches!(here.standing, Standing::Differs(_)) {
+            lines.push(differs_line(here));
+        }
+        lines.push(apply_line(blocked));
+        return lines;
+    }
     match &here.standing {
         Standing::Newer(staged) | Standing::Differs(staged) if staged.smoke == Smoke::Fail => {
             lines.push(format!(
@@ -546,14 +745,7 @@ pub fn status_lines(running: Running<'_>, here: &Here) -> Vec<String> {
                 staged_when(staged),
                 staged.smoke.as_str(),
             ));
-            lines.push(format!(
-                "{} carries the same build number and is not that build (a changed tree, or \
-                 another commit)",
-                here.installed.as_ref().map_or_else(
-                    || "this copy".to_string(),
-                    |installed| format!("the installed copy, {},", installed.name()),
-                ),
-            ));
+            lines.push(differs_line(here));
             lines.push(apply_line(blocked));
         }
         Standing::Installed(staged) => lines.push(format!(
@@ -563,19 +755,24 @@ pub fn status_lines(running: Running<'_>, here: &Here) -> Vec<String> {
             staged_when(staged),
         )),
         Standing::Same(staged) => lines.push(format!(
-            "aterm is current: this is the newest staged build{} \u{2014} `{STAGE_COMMAND}` \
-             builds a newer one",
+            "aterm is current: this is the newest staged build{} \u{2014} {}",
             staged_when(staged),
+            newer_from(here.origin),
         )),
         Standing::Older(staged) => lines.push(format!(
             "aterm is current: the staged build, {}, is older than what is installed \u{2014} \
-             `{STAGE_COMMAND}` builds a newer one",
+             {}",
             staged.name(),
+            newer_from(here.origin),
         )),
         Standing::Unstamped(staged) => lines.push(format!(
             "this copy carries no build number (an unstamped build), so it cannot be compared \
              with the staged build, {}",
             staged.name(),
+        )),
+        Standing::Absent if here.channel.is_some() => lines.push(format!(
+            "no staged build \u{2014} `{CHECK_COMMAND}` looks for a newer release, \
+             `{STAGE_COMMAND}` builds one here"
         )),
         Standing::Absent => lines.push(format!(
             "no staged build: {} does not exist \u{2014} `{STAGE_COMMAND}` builds one and \
@@ -599,7 +796,10 @@ fn wire_quoted(value: &str) -> String {
 }
 
 /// The `aterm ctl update status` answer on Windows, one `OK key=value …` line without its
-/// newline. `enabled=false` is the network checker, which Windows does not run.
+/// newline. `enabled=false` is the macOS and Linux in-process checker, which Windows does not
+/// run; where this copy has a release channel lane, `channel=on|off` says whether it checks the
+/// channel by itself, `origin=` which lane the staged build came from, and `channel_outcome=`
+/// the channel's last check.
 #[must_use]
 pub fn control_line(running: Running<'_>, here: &Here) -> String {
     let standing = &here.standing;
@@ -628,6 +828,22 @@ pub fn control_line(running: Running<'_>, here: &Here) -> String {
     }
     if let Some(installed) = &here.installed {
         line.push_str(&format!(" installed_build={}", installed.build_number));
+    }
+    if let Some(note) = &here.channel {
+        line.push_str(&format!(
+            " channel={} origin={}",
+            if note.automatic { "on" } else { "off" },
+            here.origin.word()
+        ));
+        if !note.checked_at.is_empty() {
+            line.push_str(&format!(
+                " channel_checked_at={}",
+                wire_quoted(&note.checked_at)
+            ));
+        }
+        if !note.outcome.is_empty() {
+            line.push_str(&format!(" channel_outcome={}", wire_quoted(&note.outcome)));
+        }
     }
     let outcome = match standing {
         Standing::Newer(staged) | Standing::Differs(staged) if staged.smoke == Smoke::Fail => {
@@ -663,6 +879,47 @@ fn is_dist_name(name: &std::ffi::OsStr) -> bool {
         .is_some_and(|name| name.len() == 12 && name.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// Whether `dir` is a build tree's: a Cargo profile folder holds `deps` and `.fingerprint`, and
+/// a test or an example runs from a folder inside one (`deps`, `examples`).
+fn in_build_tree(dir: &Path) -> bool {
+    let cargo_profile = |dir: &Path| dir.join("deps").is_dir() || dir.join(".fingerprint").is_dir();
+    cargo_profile(dir)
+        || dir
+            .parent()
+            .is_some_and(|up| up.join(".fingerprint").is_dir())
+}
+
+/// Whether `dir` is inside an MSIX package, which Windows itself updates.
+fn in_msix(dir: &Path) -> bool {
+    dir.components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+}
+
+/// Whether `dir` is a dist folder one of the two lanes keeps: named by a commit, in
+/// `…\aterm\dist` (the local build loop's) or `…\aterm\update\channel` (the release channel's).
+/// A staged build in the other lane must not be installed over it either.
+fn in_a_lane(dir: &Path) -> bool {
+    let named = |path: Option<&Path>, name: &str| {
+        path.and_then(Path::file_name)
+            .is_some_and(|own| own.eq_ignore_ascii_case(name))
+    };
+    let up = |levels: usize| dir.ancestors().nth(levels);
+    dir.file_name().is_some_and(is_dist_name)
+        && ((named(up(1), "dist") && named(up(2), "aterm"))
+            || (named(up(1), "channel") && named(up(2), "update") && named(up(3), "aterm")))
+}
+
+/// Whether the copy `running_exe` belongs to is one an installer may replace: not a build tree,
+/// not an MSIX package and not a dist folder a lane keeps. A copy that is not is never the
+/// reason for an automatic download.
+#[must_use]
+pub fn runs_from_an_install(running_exe: &Path) -> bool {
+    running_exe
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .is_some_and(|dir| !in_build_tree(dir) && !in_msix(dir) && !in_a_lane(dir))
+}
+
 /// Where `apply` installs: the folder the running executable is in, unless that folder is not
 /// a per-user install the dist's installer can replace (a build tree, an MSIX package, the
 /// staged dist itself, or another dist folder the build loop keeps beside it).
@@ -671,14 +928,7 @@ pub fn install_dest(running_exe: &Path, staged: &StagedBuild) -> Result<PathBuf,
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .ok_or_else(|| format!("{} has no folder", running_exe.display()))?;
-    // A profile folder holds `deps` and `.fingerprint`; a test or an example runs from a
-    // folder inside it (`deps`, `examples`).
-    let cargo_profile = |dir: &Path| dir.join("deps").is_dir() || dir.join(".fingerprint").is_dir();
-    if cargo_profile(dest)
-        || dest
-            .parent()
-            .is_some_and(|up| up.join(".fingerprint").is_dir())
-    {
+    if in_build_tree(dest) {
         return Err(format!(
             "this copy runs from a build tree ({}), not an install \u{2014} run {} yourself to \
              install the staged build",
@@ -686,10 +936,7 @@ pub fn install_dest(running_exe: &Path, staged: &StagedBuild) -> Result<PathBuf,
             staged.installer().display(),
         ));
     }
-    if dest
-        .components()
-        .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
-    {
+    if in_msix(dest) {
         return Err(format!(
             "this copy is an MSIX package ({}), which Windows updates \u{2014} install a newer \
              package, or run {} for a per-user install",
@@ -709,13 +956,14 @@ pub fn install_dest(running_exe: &Path, staged: &StagedBuild) -> Result<PathBuf,
         ));
     }
     // A dist the build loop keeps (the one staged before, the installed one's source) sits
-    // beside the staged one under its commit's name. Installing over it would leave a folder
-    // whose name is no longer its build, which the loop's retention reads.
+    // beside the staged one under its commit's name, and the other lane's dists sit in its own
+    // folder. Installing over one would leave a folder whose name is no longer its build, which
+    // each lane's retention and receipt read.
     let beside_staged = dest
         .parent()
         .zip(staged.dir.parent())
         .is_some_and(|(a, b)| same(a, b));
-    if beside_staged && dest.file_name().is_some_and(is_dist_name) {
+    if (beside_staged || in_a_lane(dest)) && dest.file_name().is_some_and(is_dist_name) {
         return Err(format!(
             "this copy runs from a staged dist folder ({}), not an install \u{2014} run {} to \
              install the staged build",
@@ -738,11 +986,17 @@ pub enum ApplyMode {
 /// The installer's arguments after the PowerShell executable (`install.ps1`'s own contract:
 /// every lay is staged, `-Restart` also saves the open windows, stops the installed copy and
 /// starts the new build once the lay went in, and it exits 0 or 1 with one line that says why).
+///
+/// A channel dist's installer is also told `-Update` (create nothing outside `-Dest`): every
+/// release zip carries an `install.ps1` that takes it. A local dist is not, since one staged
+/// before `install.ps1` grew the switch (2026-11-11) would refuse an unknown parameter;
+/// `-NoShortcuts -NoPath` say the same of what it would create.
 #[must_use]
 pub fn installer_args(
     staged: &StagedBuild,
     dest: &Path,
     mode: ApplyMode,
+    origin: Origin,
 ) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
         .into_iter()
@@ -756,6 +1010,9 @@ pub fn installer_args(
         }
         .into(),
     );
+    if origin == Origin::Channel {
+        args.push("-Update".into());
+    }
     args.push("-Dest".into());
     args.push(dest.as_os_str().to_os_string());
     // An update replaces the build. The shortcuts and the PATH entry are the first install's
@@ -802,8 +1059,8 @@ pub fn apply_refusal(standing: &Standing) -> Result<&StagedBuild, String> {
         }
         Standing::Same(_) | Standing::Older(_) => {
             return Err(format!(
-                "nothing to install: this copy is current \u{2014} `{STAGE_COMMAND}` builds a \
-                 newer one"
+                "nothing to install: this copy is current \u{2014} `{CHECK_COMMAND}` looks for \
+                 a newer release, `{STAGE_COMMAND}` builds one here"
             ));
         }
         Standing::Unstamped(_) => {
@@ -815,7 +1072,8 @@ pub fn apply_refusal(standing: &Standing) -> Result<&StagedBuild, String> {
         }
         Standing::Absent => {
             return Err(format!(
-                "no staged build \u{2014} `{STAGE_COMMAND}` builds one and stages it"
+                "no staged build \u{2014} `{CHECK_COMMAND}` looks for a newer release, \
+                 `{STAGE_COMMAND}` builds one here"
             ));
         }
         Standing::Unreadable(why) => {
@@ -823,6 +1081,27 @@ pub fn apply_refusal(standing: &Standing) -> Result<&StagedBuild, String> {
         }
     };
     missing_installer(staged).map_or(Ok(staged), Err)
+}
+
+/// What must hold of `staged`'s folder right before its installer runs, and which lane staged
+/// it: a folder of the release channel's `lane` must still be the stage its pointer names, which
+/// the lane's floors still admit (its signer not revoked, its build not below the signed
+/// minimum), and what was verified
+/// ([`crate::windows_channel::Lane::verify_stage`], Authenticode included when `publisher` is
+/// pinned); a local build loop's folder is its own record, as before.
+pub fn before_install(
+    staged: &StagedBuild,
+    lane: Option<&crate::windows_channel::Lane>,
+    publisher: &str,
+    signer: crate::windows_channel::Signer<'_>,
+) -> Result<Origin, String> {
+    match lane.filter(|lane| lane.holds(&staged.dir)) {
+        Some(lane) => lane
+            .verify_stage(staged, publisher, signer)
+            .map(|()| Origin::Channel)
+            .map_err(|why| format!("{} is not installed: {why}", staged.name())),
+        None => Ok(Origin::Local),
+    }
 }
 
 /// Why `staged` cannot be installed for want of its installer (its dist was removed, or
@@ -884,8 +1163,16 @@ pub fn pointer_path() -> Option<PathBuf> {
         .map(|dir| pointer_path_under(Path::new(&dir)))
 }
 
-/// [`look`] from this executable at this user's pointer. Every call reads the pointer and the
-/// record beside the executable again: both change under a running window.
+/// Whether this copy checks the release channel by itself: `[update] enabled` as this process
+/// launched with it, off while that read has not answered.
+#[cfg(windows)]
+fn channel_automatic() -> bool {
+    aterm_update_core::settings::update_enabled_at_launch() == Some(true)
+}
+
+/// [`look_with`] from this executable at this user's pointer and release channel lane. Every
+/// call reads both pointers and the record beside the executable again: they change under a
+/// running window.
 #[cfg(windows)]
 #[must_use]
 pub fn here(running: Running<'_>) -> Here {
@@ -895,13 +1182,99 @@ pub fn here(running: Running<'_>) -> Here {
             pointer: PathBuf::from("%LOCALAPPDATA%\\aterm\\dist\\latest.json"),
             installed: None,
             blocked: None,
+            origin: Origin::Local,
+            channel: None,
         };
     };
-    look(running, std::env::current_exe().ok().as_deref(), &pointer)
+    let lane = crate::windows_channel::Lane::of_this_user();
+    look_with(
+        running,
+        std::env::current_exe().ok().as_deref(),
+        &pointer,
+        lane.as_ref().map(|lane| (lane, channel_automatic())),
+    )
+}
+
+/// What this machine has that a release must beat ([`crate::windows_channel::Have`]): the
+/// installed copy's build, and the build the local build loop offers.
+#[cfg(windows)]
+fn have(running: Running<'_>) -> crate::windows_channel::Have {
+    let installed = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(read_installed)
+        .map_or(running.build_number, |installed| installed.build_number);
+    let offered = pointer_path()
+        .and_then(|pointer| read_pointer(&pointer).ok().flatten())
+        .filter(|staged| staged.smoke != Smoke::Fail)
+        .map_or(0, |staged| staged.build_number);
+    crate::windows_channel::Have { installed, offered }
+}
+
+/// Check the release channel now, whatever the schedule and the setting: what
+/// `aterm update check` runs. It reads the compiled channel (`alabsystems/aterm`) anonymously.
+#[cfg(windows)]
+pub fn check_channel_now(running: Running<'_>) -> Result<crate::windows_channel::Checked, String> {
+    let lane = crate::windows_channel::Lane::of_this_user()
+        .ok_or("%LOCALAPPDATA% is not set, so there is no folder to stage a release in")?;
+    crate::windows_channel::check(
+        &lane,
+        &aterm_update_core::release_asset::Reader::anonymous(),
+        &aterm_update_core::Source::resolve_with(false, None, None),
+        crate::windows_channel::PRODUCTION_PINS,
+        have(running),
+        aterm_update_core::roster::now_unix(),
+        &crate::windows_channel::authenticode_signer,
+    )
+}
+
+/// The window's scheduled check of the release channel: `true` when it staged a build. It runs
+/// only while `[update] enabled` is on, the check is due ([`CHECK_EVERY`]), and this copy is a
+/// stamped install an installer may replace (a build tree or an unstamped build never
+/// downloads by itself).
+///
+/// [`CHECK_EVERY`]: crate::windows_channel::CHECK_EVERY
+#[cfg(windows)]
+fn scheduled_channel_check(running: Running<'_>) -> bool {
+    let Some(lane) = crate::windows_channel::Lane::of_this_user() else {
+        return false;
+    };
+    let install = std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| runs_from_an_install(&exe));
+    if !channel_automatic()
+        || running.build_number == 0
+        || !install
+        || !lane.due(aterm_update_core::roster::now_unix())
+    {
+        return false;
+    }
+    matches!(
+        check_channel_now(running),
+        Ok(crate::windows_channel::Checked::Staged(_))
+    )
+}
+
+/// What this copy, running build `running_build`, tells its fleet of its updater
+/// ([`Here::fleet_fact`]): [`here`] of the running image as `aterm update status` names it (the
+/// stamp's version and commit), with no network and no lock.
+#[cfg(windows)]
+#[must_use]
+pub fn fleet_fact(running_build: u64) -> UpdateFact {
+    let stamp = aterm_stamp::current();
+    here(Running {
+        version: stamp.app_version,
+        commit: stamp.git_commit,
+        build_number: running_build,
+    })
+    .fleet_fact()
 }
 
 /// Start the window's watch on its own thread. It wakes once per [`WATCH_EVERY`], reads two
-/// small files, and calls `notify` only when what the window should say changes.
+/// small files, and calls `notify` only when what the window should say changes; between
+/// looks it checks the release channel when that is due, and looks again at once when the
+/// check staged a build.
 #[cfg(windows)]
 pub fn spawn_watch(running: Running<'static>, notify: Box<dyn Fn(Notice) + Send>) -> bool {
     if pointer_path().is_none() {
@@ -914,7 +1287,9 @@ pub fn spawn_watch(running: Running<'static>, notify: Box<dyn Fn(Notice) + Send>
                 &mut || here(running).notice(),
                 &mut |notice| notify(notice),
                 &mut |period| {
-                    std::thread::sleep(period);
+                    if !scheduled_channel_check(running) {
+                        std::thread::sleep(period);
+                    }
                     true
                 },
             );
@@ -942,8 +1317,10 @@ pub enum InstallerOutput {
     Capture,
 }
 
+/// Windows PowerShell 5.1, which every Windows carries: the installer's host, and the reader of
+/// an image's Authenticode signature.
 #[cfg(windows)]
-fn powershell() -> PathBuf {
+pub(crate) fn powershell() -> PathBuf {
     std::env::var_os("SystemRoot")
         .map(|root| {
             Path::new(&root)
@@ -970,9 +1347,23 @@ pub fn apply(
 
     let staged = apply_refusal(standing)?;
     let dest = install_dest(running_exe, staged)?;
+    let lane = crate::windows_channel::Lane::of_this_user();
+    // A release channel's folder is held still from its read-back until its installer exits,
+    // so no check prunes or replaces it in between; the lock goes with this process.
+    let _held = lane
+        .as_ref()
+        .filter(|lane| lane.holds(&staged.dir))
+        .map(crate::windows_channel::Lane::hold)
+        .transpose()?;
+    let origin = before_install(
+        staged,
+        lane.as_ref(),
+        crate::windows_channel::PRODUCTION_PINS.publisher,
+        &crate::windows_channel::authenticode_signer,
+    )?;
     let mut command = aterm_uds::spawnfd::command(powershell());
     command
-        .args(installer_args(staged, &dest, mode))
+        .args(installer_args(staged, &dest, mode, origin))
         .stdin(Stdio::null());
     let capture = output == InstallerOutput::Capture && mode == ApplyMode::Staged;
     if mode == ApplyMode::Restart {

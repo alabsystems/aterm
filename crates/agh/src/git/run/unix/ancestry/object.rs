@@ -30,8 +30,14 @@ pub(super) fn parents(body: &[u8]) -> Result<Vec<String>> {
         .ok_or_else(|| Error::protocol("commit lacks an exact tree identity"))?;
     let _ = tree; // A tree ID is metadata here; no tree is fetched or licensed.
     let mut parents = Vec::new();
+    let mut parent_block = true;
     for line in lines {
         if let Some(id) = line.strip_prefix(b"parent ") {
+            if !parent_block {
+                return Err(Error::protocol(
+                    "commit parent lies outside its leading parent block",
+                ));
+            }
             let id = std::str::from_utf8(id)
                 .ok()
                 .filter(|id| crate::path::is_sha(id))
@@ -40,6 +46,8 @@ pub(super) fn parents(body: &[u8]) -> Result<Vec<String>> {
                 return Err(Error::protocol("commit parent count exceeds bound"));
             }
             parents.push(id.to_owned());
+        } else {
+            parent_block = false;
         }
     }
     Ok(parents)

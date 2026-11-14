@@ -203,13 +203,22 @@ type Film = (
     (&'static str, &'static [u8]),
 );
 
-/// Where a person types (a shell's prompt on the last row of a full page, Claude Code's
-/// composer) and on an open row, the trail's own pixels stay at three flashes a second or
-/// fewer: the flagship on paper, on a dark page and on a dim one, under a bar, a block and an
-/// underline caret, and the dog's style where its own residue does not already break the law
-/// (its dark films under a bar caret read 1 and 15 px over at the caret, not held here).
+/// Where a person types, on every scene of `lab trail-film` cheap enough for the dev set, the
+/// trail's own pixels stay at three flashes a second or fewer: the flagship on paper, on a dark
+/// page and on a dim one, under a bar, a block and an underline caret, and the dog's style.
+/// Held: the scenes that read 0 on the films they are taken under here. Not held, each with
+/// what still breaks it: `jump` under a bar caret and on paper (the row's ribbon and rail
+/// washing and re-lighting under Home and End: 1 px on a dark page, 49 and 52 on GitHub Light;
+/// a dark page's under a block caret is held), the walls on paper (`wall-70` and `wall-73` on
+/// GitHub Light: the swoosh's suck-in slides the band's stepped top through the letter cells
+/// whose top it lights, 15 px under a bar and 16 under a block, as on main since the band came
+/// back beside the line; with no suck-in, 0), `enter-long` on paper (a flying
+/// train's even stations), `backspace`, `steam`, `wrapped`, `focus-wrap`, `wall-69` and
+/// paper's `fold-rest`; `verdict`, `last-row` and `long-build` are not cheap (twice to four
+/// times the frames of the rest, and `long-build`'s page scrolls, which this reading does not
+/// book apart).
 ///
-/// What each film holds:
+/// What each control holds:
 /// - the open row on GitHub Light (`typing`): paper's stars stand still and only cool. Its
 ///   control flies them as a dark page's fly (`stardust::with_paper_stars_flying`): the grains
 ///   of one typed line then cross the same pixels in turn, hundreds of pixels over the bound.
@@ -217,23 +226,32 @@ type Film = (
 ///   laid finely whenever its windows fit the quad budget. Its control lays it finely only in a
 ///   roomy frame (`ribbon::with_head_feather_by_room`), a stair of slabs that walks under the
 ///   feather as the line flows.
-/// - the resident scenes: the line in the typed row's foot band, its gaps and the stars over
-///   it add no pixel over the bound, in either style. No control of their own; they read 0
-///   before the line was drawn there too.
+/// - the caret moved up a row on GitHub Light (`move-up`): a landed train's body stands on a
+///   lattice from its landing. Its control spreads the body evenly over the span as the root
+///   sucks in (`meteor::with_trains_spread`), every station sliding a little each frame.
+/// - Home and End on a dark page (`jump`): a landing's sparks stand at points of their throws
+///   and only cool. Its control throws them (`meteor::with_sparks_thrown`), forty to sixty
+///   stars crossing the pixels round each landing in turn.
 ///
-/// A film may sit at exactly six turns in a second, the bound itself (the open row and the
-/// fold do): the law is the bound, and a change that adds a turn there has broken it.
+/// A film may sit at exactly six turns in a second, the bound itself: the law is the bound, and
+/// a change that adds a turn there has broken it.
 #[test]
 fn the_flagship_trail_stays_under_three_flashes_a_second() {
-    let typing = Take::Gallery(Scene::Typing);
-    let fold = Take::Gallery(Scene::FoldRest);
-    let films: [Film; 13] = [
+    let g = Take::Gallery;
+    let films: Vec<Film> = vec![
+        ("typing", CAT, g(Scene::Typing), GITHUB_LIGHT, BAR),
+        ("typing", CAT, g(Scene::Typing), DARK, BAR),
+        ("typing", CAT, g(Scene::Typing), GITHUB_LIGHT, BLOCK),
+        ("typing", DOG, g(Scene::Typing), GITHUB_LIGHT, BAR),
+        ("burst", CAT, g(Scene::Burst), GITHUB_LIGHT, BAR),
+        ("burst", CAT, g(Scene::Burst), DARK, BLOCK),
+        ("burst", DOG, g(Scene::Burst), GITHUB_LIGHT, BLOCK),
+        ("context", CAT, g(Scene::Context), DARK, BAR),
+        ("context", CAT, g(Scene::Context), GITHUB_LIGHT, BAR),
+        ("enter", CAT, g(Scene::EnterBottom), DARK, BAR),
+        ("enter", DOG, g(Scene::EnterBottom), DARK, BLOCK),
         ("bottom-prompt", CAT, Take::BottomPrompt, GITHUB_LIGHT, BAR),
         ("bottom-prompt", CAT, Take::BottomPrompt, DARK, BAR),
-        ("composer", CAT, Take::Composer, GITHUB_LIGHT, BAR),
-        ("composer", CAT, Take::Composer, DARK, BAR),
-        ("typing", CAT, typing, GITHUB_LIGHT, BAR),
-        ("fold-rest", CAT, fold, DARK, BAR),
         (
             "bottom-prompt",
             CAT,
@@ -241,8 +259,6 @@ fn the_flagship_trail_stays_under_three_flashes_a_second() {
             GITHUB_LIGHT,
             BLOCK,
         ),
-        ("composer", CAT, Take::Composer, DARK, BLOCK),
-        ("composer", CAT, Take::Composer, DARK, UNDERLINE),
         (
             "bottom-prompt",
             CAT,
@@ -250,11 +266,35 @@ fn the_flagship_trail_stays_under_three_flashes_a_second() {
             SOLARIZED_DARK,
             BAR,
         ),
+        ("composer", CAT, Take::Composer, GITHUB_LIGHT, BAR),
+        ("composer", CAT, Take::Composer, DARK, BAR),
+        ("composer", CAT, Take::Composer, DARK, BLOCK),
+        ("composer", CAT, Take::Composer, DARK, UNDERLINE),
         ("composer", DOG, Take::Composer, GITHUB_LIGHT, BAR),
         ("composer", DOG, Take::Composer, GITHUB_LIGHT, BLOCK),
         ("composer", DOG, Take::Composer, DARK, BLOCK),
+        ("enter-long", CAT, Take::EnterLong, DARK, BAR),
+        ("enter-long", DOG, Take::EnterLong, DARK, BLOCK),
+        ("wall-73", CAT, Take::Wall(73), DARK, BAR),
+        (
+            "coloured-prompt",
+            CAT,
+            Take::ColouredPrompt,
+            GITHUB_LIGHT,
+            BAR,
+        ),
+        ("coloured-prompt", CAT, Take::ColouredPrompt, DARK, BAR),
+        ("cjk", CAT, g(Scene::Cjk), GITHUB_LIGHT, BAR),
+        ("cjk", DOG, g(Scene::Cjk), DARK, BLOCK),
+        ("fold-rest", CAT, g(Scene::FoldRest), DARK, BAR),
+        ("move-up", CAT, g(Scene::MoveUp), GITHUB_LIGHT, BAR),
+        ("move-up", CAT, g(Scene::MoveUp), DARK, BAR),
+        ("move-up", DOG, g(Scene::MoveUp), GITHUB_LIGHT, BLOCK),
+        ("split", CAT, g(Scene::SplitBurst), GITHUB_LIGHT, BAR),
+        ("split", DOG, g(Scene::SplitBurst), DARK, BAR),
+        ("jump", CAT, Take::Jump, DARK, BLOCK),
     ];
-    let (reads, flying, stair) = std::thread::scope(|s| {
+    let (reads, flying, stair, spread, thrown) = std::thread::scope(|s| {
         let held: Vec<_> = films
             .iter()
             .map(|&(_, style, take, look, caret)| {
@@ -263,12 +303,22 @@ fn the_flagship_trail_stays_under_three_flashes_a_second() {
             .collect();
         let flying = s.spawn(move || {
             aterm_effects::rainbow_kitty::stardust::with_paper_stars_flying(|| {
-                trail_flashes(CAT, typing, GITHUB_LIGHT, BAR.1)
+                trail_flashes(CAT, g(Scene::Typing), GITHUB_LIGHT, BAR.1)
             })
         });
         let stair = s.spawn(move || {
             aterm_effects::rainbow_kitty::ribbon::with_head_feather_by_room(|| {
-                trail_flashes(CAT, fold, DARK, BAR.1)
+                trail_flashes(CAT, g(Scene::FoldRest), DARK, BAR.1)
+            })
+        });
+        let spread = s.spawn(move || {
+            aterm_effects::rainbow_kitty::meteor::with_trains_spread(|| {
+                trail_flashes(CAT, g(Scene::MoveUp), GITHUB_LIGHT, BAR.1)
+            })
+        });
+        let thrown = s.spawn(move || {
+            aterm_effects::rainbow_kitty::meteor::with_sparks_thrown(|| {
+                trail_flashes(CAT, Take::Jump, DARK, BLOCK.1)
             })
         });
         let reads: Vec<Read> = held
@@ -279,20 +329,30 @@ fn the_flagship_trail_stays_under_three_flashes_a_second() {
             reads,
             flying.join().expect("the stars' control"),
             stair.join().expect("the feather's control"),
+            spread.join().expect("the trains' control"),
+            thrown.join().expect("the sparks' control"),
         )
     });
+    // Every film is read before any is judged, so one red names all of them.
+    let mut reds = Vec::new();
     for ((scene, style, _, look, caret), read) in films.iter().zip(&reads) {
         let film = format!("{style}, {scene} on {}, {} caret", look.name, caret.0);
         eprintln!("flash_probe {film}: {read:?}");
-        assert!(read.frames > 100, "{film} filmed {} frames", read.frames);
-        assert_eq!(
-            read.over, 0,
-            "{film}: {} px of the trail's own flash faster than 3 a second, the worst {} \
-             turns in a second at px {:?}",
-            read.over, read.most, read.worst
-        );
+        if read.frames <= 100 {
+            reds.push(format!("{film} filmed {} frames", read.frames));
+        } else if read.over != 0 {
+            reds.push(format!(
+                "{film}: {} px of the trail's own flash faster than 3 a second, the worst {} \
+                 turns in a second at px {:?}",
+                read.over, read.most, read.worst
+            ));
+        }
     }
     eprintln!("flash_probe control (paper's stars flying, typing, github-light): {flying:?}");
+    eprintln!("flash_probe control (the head feather laid by room, fold-rest, dark): {stair:?}");
+    eprintln!("flash_probe control (a landed train spread, move-up, github-light): {spread:?}");
+    eprintln!("flash_probe control (a landing's sparks thrown, jump, dark): {thrown:?}");
+    assert!(reds.is_empty(), "{}", reds.join("\n"));
     assert!(
         flying.over > 100 && flying.most > 2 * TURNS_MOST,
         "control: with paper's stars flying the open row reads {} px over and {} turns at \
@@ -300,12 +360,25 @@ fn the_flagship_trail_stays_under_three_flashes_a_second() {
         flying.over,
         flying.most
     );
-    eprintln!("flash_probe control (the head feather laid by room, fold-rest, dark): {stair:?}");
     assert!(
         stair.over > 10 && stair.most > 2 * TURNS_MOST,
         "control: with the head feather laid by room the fold reads {} px over and {} turns \
          at most, so the law is not reading the feather",
         stair.over,
         stair.most
+    );
+    assert!(
+        spread.over > 10 && spread.most > TURNS_MOST,
+        "control: with a landed train's body spread the move up reads {} px over and {} \
+         turns at most, so the law is not reading the train",
+        spread.over,
+        spread.most
+    );
+    assert!(
+        thrown.over > 10 && thrown.most > TURNS_MOST,
+        "control: with a landing's sparks thrown Home and End read {} px over and {} turns \
+         at most, so the law is not reading the sparks",
+        thrown.over,
+        thrown.most
     );
 }

@@ -845,6 +845,89 @@ fn a_clean_exit_that_removed_its_writer_lock_resumes_the_same_conversation() {
     assert!(Witnesses::under(&rig.opts.state).handled(snap.pid, &snap.start));
 }
 
+/// THE HAND-BACK OF A SESSION AN ACCOUNT RENEWAL SIGNALLED WITH NO SUCCESSOR (aterm-gui's
+/// renewal worker, [`super::super::renewal_hand_back`]): the source's own line, on the login it
+/// ran on, typed once and filed as the renewal's own relaunch, never as an explicit restart;
+/// handled for every later step. While another tab's relaunch holds the sweep it is busy and types
+/// nothing.
+#[test]
+fn a_renewal_hand_back_types_its_source_line_once_on_the_login_it_ran_on() {
+    let rig = Rig::new("renewal-hand-back", &["zsh: terminated codex"]);
+    rig.twin_to_build(true);
+    let snap = rig.snap(None);
+    let login = "/Users//me/.aterm/accounts-codex/main/auth.json";
+    let mut resume = rig.resume(None);
+    resume.codex_auth_path = Some(login.to_string());
+    let step =
+        || self_claimed_after_exit(&rig.opts, &snap, &resume, ExitCause::Renewal, &rig.kernel);
+    let sweep = super::super::sweep_lock(&rig.opts)
+        .expect("the sweep lock")
+        .expect("held by another relaunch");
+    assert_eq!(step().step, "busy:another-sweep");
+    drop(sweep);
+    assert!(rig.typed().is_empty());
+    let r = step();
+    assert_eq!(r.step, "done:resumed", "{r:?}\n{:#?}", rig.asked());
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "{typed:#?}");
+    assert!(
+        typed[0].contains(&format!("CODEX_AUTH_PATH={login}"))
+            || typed[0].contains(&format!("CODEX_AUTH_PATH='{login}'")),
+        "the login it ran on: {typed:#?}"
+    );
+    assert!(typed[0].contains(T2), "the same conversation: {typed:#?}");
+    assert_eq!(rig.state().cause, crate::harness::relaunch::CAUSE_RENEWAL);
+    assert!(Witnesses::under(&rig.opts.state).handled(snap.pid, &snap.start));
+    assert_eq!(step().step, "ended:handled");
+    assert_eq!(rig.typed(), typed, "the line is never typed twice");
+}
+
+/// A RENEWAL'S HAND-BACK READS ITS CONVERSATION AS ANOTHER'S
+/// ([`super::super::renewal_conversation_taken`]) only once the source agent is gone and a
+/// process holds that conversation's writer lock under the source's home: never a lock nobody
+/// holds, another conversation's lock, or the source's own while it still runs.
+#[test]
+fn a_renewal_reads_its_conversation_as_taken_only_by_another_holder() {
+    let mut rig = Rig::new("renewal-conversation-taken", &[]);
+    let snap = rig.snap(None);
+    let resume = rig.resume(None);
+    let source = crate::harness::self_claimed::Copy {
+        lifetime: None,
+        pid: snap.pid,
+        start: snap.start.clone(),
+        home: rig.home.clone(),
+        seen: crate::harness::self_claimed::Seen::Never,
+        resume: Ok(resume.clone()),
+    };
+    let mut elsewhere = resume.clone();
+    elsewhere.session = T1.to_string();
+    assert!(
+        !conversation_taken(&source, &resume, &rig.kernel),
+        "nobody holds it"
+    );
+    // The scripted kernel reads the conversation's lock as held once a process runs it.
+    rig.kernel.relaunched.store(true, Ordering::SeqCst);
+    assert!(
+        conversation_taken(&source, &resume, &rig.kernel),
+        "another process holds it once its source is gone"
+    );
+    assert!(
+        !conversation_taken(&source, &elsewhere, &rig.kernel),
+        "another conversation's lock is not this one's"
+    );
+    rig.kernel.tui_alive = true;
+    rig.kernel.tui_birth = Some(snap.start.clone());
+    assert!(
+        !conversation_taken(&source, &resume, &rig.kernel),
+        "the source still runs: the lock is its own"
+    );
+    rig.kernel.tui_birth = Some("Fri Oct 17 09:00:00 2026".to_string());
+    assert!(
+        conversation_taken(&source, &resume, &rig.kernel),
+        "a reused pid is not the source"
+    );
+}
+
 fn stamp_input(rig: &Rig, host: String) -> crate::harness::restart_stamp::Input {
     use crate::harness::restart_stamp::{Cause, Input, Stamp, write};
     let snap = rig.snap(None);
@@ -2226,3 +2309,7 @@ fn a_record_saved_mid_restart_by_an_earlier_build_relaunches_after_a_reboot() {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+#[path = "codex_alab_drive_pty_tests.rs"]
+mod pty;

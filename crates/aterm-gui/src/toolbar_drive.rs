@@ -840,154 +840,6 @@ mod macos {
         );
     }
 
-    /// Stage 11: a real `NSStatusItem` carrying a Land desk at rest
-    /// ([`crate::status_item::a_land_desk_at_rest`]), its menu repainted by its own delegate as a
-    /// person's open repaints it, and This Mac read back off AppKit's item: once, greyed, in the
-    /// words `here_line` makes of the glance's counts, the held Land sessions counted `landing`
-    /// past the one whose need counts first (§14.6 of `docs/DESIGN-harness-autopilot-2026-10-15.md`).
-    /// The item leaves the bar when the stage ends.
-    fn this_mac_on_the_bar(cx: &mut Ctx, proxy: &EventLoopProxy<Wake>) {
-        let rows = crate::status_item::a_land_desk_at_rest();
-        let now_ms = aterm_time::unix_millis().unwrap_or(0);
-        let glance = crate::status_item::Glance::build(&rows, &[], None, now_ms, None);
-        let h = &glance.here;
-        let counts = (h.need_you, h.landing, h.resting, h.landed, h.shells);
-        cx.check(
-            counts == (1, 6, 1, 5, 3),
-            format!(
-                "the desk's glance counts 1 need you, 6 landing, 1 resting, 5 landed and 3 shells (got {counts:?})"
-            ),
-        );
-        let want = crate::status_item::here_line(h, glance.machine.as_deref());
-        let Some(item) = crate::status_item::install(proxy, &glance) else {
-            cx.check(false, "the status bar gave the drive no item".to_owned());
-            return;
-        };
-        let items = crate::status_item::items_on_the_bar(&item);
-        drop(item);
-        for i in items.iter().filter(|i| i.title.starts_with("This Mac")) {
-            println!("  --  {:?} enabled={}", i.title, i.enabled);
-        }
-        cx.check(
-            items
-                .iter()
-                .filter(|i| i.title == want && !i.enabled)
-                .count()
-                == 1,
-            format!(
-                "the real status item's NSMenu holds {want:?} once, greyed ({} items)",
-                items.len()
-            ),
-        );
-    }
-
-    /// Stage 12: a real `NSStatusItem` carrying a box beside an older report
-    /// ([`crate::status_item::a_box_beside_an_older_report`]), its menu repainted by its own
-    /// delegate as a person's open repaints it, and Needs you read back off AppKit's items: the
-    /// box that stopped its agent above the three-hour-old report its agent carries on past (STOPPED
-    /// WORK FIRST, §14.7 of `docs/DESIGN-harness-autopilot-2026-10-15.md`), the report's
-    /// `-toolTip` its program carrying on meanwhile in the words the glance makes
-    /// ([`aterm_agent::supervise::mode_words::report_words`]), and the box's none. The item leaves
-    /// the bar when the stage ends.
-    fn stopped_first_on_the_bar(cx: &mut Ctx, proxy: &EventLoopProxy<Wake>) {
-        let now_ms = aterm_time::unix_millis().unwrap_or(0);
-        let now_unix = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
-        let rows = crate::status_item::a_box_beside_an_older_report(now_unix);
-        let glance = crate::status_item::Glance::build(&rows, &[], None, now_ms, None);
-        let Some(item) = crate::status_item::install(proxy, &glance) else {
-            cx.check(false, "the status bar gave the drive no item".to_owned());
-            return;
-        };
-        let items = crate::status_item::items_on_the_bar(&item);
-        drop(item);
-        let needs: Vec<_> = items
-            .iter()
-            .filter(|i| i.title.starts_with('\u{25c7}'))
-            .collect();
-        for i in &needs {
-            println!("  --  {:?} enabled={} tip={:?}", i.title, i.enabled, i.tip);
-        }
-        let at = |label: &str| {
-            let head = format!("\u{25c7} {label} \u{2014}");
-            needs.iter().position(|i| i.title.starts_with(&head))
-        };
-        let (approval, report) = (at("build"), at("proj-api"));
-        cx.check(
-            matches!((approval, report), (Some(b), Some(r)) if b < r),
-            format!(
-                "Needs you lists the box that stopped its agent above the older report (box at {approval:?}, report at {report:?} of {} rows)",
-                needs.len()
-            ),
-        );
-        let want = aterm_agent::supervise::mode_words::report_words(
-            aterm_phase::Program::Claude.product(),
-            aterm_agent::harness::hold_said::NeedTail::CarryingOn,
-            false,
-        );
-        let tip = report.and_then(|r| needs[r].tip.clone());
-        cx.check(
-            tip.as_deref() == Some(want.as_str()),
-            format!("the report row's -toolTip is {want:?} (got {tip:?})"),
-        );
-        let box_tip = approval.and_then(|b| needs[b].tip.clone());
-        cx.check(
-            box_tip.is_none(),
-            format!("the box's row carries no -toolTip (got {box_tip:?})"),
-        );
-    }
-
-    /// Stage 13: a real `NSStatusItem` carrying two landings with their receipts
-    /// ([`crate::status_item::a_landing_with_its_receipt`]), its menu repainted by its own delegate
-    /// as a person's open repaints it, and the tips read back off AppKit (THE LANDING'S RECEIPT,
-    /// §14.9 slice 9c of `docs/DESIGN-harness-autopilot-2026-10-15.md`): the Done for you row's
-    /// `-toolTip` says what aterm checked and what the agent said
-    /// ([`aterm_agent::supervise::mode_words::landed_tip`]), naming the head's 12 digits and
-    /// `origin/main`; the worker's row, one level into its manager's submenu, says what aterm
-    /// checked in a repository with no remote ([`aterm_agent::supervise::mode_words::checked_words`]),
-    /// never "remote main". The item leaves the bar when the stage ends. (An `NSMenuItem` answers
-    /// no `-accessibilityHelp`, so the drive reads none; the chip's screen-reader description is
-    /// held to `mode_words::landed_words` by `the_landed_words_say_what_aterm_checked` and read
-    /// off `chrome`'s `a11y` line in the captures.)
-    fn receipt_on_the_bar(cx: &mut Ctx, proxy: &EventLoopProxy<Wake>) {
-        use aterm_agent::supervise::mode_words;
-        let now_ms = aterm_time::unix_millis().unwrap_or(0);
-        let rows = crate::status_item::a_landing_with_its_receipt(now_ms);
-        let glance = crate::status_item::Glance::build(&rows, &[], None, now_ms, None);
-        let Some(item) = crate::status_item::install(proxy, &glance) else {
-            cx.check(false, "the status bar gave the drive no item".to_owned());
-            return;
-        };
-        let items = crate::status_item::items_on_the_bar(&item);
-        drop(item);
-        let (on_main, no_remote) = crate::status_item::landing_receipts();
-        let done = items
-            .iter()
-            .find(|i| i.title.starts_with("\u{2713} proj-api \u{2014} landed"));
-        let worker = items
-            .iter()
-            .flat_map(|i| i.under.iter())
-            .find(|i| i.title.starts_with("\u{2713} parser \u{2014} landed"));
-        for i in [done, worker].into_iter().flatten() {
-            println!("  --  {:?} tip={:?}", i.title, i.tip);
-        }
-        let want = mode_words::landed_tip(Some(&on_main));
-        let tip = done.and_then(|i| i.tip.clone());
-        cx.check(
-            tip.as_deref() == Some(want.as_str())
-                && want.contains("3f9a1c2e4b7d on origin/main")
-                && !want.contains("remote main"),
-            format!("the Done for you row's -toolTip is {want:?} (got {tip:?})"),
-        );
-        let want = mode_words::checked_words(Some(&no_remote));
-        let tip = worker.and_then(|i| i.tip.clone());
-        cx.check(
-            tip.as_deref() == Some(want.as_str())
-                && want.contains("this repository has no remote")
-                && !want.contains("remote main"),
-            format!("the worker row's -toolTip under its manager is {want:?} (got {tip:?})"),
-        );
-    }
-
     /// A captured view as text, one character a point: what a person reading the drive's output
     /// sees of the drawing.
     fn show_bitmap(w: usize, h: usize, px: &[u8], points: (f64, f64)) -> Vec<String> {
@@ -1020,34 +872,31 @@ mod macos {
             .collect()
     }
 
-    /// Stage 14: a real `NSStatusItem` on a Mac in a fleet at each fleet access level in turn
+    /// Stage 11: a real `NSStatusItem` on a Mac in a fleet at each fleet access level in turn
     /// (`docs/DESIGN-fleet-access-lock-2026-11-10.md` §6, §7), read back off AppKit: the
     /// button's title the caret, its image that level's template lock, its hover and its
     /// accessibility label the ones the glance makes, the item with no `-menu` of its own and
     /// `statusClicked:` as the button's action; the button as AppKit draws it, inked wider than
-    /// the caret alone and no two levels alike; and, first in the menu the click handler pops
-    /// up, the Fleet Access submenu with the level in force checked. A fresh click's level
-    /// joins the title while the checkmark stays on the level in force, and out of a fleet the
-    /// same item shows no image. The levels are the glance's: nothing is clicked and no level
-    /// is stored. The item leaves the bar when the stage ends.
+    /// the caret alone and no two levels alike; and, in the menu the click handler pops up,
+    /// this Mac's line first and greyed, then the three levels with the one in force checked.
+    /// A fresh click's level joins the title while the checkmark stays on the level in force.
+    /// An hour with a request this Mac's lock refused ([`crate::status_item::a_blocked_hour`])
+    /// puts the blocked mark on the lock, says so in the hover and the label, and marks the
+    /// traffic's headline and that Mac's line in the menu while the others hold the mark's
+    /// room; out of a fleet the same item shows no image and the menu is this Mac's line
+    /// alone. The levels and the traffic are the glance's: nothing is clicked, no level is
+    /// stored and no record is read. The item leaves the bar when the stage ends.
     fn lock_on_the_bar(cx: &mut Ctx, proxy: &EventLoopProxy<Wake>) {
         use aterm_types::fleet_access::FleetAccess;
         const CARET: &str = "\u{276f}";
         let now_ms = aterm_time::unix_millis().unwrap_or(0);
-        let slot = crate::fleet_glance::FleetSlot {
-            book: crate::fleet_glance::BookFacts {
-                in_fleet: true,
-                ..crate::fleet_glance::BookFacts::default()
-            },
-            ..crate::fleet_glance::FleetSlot::default()
+        let at = |level: FleetAccess| crate::status_item::Glance {
+            in_fleet: true,
+            access: level,
+            access_shown: level,
+            ..crate::status_item::Glance::default()
         };
-        let at = |level: FleetAccess| {
-            let mut glance = crate::status_item::Glance::build(&[], &[], Some(&slot), now_ms, None);
-            glance.access = level;
-            glance.access_shown = level;
-            glance
-        };
-        let alone = crate::status_item::Glance::build(&[], &[], None, now_ms, None);
+        let alone = crate::status_item::Glance::default();
         let Some(item) = crate::status_item::install(proxy, &alone) else {
             cx.check(false, "the status bar gave the drive no item".to_owned());
             return;
@@ -1078,6 +927,11 @@ mod macos {
              the button's action is statusClicked:"
                 .to_owned(),
         );
+        let items = crate::status_item::items_on_the_bar(&item);
+        cx.check(
+            matches!(items.as_slice(), [only] if !only.enabled && only.title.ends_with("not in a fleet")),
+            format!("out of a fleet the menu is this Mac's line alone, greyed ({items:?})"),
+        );
         let bare = drawn("out of a fleet");
         cx.check(
             bare.as_ref().is_some_and(|(inked, _)| *inked > 0),
@@ -1086,6 +940,15 @@ mod macos {
                 bare.as_ref().map(|(inked, _)| *inked)
             ),
         );
+        // The levels' rows of the real menu: each level's title, whether it is checked and
+        // whether it has a hover.
+        let levels_of = |items: &[crate::status_item::BarItem]| -> Vec<(String, bool, bool)> {
+            items
+                .iter()
+                .filter(|i| FleetAccess::ALL.iter().any(|l| l.label() == i.title))
+                .map(|i| (i.title.clone(), i.checked && i.enabled, i.tip.is_some()))
+                .collect()
+        };
         let mut locks: Vec<Vec<u8>> = Vec::new();
         for level in FleetAccess::ALL {
             let glance = at(level);
@@ -1093,7 +956,7 @@ mod macos {
             crate::status_item::update(&item, glance);
             let face = crate::status_item::face_on_the_bar(&item);
             println!("  --  {}: {face:?}", level.word());
-            let image = crate::status_lock_icon::description(level);
+            let image = crate::status_lock_icon::description(level, false);
             cx.check(
                 face.as_ref().is_some_and(|f| {
                     f.title == CARET
@@ -1135,24 +998,16 @@ mod macos {
             locks.extend(shot.map(|(_, px)| px));
             let items = crate::status_item::items_on_the_bar(&item);
             let first = items.first();
-            let levels: Vec<(&str, bool, bool)> = first
-                .map(|i| {
-                    i.under
-                        .iter()
-                        .map(|l| (l.title.as_str(), l.checked, l.tip.is_some()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let want: Vec<(&str, bool, bool)> = FleetAccess::ALL
+            let levels = levels_of(&items);
+            let want: Vec<(String, bool, bool)> = FleetAccess::ALL
                 .iter()
-                .map(|l| (l.label(), *l == level, true))
+                .map(|l| (l.label().to_owned(), *l == level, true))
                 .collect();
             cx.check(
-                first.is_some_and(|i| i.title.ends_with(level.label())) && levels == want,
+                first.is_some_and(|i| !i.enabled && i.title.ends_with("fleet")) && levels == want,
                 format!(
-                    "at {} the menu's first item is Fleet Access, named for the level, holding \
-                     the three levels with a hover each and that one checked (got {:?}: \
-                     {levels:?})",
+                    "at {} the menu opens with this Mac's line, greyed, then the three levels \
+                     with a hover each and that one checked (got {:?}: {levels:?})",
                     level.word(),
                     first.map(|i| i.title.as_str())
                 ),
@@ -1177,11 +1032,11 @@ mod macos {
         let face = crate::status_item::face_on_the_bar(&item);
         println!("  --  a raise not yet in effect: {face:?}");
         let named = format!("{CARET} {}", FleetAccess::ReadWrite.short());
-        let image = crate::status_lock_icon::description(FleetAccess::ReadWrite);
-        let checked: Vec<bool> = crate::status_item::items_on_the_bar(&item)
-            .first()
-            .map(|i| i.under.iter().map(|l| l.checked).collect())
-            .unwrap_or_default();
+        let image = crate::status_lock_icon::description(FleetAccess::ReadWrite, false);
+        let checked: Vec<bool> = levels_of(&crate::status_item::items_on_the_bar(&item))
+            .into_iter()
+            .map(|(_, checked, _)| checked)
+            .collect();
         cx.check(
             face.as_ref()
                 .is_some_and(|f| f.title == named && f.image.as_deref() == Some(image))
@@ -1192,6 +1047,65 @@ mod macos {
             ),
         );
         let _ = drawn("a raise not yet in effect");
+        // An hour in which this Mac's lock refused a request, not yet looked at.
+        let mut blocked = at(FleetAccess::ReadOnly);
+        blocked.traffic = Some(crate::status_item::a_blocked_hour(now_ms));
+        blocked.blocked = true;
+        let (tip, label) = (blocked.tooltip(), blocked.accessibility_label());
+        crate::status_item::update(&item, blocked);
+        let face = crate::status_item::face_on_the_bar(&item);
+        println!("  --  a request blocked: {face:?}");
+        let image = crate::status_lock_icon::description(FleetAccess::ReadOnly, true);
+        cx.check(
+            face.as_ref().is_some_and(|f| {
+                f.title == CARET
+                    && f.image.as_deref() == Some(image)
+                    && f.template
+                    && f.tip.as_deref() == Some(tip.as_str())
+                    && f.label.as_deref() == Some(label.as_str())
+            }) && tip.contains("blocked")
+                && label.contains("blocked"),
+            format!(
+                "with a request blocked the lock is the template image {image:?}, and the hover \
+                 {tip:?} and the label {label:?} say so"
+            ),
+        );
+        let shot = drawn("a request blocked");
+        cx.check(
+            matches!((&shot, locks.first()), (Some((_, px)), Some(plain)) if px != plain),
+            "AppKit draws the blocked lock unlike the plain one at the same level".to_owned(),
+        );
+        let items = crate::status_item::items_on_the_bar(&item);
+        for i in &items {
+            println!(
+                "  --  {:?} enabled={} checked={} image={:?}",
+                i.title, i.enabled, i.checked, i.image
+            );
+        }
+        let marked: Vec<&str> = items
+            .iter()
+            .filter(|i| i.image.as_deref() == Some(crate::status_lock_icon::ROW_MARK_DESCRIPTION))
+            .map(|i| i.title.as_str())
+            .collect();
+        let room = items
+            .iter()
+            .filter(|i| i.image.as_deref() == Some(""))
+            .count();
+        cx.check(
+            matches!(marked.as_slice(), [headline, mac]
+                if headline.starts_with("Last hour") && headline.ends_with("blocked")
+                    && mac.contains("blocked"))
+                && room == 1
+                && items.iter().all(|i| i.image.is_none() || !i.enabled)
+                && items
+                    .last()
+                    .is_some_and(|i| i.enabled && i.title.starts_with("All activity")),
+            format!(
+                "the traffic's headline and the Mac with a blocked request wear the blocked \
+                 mark, the other Mac's line holds its room, and All activity… closes the menu \
+                 (marked: {marked:?}, room on {room})"
+            ),
+        );
         crate::status_item::update(&item, alone);
         let face = crate::status_item::face_on_the_bar(&item);
         cx.check(
@@ -2808,18 +2722,9 @@ mod macos {
             audit_declared(&mut cx, dcl);
         }
 
-        println!("\n-- stage 11: the menu bar's This Mac row, off the real status item's NSMenu");
-        this_mac_on_the_bar(&mut cx, &proxy);
-
         println!(
-            "\n-- stage 12: the menu bar's Needs you, stopped work first, off the real NSMenu"
-        );
-        stopped_first_on_the_bar(&mut cx, &proxy);
-        receipt_on_the_bar(&mut cx, &proxy);
-
-        println!(
-            "\n-- stage 14: the menu bar's fleet access lock, off the real status item's button \
-             and NSMenu"
+            "\n-- stage 11: the menu bar's fleet access lock and its menu, off the real status \
+             item's button and NSMenu"
         );
         lock_on_the_bar(&mut cx, &proxy);
 

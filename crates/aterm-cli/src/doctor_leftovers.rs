@@ -110,38 +110,47 @@ fn outlived(state: &str, reason: &str) -> bool {
 /// links. `None` for a body that is not the leftover view's.
 pub(crate) fn from_json(body: &str) -> Option<Leftovers> {
     use aterm_json::Value;
-    let doc: Value = aterm_json::from_str(body).ok()?;
-    let procs = doc.get("procs")?.as_array()?;
-    fn word<'v>(p: &'v Value, key: &str) -> &'v str {
-        p.get(key).and_then(Value::as_str).unwrap_or_default()
+    let Value::Object(doc) = aterm_json::from_str(body).ok()? else {
+        return None;
+    };
+    if doc.get("schema").and_then(Value::as_u64) != Some(1)
+        || doc.get("kind").and_then(Value::as_str) != Some("sys.left")
+    {
+        return None;
     }
-    let left: Vec<&Value> = procs
-        .iter()
-        .filter(|p| outlived(word(p, "state"), word(p, "reason")))
-        .collect();
+    let procs = doc.get("procs")?.as_array()?;
     let reading = |key: &str| {
         doc.get("left")
             .and_then(|l| l.get(key))
             .and_then(Value::as_bool)
     };
     let whole = reading("complete") == Some(true) && reading("bounded") == Some(false);
-    Some(Leftovers {
+    let mut left = Leftovers {
         from_instance: true,
-        rows: left.len(),
+        rows: 0,
         more: !whole
             || doc
                 .get("more")
                 .and_then(Value::as_u64)
                 .is_some_and(|n| n > 0),
-        oldest_ms: left
-            .iter()
-            .filter_map(|p| p.get("started_ms").and_then(Value::as_u64))
-            .max(),
-        eligible: left
-            .iter()
-            .any(|p| p.get("entry").and_then(Value::as_bool) == Some(true)),
+        oldest_ms: None,
+        eligible: false,
         links: doc.get("links").and_then(Value::as_array).map(Vec::len),
-    })
+    };
+    for process in procs {
+        // Missing or non-string classification fields cannot prove that a row is unrelated.
+        let state = process.get("state")?.as_str()?;
+        let reason = process.get("reason")?.as_str()?;
+        if outlived(state, reason) {
+            left.rows += 1;
+            left.oldest_ms = left
+                .oldest_ms
+                .max(process.get("started_ms").and_then(Value::as_u64));
+            left.eligible =
+                left.eligible || process.get("entry").and_then(Value::as_bool) == Some(true);
+        }
+    }
+    Some(left)
 }
 
 /// The facts of rows a reading judged with no tab known (this boot's records and this user's
@@ -169,7 +178,7 @@ pub(crate) fn from_rows(view: &aterm_vitals::left::LeftView) -> Leftovers {
 pub(crate) enum Asked {
     /// No instance takes a connection: none runs.
     NoInstance,
-    /// Its answer's body, the line after its `OK … view=left` header.
+    /// Its fresh answer's body, the line after its `OK … view=left` header.
     View(String),
     /// An instance takes connections but did not answer its leftover view: why.
     NoView(String),
@@ -199,9 +208,7 @@ fn ask_instance() -> Asked {
 
 /// One `AUTH` and [`REQUEST`] to the front-door instance on one connection, as its owner.
 fn ask_instance_now() -> Asked {
-    use std::io::{BufRead as _, Read as _, Write as _};
-    const MAX_HEADER_BYTES: u64 = 4096;
-    const MAX_BODY_BYTES: u64 = 4 << 20;
+    use std::io::Write as _;
     let Some(sock) = aterm_ctl::front_door_instance() else {
         return Asked::NoInstance;
     };
@@ -219,17 +226,39 @@ fn ask_instance_now() -> Asked {
     if asked.is_err() {
         return not("did not take the request");
     }
-    let mut reader = std::io::BufReader::new(&stream);
+    read_view(std::io::BufReader::new(&stream))
+}
+
+/// Read the bounded protocol reply doctor uses for its leftover measurement.
+fn read_view(mut reader: impl std::io::BufRead) -> Asked {
+    use std::io::{BufRead as _, Read as _};
+    const MAX_HEADER_BYTES: u64 = 4096;
+    const MAX_BODY_BYTES: u64 = 4 << 20;
+    let not = |what: &str| Asked::NoView(format!("the running instance {what}"));
     let mut header = String::new();
     if (&mut reader)
         .take(MAX_HEADER_BYTES + 1)
         .read_line(&mut header)
         .is_err()
+        || header.len() as u64 > MAX_HEADER_BYTES
         || !header.ends_with('\n')
         || !header.starts_with("OK ")
-        || !header.contains(" view=left")
+        || !header
+            .split_ascii_whitespace()
+            .any(|word| word == "view=left")
     {
         return not("answered no leftover view");
+    }
+    for state in header
+        .split_ascii_whitespace()
+        .filter_map(|word| word.strip_prefix("state="))
+    {
+        match state {
+            "fresh" => {}
+            "stale" => return not("answered a stale leftover view"),
+            "warming" => return not("has not read its leftover view yet"),
+            _ => return not("answered an unknown leftover-view state"),
+        }
     }
     let mut body = String::new();
     if (&mut reader)
@@ -237,6 +266,7 @@ fn ask_instance_now() -> Asked {
         .read_line(&mut body)
         .is_err()
         || body.len() as u64 > MAX_BODY_BYTES
+        || !body.ends_with('\n')
     {
         return not("did not answer its leftover view");
     }

@@ -14,8 +14,9 @@
 
 use std::collections::BTreeMap;
 
-/// The release channel's GitHub token, `alabsystems`' writer.
-pub const RELEASE_GH_TOKEN: &str = "gh_access_token_alabsystems";
+/// The two GitHub tokens: the development one and the release channel's, `alabsystems`' writer.
+/// Spelled in `aterm_types::vault_entry`, which agh also reads; it links no aterm-secrets.
+pub use aterm_types::vault_entry::{DEV_GH_TOKEN, RELEASE_GH_TOKEN};
 
 /// The notary credential the release subscriber consumes.
 pub const NOTARY: &str = "release-notary";

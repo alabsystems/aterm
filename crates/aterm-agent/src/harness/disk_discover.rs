@@ -1210,10 +1210,26 @@ fn worktree_root(dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// The linked worktrees of the main checkout `repo` that stand, as its `.git/worktrees/*/gitdir`
+/// files name them: at most [`MAX_CHILDREN`] registrations read, at most [`MAX_WORKTREES`]
+/// worktrees kept ([`placed_worktrees`]).
 fn worktrees(repo: &Path, homes: &[&Path]) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(repo.join(".git").join("worktrees")) else {
         return Vec::new();
     };
+    placed_worktrees(
+        rd.flatten()
+            .take(MAX_CHILDREN)
+            .filter_map(|e| small_text(&e.path().join("gitdir")))
+            .map(|t| PathBuf::from(t.trim())),
+        homes,
+    )
+}
+
+/// The worktrees `gitdirs` (each a registration's `gitdir`, the worktree's `.git`) name that
+/// stand in a place a pass looks into, each once, at most [`MAX_WORKTREES`]: the bound applies
+/// after the filter, so registrations whose worktree is gone never hide one that stands.
+fn placed_worktrees(gitdirs: impl Iterator<Item = PathBuf>, homes: &[&Path]) -> Vec<PathBuf> {
     let placed = |p: &Path| {
         p.is_absolute()
             && !p
@@ -1223,15 +1239,52 @@ fn worktrees(repo: &Path, homes: &[&Path]) -> Vec<PathBuf> {
                 .iter()
                 .all(|home| checkout::never_looked_at(p, Some(home)).is_none())
     };
-    let mut out: Vec<PathBuf> = rd
-        .flatten()
-        .take(MAX_WORKTREES)
-        .filter_map(|e| small_text(&e.path().join("gitdir")))
-        .map(|t| PathBuf::from(t.trim()))
+    let mut out: Vec<PathBuf> = gitdirs
         .filter(|p| placed(p))
         .filter_map(|p| p.parent().map(Path::to_path_buf))
         .filter(|wt| std::fs::symlink_metadata(wt).is_ok_and(|m| m.is_dir()))
         .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_WORKTREES);
+    out
+}
+
+/// Every linked worktree of a main checkout among `home`'s children, with that checkout:
+/// `(checkout, worktree)`. A child counts when it is a folder (not a link, not hidden, not one
+/// [`HOME_SKIP`] names) holding a `.git` folder; its worktrees are those its registrations name
+/// that stand ([`worktrees`]), and those an interrupted removal holds a receipt for
+/// (`atpkg::build_cache::retired::retiring`), whose folder may be gone.
+#[must_use]
+pub fn linked_worktrees(home: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let Ok(home) = std::fs::canonicalize(home) else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(&home) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for e in rd.flatten().take(MAX_CHILDREN) {
+        let name = e.file_name();
+        if name.to_string_lossy().starts_with('.') || home_skipped(&name) {
+            continue;
+        }
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let child = e.path();
+        if !std::fs::symlink_metadata(child.join(".git")).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        for wt in worktrees(&child, &[&home]) {
+            out.push((child.clone(), wt));
+        }
+        for wt in atpkg::build_cache::retired::retiring(&child) {
+            if !out.iter().any(|(c, w)| *c == child && *w == wt) {
+                out.push((child.clone(), wt));
+            }
+        }
+    }
     out.sort();
     out.dedup();
     out

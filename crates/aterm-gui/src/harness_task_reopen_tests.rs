@@ -838,7 +838,7 @@ fn a_self_claims_face_stands_across_its_own_reexec() {
 
 /// THE PROGRAM'S OWN REPORTS ARE ITS WORK (§11.2.3's floor, `END_WORK_MS`): aterm's reader reads
 /// no phase from codex-alab's screen (`agent=unknown`), so the A/B book charges the turns its OSC
-/// 7501 reports say, and a landing after 40 s of them is an end, a Done for you row's; one after
+/// 7501 reports say, and a landing after 40 s of them is an end (`end_unseen`); one after
 /// 8 s is none.
 #[test]
 fn a_self_claims_reported_work_past_the_floor_makes_its_landing_an_end() {

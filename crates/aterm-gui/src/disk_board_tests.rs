@@ -577,3 +577,172 @@ fn a_session_spelled_long_reads_its_volumes_row_while_it_reports_it() {
     assert_eq!(free(&b, 7, short), None, "the oldest went");
     assert_eq!(free(&b, 100, short), Some(9 << 30));
 }
+
+/// A sizing of the volume `key`: 926 GiB, 779 GiB used, at least 381 GiB of it rebuildable,
+/// ended at unix second `at`.
+fn sizing(key: &VolumeKey, at: i64) -> Sizing {
+    Sizing {
+        volume: key.spelled(),
+        total: 926 * GIB,
+        used: 779 * GIB,
+        sized: aterm_agent::harness::disk::Rebuildable {
+            bytes: 381 * GIB,
+            partial: true,
+        },
+        sized_unix: at,
+    }
+}
+
+/// THE BUDGET READS ON ITS OWN VOLUME ALONE: the volume the watch sizes reads the sizing's
+/// figures with its age; another volume, one with no row and a process that sizes none read
+/// not sampled, whatever the cap; before a watching process's first look, and on its volume
+/// before a sizing, it reads warming; and a clock that is unread or reads before the sizing
+/// gives an age of 0, never a wrapped one.
+#[test]
+fn the_budget_reads_on_its_own_volume_alone() {
+    let home = VolumeKey::Container("disk3".to_owned());
+    let other = VolumeKey::Container("disk7".to_owned());
+    let mut b = Board::new();
+    assert_eq!(
+        b.budget_read(Some(&home), Some(2_800)),
+        BudgetRead::NotSampled
+    );
+    b.watched = true;
+    assert_eq!(b.budget_read(Some(&home), Some(2_800)), BudgetRead::Warming);
+    b.budget_look(Cap::Written(466), Some(home.spelled()));
+    assert_eq!(b.budget_read(Some(&home), Some(2_800)), BudgetRead::Warming);
+    b.budget_sized(sizing(&home, 1_000));
+    let facts = BudgetFacts {
+        cap: 466 * GIB,
+        cap_written: true,
+        kept: 398 * GIB,
+        target: 68 * GIB,
+        rebuildable: 381 * GIB,
+        partial: true,
+        sized_s: 1_800,
+    };
+    assert_eq!(
+        b.budget_read(Some(&home), Some(2_800)),
+        BudgetRead::Sized(facts)
+    );
+    assert_eq!(
+        b.budget_read(Some(&other), Some(2_800)),
+        BudgetRead::NotSampled
+    );
+    assert_eq!(b.budget_read(None, Some(2_800)), BudgetRead::NotSampled);
+    let fresh = BudgetRead::Sized(BudgetFacts {
+        sized_s: 0,
+        ..facts
+    });
+    assert_eq!(b.budget_read(Some(&home), None), fresh);
+    assert_eq!(b.budget_read(Some(&home), Some(900)), fresh);
+
+    // The key is read before the switch: off on the sized volume, not sampled elsewhere.
+    b.budget_look(Cap::Off, Some(home.spelled()));
+    assert_eq!(b.budget_read(Some(&home), Some(2_800)), BudgetRead::Off);
+    assert_eq!(
+        b.budget_read(Some(&other), Some(2_800)),
+        BudgetRead::NotSampled
+    );
+
+    // A process that is not the account's own watch sizes nothing and says so.
+    b.budget_look(Cap::Written(466), None);
+    assert_eq!(
+        b.budget_read(Some(&home), Some(2_800)),
+        BudgetRead::NotSampled
+    );
+
+    // A sizing of another volume is not this one's.
+    b.budget_look(Cap::Written(466), Some(other.spelled()));
+    assert_eq!(
+        b.budget_read(Some(&other), Some(2_800)),
+        BudgetRead::Warming
+    );
+}
+
+/// A CAP EDIT MOVES THE BUDGET WITHOUT A WALK, AND THE LATER SIZING STANDS: the stored sizing
+/// gives its budget under the cap each look reads, so an unwritten cap reads the volume's
+/// share, a cap that turns the budget off keeps the sizing, and the cap written again reads the
+/// first figures back; an older record read after a newer sizing does not replace it.
+#[test]
+fn a_cap_edit_moves_the_budget_without_a_walk() {
+    let home = VolumeKey::Container("disk3".to_owned());
+    let mut b = Board::new();
+    b.budget_look(Cap::Written(466), Some(home.spelled()));
+    b.budget_sized(sizing(&home, 1_000));
+    let first = b.budget_read(Some(&home), Some(1_000));
+
+    b.budget_look(Cap::Unwritten, Some(home.spelled()));
+    let share = (926 * GIB / 100) * 80;
+    let BudgetRead::Sized(unwritten) = b.budget_read(Some(&home), Some(1_000)) else {
+        panic!("an unwritten cap still reads a budget");
+    };
+    assert_eq!((unwritten.cap, unwritten.cap_written), (share, false));
+    assert_eq!(unwritten.kept, 398 * GIB);
+    assert_eq!(unwritten.target, share - 398 * GIB);
+    assert_eq!(unwritten.rebuildable, 381 * GIB);
+
+    b.budget_look(Cap::Off, Some(home.spelled()));
+    assert_eq!(b.budget_read(Some(&home), Some(1_000)), BudgetRead::Off);
+    assert!(
+        b.budget.is_some(),
+        "the sizing is kept while the budget is off"
+    );
+
+    b.budget_look(Cap::Written(466), Some(home.spelled()));
+    assert_eq!(b.budget_read(Some(&home), Some(1_000)), first);
+    assert!(matches!(first, BudgetRead::Sized(f) if f.cap == 466 * GIB && f.cap_written));
+
+    b.budget_sized(sizing(&home, 500));
+    assert_eq!(
+        b.budget.as_ref().map(|s| s.sized_unix),
+        Some(1_000),
+        "older"
+    );
+    b.budget_sized(sizing(&home, 4_600));
+    assert_eq!(
+        b.budget.as_ref().map(|s| s.sized_unix),
+        Some(4_600),
+        "newer"
+    );
+}
+
+/// A BOARD WITH A VOLUME FAR OVER ITS BUDGET SAYS WHAT IT SAID WITHOUT ONE: `status disk=`'s
+/// fields and the Stats Deck's facts for the home volume are the same with no budget, with one
+/// 313 GiB over and with the budget off. CONTROL: a lower free figure moves both, so the
+/// comparison can fail.
+#[test]
+fn a_board_over_its_budget_says_disk_ok_in_status_and_on_the_deck() {
+    let home = VolumeKey::Container("disk3".to_owned());
+    let mut b = Board::new();
+    b.watched = true;
+    b.volumes.push(measured(
+        "/System/Volumes/Data",
+        home.clone(),
+        900 * GIB,
+        1 << 30,
+    ));
+    b.sessions.insert(7, 0);
+    let at = Instant::now();
+    let now = clock(UTC_MIDNIGHT + 37_800);
+    let said = |b: &Board| (b.status_words(7, None, at), b.deck_facts(&home, &now));
+    let plain = said(&b);
+    assert!(plain.0.starts_with("disk=ok "), "{}", plain.0);
+    assert_eq!(plain.1.level, Some(Level::Ok));
+
+    b.budget_look(Cap::Written(466), Some(home.spelled()));
+    b.budget_sized(sizing(&home, UTC_MIDNIGHT));
+    assert!(matches!(
+        b.budget_read(Some(&home), now.unix),
+        BudgetRead::Sized(f) if f.rebuildable > f.target
+    ));
+    assert_eq!(said(&b), plain, "over its budget");
+    b.budget_look(Cap::Off, Some(home.spelled()));
+    assert_eq!(said(&b), plain, "the budget off");
+
+    // CONTROL: the board's own reading moves what it says.
+    b.volumes[0] = measured("/System/Volumes/Data", home.clone(), 40 * GIB, 1 << 30);
+    let low = said(&b);
+    assert_ne!(low.0, plain.0);
+    assert_ne!(low.1, plain.1);
+}

@@ -442,22 +442,34 @@ pub enum LoginHalf {
         /// The forecast end.
         end: i64,
     },
-    /// Ended, at `at` where it is known.
+    /// Its forecast end has passed, at `at`, with no word yet that it is signed out.
     Ended {
+        /// When.
+        at: Option<i64>,
+    },
+    /// The row has no login to run on here: none was made on this Mac, or the one made is
+    /// signed out ([`accounts::login_here`]), since `at` where a record says when.
+    SignedOut {
         /// When.
         at: Option<i64>,
     },
 }
 
 impl LoginHalf {
-    /// The half of `row`'s stored login here at `now`, from its records
-    /// ([`accounts::signed_out_here`], [`accounts::login_forecast`]).
+    /// The half of `row`'s stored login here at `now`: the one reading of its login here
+    /// ([`accounts::login_here`], with `enrolled` whether one was made on this Mac), which the
+    /// accounts report's row says in the same word, then its records' forecast
+    /// ([`accounts::login_forecast`]).
     #[must_use]
-    pub fn of_row(row: &Row, logins: &Logins, state: &State, now: i64) -> Self {
-        if accounts::signed_out_here(row, state) {
-            return Self::Ended {
-                at: accounts::login_ended_at(row, logins, state),
-            };
+    pub fn of_row(row: &Row, logins: &Logins, state: &State, enrolled: bool, now: i64) -> Self {
+        match accounts::login_here(row, state, enrolled) {
+            accounts::LoginHere::NotMade => return Self::SignedOut { at: None },
+            accounts::LoginHere::SignedOut => {
+                return Self::SignedOut {
+                    at: accounts::login_ended_at(row, logins, state),
+                };
+            }
+            accounts::LoginHere::In => {}
         }
         match accounts::login_forecast(row, logins, state) {
             Some(end) if end <= now => Self::Ended { at: Some(end) },
@@ -466,7 +478,7 @@ impl LoginHalf {
         }
     }
 
-    /// The half's word in the pair.
+    /// The half's word in the pair and in the report.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -474,6 +486,7 @@ impl LoginHalf {
             Self::Ok => "ok",
             Self::Ending { .. } => "ending",
             Self::Ended { .. } => "ended",
+            Self::SignedOut { .. } => accounts::LoginHere::SIGNED_OUT,
         }
     }
 
@@ -482,7 +495,7 @@ impl LoginHalf {
     pub const fn since(self) -> Option<i64> {
         match self {
             Self::Ending { end } => Some(end - ENDING_S),
-            Self::Ended { at } => at,
+            Self::Ended { at } | Self::SignedOut { at } => at,
             Self::InUse | Self::Ok => None,
         }
     }
@@ -1080,11 +1093,12 @@ pub fn build(inputs: &Inputs<'_>) -> AccountCard {
             None => (None, JournalHeld::Silent),
         },
     };
+    // Only a row whose login was made here has a half; it may still read signed out.
     let login = who
         .label()
         .filter(|label| inputs.enrolled.contains(*label))
         .and_then(|label| roster.row(label))
-        .map(|row| LoginHalf::of_row(row, inputs.logins, state, now));
+        .map(|row| LoginHalf::of_row(row, inputs.logins, state, true, now));
     let history = match (&inputs.history, inputs.cli) {
         (_, cli) if cli != Cli::Claude => Arc::new(History::none(HistoryFrom::NotKept)),
         (HistoryIn::Kept(kept), _) => or_the_journals(Arc::clone(kept), seen, now),

@@ -196,7 +196,9 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "`needs_n=` counts a harness's needs (`meta set harness_needs`) and any its \
                      entry's `(+N more)` counts. Debug builds also write `needs_told=` after \
-                     `needs_n=`, and `end= end_seen= end_cheered=` after `landed_repo=`.",
+                     `needs_n=`, and `end= end_seen= end_cheered= done_unseen=` after `landed_repo=` \
+                     (`done_unseen=1` while the session holds a done or an end nobody looked \
+                     at, in front or behind).",
                 ),
             ],
         },

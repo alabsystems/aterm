@@ -143,6 +143,7 @@ pub mod source_exec_journal;
 pub use native_launch::{
     FixtureStage as NativeLauncherFixtureStage, fixture_entry as native_launcher_fixture_entry,
 };
+mod fleet_session;
 #[cfg(all(test, target_os = "macos"))]
 mod native_launch_tests;
 pub mod native_observe;
@@ -173,6 +174,8 @@ pub mod session_usage;
 #[cfg(unix)]
 pub mod setup_token;
 pub(crate) mod sign_in_ladder;
+#[cfg(target_os = "macos")]
+mod signin_window;
 pub mod source;
 pub mod spend;
 pub(crate) use aterm_uds::sqlite_read;

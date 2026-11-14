@@ -64,6 +64,8 @@ fn here(standing: Standing) -> Here {
         pointer: PathBuf::from(r"C:\scratch\aterm\dist\latest.json"),
         installed: None,
         blocked: None,
+        origin: Origin::Local,
+        channel: None,
     }
 }
 
@@ -239,6 +241,51 @@ fn the_build_number_orders_the_staged_build_against_the_running_copy() {
         classify(RUNNING, None, Ok(Some(renamed.clone()))),
         Standing::Older(renamed)
     );
+}
+
+/// The local build loop's build and the release channel's: the higher build number, the local
+/// one on a tie, and a failed smoke test hides no channel build.
+#[test]
+fn the_newer_of_the_two_lanes_builds_is_weighed() {
+    let channel_build = |build| {
+        let mut staged = staged(build, Smoke::NotRun);
+        staged.dir =
+            PathBuf::from(r"C:\Users\someone\AppData\Local\aterm\update\channel\0123456789ab");
+        staged
+    };
+    let local = |build, smoke| Ok(Some(staged(build, smoke)));
+    assert_eq!(
+        pick(local(102, Smoke::Pass), Some(channel_build(101))),
+        (local(102, Smoke::Pass), Origin::Local)
+    );
+    assert_eq!(
+        pick(local(101, Smoke::Pass), Some(channel_build(101))),
+        (local(101, Smoke::Pass), Origin::Local),
+        "a tie is one commit's build: the one this machine smoke-tested stands"
+    );
+    assert_eq!(
+        pick(local(100, Smoke::NotRun), Some(channel_build(101))),
+        (Ok(Some(channel_build(101))), Origin::Channel)
+    );
+    assert_eq!(
+        pick(local(105, Smoke::Fail), Some(channel_build(101))),
+        (Ok(Some(channel_build(101))), Origin::Channel),
+        "a local build that failed its smoke test hides no release"
+    );
+    for absent in [Ok(None), Err("not JSON".to_string())] {
+        assert_eq!(
+            pick(absent, Some(channel_build(101))),
+            (Ok(Some(channel_build(101))), Origin::Channel)
+        );
+    }
+    // With no channel build, the local pointer stands as read, its faults included.
+    for read in [
+        local(105, Smoke::Fail),
+        Ok(None),
+        Err("not JSON".to_string()),
+    ] {
+        assert_eq!(pick(read.clone(), None), (read, Origin::Local));
+    }
 }
 
 /// A staged build is offered only while it is not what is installed on disk. The window that
@@ -737,15 +784,15 @@ fn the_control_line_s_quoted_fields_survive_an_unescaping_reader() {
 fn the_installer_is_run_staged_into_the_running_copy_s_folder() {
     let build = staged(101, Smoke::Pass);
     let dest = Path::new(r"C:\Users\someone\AppData\Local\Programs\aterm");
-    let args = |mode| -> Vec<String> {
-        installer_args(&build, dest, mode)
+    let args = |mode, origin| -> Vec<String> {
+        installer_args(&build, dest, mode, origin)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
     };
     let installer = build.installer().display().to_string();
     assert_eq!(
-        args(ApplyMode::Staged),
+        args(ApplyMode::Staged, Origin::Local),
         [
             "-NoProfile",
             "-ExecutionPolicy",
@@ -759,9 +806,28 @@ fn the_installer_is_run_staged_into_the_running_copy_s_folder() {
             "-NoPath",
         ]
     );
-    let restart = args(ApplyMode::Restart);
+    let restart = args(ApplyMode::Restart, Origin::Local);
     assert!(restart.contains(&"-Restart".to_string()), "{restart:?}");
     assert!(!restart.contains(&"-Staged".to_string()), "{restart:?}");
+    // A release's installer is told it updates an install that exists; a local dist's, which
+    // may predate the switch, is not.
+    assert_eq!(
+        args(ApplyMode::Staged, Origin::Channel),
+        [
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            installer.as_str(),
+            "-Staged",
+            "-Update",
+            "-Dest",
+            r"C:\Users\someone\AppData\Local\Programs\aterm",
+            "-NoShortcuts",
+            "-NoPath",
+        ]
+    );
+    assert!(!restart.contains(&"-Update".to_string()), "{restart:?}");
 }
 
 #[test]
@@ -907,6 +973,37 @@ fn apply_installs_only_over_an_install_folder() {
         Ok(beside.clone())
     );
 
+    // Nor a dist folder of the other lane: a copy run from the local build loop's dist, with the
+    // release channel's build staged, and the reverse. Neither downloads by itself.
+    let channel_root = scratch.join("aterm").join("update").join("channel");
+    let mut release = staged(102, Smoke::NotRun);
+    release.dir = channel_root.join("cafecafecafe");
+    std::fs::create_dir_all(&release.dir).unwrap();
+    let why = install_dest(&kept.join("aterm.exe"), &release).unwrap_err();
+    assert!(why.contains("a staged dist folder"), "{why}");
+    let previous = channel_root.join("0ff1ce0ff1ce");
+    std::fs::create_dir_all(&previous).unwrap();
+    let why = install_dest(&previous.join("aterm.exe"), &build).unwrap_err();
+    assert!(why.contains("a staged dist folder"), "{why}");
+    for lane_copy in [&kept, &previous, &build.dir, &release.dir] {
+        assert!(
+            !runs_from_an_install(&lane_copy.join("aterm.exe")),
+            "{}",
+            lane_copy.display()
+        );
+    }
+    assert!(runs_from_an_install(&install.join("aterm.exe")));
+    assert!(runs_from_an_install(&beside.join("aterm.exe")));
+    assert!(!runs_from_an_install(&target.join("aterm.exe")));
+    // The control: a commit-named folder outside both lanes is an install.
+    let elsewhere = scratch.join("tools").join("cafecafecafe");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    assert_eq!(
+        install_dest(&elsewhere.join("aterm.exe"), &release),
+        Ok(elsewhere.clone())
+    );
+    assert!(runs_from_an_install(&elsewhere.join("aterm.exe")));
+
     // Nor an MSIX package, which only Windows can replace; the folder's case is Windows'.
     for apps in ["WindowsApps", "windowsapps"] {
         let package = scratch
@@ -984,4 +1081,103 @@ fn the_watch_tells_each_change_once_and_withdraws_what_is_no_longer_offered() {
             .all(|period| *period >= Duration::from_secs(600)),
         "the window reads the pointer no more often than every ten minutes: {waits:?}"
     );
+}
+
+/// THE FLEET IS TOLD WHAT `aterm update status` SAYS HERE: a Windows copy's fleet standing is
+/// decided by the staged build's standing its status lines are said by, never `off`, which told
+/// the fleet "does not update itself" while a window offered, or waited to restart onto, a staged
+/// build. Each standing pairs with the status line it stands beside: a staged build `apply`
+/// installs is downloaded; one it will not (a failed smoke test, a copy it cannot install over)
+/// is not installing; one laid under the window is installed; the newest or an older staged build
+/// is current; an unstamped copy cannot update itself; no pointer is unchecked and one that cannot
+/// be read unread. Only the staged build's version is named: no folder, commit or reason.
+/// NEGATIVE CONTROL: a `Here::fleet_fact` that says `off`, as Windows did, fails "a staged build
+/// apply installs".
+#[test]
+fn the_fleet_is_told_the_staged_builds_standing_as_status_says_it() {
+    let blocked = |standing: Standing| Here {
+        blocked: Some(format!("this copy is an MSIX package ({DIR})")),
+        ..here(standing)
+    };
+    for (here, standing, to, said) in [
+        (
+            here(Standing::Newer(staged(101, Smoke::Pass))),
+            UpdateStanding::Downloaded,
+            Some("0.200.0"),
+            "`aterm update apply` installs it",
+        ),
+        (
+            here(Standing::Differs(staged(100, Smoke::NotRun))),
+            UpdateStanding::Downloaded,
+            Some("0.200.0"),
+            "`aterm update apply` installs it",
+        ),
+        (
+            here(Standing::Newer(staged(101, Smoke::Fail))),
+            UpdateStanding::NotInstalling,
+            Some("0.200.0"),
+            "smoke test failed",
+        ),
+        (
+            blocked(Standing::Newer(staged(101, Smoke::Pass))),
+            UpdateStanding::NotInstalling,
+            Some("0.200.0"),
+            "cannot install it",
+        ),
+        (
+            here(Standing::Installed(staged(101, Smoke::Pass))),
+            UpdateStanding::Installed,
+            Some("0.200.0"),
+            "restart aterm",
+        ),
+        (
+            here(Standing::Same(staged(100, Smoke::Pass))),
+            UpdateStanding::Current,
+            None,
+            "aterm is current",
+        ),
+        (
+            here(Standing::Older(staged(99, Smoke::Pass))),
+            UpdateStanding::Current,
+            None,
+            "aterm is current",
+        ),
+        (
+            here(Standing::Unstamped(staged(101, Smoke::Pass))),
+            UpdateStanding::Cannot,
+            None,
+            "carries no build number",
+        ),
+        (
+            here(Standing::Absent),
+            UpdateStanding::Unchecked,
+            None,
+            "no staged build",
+        ),
+        (
+            here(Standing::Unreadable(format!("schema 2 at {DIR}"))),
+            UpdateStanding::Unread,
+            None,
+            "can\u{2019}t read the staged build pointer",
+        ),
+    ] {
+        let lines = status_lines(RUNNING, &here).join("\n");
+        assert!(
+            lines.contains(said),
+            "{standing:?} beside {said:?}: {lines}"
+        );
+        let fact = here.fleet_fact();
+        assert_eq!(
+            (fact.standing.known(), fact.to.as_deref()),
+            (Some(standing), to),
+            "a staged build apply installs, and each other standing: {here:?}"
+        );
+        let words = fact.tokens();
+        assert!(
+            !words.contains("someone")
+                && !words.contains("0123456789ab")
+                && !words.contains("MSIX"),
+            "no folder, commit or reason: {words}"
+        );
+    }
 }

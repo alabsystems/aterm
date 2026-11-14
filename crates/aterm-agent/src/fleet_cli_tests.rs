@@ -22,6 +22,7 @@ fn every_mode_word_routes_to_its_one_answer() {
     ] {
         assert_eq!(route(Some(word)), Route::Membership, "{word}");
     }
+    assert_eq!(route(Some("activity")), Route::Activity);
     for mode in [
         "events",
         "exec",
@@ -55,6 +56,11 @@ fn help_succeeds_and_a_refused_word_is_a_usage_error() {
         &["remove"],
         &["admit"],
         &["invite", "x"],
+        &["activity", "--since"],
+        &["activity", "--since", "soon"],
+        &["activity", "--since", "5s"],
+        &["activity", "--json", "--json"],
+        &["activity", "extra"],
     ] {
         assert_eq!(exit(args), ExitCode::from(2), "{args:?}");
     }

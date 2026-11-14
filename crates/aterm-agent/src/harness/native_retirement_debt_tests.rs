@@ -138,6 +138,10 @@ fn unadmitted_reply(st: &mut St) -> Result<Recovery, &'static str> {
     recover_reply(st, Reply::Unadmitted("ab".repeat(16)))
 }
 
+fn closed_reply(st: &mut St) -> Option<Recovery> {
+    terminal_reply(st, &Reply::Closed("ab".repeat(16)))
+}
+
 pub(super) fn transition(state: &State, action: &str) -> State {
     let mut asked = state["asked"] == 1;
     let mut st = if asked {
@@ -145,7 +149,9 @@ pub(super) fn transition(state: &State, action: &str) -> State {
     } else {
         baseline(state["bound"] == 1)
     };
-    if state["kept"] == 0 && state["observed"] == 0 && state["finished"] == 0 {
+    if state["closed"] == 1 {
+        assert_eq!(closed_reply(&mut st), Some(Recovery::Closed));
+    } else if state["kept"] == 0 && state["observed"] == 0 && state["finished"] == 0 {
         assert_eq!(unadmitted_reply(&mut st), Ok(Recovery::Unadmitted));
     }
     if state["held"] == 1 {
@@ -215,6 +221,7 @@ pub(super) fn transition(state: &State, action: &str) -> State {
             }
             assert_eq!(lapsed_reply(&mut st), Ok(Recovery::Lapsed));
         }
+        "Closed" => assert_eq!(closed_reply(&mut st), Some(Recovery::Closed)),
         _ => unreachable!("unmapped model action"),
     }
     let mut next = state.clone();
@@ -240,6 +247,12 @@ pub(super) fn transition(state: &State, action: &str) -> State {
         "finished",
         i64::from(!matches!(st.phase, Phase::Exiting { .. })),
     );
+    // Input history, as `observed` is: the watch bit alone would make its law vacuous.
+    next.insert(
+        "closed",
+        i64::from(state["closed"] == 1 || action == "Closed"),
+    );
+    next.insert("watch", i64::from(st.native_closed.is_some()));
     next
 }
 
@@ -317,6 +330,27 @@ fn retirement_debt_model_catches_an_unadmitted_clear_of_a_binding_or_a_hold() {
         Err("native-unknown")
     );
     assert_eq!(st, baseline(false));
+}
+
+#[test]
+fn retirement_debt_model_catches_a_closed_answer_that_leaves_no_watch() {
+    let model = aterm_models_harness::native_retirement_debt_model();
+    for bound in [false, true] {
+        let mut st = baseline(bound);
+        assert_eq!(closed_reply(&mut st), Some(Recovery::Closed));
+        assert!(
+            st.native_closed.is_some(),
+            "the real answer keeps its watch"
+        );
+        // Negative control: the answer's clear without its watch, today's lapse-like drop.
+        st.native_closed = None;
+        let mut bad = model.init_state();
+        bad.insert("bound", i64::from(st.native.is_some()));
+        bad.insert("kept", i64::from(unchanged(&st, bound)));
+        bad.insert("closed", 1);
+        bad.insert("watch", i64::from(st.native_closed.is_some()));
+        assert!(!model.check_invariant("ClosedLeavesAWatch", &bad));
+    }
 }
 
 #[test]

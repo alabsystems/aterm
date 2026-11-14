@@ -812,7 +812,7 @@ fn run_window_fleet_relay() {
                 content,
                 drive,
                 peer,
-            } => crate::control::attach_fleet_connection(stream, (content, drive), peer),
+            } => crate::control::attach_fleet_connection(stream, (content, drive), peer, None),
             RelayHeader::Drive {
                 driver,
                 key,
@@ -5821,13 +5821,20 @@ fn serve_one_node_generation(
                     "[fleet] lowered its level while it was admitted",
                 ));
             };
+            let reader = crate::fleet_activity::Reader::of(served.peer_node());
             if has_live_window_relay(windows.dir()) {
                 let header = RelayHeader::Survey {
                     content,
                     drive,
                     peer,
                 };
-                spawn_node_survey(near, windows.clone(), header, Arc::clone(&open))?;
+                spawn_node_survey(
+                    near,
+                    windows.clone(),
+                    header,
+                    Arc::clone(&open),
+                    (state_dir.clone(), reader),
+                )?;
             } else {
                 spawn_windowless_survey(
                     near,
@@ -5835,6 +5842,7 @@ fn serve_one_node_generation(
                     home_dir.clone(),
                     config_path.clone(),
                     (content, drive),
+                    reader,
                 )?;
             }
             served.relay_answers(far)
@@ -5901,7 +5909,7 @@ fn push_node_facts_heartbeat(
         None
     }
     .unwrap_or_else(|| {
-        aterm_agent::survey_facts::SwarmSurveyFacts::collect_at(
+        let mut facts = aterm_agent::survey_facts::SwarmSurveyFacts::collect_at(
             state_dir,
             home_dir,
             config_path,
@@ -5909,7 +5917,9 @@ fn push_node_facts_heartbeat(
             window,
             node,
             now_s,
-        )
+        );
+        facts.update = Some(crate::survey::updater_fact());
+        facts
     });
     let at_ms = aterm_time::unix_millis().unwrap_or(0);
     let host = aterm_uds::process::lan_host_name();
@@ -5946,6 +5956,7 @@ fn spawn_node_survey(
     windows: WindowRelays,
     header: RelayHeader,
     open: Arc<NodeOpened>,
+    (state_dir, reader): (PathBuf, Option<crate::fleet_activity::Reader>),
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("aterm-node-survey".to_owned())
@@ -5984,6 +5995,13 @@ fn spawn_node_survey(
                     }
                     break;
                 }
+                // The session that asked, where the line names one: this job notes its read, and
+                // hands each window the line without the word, which a window of an aterm from
+                // before it would answer with its usage.
+                let rest = line.trim_start().strip_prefix("survey").unwrap_or_default();
+                let asker = aterm_types::fleet_activity::survey_asker(rest).map(str::to_owned);
+                let line = aterm_types::fleet_activity::survey_unmarked(line.trim_end())
+                    .map_or(line, |plain| format!("{plain}\n"));
                 let answer = match survey_every_window(&windows, &header, &line) {
                     WindowsSurveyed::Answered(answer) => answer,
                     WindowsSurveyed::Untaken(why) => {
@@ -5995,6 +6013,12 @@ fn spawn_node_survey(
                 };
                 if near.write_all(answer.as_bytes()).is_err() || near.flush().is_err() {
                     break;
+                }
+                if answer.starts_with("OK ") {
+                    crate::fleet_activity::note_in(
+                        &state_dir,
+                        crate::fleet_activity::surveyed(reader.as_ref(), asker.as_deref()),
+                    );
                 }
             }
             let _ = near.flush();
@@ -6034,6 +6058,7 @@ fn spawn_windowless_survey(
     home_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
     (content, drive): (bool, bool),
+    reader: Option<crate::fleet_activity::Reader>,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("aterm-node-survey".to_owned())
@@ -6094,7 +6119,7 @@ fn spawn_windowless_survey(
                         let now_s = aterm_time::unix_secs()
                             .and_then(|s| i64::try_from(s).ok())
                             .unwrap_or(0);
-                        let facts = aterm_agent::survey_facts::SwarmSurveyFacts::collect_at(
+                        let mut facts = aterm_agent::survey_facts::SwarmSurveyFacts::collect_at(
                             &state_dir,
                             home_dir.as_deref(),
                             config_path.as_deref(),
@@ -6103,6 +6128,7 @@ fn spawn_windowless_survey(
                             node,
                             now_s,
                         );
+                        facts.update = Some(crate::survey::updater_fact());
                         let here = crate::survey::Here {
                             host: aterm_uds::process::lan_host_name(),
                             instances: 0,
@@ -6119,6 +6145,17 @@ fn spawn_windowless_survey(
                         );
                         if near.write_all(reply.as_bytes()).is_err() {
                             break;
+                        }
+                        // A survey a session asked for is that session's read of this Mac.
+                        if reply.starts_with("OK ") {
+                            let _ = near.flush();
+                            crate::fleet_activity::note_in(
+                                &state_dir,
+                                crate::fleet_activity::surveyed(
+                                    reader.as_ref(),
+                                    aterm_types::fleet_activity::survey_asker(rest),
+                                ),
+                            );
                         }
                     }
                     _ => {
@@ -6195,17 +6232,44 @@ fn spawn_node_drive(
             // kind against this Mac's stored level. A line with no kind is no act the lock
             // names, and whoever serves it refuses it in its own words.
             let kind = crate::control::drive_kind_of_line(trimmed);
-            if let Ok(kind) = kind
-                && let Some(refusal) = crate::control::drive_locked(node_access(&state_dir), kind)
-            {
-                note_refused_driver(
-                    peer,
-                    &format!("{} driving `{}`: fleet access", driver.host, kind.word()),
+            // The fleet activity record's row of this first line, where this job ends or serves
+            // it: a line it relays is the window's to note, which judges it again. A read no
+            // session asked for has no row, and neither has a fleet service's line (the
+            // vault's, service-repair's, accounts-renew's), whose client is aterm itself.
+            let note = |kind: DriveKind, outcome| {
+                crate::fleet_activity::note_in(
+                    &state_dir,
+                    crate::fleet_activity::driven(&driver, kind, requester.sid(), outcome),
                 );
-                let _ = near.write_all(refusal.as_bytes());
-                let _ = near.flush();
-                aterm_uds::hangup::hang_up(&near);
-                return;
+            };
+            let served = |reply: &str| {
+                if let Ok(kind) = kind
+                    && reply.starts_with("OK")
+                {
+                    note(kind, aterm_types::fleet_activity::Outcome::Admitted);
+                }
+            };
+            if let Ok(kind) = kind {
+                let level = node_access(&state_dir);
+                if let Some(refusal) = crate::control::drive_locked(level, kind) {
+                    note_refused_driver(
+                        peer,
+                        &format!("{} driving `{}`: fleet access", driver.host, kind.word()),
+                    );
+                    let _ = near.write_all(refusal.as_bytes());
+                    let _ = near.flush();
+                    // Every refusal has its row, however many the log line above thins; it is
+                    // handed over once the answer is out.
+                    note(
+                        kind,
+                        aterm_types::fleet_activity::Outcome::Blocked {
+                            level,
+                            needs: kind.needs(),
+                        },
+                    );
+                    aterm_uds::hangup::hang_up(&near);
+                    return;
+                }
             }
             if verb == "vault" {
                 let reply = aterm_secrets::client::admin_service::serve_at(
@@ -6230,6 +6294,7 @@ fn spawn_node_drive(
                 };
                 let _ = near.write_all(reply.as_bytes());
                 let _ = near.flush();
+                served(&reply);
                 aterm_uds::hangup::hang_up(&near);
                 return;
             }
@@ -6278,7 +6343,27 @@ fn spawn_node_drive(
                     return;
                 }
                 DriveRoute::Split(shares) => {
-                    serve_split_await(near, &open, &header, shares, &first_line);
+                    // The wait is one request of this Mac however many windows share it: its
+                    // row is written here, and each window is handed its share naming no
+                    // session ([`unnamed`]), which it counts as no request.
+                    if let (
+                        Ok(kind),
+                        RelayHeader::Drive {
+                            driver, requester, ..
+                        },
+                    ) = (kind, &header)
+                    {
+                        crate::fleet_activity::note_in(
+                            &state_dir,
+                            crate::fleet_activity::driven(
+                                driver,
+                                kind,
+                                requester.sid(),
+                                aterm_types::fleet_activity::Outcome::Admitted,
+                            ),
+                        );
+                    }
+                    serve_split_await(near, &open, &unnamed(&header), shares, &first_line);
                     return;
                 }
                 DriveRoute::Answer(answer) => answer,
@@ -6432,7 +6517,7 @@ fn route_drive(windows: &WindowRelays, header: &RelayHeader, first_line: &str) -
                 .map(|(sid, _)| sid.clone())
                 .collect();
             let path = declined.hosting[at].0.clone();
-            match hand_over(&path, &naming(share.clone()).encode()) {
+            match hand_over(&path, &share_header(&unnamed(header), &share).encode()) {
                 HandOver::Took(stream) => shares.push(AwaitShare {
                     path,
                     stream,
@@ -6691,6 +6776,28 @@ fn read_share_now(
         .map(|()| read_share_reply(&mut stream));
     aterm_uds::hangup::hang_up(&stream);
     read.unwrap_or(ShareReply::HungUp)
+}
+
+/// `header` naming no requester: what a window is handed with its share of a split wait. The
+/// node job wrote the wait's one fleet activity row, so no window counts its share as a
+/// request of its own.
+fn unnamed(header: &RelayHeader) -> RelayHeader {
+    match header.clone() {
+        RelayHeader::Drive {
+            driver,
+            key,
+            peer,
+            sids,
+            ..
+        } => RelayHeader::Drive {
+            driver,
+            key,
+            peer,
+            sids,
+            requester: aterm_types::control_verbs::Requester::default(),
+        },
+        other => other,
+    }
 }
 
 /// `header` naming `sids`: a split wait's share handed over again.
@@ -7091,13 +7198,20 @@ impl LinkServe {
         let Ok(Some(open)) = self.open.admit(content, None, &near, still) else {
             return incoming.refuse("level");
         };
+        let reader = crate::fleet_activity::Reader::of(Some(incoming.peer()));
         let serving = if has_live_window_relay(self.windows.dir()) {
             let header = RelayHeader::Survey {
                 content,
                 drive,
                 peer,
             };
-            spawn_node_survey(near, self.windows.clone(), header, Arc::clone(&open))
+            spawn_node_survey(
+                near,
+                self.windows.clone(),
+                header,
+                Arc::clone(&open),
+                (self.state_dir.clone(), reader),
+            )
         } else {
             spawn_windowless_survey(
                 near,
@@ -7105,6 +7219,7 @@ impl LinkServe {
                 self.home_dir.clone(),
                 self.config_path.clone(),
                 (content, drive),
+                reader,
             )
         };
         if serving.is_err() {

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-bootstrap-verify`: tools/install.sh's Linux verifier ([`aterm_bootstrap_verify`]).
-//! Exit 0 admits (and prints the signed target's line), exit 1 refuses with one line on
-//! stderr.
+//! `aterm-bootstrap-verify`: tools/install.sh's Linux verifier, and on Windows
+//! apps/aterm-win/get-aterm.ps1's ([`aterm_bootstrap_verify`]). Exit 0 admits (and prints the
+//! signed target's line), exit 1 refuses with one line on stderr.
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -25,11 +25,14 @@ fn main() -> ExitCode {
     match said {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
-            // One line, whatever a refusal's words hold: install.sh reads one.
+            #[cfg(windows)]
+            let refused = aterm_bootstrap_verify::WINDOWS_REFUSED;
+            #[cfg(not(windows))]
+            let refused = aterm_bootstrap_verify::REFUSED;
+            // One line, whatever a refusal's words hold: install.sh and get-aterm.ps1 read one.
             let _ = writeln!(
                 std::io::stderr(),
-                "{}{}",
-                aterm_bootstrap_verify::REFUSED,
+                "{refused}{}",
                 why.0.replace(['\r', '\n'], " ")
             );
             ExitCode::from(1)

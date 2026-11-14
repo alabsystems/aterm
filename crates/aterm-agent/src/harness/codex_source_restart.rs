@@ -388,6 +388,7 @@ impl Registry {
                     .collect(),
                 expected_unset: starter.unset,
                 process: None,
+                binding: LaunchBinding::Consumer,
                 typed: true,
                 gate: Some(Arc::new(gate)),
                 _scope: Some(scope),

@@ -1287,7 +1287,7 @@ fn every_reading_of_a_stall_names_the_clock_time_it_was_published_with() {
     let row = {
         let tl = ctx.timeline.lock().unwrap();
         let fact = tl.agent().input.clone().expect("the timeline's stall");
-        menu_row(
+        stall_row(
             &fact,
             tl.agent().program.as_deref(),
             &after_restart(&tl, fact.act.as_ref()),
@@ -1741,15 +1741,15 @@ fn the_memory_row_promises_the_restart_only_on_the_hosts_word() {
 }
 
 #[test]
-fn the_menu_row_is_keyed_by_episode() {
+fn the_stall_row_is_keyed_by_episode() {
     let now = Instant::now();
     let fact = InputStallFact {
         footprint_mb: Some(39_731),
         ..stalled(now.checked_sub(Duration::from_secs(95)).unwrap_or(now))
     };
     let sid = "s-b7cf523445a1b0d8658e";
-    let row = menu_row(&fact, Some("claude"), &own(), sid, now);
-    let later = menu_row(
+    let row = stall_row(&fact, Some("claude"), &own(), sid, now);
+    let later = stall_row(
         &InputStallFact {
             bytes: 9,
             word: InputWord::Stopped,

@@ -919,10 +919,9 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         switching it on is yours.\n\
      \x20                         Later, a grant aterm verified that reads off again (found at\n\
      \x20                         launch, or when macOS shows its \"access data from other apps\"\n\
-     \x20                         dialog for a program of yours) puts one line on aterm's\n\
-     \x20                         menu-bar menu, \"System State: Needs you: Full Disk Access\",\n\
-     \x20                         which opens System State; nothing is filed in Messages, and\n\
-     \x20                         Not now on that step keeps the line dark until Permissions is\n\
+     \x20                         dialog for a program of yours) reads Needs you on System\n\
+     \x20                         State's Full Disk Access row; nothing is filed in Messages, and\n\
+     \x20                         Not now on that step keeps the row quiet until Permissions is\n\
      \x20                         set up again. Off pauses the steps with no answer\n\
      \x20                         recorded, and they go on once it is on again; no key makes\n\
      \x20                         aterm start one.\n\

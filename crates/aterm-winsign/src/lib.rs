@@ -7,7 +7,6 @@
     reason = "never linked into the shipped binary: Authenticode signing behind targo --unverified winsign"
 )]
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -137,7 +136,6 @@ pub trait Host {
     fn is_file(&self, path: &Path) -> bool;
     /// Directory entry names, or empty when the directory cannot be read.
     fn list_dir(&self, path: &Path) -> Vec<String>;
-    fn read_to_string(&self, path: &Path) -> Result<String, String>;
     fn write(&self, path: &Path, text: &str) -> Result<(), String>;
     fn remove_file(&self, path: &Path);
     fn temp_dir(&self) -> PathBuf;
@@ -151,9 +149,6 @@ pub trait Host {
     -> Result<Ran, String>;
     fn is_windows(&self) -> bool;
 }
-
-/// Maximum bytes [`RealHost::read_to_string`] reads from a host file.
-const MAX_HOST_READ_BYTES: u64 = 1024 * 1024;
 
 /// The real machine.
 pub struct RealHost;
@@ -199,86 +194,6 @@ impl Host for RealHost {
                     .collect()
             })
             .unwrap_or_default()
-    }
-    fn read_to_string(&self, path: &Path) -> Result<String, String> {
-        use std::io::Read;
-        #[cfg(any(
-            all(
-                any(target_os = "linux", target_os = "android"),
-                any(
-                    target_arch = "x86",
-                    target_arch = "x86_64",
-                    target_arch = "riscv64",
-                    target_arch = "aarch64",
-                    target_arch = "arm",
-                ),
-            ),
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-        ))]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(OPEN_FLAGS)
-                .open(path)
-                .map_err(|e| format!("{}: {e}", path.display()))?
-        };
-        #[cfg(not(any(
-            all(
-                any(target_os = "linux", target_os = "android"),
-                any(
-                    target_arch = "x86",
-                    target_arch = "x86_64",
-                    target_arch = "riscv64",
-                    target_arch = "aarch64",
-                    target_arch = "arm",
-                ),
-            ),
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-        )))]
-        let file = {
-            let pre =
-                std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            if !pre.file_type().is_file() {
-                return Err(format!("{}: not a regular file", path.display()));
-            }
-            std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?
-        };
-        let meta = file
-            .metadata()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if !meta.is_file() {
-            return Err(format!("{}: not a regular file", path.display()));
-        }
-        if meta.len() > MAX_HOST_READ_BYTES {
-            return Err(format!(
-                "{}: exceeds {MAX_HOST_READ_BYTES}-byte limit",
-                path.display()
-            ));
-        }
-        let mut out =
-            String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
-        let read = file
-            .take(MAX_HOST_READ_BYTES + 1)
-            .read_to_string(&mut out)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if read as u64 > MAX_HOST_READ_BYTES {
-            return Err(format!(
-                "{}: exceeds {MAX_HOST_READ_BYTES}-byte limit",
-                path.display()
-            ));
-        }
-        Ok(out)
     }
     fn write(&self, path: &Path, text: &str) -> Result<(), String> {
         use std::io::Write;
@@ -389,149 +304,65 @@ impl Host for RealHost {
 /// The signing lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lane {
-    /// Azure Trusted Signing.
+    /// Azure Artifact Signing (formerly Trusted Signing).
     TrustedSigning {
         endpoint: String,
         account: String,
         profile: String,
-        /// `Azure.CodeSigning.Dlib.dll`; `None` = find it under the NuGet cache.
-        dlib: Option<PathBuf>,
     },
     /// A certificate already in the user's store, named by SHA-1 thumbprint.
     Thumbprint(String),
 }
 
-/// The keys every source spells the same way: `--<key>`, `ATERM_WINSIGN_<KEY>`,
-/// `winsign_<key> = "…"`.
-const KEYS: &[&str] = &[
-    "lane",
-    "endpoint",
-    "account",
-    "profile",
-    "dlib",
-    "thumbprint",
-    "timestamp",
-    "signtool",
-];
+/// Tier WINDOWS's Lane A identity, committed beside its anchor
+/// (`pins::WINDOWS_SIGNING_PUBLISHER`): the Azure Artifact Signing endpoint, account and
+/// certificate profile, empty until the identity exists. None of the three is a secret; the
+/// plug-in authenticates the Azure principal itself.
+pub const TRUSTED_SIGNING: [&str; 3] = ["", "", ""];
 
-/// Values gathered from one source, keyed by the bare key name.
-pub type Values = BTreeMap<String, String>;
+/// Tier WINDOWS's Lane B identity: the SHA-1 thumbprint of a certificate in
+/// `Cert:\CurrentUser\My`, empty until one exists. A thumbprint is public: every signature
+/// carries it.
+pub const THUMBPRINT: &str = "";
 
-/// Environment values.
-pub fn values_from_env(host: &dyn Host) -> Values {
-    KEYS.iter()
-        .filter_map(|k| {
-            host.env(&format!("ATERM_WINSIGN_{}", k.to_ascii_uppercase()))
-                .map(|v| (k.to_string(), v))
-        })
-        .collect()
+/// The lane the committed identity names.
+///
+/// # Errors
+/// A partial Lane A identity, both lanes pinned, or a thumbprint that is not 40 hex digits.
+pub fn pinned_lane() -> Result<Option<Lane>, String> {
+    lane_from(TRUSTED_SIGNING, THUMBPRINT)
 }
 
-/// Credentials-profile values.
-pub fn values_from_profile(text: &str) -> Result<Values, String> {
-    let mut out = Values::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("not a `key = value` line: {line}"));
-        };
-        let key = key.trim();
-        let Some(bare) = key.strip_prefix("winsign_") else {
-            continue;
-        };
-        if !KEYS.contains(&bare) {
-            return Err(format!(
-                "unknown credentials key `{key}` (known: {})",
-                KEYS.join(", ")
-            ));
-        }
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .ok_or_else(|| format!("{key} must be a quoted string"))?;
-        if value.is_empty() {
-            return Err(format!("{key} is empty"));
-        }
-        out.insert(bare.to_string(), value.to_string());
+fn lane_from(trusted: [&str; 3], thumbprint: &str) -> Result<Option<Lane>, String> {
+    let [endpoint, account, profile] = trusted;
+    let trusted_any = trusted.iter().any(|v| !v.is_empty());
+    if trusted_any && trusted.iter().any(|v| v.is_empty()) {
+        return Err(
+            "TRUSTED_SIGNING pins an endpoint, an account and a profile, all three or none".into(),
+        );
     }
-    Ok(out)
+    if trusted_any && !thumbprint.is_empty() {
+        return Err("both TRUSTED_SIGNING and THUMBPRINT are pinned; one lane signs".into());
+    }
+    if trusted_any {
+        return Ok(Some(Lane::TrustedSigning {
+            endpoint: endpoint.to_owned(),
+            account: account.to_owned(),
+            profile: profile.to_owned(),
+        }));
+    }
+    if thumbprint.is_empty() {
+        return Ok(None);
+    }
+    if thumbprint.len() != 40 || !thumbprint.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "THUMBPRINT is a certificate's 40 hex digits (SHA-1); got `{thumbprint}`"
+        ));
+    }
+    Ok(Some(Lane::Thumbprint(thumbprint.to_ascii_uppercase())))
 }
 
-/// The resolved configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Config {
-    pub lane: Option<Lane>,
-    /// RFC 3161 timestamp server.
-    pub timestamp: Option<String>,
-    /// An explicit `signtool.exe`.
-    pub signtool: Option<PathBuf>,
-}
-
-/// Merge sources in precedence order (first wins) and validate the shape.
-pub fn resolve_config(sources: &[&Values]) -> Result<Config, String> {
-    let get = |key: &str| -> Option<String> { sources.iter().find_map(|s| s.get(key).cloned()) };
-    let endpoint = get("endpoint");
-    let account = get("account");
-    let profile = get("profile");
-    let thumbprint = get("thumbprint");
-    let dlib = get("dlib").map(PathBuf::from);
-    let trusted_any = endpoint.is_some() || account.is_some() || profile.is_some();
-
-    let lane_name = get("lane");
-    let lane = match lane_name.as_deref() {
-        Some("trusted-signing") | None if trusted_any => {
-            if thumbprint.is_some() && lane_name.is_none() {
-                return Err("both a Trusted Signing account and a thumbprint are configured; say which with `--lane trusted-signing` or `--lane thumbprint`".into());
-            }
-            let (Some(endpoint), Some(account), Some(profile)) = (endpoint, account, profile)
-            else {
-                return Err("the Trusted Signing lane needs all three of endpoint, account and profile (`--endpoint https://<region>.codesigning.azure.net --account <name> --profile <name>`, or ATERM_WINSIGN_ENDPOINT / _ACCOUNT / _PROFILE, or winsign_endpoint / _account / _profile in the credentials profile)".into());
-            };
-            Some(Lane::TrustedSigning {
-                endpoint,
-                account,
-                profile,
-                dlib,
-            })
-        }
-        Some("trusted-signing") => {
-            return Err(
-                "`--lane trusted-signing` was named but no endpoint/account/profile is configured"
-                    .into(),
-            );
-        }
-        Some("thumbprint") | None if thumbprint.is_some() => {
-            let t = thumbprint.unwrap_or_default();
-            let clean: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-            if clean.len() != 40 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(format!(
-                    "a certificate thumbprint is 40 hex digits (SHA-1); got `{t}`"
-                ));
-            }
-            Some(Lane::Thumbprint(clean.to_ascii_uppercase()))
-        }
-        Some("thumbprint") => {
-            return Err("`--lane thumbprint` was named but no thumbprint is configured".into());
-        }
-        Some(other) => {
-            return Err(format!(
-                "unknown lane `{other}`: use `trusted-signing` or `thumbprint`"
-            ));
-        }
-        None => None,
-    };
-    Ok(Config {
-        lane,
-        timestamp: get("timestamp"),
-        signtool: get("signtool").map(PathBuf::from),
-    })
-}
-
-/// The timestamp server a lane uses when none is configured.
+/// The RFC 3161 timestamp server a lane signs against.
 #[must_use]
 pub const fn default_timestamp(lane: &Lane) -> &'static str {
     match lane {
@@ -631,7 +462,7 @@ pub fn find_signtool(host: &dyn Host, configured: Option<&Path>) -> Result<PathB
     }
     Err(format!(
         "signtool.exe not found (looked for {}). Install the Windows SDK's \"Windows SDK Signing Tools\" \
-         feature, open a Developer prompt, or set ATERM_WINSIGN_SIGNTOOL.",
+         feature, open a Developer prompt, or pass --signtool <path>.",
         looked.join(", ")
     ))
 }
@@ -678,7 +509,7 @@ pub fn find_dlib(host: &dyn Host, configured: Option<&Path>) -> Result<PathBuf, 
     }
     Err(format!(
         "Azure.CodeSigning.Dlib.dll not found (looked for {}). Install the Microsoft.ArtifactSigning.Client \
-         NuGet package (apps/aterm-win/SIGNING.md, Lane A step 7) or set ATERM_WINSIGN_DLIB to the dll.",
+         NuGet package (apps/aterm-win/SIGNING.md, Lane A step 7) or pass --dlib <path>.",
         looked.join(", ")
     ))
 }
@@ -750,7 +581,8 @@ pub fn find_dotnet_runtime(host: &dyn Host) -> Result<DotnetRuntime, String> {
     ))
 }
 
-/// The Trusted Signing metadata file the dlib reads (`/dmdf`).
+/// The Trusted Signing metadata file the dlib reads (`/dmdf`). It excludes the plug-in's
+/// interactive browser credential, so a `sign` never waits on a person's sign-in.
 #[must_use]
 pub fn trusted_signing_metadata(endpoint: &str, account: &str, profile: &str) -> String {
     fn esc(s: &str) -> String {
@@ -769,7 +601,7 @@ pub fn trusted_signing_metadata(endpoint: &str, account: &str, profile: &str) ->
         out
     }
     format!(
-        "{{\n  \"Endpoint\": \"{}\",\n  \"CodeSigningAccountName\": \"{}\",\n  \"CertificateProfileName\": \"{}\"\n}}\n",
+        "{{\n  \"Endpoint\": \"{}\",\n  \"CodeSigningAccountName\": \"{}\",\n  \"CertificateProfileName\": \"{}\",\n  \"ExcludeCredentials\": [\"InteractiveBrowserCredential\"]\n}}\n",
         esc(endpoint),
         esc(account),
         esc(profile)
@@ -997,32 +829,29 @@ USAGE
   targo --unverified winsign doctor [options]            what this machine can sign with, and what is missing
   targo --unverified winsign help
 
-OPTIONS (flag > ATERM_WINSIGN_<KEY> > credentials profile `winsign_<key> = \"…\"`)
-  --credentials <file>   a release-credentials profile to read winsign_* keys from
-  --lane <l>             trusted-signing | thumbprint (inferred when only one is configured)
-  --endpoint <url>       Trusted Signing endpoint, e.g. https://eus.codesigning.azure.net
-  --account <name>       Trusted Signing account name
-  --profile <name>       Trusted Signing certificate profile name
-  --dlib <path>          Azure.CodeSigning.Dlib.dll (default: newest under the NuGet cache)
-  --thumbprint <sha1>    a certificate in the user's store (Cert:\\CurrentUser\\My), by thumbprint
-  --timestamp <url>      RFC 3161 server (default: the lane's own)
+The identity it signs with is committed: TRUSTED_SIGNING (Lane A) or THUMBPRINT
+(Lane B) in crates/aterm-winsign/src/lib.rs, beside pins::WINDOWS_SIGNING_PUBLISHER.
+
+OPTIONS
   --signtool <path>      signtool.exe (default: PATH, then the newest Windows SDK)
+  --dlib <path>          Azure.CodeSigning.Dlib.dll (default: newest under the NuGet cache)
 
 EXIT
   0 verdict accepted, `doctor` READY, or `help`
   1 bad signing or verdict: unsigned, untrusted chain, refused by the active
     tier, or signtool ran and exited non-zero (its output printed)
-  2 nothing signed and no verdict read: bad arguments or credentials profile,
-    an unresolved lane, nothing to sign with, or a missing tool
+  2 nothing signed and no verdict read: bad arguments, no pinned identity,
+    or a missing tool
 
 Identity: Azure Artifact Signing or a publicly trusted code-signing
 certificate; apps/aterm-win/SIGNING.md is the runbook.";
 
+/// Where the tools come from when discovery is not enough.
 #[derive(Debug, Default)]
 struct Flags {
     verb: Option<String>,
-    credentials: Option<PathBuf>,
-    values: Values,
+    signtool: Option<PathBuf>,
+    dlib: Option<PathBuf>,
     files: Vec<PathBuf>,
 }
 
@@ -1034,63 +863,62 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             f.verb = Some(a.clone());
             continue;
         }
-        if let Some(key) = a.strip_prefix("--") {
-            if key == "credentials" {
-                let v = it.next().ok_or("--credentials needs a file")?;
-                f.credentials = Some(PathBuf::from(v));
-            } else if KEYS.contains(&key) {
-                let v = it.next().ok_or_else(|| format!("--{key} needs a value"))?;
-                f.values.insert(key.to_string(), v.clone());
-            } else if key == "help" {
-                f.verb = Some("help".into());
-            } else {
-                return Err(format!("unknown option --{key}"));
+        match a.as_str() {
+            "--signtool" => {
+                f.signtool = Some(PathBuf::from(it.next().ok_or("--signtool needs a path")?));
             }
-        } else {
-            f.files.push(PathBuf::from(a));
+            "--dlib" => f.dlib = Some(PathBuf::from(it.next().ok_or("--dlib needs a path")?)),
+            "--help" => f.verb = Some("help".into()),
+            _ if a.starts_with("--") => return Err(format!("unknown option {a}")),
+            _ => f.files.push(PathBuf::from(a)),
         }
     }
     Ok(f)
 }
 
-/// Run the tool against the committed [`tier()`].
+/// Run the tool against the committed [`tier()`] and [`pinned_lane()`]. An invalid pin fails
+/// only the verbs that sign with it (`sign`, `doctor`); `help` and `verify` need no lane.
 pub fn run(args: Vec<String>, host: &dyn Host) -> i32 {
-    run_with_tier(args, host, &tier())
+    let pinned = pinned_lane();
+    exit_code(run_inner(
+        &args,
+        host,
+        &tier(),
+        pinned.as_ref().map(Option::as_ref).map_err(String::as_str),
+    ))
 }
 
-/// Run the tool against an explicit [`Tier`].
-pub fn run_with_tier(args: Vec<String>, host: &dyn Host, tier: &Tier) -> i32 {
-    match run_inner(&args, host, tier) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("aterm-winsign: {e}");
-            2
-        }
-    }
+/// Run the tool against an explicit [`Tier`] and lane.
+pub fn run_with(args: Vec<String>, host: &dyn Host, tier: &Tier, lane: Option<&Lane>) -> i32 {
+    exit_code(run_inner(&args, host, tier, Ok(lane)))
 }
 
-fn run_inner(args: &[String], host: &dyn Host, tier: &Tier) -> Result<i32, String> {
+fn exit_code(r: Result<i32, String>) -> i32 {
+    r.unwrap_or_else(|e| {
+        eprintln!("aterm-winsign: {e}");
+        2
+    })
+}
+
+fn run_inner(
+    args: &[String],
+    host: &dyn Host,
+    tier: &Tier,
+    lane: Result<Option<&Lane>, &str>,
+) -> Result<i32, String> {
     let flags = parse_flags(args)?;
     let verb = flags.verb.clone().unwrap_or_else(|| "help".into());
-    if verb == "help" {
-        println!("{USAGE}");
-        return Ok(0);
-    }
-    let env = values_from_env(host);
-    let profile = match &flags.credentials {
-        Some(p) => values_from_profile(&host.read_to_string(p)?)
-            .map_err(|e| format!("{}: {e}", p.display()))?,
-        None => Values::new(),
-    };
-    let config = resolve_config(&[&flags.values, &env, &profile])?;
-
     match verb.as_str() {
-        "doctor" => Ok(doctor(host, tier, &config)),
+        "help" => {
+            println!("{USAGE}");
+            Ok(0)
+        }
+        "doctor" => Ok(doctor(host, tier, lane, &flags)),
         "verify" => {
             if flags.files.is_empty() {
                 return Err("verify needs at least one exe".into());
             }
-            let signtool = find_signtool(host, config.signtool.as_deref())?;
+            let signtool = find_signtool(host, flags.signtool.as_deref())?;
             let mut code = 0;
             for f in &flags.files {
                 if !report_file(host, &signtool, tier, f)? {
@@ -1099,17 +927,38 @@ fn run_inner(args: &[String], host: &dyn Host, tier: &Tier) -> Result<i32, Strin
             }
             Ok(code)
         }
-        "sign" => run_sign(host, tier, &config, &flags.files),
+        "sign" => run_sign(host, tier, lane?, &flags),
         other => Err(format!("unknown verb `{other}`\n{USAGE}")),
+    }
+}
+
+/// Why `sign` has nothing to sign with: a fact about the committed identity, not a request.
+const NO_IDENTITY: &str = "no Windows signing identity is pinned (TRUSTED_SIGNING and THUMBPRINT in crates/aterm-winsign/src/lib.rs are empty)";
+
+/// Why Lane A has no Azure principal: a fact about this host, not a request.
+const NO_PRINCIPAL: &str = "no Azure signing principal on this host (no AZURE_TENANT_ID, AZURE_CLIENT_ID and AZURE_CLIENT_SECRET, no az CLI)";
+
+/// The non-interactive source the plug-in authenticates the Azure principal from, if any.
+fn azure_principal(host: &dyn Host) -> Option<&'static str> {
+    if ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"]
+        .iter()
+        .all(|k| host.env(k).is_some())
+    {
+        Some("service-principal environment")
+    } else if find_on_path(host, "az").is_some() {
+        Some("az CLI session")
+    } else {
+        None
     }
 }
 
 fn run_sign(
     host: &dyn Host,
     tier: &Tier,
-    config: &Config,
-    files: &[PathBuf],
+    lane: Option<&Lane>,
+    flags: &Flags,
 ) -> Result<i32, String> {
+    let files = &flags.files;
     if files.is_empty() {
         return Err("sign needs at least one exe".into());
     }
@@ -1118,29 +967,25 @@ fn run_sign(
             return Err(format!("not a file: {}", f.display()));
         }
     }
-    let Some(lane) = &config.lane else {
-        let why = "no signing lane is configured: name a Trusted Signing account (endpoint/account/profile) or a certificate thumbprint — apps/aterm-win/SIGNING.md";
+    let Some(lane) = lane else {
         return match tier {
-            Tier::Active { .. } => Err(format!("{tier}; {why}")),
-            Tier::Inactive => Err(why.into()),
+            Tier::Active { .. } => Err(format!("{tier}; {NO_IDENTITY}")),
+            Tier::Inactive => Err(NO_IDENTITY.into()),
         };
     };
-    let signtool = find_signtool(host, config.signtool.as_deref())?;
+    let signtool = find_signtool(host, flags.signtool.as_deref())?;
     eprintln!("{tier}");
     eprintln!("signtool: {}", signtool.display());
-    let timestamp = config
-        .timestamp
-        .clone()
-        .unwrap_or_else(|| default_timestamp(lane).to_string());
+    let timestamp = default_timestamp(lane);
     let mut child_env: Vec<(String, String)> = Vec::new();
     let (dlib, metadata) = match lane {
         Lane::TrustedSigning {
             endpoint,
             account,
             profile,
-            dlib,
         } => {
-            let dlib = find_dlib(host, dlib.as_deref())?;
+            let principal = azure_principal(host).ok_or(NO_PRINCIPAL)?;
+            let dlib = find_dlib(host, flags.dlib.as_deref())?;
             let runtime = find_dotnet_runtime(host)?;
             if runtime.needs_root_env {
                 child_env.push((
@@ -1155,6 +1000,7 @@ fn run_sign(
             host.write(&meta, &trusted_signing_metadata(endpoint, account, profile))?;
             eprintln!("lane: Azure Artifact Signing — {account} / {profile} at {endpoint}");
             eprintln!("dlib: {}", dlib.display());
+            eprintln!("azure identity: {principal}");
             eprintln!(
                 "dotnet: {} at {}{}",
                 runtime.version,
@@ -1172,13 +1018,7 @@ fn run_sign(
             (None, None)
         }
     };
-    let args = sign_args(
-        lane,
-        &timestamp,
-        dlib.as_deref(),
-        metadata.as_deref(),
-        files,
-    );
+    let args = sign_args(lane, timestamp, dlib.as_deref(), metadata.as_deref(), files);
     let ran = host.run(&signtool, &args, &child_env);
     if let Some(m) = &metadata {
         host.remove_file(m);
@@ -1243,40 +1083,41 @@ fn report_file(host: &dyn Host, signtool: &Path, tier: &Tier, file: &Path) -> Re
 }
 
 /// What this machine can sign with. Exit 0 when a `sign` would run.
-fn doctor(host: &dyn Host, tier: &Tier, config: &Config) -> i32 {
+fn doctor(host: &dyn Host, tier: &Tier, lane: Result<Option<&Lane>, &str>, flags: &Flags) -> i32 {
     let mut ok = true;
     println!("{tier}");
     if !host.is_windows() {
         println!("host: not Windows — signtool is a Windows SDK tool; sign on a Windows machine");
         ok = false;
     }
-    match find_signtool(host, config.signtool.as_deref()) {
+    match find_signtool(host, flags.signtool.as_deref()) {
         Ok(p) => println!("signtool: {}", p.display()),
         Err(e) => {
             println!("signtool: MISSING — {e}");
             ok = false;
         }
     }
-    match &config.lane {
-        None => {
-            println!(
-                "lane: none configured — set ATERM_WINSIGN_THUMBPRINT, or ATERM_WINSIGN_ENDPOINT / _ACCOUNT / _PROFILE (or the winsign_* keys of a credentials profile)"
-            );
+    match lane {
+        Err(e) => {
+            println!("lane: INVALID — {e}");
             ok = false;
         }
-        Some(Lane::Thumbprint(t)) => println!(
+        Ok(None) => {
+            println!("lane: none — {NO_IDENTITY}");
+            ok = false;
+        }
+        Ok(Some(Lane::Thumbprint(t))) => println!(
             "lane: certificate thumbprint {t} (must be in the user's certificate store with its private key)"
         ),
-        Some(Lane::TrustedSigning {
+        Ok(Some(Lane::TrustedSigning {
             endpoint,
             account,
             profile,
-            dlib,
-        }) => {
+        })) => {
             println!(
                 "lane: Azure Artifact Signing — account {account}, profile {profile}, endpoint {endpoint}"
             );
-            match find_dlib(host, dlib.as_deref()) {
+            match find_dlib(host, flags.dlib.as_deref()) {
                 Ok(p) => println!("dlib: {}", p.display()),
                 Err(e) => {
                     println!("dlib: MISSING — {e}");
@@ -1299,29 +1140,18 @@ fn doctor(host: &dyn Host, tier: &Tier, config: &Config) -> i32 {
                     ok = false;
                 }
             }
-            let sp = ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"]
-                .iter()
-                .all(|k| host.env(k).is_some());
-            let az = find_on_path(host, "az").is_some();
-            println!(
-                "azure identity: {}",
-                if sp {
-                    "service-principal environment set (unattended)"
-                } else if az {
-                    "az CLI on PATH — its `az login` session is used when valid; otherwise the browser sign-in"
-                } else {
-                    "interactive browser sign-in (the plug-in opens it on `sign`; sign in as a principal holding Artifact Signing Certificate Profile Signer)"
+            match azure_principal(host) {
+                Some(p) => println!("azure identity: {p}"),
+                None => {
+                    println!("azure identity: MISSING — {NO_PRINCIPAL}");
+                    ok = false;
                 }
-            );
+            }
         }
     }
-    println!(
-        "timestamp: {}",
-        config
-            .timestamp
-            .as_deref()
-            .unwrap_or("(the lane's default)")
-    );
+    if let Ok(Some(lane)) = lane {
+        println!("timestamp: {}", default_timestamp(lane));
+    }
     println!(
         "{}",
         if ok {

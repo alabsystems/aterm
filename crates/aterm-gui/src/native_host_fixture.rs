@@ -19,6 +19,32 @@ type SourceOutcomeObserver<'a> =
 mod source_proof;
 pub use source_proof::run_native_source_proof_fixture;
 
+/// The account services every fixture context serves with: the app's own constructor over a
+/// fresh lifetime, so a fixture's dispatch lends a renewal Attach an app-bound registry.
+fn fixture_account_services() -> AccountServices {
+    AccountServices::for_app(Default::default())
+}
+
+/// Run `serve` as one dispatch of a fixture context runs: over [`fixture_account_services`],
+/// lent by the [`AccountServices::serving`] every [`DispatchCx`] is built from.
+#[cfg(test)]
+pub(crate) fn serve_as_fixture_dispatch<R>(serve: impl FnOnce() -> R) -> R {
+    let services = fixture_account_services();
+    let _serving = services.serving();
+    serve()
+}
+
+/// Run `serve` with `registry` lent as a dispatch's, for a test that shows what a registry no
+/// context owns admits. Outside the control host only tests can lend one, through here.
+#[cfg(test)]
+pub(crate) fn serve_with_registry<R>(
+    registry: &Arc<aterm_agent::harness::codex_source_registry::Registry>,
+    serve: impl FnOnce() -> R,
+) -> R {
+    let _serving = ServingSourceRegistry::enter(registry);
+    serve()
+}
+
 fn failure(words: impl Into<String>) -> io::Error {
     io::Error::other(words.into())
 }
@@ -566,10 +592,7 @@ fn run_native_host_fixture_inner(
         active,
         store,
         proxy: event_loop.create_proxy(),
-        account_services: AccountServices {
-            source_registry: Arc::new(Default::default()),
-            lifetime: Default::default(),
-        },
+        account_services: fixture_account_services(),
         token: Arc::new(token),
         sock_dir: world,
         recovery_count_admission: Arc::new(

@@ -54,6 +54,8 @@ fn link(answer: fn(&str) -> String, seen: &'static Mutex<Vec<String>>) -> DriveL
         }),
         label: "lab-mini".to_owned(),
         node: None,
+        asked_by: None,
+        unnamed: None,
     }
 }
 
@@ -733,6 +735,8 @@ fn a_partial_fleet_send_is_never_repeated() {
                 stream: Box::new(PartialSend(true)),
                 label: "lab-mini".into(),
                 node: None,
+                asked_by: None,
+                unnamed: None,
             })
         })
         .is_err()
@@ -1066,6 +1070,8 @@ fn a_drive_cut_before_its_answer_says_what_cuts_one_and_what_may_have_landed() {
         stream: Box::new(Cut),
         label: "lab-mini".to_owned(),
         node: None,
+        asked_by: None,
+        unnamed: None,
     };
     let turned = exchange(cut(), "@s-a1 turn timeout=20000 go\n", "turn", OWN)
         .expect_err("cut")
@@ -1132,6 +1138,8 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
         stream: Box::new(Frozen),
         label: "lab-mini".to_owned(),
         node: None,
+        asked_by: None,
+        unnamed: None,
     };
     let turned =
         exchange(frozen(), "@s-a1 turn timeout=20000 go\n", "turn", OWN).expect_err("unanswered");
@@ -1170,6 +1178,8 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
             stream: Box::new(Frozen),
             label: "lab-mini".to_owned(),
             node: None,
+            asked_by: None,
+            unnamed: None,
         })
     }
     let awaited = await_task::run_driven(&words("await task @s-a1"), None, "lab-mini", drive)
@@ -1190,6 +1200,8 @@ fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
             stream: Box::new(Frozen),
             label: "lab-mini".to_owned(),
             node: None,
+            asked_by: None,
+            unnamed: None,
         })
     }
     let local = LocalVerbs {
@@ -1351,6 +1363,8 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
                 stream: Box::new(Frozen),
                 label: "lab-mini".to_owned(),
                 node: None,
+                asked_by: None,
+                unnamed: None,
             }
         })
     }
@@ -1724,6 +1738,8 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
             }),
             label: host.to_owned(),
             node: None,
+            asked_by: None,
+            unnamed: None,
         })
     }
 
@@ -1874,4 +1890,152 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
             "a row open to others is not read: the survey places the sid"
         );
     }
+}
+
+const ACTIVITY_NODE: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+const ACTIVITY_ASKER: &str = "s-0123456789abcdef0123";
+
+/// The lock's refusal of an act of `kind` as a driven Mac at Read Only answers it.
+fn locked(kind: aterm_types::fleet_access::DriveKind) -> String {
+    let refusal = aterm_types::fleet_access::FleetAccess::ReadOnly
+        .refusal(kind)
+        .expect("Read Only refuses it");
+    format!("{refusal}; not `{}`\n", kind.word())
+}
+
+/// What the requests since the last call left for the fleet activity record: each row's type,
+/// whether the other Mac's lock blocked it, and the session that asked.
+fn activity() -> Vec<(aterm_types::fleet_activity::Plain, bool, Option<String>)> {
+    crate::fleet_activity::NOTED
+        .with(|noted| std::mem::take(&mut *noted.borrow_mut()))
+        .into_iter()
+        .map(|row| {
+            assert_eq!(
+                (row.way, row.node.as_str(), row.host.as_deref(), row.n),
+                (
+                    aterm_types::fleet_activity::Way::Out,
+                    ACTIVITY_NODE,
+                    Some("lab-mini"),
+                    1
+                )
+            );
+            (row.what, row.blocked(), row.by)
+        })
+        .collect()
+}
+
+/// A REQUEST `aterm ctl --host` SENT IS ONE OUTGOING ROW, AS THE OTHER MAC'S LOCK ANSWERED IT:
+/// admitted where its answer is `OK`, blocked where it is that Mac's fleet access refusing it,
+/// and none where the answer is the gate's own refusal, which no lock decided. A read is a row
+/// only where a session asked for it (the drive's requester line named one); what a drive does
+/// to a session is a row whoever asked. A link whose dial proved no node names no Mac to count.
+#[test]
+fn a_request_sent_over_a_drive_is_one_row_as_the_other_macs_lock_answered_it() {
+    use aterm_types::fleet_access::DriveKind;
+    use aterm_types::fleet_activity::Plain;
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn answer(sent: &str) -> String {
+        match sent.split_whitespace().nth(1) {
+            Some("close") => "ERR denied: a drive closes only a worker it spawned\n".to_owned(),
+            Some("turn") => "OK 1 turn submitted=1 status=done seq=4\n❯ go\n".to_owned(),
+            Some("send") => locked(DriveKind::Send),
+            _ => "OK 2\nrow one\nrow two\n".to_owned(),
+        }
+    }
+    let run = |node: Option<&str>, by: Option<&str>, line: &str, verb: &str| {
+        let link = DriveLink {
+            node: node.map(str::to_owned),
+            asked_by: by.map(str::to_owned),
+            unnamed: None,
+            ..link(answer, &SEEN)
+        };
+        let ((ended, _printed), _told) = crate::stderr_lines_of(|| {
+            crate::stdout_lines_of(false, || exchange(link, line, verb, OWN))
+        });
+        assert!(ended.is_ok(), "{line}");
+        activity()
+    };
+    drop(activity());
+    let (node, asker) = (Some(ACTIVITY_NODE), Some(ACTIVITY_ASKER));
+    let by = Some(ACTIVITY_ASKER.to_owned());
+    assert_eq!(
+        run(node, asker, "@s-a1 turn timeout=20000 go\n", "turn"),
+        [(Plain::Typed, false, by.clone())]
+    );
+    assert_eq!(
+        run(node, asker, "@s-a1 text\n", "text"),
+        [(Plain::Read, false, by.clone())]
+    );
+    assert_eq!(
+        run(node, asker, "@s-a1 send hi\n", "send"),
+        [(Plain::Typed, true, by)],
+        "the lock's refusal"
+    );
+    assert_eq!(
+        run(node, asker, "@s-a1 close\n", "close"),
+        [],
+        "the gate's refusal"
+    );
+    // No session asked: a read is aterm's own poll, a typed line still counts.
+    assert_eq!(run(node, None, "@s-a1 text\n", "text"), []);
+    assert_eq!(
+        run(node, None, "@s-a1 turn timeout=20000 go\n", "turn"),
+        [(Plain::Typed, false, None)]
+    );
+    assert_eq!(
+        run(None, asker, "@s-a1 turn timeout=20000 go\n", "turn"),
+        [],
+        "no node proved"
+    );
+}
+
+/// A WORKER STARTED ON ANOTHER MAC IS AN OUTGOING NEW JOB, and one that Mac's fleet access
+/// refused is a blocked one; a spawn the dial never carried has no row (nothing was asked).
+#[test]
+fn a_spawn_sent_to_another_mac_is_a_new_job_row_admitted_or_blocked() {
+    use aterm_types::fleet_activity::Plain;
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn go(_: &str) -> String {
+        format!(
+            "{}OK s-0e1 task_rev=1\n",
+            aterm_types::control_verbs::task_frame_go(b"go on".len())
+        )
+    }
+    fn refuse(_: &str) -> String {
+        locked(aterm_types::fleet_access::DriveKind::Spawn)
+    }
+    fn dialled(answer: fn(&str) -> String) -> DriveLink {
+        DriveLink {
+            node: Some(ACTIVITY_NODE.to_owned()),
+            asked_by: Some(ACTIVITY_ASKER.to_owned()),
+            unnamed: None,
+            ..link(answer, &SEEN)
+        }
+    }
+    fn started(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        Ok(dialled(go))
+    }
+    fn blocked(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        Ok(dialled(refuse))
+    }
+    fn undialled(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        Err(DriveRefused::once(
+            "lab-mini serves no drive to this Mac".to_owned(),
+        ))
+    }
+    let args = words("agent=claude cwd=/w -");
+    let by = Some(ACTIVITY_ASKER.to_owned());
+    let (_tmp, _here, _board) = scratch_board("activity");
+    let spawn = |drive: FleetDriveFn| {
+        drop(activity());
+        let _ = crate::stderr_lines_of(|| {
+            crate::stdout_lines_of(false, || {
+                spawn_worker(fleet_worker("lab-mini", &args), OWN, drive)
+            })
+        });
+        activity()
+    };
+    assert_eq!(spawn(started), [(Plain::NewJob, false, by.clone())]);
+    assert_eq!(spawn(blocked), [(Plain::NewJob, true, by)]);
+    assert_eq!(spawn(undialled), []);
 }

@@ -192,7 +192,7 @@ fn cached_profile_only(env: &Env) {
 }
 
 struct RenewHost {
-    service_unavailable: bool,
+    defers: bool,
     work: Option<crate::harness::account_work::Scope>,
     tty: bool,
     ssh_session: bool,
@@ -211,12 +211,23 @@ struct RenewHost {
     env_mailbox: Option<PathBuf>,
     env_browser: Option<PathBuf>,
     agent: bool,
+    /// Whether the host is macOS ([`AccountsHost::on_macos`]); the build's own by default.
+    macos: bool,
+    /// Whether this run was started for another machine's request
+    /// ([`crate::harness::remote_renew::FOR_PEER_ENV`]): a renewal a peer asked for, or a tab
+    /// another Mac's fleet drive started.
+    for_peer: bool,
+    /// Whether another Mac's fleet drive typed into this run's session
+    /// ([`AccountsHost::driven_over_the_fleet`]).
+    fleet_typed: bool,
+    /// Whether the host's environment names a mailbox only a headless browser reads (webmail).
+    env_webmail: bool,
 }
 
 impl RenewHost {
     fn new() -> RenewHost {
         RenewHost {
-            service_unavailable: false,
+            defers: false,
             work: None,
             tty: true,
             ssh_session: false,
@@ -234,7 +245,22 @@ impl RenewHost {
             env_mailbox: None,
             env_browser: None,
             agent: false,
+            macos: cfg!(target_os = "macos"),
+            for_peer: false,
+            fleet_typed: false,
+            env_webmail: false,
         }
+    }
+}
+
+/// Whether `browser` is what a run a person started at `host`'s terminal signs a row with a
+/// headless route in with: on macOS aterm's own window, elsewhere the headless sign-in that
+/// opens nothing a person sees.
+fn a_persons_headless_run(host: &RenewHost, browser: &RenewBrowser) -> bool {
+    if host.macos {
+        matches!(browser, RenewBrowser::Window { .. })
+    } else {
+        matches!(browser, RenewBrowser::Remote { .. })
     }
 }
 
@@ -262,7 +288,7 @@ impl AccountsHost for RenewHost {
         browser: &RenewBrowser,
     ) -> Result<RenewalExit, RenewalFailure> {
         let code = self.renew_flow(home, email, browser)?;
-        if self.service_unavailable {
+        if self.defers {
             Err(RenewalFailure::deferred())
         } else {
             Ok(code.into())
@@ -276,6 +302,10 @@ impl AccountsHost for RenewHost {
 
     fn stdin_is_terminal(&self) -> bool {
         self.tty
+    }
+
+    fn on_macos(&self) -> bool {
+        self.macos
     }
 
     fn auth_status(&self, login: &str) -> Result<Captured, String> {
@@ -352,6 +382,21 @@ impl AccountsHost for RenewHost {
         self.ssh_session
     }
 
+    fn opens_sign_in_window(&self) -> bool {
+        opens_sign_in_window_by(
+            self.macos,
+            &|name| match name {
+                "SSH_CONNECTION" if self.ssh_session => Some("10.0.0.1 1 10.0.0.2 22".into()),
+                _ => self.machine_var(name),
+            },
+            &|| self.fleet_typed,
+        )
+    }
+
+    fn driven_over_the_fleet(&self) -> bool {
+        self.fleet_typed
+    }
+
     fn current_exe(&self) -> Option<PathBuf> {
         self.exe.clone()
     }
@@ -361,6 +406,15 @@ impl AccountsHost for RenewHost {
             crate::harness::open_url::MAILBOX_ENV => self.env_mailbox.as_ref(),
             crate::harness::headless_oauth::BROWSER_BIN_ENV => self.env_browser.as_ref(),
             "CLAUDECODE" if self.agent => return Some("1".into()),
+            crate::harness::remote_renew::FOR_PEER_ENV if self.for_peer => {
+                return Some("1".into());
+            }
+            crate::harness::headless_oauth::WEBMAIL_URL_ENV if self.env_webmail => {
+                return Some("https://mail.example.com/".into());
+            }
+            crate::harness::headless_oauth::WEBMAIL_PASS_ENV if self.env_webmail => {
+                return Some("a mailbox password".into());
+            }
             _ => None,
         }
         .map(|path| path.clone().into_os_string())
@@ -523,10 +577,16 @@ fn renewal_ready_opener_runs_the_selected_headless_route() {
     let calls = host.flows.borrow();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].1, WORK);
+    // On macOS a row with a mailbox signs in in aterm's own window, with or without a
+    // terminal; elsewhere its headless route runs.
     assert_eq!(
         calls[0].2,
-        RenewBrowser::Remote {
-            opener: Some(opener)
+        if host.macos {
+            RenewBrowser::Window { opener }
+        } else {
+            RenewBrowser::Remote {
+                opener: Some(opener),
+            }
         }
     );
     assert_eq!(host.checked.borrow().as_slice(), [calls[0].0.clone()]);
@@ -766,7 +826,11 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     let staging = store.logins_dir().join("main+1");
     let staging = staging.to_str().expect("utf-8").to_string();
     let opener = store.dir.join("bin").join(crate::harness::open_url::OPENER);
-    let browser = if cfg!(unix) {
+    let browser = if host.macos {
+        RenewBrowser::Window {
+            opener: opener.clone(),
+        }
+    } else if cfg!(unix) {
         RenewBrowser::Profile {
             opener: opener.clone(),
             profile: "Claude main".into(),
@@ -824,7 +888,9 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     assert_eq!(kinds, [accounts::Kind::Auth, accounts::Kind::Renewed]);
     assert!(store.wake_path().exists(), "the waiting decide again");
     assert!(out.contains("main: renewed"), "{out}");
-    let opens = if cfg!(unix) {
+    let opens = if host.macos {
+        "it opens in a window of aterm's own"
+    } else if cfg!(unix) {
         "it opens in browser profile 'Claude main'"
     } else {
         "it opens in your default browser"
@@ -987,16 +1053,12 @@ fn a_renewal_that_answers_another_account_changes_nothing_live() {
     assert!(report.contains("last renewal: wrong account"), "{report}");
 }
 
-#[cfg(unix)]
+/// A RENEWAL A SIGNAL ENDED IS NOBODY'S FAILURE: a person's Ctrl-C, or a kill of the provider,
+/// runs no check and records nothing, the row's last sign-in included. A provider that exited
+/// with a failure of its own is the next test's.
 #[test]
 fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
-    for (flow, cached) in [
-        (130, false),
-        (1, false),
-        (130, true),
-        (137, true),
-        (143, true),
-    ] {
+    for (flow, cached) in [(130, false), (130, true), (137, true), (143, true)] {
         if cached && !cfg!(unix) {
             continue;
         }
@@ -1011,10 +1073,7 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
         assert_eq!(code, exit(1), "{out}{err}");
         assert_eq!(host.flows.borrow().len(), 1);
         if cached {
-            assert!(matches!(
-                &host.flows.borrow()[0].2,
-                RenewBrowser::Remote { .. }
-            ));
+            assert!(a_persons_headless_run(&host, &host.flows.borrow()[0].2));
         }
         assert!(
             host.checked.borrow().is_empty(),
@@ -1090,14 +1149,23 @@ fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_br
     let (_tmp, env) = renew_env("renew-headless-auth-fallback");
     cached_profile_only(&env);
     let mut host = RenewHost::new();
+    // Off macOS: on macOS the sign-in runs in aterm's own window and has no headless try.
+    host.macos = false;
     host.flow = 1;
     host.flow_after_first = Some(0);
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let flows = host.flows.borrow();
     assert_eq!(flows.len(), 2);
-    assert!(matches!(&flows[0].2, RenewBrowser::Remote { .. }));
-    assert!(!matches!(&flows[1].2, RenewBrowser::Remote { .. }));
+    assert!(a_persons_headless_run(&host, &flows[0].2));
+    assert!(
+        matches!(
+            &flows[1].2,
+            RenewBrowser::Default | RenewBrowser::Profile { .. }
+        ),
+        "the fallback is the person's own browser: {:?}",
+        flows[1].2
+    );
     assert_eq!(*host.checked.borrow(), [flows[1].0.clone()]);
     let store = env.accounts_store();
     assert_eq!(
@@ -1136,7 +1204,7 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
     assert_eq!(
-        matches!(&host.flows.borrow()[0].2, RenewBrowser::Remote { .. }),
+        a_persons_headless_run(&host, &host.flows.borrow()[0].2),
         cfg!(unix)
     );
     assert_eq!(host.checked.borrow().len(), 1);
@@ -1188,7 +1256,7 @@ fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
     assert_eq!(code, exit(0), "{out}{err}");
     assert_eq!(host.flows.borrow().len(), 1);
     assert_eq!(
-        matches!(&host.flows.borrow()[0].2, RenewBrowser::Remote { .. }),
+        a_persons_headless_run(&host, &host.flows.borrow()[0].2),
         cfg!(unix)
     );
     assert_eq!(host.checked.borrow().len(), 1);
@@ -1260,7 +1328,9 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
         "{out}"
     );
     let (_tmp, env) = renew_env("renew-default");
-    let host = RenewHost::new();
+    let mut host = RenewHost::new();
+    // Off macOS, where a person's sign-in is their own browser's.
+    host.macos = false;
     let (code, ..) = acc(renew(&["work-2"], false, None), &env, &host);
     assert_eq!(code, exit(0));
     assert_eq!(host.flows.borrow()[0].2, RenewBrowser::Default);
@@ -1642,52 +1712,250 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
     assert!(!report.contains("accounts login w3"), "{report}");
 }
 
-/// The step that report names does what it says: a person at this Mac's terminal signs in a row
-/// its page stopped in that row's own browser profile, or with none named in their default
-/// browser, since another headless run would meet that page again and a default browser signed in
-/// to another account answers `wrong-account` every time. NEGATIVE CONTROLS: the same row with
-/// `Failed` goes headless, and a `Blocked` one goes headless too with nobody at a terminal, over
-/// SSH, or at an agent's terminal, since no window may open on this Mac for any of them.
+/// WHO MAY OPEN ATERM'S SIGN-IN WINDOW. On macOS every sign-in this Mac starts for its own row
+/// opens in aterm's own window at once, whatever browser profile the row names and whatever
+/// its last attempt met: a person's at this Mac's terminal (with or without a mailbox, since
+/// they may type the code in the window), and, for a row whose mailbox the window reads by
+/// itself, an agent's terminal's and a run with no terminal (this Mac's upkeep). NOBODY ELSE
+/// DOES: a run started for another machine's request, a tab another Mac's fleet drive started
+/// or typed into (it has a terminal, and nobody of this Mac's is at it), an SSH session, and
+/// a run nobody is at for a row with no mailbox, or with one only a headless browser reads
+/// (webmail), go headless with no grant, and nothing opens on this Mac's desk. Off macOS
+/// there is no window: a person signs a stopped row in in its own browser profile, or with
+/// none named their default browser. What the provider's environment carries is the browser's
+/// alone to say: the window's grant is set for the window and for no other, whatever the
+/// renewal itself inherited.
 #[cfg(unix)]
 #[test]
-fn a_person_signs_a_row_its_page_stopped_in_its_own_browser() {
+fn only_a_sign_in_this_mac_started_for_itself_opens_the_sign_in_window() {
     use accounts::AttemptOutcome::{Blocked, Failed};
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Opens {
+        Window,
         OwnProfile,
         Default,
+        /// Headless, and nothing a person sees.
         Headless,
     }
-    let own = if cfg!(unix) {
-        Opens::OwnProfile
-    } else {
-        Opens::Default
+    #[derive(Clone, Copy)]
+    struct Who {
+        macos: bool,
+        tty: bool,
+        ssh: bool,
+        agent: bool,
+        for_peer: bool,
+        fleet_typed: bool,
+        mailbox: bool,
+        webmail: bool,
+    }
+    let person = Who {
+        macos: true,
+        tty: true,
+        ssh: false,
+        agent: false,
+        for_peer: false,
+        fleet_typed: false,
+        mailbox: false,
+        webmail: false,
     };
-    for (tag, outcome, tty, ssh, agent, named, opens) in [
-        ("failed", Failed, true, false, false, true, Opens::Headless),
-        ("stopped", Blocked, true, false, false, true, own),
+    let agent = Who {
+        agent: true,
+        ..person
+    };
+    let upkeep = Who {
+        tty: false,
+        ..person
+    };
+    let elsewhere = Who {
+        macos: false,
+        ..person
+    };
+    let with_mailbox = |who: Who| Who {
+        mailbox: true,
+        ..who
+    };
+    let with_webmail = |who: Who| Who {
+        webmail: true,
+        ..who
+    };
+    for (tag, who, outcome, named, opens) in [
+        ("person-failed", person, Failed, true, Opens::Window),
+        ("person-stopped", person, Blocked, true, Opens::Window),
+        ("person-unnamed", person, Blocked, false, Opens::Window),
         (
-            "unnamed",
+            "person-mailbox",
+            with_mailbox(person),
+            Failed,
+            true,
+            Opens::Window,
+        ),
+        (
+            "agent-mailbox",
+            with_mailbox(agent),
+            Failed,
+            true,
+            Opens::Window,
+        ),
+        (
+            "agent-mailbox-stopped",
+            with_mailbox(agent),
             Blocked,
             true,
-            false,
-            false,
+            Opens::Window,
+        ),
+        (
+            "upkeep-mailbox",
+            with_mailbox(upkeep),
+            Failed,
+            true,
+            Opens::Window,
+        ),
+        (
+            "upkeep-mailbox-stopped",
+            with_mailbox(upkeep),
+            Blocked,
+            true,
+            Opens::Window,
+        ),
+        // Nobody to type a code and no mailbox to read it from: no window.
+        ("agent-no-mailbox", agent, Blocked, true, Opens::Headless),
+        ("upkeep-no-mailbox", upkeep, Failed, true, Opens::Headless),
+        // A mailbox only a headless browser reads gives the window no code: nobody is
+        // there to type one, so no window. A person at the terminal types it.
+        (
+            "agent-webmail",
+            with_webmail(agent),
+            Failed,
+            true,
+            Opens::Headless,
+        ),
+        (
+            "upkeep-webmail",
+            with_webmail(upkeep),
+            Blocked,
+            true,
+            Opens::Headless,
+        ),
+        (
+            "person-webmail",
+            with_webmail(person),
+            Failed,
+            true,
+            Opens::Window,
+        ),
+        // A tab another Mac's fleet drive started carries that Mac's mark, and one it typed
+        // into is named by the instance that holds it: each has a terminal, and neither is a
+        // person's at this Mac.
+        (
+            "fleet-started-tab",
+            Who {
+                for_peer: true,
+                ..with_mailbox(person)
+            },
+            Failed,
+            true,
+            Opens::Headless,
+        ),
+        (
+            "fleet-typed-tab",
+            Who {
+                fleet_typed: true,
+                ..with_mailbox(person)
+            },
+            Failed,
+            true,
+            Opens::Headless,
+        ),
+        (
+            "fleet-typed-agent",
+            Who {
+                fleet_typed: true,
+                ..with_mailbox(agent)
+            },
+            Blocked,
+            true,
+            Opens::Headless,
+        ),
+        // Another machine's request opens nothing here, mailbox or not.
+        (
+            "peer-mailbox",
+            Who {
+                for_peer: true,
+                ..with_mailbox(upkeep)
+            },
+            Failed,
+            true,
+            Opens::Headless,
+        ),
+        (
+            "peer-stopped",
+            Who {
+                for_peer: true,
+                ..with_mailbox(upkeep)
+            },
+            Blocked,
+            true,
+            Opens::Headless,
+        ),
+        // Neither does an SSH session, a person's included.
+        (
+            "ssh-person",
+            Who {
+                ssh: true,
+                ..with_mailbox(person)
+            },
+            Blocked,
+            true,
+            Opens::Headless,
+        ),
+        (
+            "ssh-nobody",
+            Who {
+                ssh: true,
+                ..with_mailbox(upkeep)
+            },
+            Failed,
+            true,
+            Opens::Headless,
+        ),
+        // Off macOS nothing changes.
+        ("failed-elsewhere", elsewhere, Failed, true, Opens::Headless),
+        (
+            "stopped-elsewhere",
+            elsewhere,
+            Blocked,
+            true,
+            Opens::OwnProfile,
+        ),
+        (
+            "unnamed-elsewhere",
+            elsewhere,
+            Blocked,
             false,
             Opens::Default,
         ),
         (
-            "nobody",
+            "agent-elsewhere",
+            Who {
+                agent: true,
+                ..elsewhere
+            },
             Blocked,
-            false,
-            false,
-            false,
             true,
             Opens::Headless,
         ),
-        ("ssh", Blocked, true, true, false, true, Opens::Headless),
-        ("agent", Blocked, true, false, true, true, Opens::Headless),
+        (
+            "mailbox-elsewhere",
+            with_mailbox(Who {
+                tty: false,
+                ..elsewhere
+            }),
+            Failed,
+            true,
+            Opens::Headless,
+        ),
     ] {
-        let (_tmp, env) = renew_env(&format!("renew-page-{tag}"));
+        let (tmp, env) = renew_env(&format!("renew-page-{tag}"));
         cached_profile_only(&env);
         if !named {
             let path = env.accounts_roster().expect("a config dir");
@@ -1714,20 +1982,156 @@ fn a_person_signs_a_row_its_page_stopped_in_its_own_browser() {
             )
             .expect("recorded");
         let mut host = RenewHost::new();
-        host.tty = tty;
-        host.ssh_session = ssh;
-        host.agent = agent;
+        host.macos = who.macos;
+        host.tty = who.tty;
+        host.ssh_session = who.ssh;
+        host.agent = who.agent;
+        host.for_peer = who.for_peer;
+        host.fleet_typed = who.fleet_typed;
+        host.env_webmail = who.webmail;
+        if who.mailbox {
+            host.env_mailbox = Some(tmp.path().to_owned());
+        }
         let (_, out, err) = acc(renew(&["main"], false, None), &env, &host);
         let flows = host.flows.borrow();
         let first = flows.first().unwrap_or_else(|| panic!("{tag}: {out}{err}"));
         let opened = match first.2 {
+            RenewBrowser::Window { .. } => Opens::Window,
             RenewBrowser::OwnProfile { .. } => Opens::OwnProfile,
             RenewBrowser::Default => Opens::Default,
             RenewBrowser::Remote { .. } => Opens::Headless,
             RenewBrowser::Profile { .. } => panic!("{tag}: {:?}", first.2),
         };
         assert_eq!(opened, opens, "{tag}: {:?}", first.2);
+        let carried: Vec<String> = renew_command(
+            std::ffi::OsStr::new("claude"),
+            "/staging",
+            "one@example.com",
+            &first.2,
+        )
+        .get_envs()
+        .filter_map(|(name, value)| value.map(|_| name.to_string_lossy().into_owned()))
+        .filter(|name| name == crate::harness::open_url::WINDOW_ENV)
+        .collect();
+        let expected: &[&str] = match opens {
+            Opens::Window => &[crate::harness::open_url::WINDOW_ENV],
+            Opens::OwnProfile | Opens::Default | Opens::Headless => &[],
+        };
+        assert_eq!(carried, expected, "{tag}");
         assert_eq!(flows.len(), 1, "{tag}: one run");
+        if opens == Opens::Window {
+            assert!(out.contains("a window of aterm's own"), "{tag}: {out}");
+            assert!(!out.contains("Safari"), "{tag}: {out}");
+        }
+    }
+}
+
+/// THE GRANT IS DENIED UNLESS EVERYTHING SAYS THIS MAC STARTED THE SIGN-IN FOR ITSELF AT ITS
+/// OWN DESK: macOS, no SSH connection, no mark of another machine's request. A host that does
+/// not say so opens no window.
+#[test]
+fn the_sign_in_window_is_denied_by_default() {
+    use crate::harness::remote_renew::FOR_PEER_ENV;
+    let env = |set: &'static [&'static str]| {
+        move |name: &str| set.contains(&name).then(|| OsString::from("1"))
+    };
+    let own = || false;
+    assert!(opens_sign_in_window_by(true, &env(&[]), &own));
+    assert!(!opens_sign_in_window_by(false, &env(&[]), &own));
+    assert!(!opens_sign_in_window_by(
+        true,
+        &env(&["SSH_CONNECTION"]),
+        &own
+    ));
+    assert!(!opens_sign_in_window_by(true, &env(&[FOR_PEER_ENV]), &own));
+    assert!(!opens_sign_in_window_by(
+        true,
+        &env(&["SSH_CONNECTION", FOR_PEER_ENV]),
+        &own
+    ));
+    // A session another Mac's fleet drive typed into is that Mac's, whatever its environment.
+    assert!(!opens_sign_in_window_by(true, &env(&[]), &|| true));
+    // The instances are asked only where nothing else refuses: the answer costs a round to
+    // each of them.
+    let asked = std::cell::Cell::new(0);
+    let counted = || {
+        asked.set(asked.get() + 1);
+        false
+    };
+    assert!(!opens_sign_in_window_by(false, &env(&[]), &counted));
+    assert!(!opens_sign_in_window_by(
+        true,
+        &env(&["SSH_CONNECTION"]),
+        &counted
+    ));
+    assert!(!opens_sign_in_window_by(
+        true,
+        &env(&[FOR_PEER_ENV]),
+        &counted
+    ));
+    assert_eq!(asked.get(), 0);
+    assert!(opens_sign_in_window_by(true, &env(&[]), &counted));
+    assert_eq!(asked.get(), 1);
+    // An empty variable is unset.
+    assert!(opens_sign_in_window_by(
+        true,
+        &|name| { (name == "SSH_CONNECTION").then(OsString::new) },
+        &own
+    ));
+    struct Inert;
+    impl AccountsHost for Inert {
+        fn stdin_is_terminal(&self) -> bool {
+            true
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            panic!("nothing is asked")
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            panic!("nothing is run")
+        }
+        fn now(&self) -> i64 {
+            0
+        }
+    }
+    assert!(
+        !Inert.opens_sign_in_window(),
+        "a host that does not say so opens none"
+    );
+}
+
+/// ONLY A SIGN-IN IN ATERM'S OWN WINDOW MAKES ITS ROW'S TOKEN IN THE SAME RUN: its session is
+/// the account's own store, so the token's page, opened there, is authorized as the row's
+/// account ([`RenewBrowser::finishes_by_itself`]). Claude Code's success names no account, so
+/// after every other sign-in (a headless one, one in a person's browser) no session is known
+/// to be the row's, and the step is offered instead.
+#[test]
+fn only_a_sign_in_in_aterms_own_window_makes_its_rows_token_in_the_same_run() {
+    let opener = || PathBuf::from("/nonexistent/opener");
+    let profile = || "Work".to_owned();
+    for browser in [
+        RenewBrowser::Default,
+        RenewBrowser::Profile {
+            opener: opener(),
+            profile: profile(),
+        },
+        RenewBrowser::OwnProfile {
+            opener: opener(),
+            profile: profile(),
+        },
+        RenewBrowser::Window { opener: opener() },
+        RenewBrowser::Remote {
+            opener: Some(opener()),
+        },
+        RenewBrowser::Remote { opener: None },
+    ] {
+        assert_eq!(
+            browser.finishes_by_itself(),
+            matches!(browser, RenewBrowser::Window { .. }),
+            "{browser:?}"
+        );
     }
 }
 
@@ -1750,6 +2154,8 @@ fn an_agents_terminal_opens_no_browser_for_a_row() {
         let (_tmp, env) = renew_env("renew-agent-fallback");
         cached_profile_only(&env);
         let mut host = RenewHost::new();
+        // Off macOS, where a headless try comes first.
+        host.macos = false;
         host.agent = agent;
         host.flow = 1;
         host.flow_after_first = Some(0);
@@ -1943,9 +2349,32 @@ fn the_sign_in_and_the_check_are_built_exactly() {
             gone(crate::harness::open_url::INPUT_ENV),
             set(accounts::HOME_ENV, "/s/logins/main+1"),
             gone(crate::harness::open_url::NO_HEADLESS_ENV),
+            gone(crate::harness::open_url::WINDOW_ENV),
             set("BROWSER", "/s/bin/aterm-open-url"),
             set(crate::harness::open_url::PROFILE_ENV, "Claude main"),
         ])
+    );
+    let window = renew_command(
+        program,
+        "/h",
+        OWNER,
+        &RenewBrowser::Window {
+            opener: PathBuf::from("/s/bin/aterm-open-url"),
+        },
+    );
+    assert_eq!(
+        envs(&window),
+        BTreeSet::from([
+            gone(accounts::LOGIN_ENV),
+            gone(crate::harness::open_url::INPUT_ENV),
+            set(accounts::HOME_ENV, "/h"),
+            gone(crate::harness::open_url::NO_HEADLESS_ENV),
+            gone(crate::harness::open_url::PROFILE_ENV),
+            set("BROWSER", "/s/bin/aterm-open-url"),
+            set(crate::harness::open_url::WINDOW_ENV, "1"),
+        ]),
+        "a sign-in in aterm's window runs aterm's opener with no browser profile and no \
+         headless try"
     );
     let own = renew_command(
         program,
@@ -1979,8 +2408,12 @@ fn the_sign_in_and_the_check_are_built_exactly() {
     let default = renew_command(program, "/h", OWNER, &RenewBrowser::Default);
     assert!(!envs(&default).iter().any(|(k, _)| k == "BROWSER"));
     assert!(envs(&default).contains(&gone(crate::harness::open_url::PROFILE_ENV)));
-    for command in [&remote, &bare, &default] {
+    for command in [&remote, &bare, &default, &own] {
         assert!(envs(command).contains(&gone(crate::harness::open_url::INPUT_ENV)));
+        assert!(
+            envs(command).contains(&gone(crate::harness::open_url::WINDOW_ENV)),
+            "only a sign-in chosen for aterm's window names it; an inherited grant is dropped"
+        );
     }
 }
 
@@ -2243,6 +2676,75 @@ fn a_hosted_code_file_with_no_valid_code_ends_the_capture() {
     assert_eq!(failure.met, None);
 }
 
+/// WHETHER THE SIGN-IN WINDOW MAY OPEN IS THE RENEWAL'S TO SAY, NEVER WHAT IT INHERITED: a
+/// renewal that chose no window runs its provider without the variable that lets its opener
+/// open one, even where the renewal's own environment holds it, as one started from a session
+/// that had it would. CONTROL: a renewal that chose the window hands its provider the grant,
+/// with a terminal or without one.
+#[cfg(unix)]
+#[test]
+fn a_renewals_provider_inherits_no_grant_to_open_the_sign_in_window() {
+    use crate::harness::open_url::WINDOW_ENV;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("state/accounts/logins/work-2+1");
+    std::fs::create_dir_all(&home).unwrap();
+    let program = tmp.path().join("provider");
+    aterm_tempfile::stand_in(
+        &program,
+        &format!("#!/bin/sh\nprintf '%s' \"${{{WINDOW_ENV}-unset}}\" > \"${{0%/*}}/grants\"\n"),
+    )
+    .unwrap();
+    let user_home = tmp.path().as_os_str().to_owned();
+    let granted = |name: &str| match name {
+        "HOME" => Some(user_home.clone()),
+        "USER" => Some("fixture-user".into()),
+        WINDOW_ENV => Some("1".into()),
+        _ => None,
+    };
+    let run = |browser: &RenewBrowser, within: Option<std::time::Duration>| {
+        let exit = renew_flow_of(
+            program.as_os_str(),
+            home.to_str().expect("a UTF-8 staging home"),
+            WORK,
+            browser,
+            &granted,
+            within,
+        )
+        .expect("the stand-in exits by itself");
+        assert_eq!(exit.code, 0);
+        std::fs::read_to_string(tmp.path().join("grants")).expect("the stand-in ran")
+    };
+    for browser in [
+        RenewBrowser::Remote { opener: None },
+        RenewBrowser::Remote {
+            opener: Some(PathBuf::from("/nonexistent/opener")),
+        },
+    ] {
+        assert_eq!(
+            run(&browser, Some(aterm_spec::wait::MUST_HAPPEN)),
+            "unset",
+            "{browser:?}"
+        );
+    }
+    assert_eq!(
+        run(&RenewBrowser::Default, None),
+        "unset",
+        "a person's own run in their browser"
+    );
+    for within in [Some(aterm_spec::wait::MUST_HAPPEN), None] {
+        assert_eq!(
+            run(
+                &RenewBrowser::Window {
+                    opener: PathBuf::from("/nonexistent/opener"),
+                },
+                within
+            ),
+            "1",
+            "CONTROL: a renewal that chose the window carries the grant"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_terminal_opener_failure_ends_the_owned_capture_before_its_budget() {
@@ -2289,6 +2791,58 @@ fn a_terminal_opener_failure_ends_the_owned_capture_before_its_budget() {
     }
 }
 
+/// A RENEWAL RUN BY HAND THAT FAILS IS THE ROW'S LAST SIGN-IN AND ONE LEDGER ROW (it wrote
+/// none): the provider's own failing exit is recorded as the upkeep's ladder records its
+/// attempts, under the `hand` word, with no binding moved and no check run; the same failure
+/// again writes no second row. Negative control: the run before it left no record at all.
+#[test]
+fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
+    let (_tmp, env) = renew_env("renew-hand-failed");
+    let store = env.accounts_store();
+    assert!(
+        !store.logins_file().exists() && store.tail(10).expect("ledger").is_empty(),
+        "NEGATIVE CONTROL: nothing is on record before the run"
+    );
+    let mut host = RenewHost::new();
+    host.flow = 1;
+    for run in 0..2 {
+        let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        assert_eq!(code, exit(1), "{out}{err}");
+        assert!(
+            host.checked.borrow().is_empty(),
+            "no `auth status` after a failed flow"
+        );
+        let binding = logins_of(&env)
+            .get("main")
+            .cloned()
+            .expect("the attempt is kept");
+        assert_eq!(binding.dir, None, "run {run}: nothing repointed");
+        let attempt = binding.sign_in_attempt.expect("the row's last sign-in");
+        assert_eq!(attempt.outcome, accounts::AttemptOutcome::Failed);
+        assert_eq!(
+            attempt.routes,
+            "by hand: claude auth login exited 1 with no login made"
+        );
+        let ledger = store.tail(10).expect("ledger");
+        assert_eq!(
+            ledger.len(),
+            1,
+            "run {run}: one row for one finding: {ledger:?}"
+        );
+        assert_eq!(ledger[0].kind, accounts::Kind::SignIn);
+        assert_eq!(
+            ledger[0].why,
+            "hand failed: by hand: claude auth login exited 1 with no login made"
+        );
+        assert_eq!(
+            accounts::AttemptOutcome::of_sign_in(&ledger[0].why),
+            Some(accounts::AttemptOutcome::Failed)
+        );
+        no_address(&env, &[&out, &err]);
+    }
+    assert_eq!(host.flows.borrow().len(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_terminal_opener_failure_releases_the_machine_signin_lock() {
@@ -2312,7 +2866,7 @@ fn a_terminal_opener_failure_releases_the_machine_signin_lock() {
         .write(true)
         .open(&gate)
         .unwrap();
-    aterm_tempfile::stand_in(&program, "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=failed\\nmet=browser-control\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nread answer < \"${0%/*}/gate\"\nexit 7\n").unwrap();
+    aterm_tempfile::stand_in(&program, "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=failed\\nmet=browser-control\\nwhy=the DevTools socket closed\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nread answer < \"${0%/*}/gate\"\nexit 7\n").unwrap();
     let before = logins_of(&env).get("work-2").cloned();
     let worker_env = env.clone();
     let host = NativeRenewal {
@@ -2334,7 +2888,51 @@ fn a_terminal_opener_failure_releases_the_machine_signin_lock() {
     assert!(returned, "the opener failure retained the sign-in lock");
     assert_ne!(answer.0, exit(0));
     assert!(store.signin_now().unwrap().is_some());
-    assert_eq!(logins_of(&env).get("work-2").cloned(), before);
+    assert_eq!(
+        crate::harness::sign_in_ladder::signing_in(&store, Cli::Claude),
+        None,
+        "the row is no longer signing in"
+    );
+    // WHY IT ENDED IS KEPT: the opener's reason is printed, is the row's last sign-in and is
+    // one `sign-in` ledger row; nothing else of the row moved.
+    const WHY: &str = "the sign-in did not finish; it could not communicate with its headless \
+                       browser: the DevTools socket closed";
+    assert!(
+        answer.2.contains("the DevTools socket closed"),
+        "the renewal prints the opener's reason: {}",
+        answer.2
+    );
+    let after = logins_of(&env).get("work-2").cloned().expect("its record");
+    let attempt = after
+        .sign_in_attempt
+        .clone()
+        .expect("the row's last sign-in");
+    assert_eq!(attempt.outcome, accounts::AttemptOutcome::Failed);
+    assert_eq!(attempt.routes, format!("by hand: {WHY}"));
+    assert_eq!(
+        after.dir,
+        before.and_then(|binding| binding.dir),
+        "no login was bound"
+    );
+    let ledger = store.tail(10).expect("ledger");
+    assert_eq!(
+        ledger
+            .iter()
+            .map(|event| (event.kind, event.why.as_str()))
+            .collect::<Vec<_>>(),
+        [(
+            accounts::Kind::SignIn,
+            format!("hand failed: by hand: {WHY}").as_str()
+        )]
+    );
+    // The report says it of a row that still needs its sign-in.
+    on_record(&env, &[("work-2", Auth::SignedOut)]);
+    let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &RenewHost::new());
+    assert!(
+        report.contains("sign-in: error failed since ")
+            && report.contains(&format!(": tried by hand: {WHY}")),
+        "{report}"
+    );
 }
 
 #[cfg(unix)]
@@ -2493,6 +3091,7 @@ fn an_unattended_browser_challenge_records_a_task_but_cancellation_does_not() {
             &RenewBrowser::Remote { opener: None },
             &mut out,
             &mut err,
+            &mut None,
         );
         let err = String::from_utf8(err).unwrap();
         assert_eq!(result, expected, "{err}");
@@ -2513,15 +3112,21 @@ fn an_unattended_browser_challenge_records_a_task_but_cancellation_does_not() {
                 .unwrap();
             assert_eq!(
                 accounts::sign_in_tasks(&records.raw_roster, &records.logins),
-                [("work-2".into(), accounts::SignInAction::Login)]
+                [("work-2".into(), accounts::SignInAction::Renew)]
             );
             let mut after = after.unwrap();
             assert_eq!(
                 after.sign_in_task.take().unwrap().action,
-                accounts::SignInAction::Login
+                accounts::SignInAction::Renew
             );
+            // The step is the one a person can run: `accounts login` refuses a row with an email.
             let out = String::from_utf8(out).unwrap();
-            assert!(out.contains("human browser challenge recorded"), "{out}");
+            assert!(
+                out.contains("aterm harness accounts renew work-2")
+                    && out.contains("in a terminal on this Mac"),
+                "{out}"
+            );
+            assert!(!out.contains("accounts login"), "{out}");
             assert!(!out.contains("NEEDS YOU"), "{out}");
             let prior_generation = before
                 .as_ref()
@@ -2957,7 +3562,7 @@ fn an_open_work_scope_preserves_actual_provider_exit_codes() {
 }
 
 #[test]
-fn typed_service_unavailability_defers_before_status_and_preserves_the_stored_login() {
+fn a_hosts_deferred_renewal_defers_before_status_and_preserves_the_stored_login() {
     let (_tmp, env) = renew_env("renew-service-deferred");
     let store = env.accounts_store();
     let path = env.accounts_roster().unwrap();
@@ -2971,7 +3576,7 @@ fn typed_service_unavailability_defers_before_status_and_preserves_the_stored_lo
         &row.label,
     );
     let mut host = RenewHost::new();
-    host.service_unavailable = true;
+    host.defers = true;
     let mut observation = None;
     let result = renew_one_observed(
         &env,
@@ -2995,7 +3600,7 @@ fn typed_service_unavailability_defers_before_status_and_preserves_the_stored_lo
         &mut observation,
     );
     assert_eq!(result, Renewal::Deferred);
-    assert!(observation.unwrap().service_deferred());
+    assert!(observation.unwrap().deferred());
     assert_eq!(host.flows.borrow().len(), 1);
     assert!(host.checked.borrow().is_empty());
     assert_eq!(
@@ -3015,56 +3620,16 @@ fn typed_service_unavailability_defers_before_status_and_preserves_the_stored_lo
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn a_deferred_opener_stops_the_owned_provider_without_an_auth_failure_or_exit_code() {
-    use std::io::Write as _;
-    let tmp = aterm_tempfile::tempdir().unwrap();
-    let gate = tmp.path().join("gate");
-    let name = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
-    // SAFETY: this names a fresh FIFO in this test's private directory.
-    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    let mut release = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&gate)
-        .unwrap();
-    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
-    cmd.args(["-c", "printf 'opener-outcome=1\\nphase=deferred\\nmet=service-unavailable\\n' > \"$ATERM_OPEN_URL_OUTCOME\"; read answer < \"$GATE\"; exit 7"]).env("GATE", &gate);
-    let (done, result) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let _ = done.send(capture_unattended_renewal(
-            cmd,
-            std::time::Duration::from_secs(3600),
-        ));
-    });
-    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
-    let returned = answer.is_ok();
-    writeln!(release, "finish").unwrap();
-    let answer =
-        answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
-    worker.join().unwrap();
-    assert!(returned);
-    let failure = answer.expect_err("deferred stopping never fabricates a provider exit");
-    assert!(failure.is_deferred(), "{failure}");
-    assert!(!failure.is_cancelled());
-    let observation = RenewalObservation::from_outcome(&Err(failure));
-    assert_eq!(observation.exit_code(), None);
-    assert!(observation.service_deferred());
-}
-
-#[test]
-fn natural_provider_status_is_retained_but_typed_unavailability_vetoes_follow_on_work() {
+fn natural_provider_status_is_retained_beside_what_its_opener_met() {
+    let consent = crate::harness::open_url::Met::new(
+        crate::harness::open_url::MetWord::WindowNoDesktop,
+        None,
+    );
     for code in [0, 1, 130] {
         let cmd = aterm_uds::spawnfd::command("unused-test-program");
         let (ran, met) = capture_unattended_renewal_with(cmd, |_, outcome| {
-            super::super::super::open_url::write_outcome(
-                outcome.unwrap(),
-                &super::super::super::open_url::Met::new(
-                    super::super::super::open_url::MetWord::ServiceUnavailable,
-                    None,
-                ),
-            );
+            crate::harness::open_url::write_outcome(outcome.unwrap(), &consent);
             Ok(Captured {
                 code: Some(code),
                 stdout: b"actual-provider-status".to_vec(),
@@ -3075,7 +3640,9 @@ fn natural_provider_status_is_retained_but_typed_unavailability_vetoes_follow_on
         assert_eq!(ran.stdout, b"actual-provider-status");
         let exit = RenewalExit::from_capture((ran, met)).unwrap();
         assert_eq!(exit.code, code);
-        assert!(exit.is_deferred());
+        assert_eq!(exit.met.as_ref(), Some(&consent));
+        let observed = RenewalObservation::from_outcome(&Ok(exit));
+        assert!(!observed.deferred(), "what an opener met defers nothing");
     }
 }
 
@@ -3086,7 +3653,7 @@ fn a_capture_error_is_not_relabelled_a_deferred_stop_by_its_diagnostic_record() 
         crate::harness::open_url::write_outcome(
             outcome.unwrap(),
             &crate::harness::open_url::Met::new(
-                crate::harness::open_url::MetWord::ServiceUnavailable,
+                crate::harness::open_url::MetWord::WindowNoDesktop,
                 None,
             ),
         );
@@ -3097,6 +3664,9 @@ fn a_capture_error_is_not_relabelled_a_deferred_stop_by_its_diagnostic_record() 
     assert!(!failure.is_cancelled());
     let observed = RenewalObservation::from_outcome(&Err(failure));
     assert!(observed.capture_failed());
-    assert!(!observed.service_deferred());
-    assert!(observed.met().unwrap().is_service_unavailable());
+    assert!(!observed.deferred());
+    assert_eq!(
+        observed.met().map(|met| met.word),
+        Some(crate::harness::open_url::MetWord::WindowNoDesktop)
+    );
 }

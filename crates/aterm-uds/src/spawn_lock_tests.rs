@@ -326,6 +326,13 @@ mod apple_test {
     /// holds descriptor `fd`: the child reports it itself, before it would exec.
     fn fork_holds(fd: RawFd) -> bool {
         let mut report = [0; 2];
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the probe forks under the shared hold, as the PTY spawn does, which copies no \
+                      marked end: a kept-out report pipe would wait behind the creation the test \
+                      holds, and handing its write end would hold the lock exclusively, so the \
+                      fork would not wait where a spawn waits"
+        )]
         // SAFETY: `pipe` fills the two-element array it is handed.
         let made = unsafe { libc::pipe(report.as_mut_ptr()) };
         assert_eq!(made, 0, "report pipe");

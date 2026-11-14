@@ -202,6 +202,7 @@ fn a_registry_label_waits_for_its_local_writer() {
             host: Some("m42"),
             within: Duration::ZERO,
             holder: None,
+            by: None,
         },
     ) else {
         panic!("an expired survey cannot resolve the label");
@@ -219,6 +220,7 @@ fn a_registry_label_waits_for_its_local_writer() {
             host: Some("m42"),
             within: HANG,
             holder: None,
+            by: None,
         },
     ) else {
         panic!("the resolved label names this machine");

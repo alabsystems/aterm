@@ -167,7 +167,7 @@ fn epochs_wrapped_to(log: &Log, recipient: &Recipient) -> BTreeSet<RecordId> {
 /// F16: m7, a plain member, removes m40 by its label, and the next value any member puts goes
 /// under an epoch no `Wrap` ever handed m40: m40, holding every record and its own identity, has
 /// no key for it, whatever the log's evaluation says of it. The removal names what m40 could read,
-/// for rotation at the provider, rotates every audience m40 was in, and writes the cascade
+/// rotates every audience m40 was in, and writes the cascade
 /// (m40's roster row to the deny-lists) into the `[everyone]` reseal.
 ///
 /// NEGATIVE CONTROL: in `rotate_after_removal`, skip the `[everyone]` epoch (`if false &&
@@ -261,7 +261,10 @@ fn a_removed_mac_cannot_read_a_value_put_after_its_removal() {
         removal.could_read.iter().any(|n| n == "shared"),
         "{removal:?}"
     );
-    assert!(removal.needs_you.is_none(), "a plain removal asks nobody");
+    assert!(
+        removal.exposure.is_none() && removal.rotation.is_none(),
+        "a plain removal files nothing"
+    );
     assert!(!removal.fleet_code_rotated);
 
     macs.server.stop();
@@ -1663,7 +1666,8 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
 }
 
 /// F16's review: a removal by a member outside a host list the removed Mac was in cannot rotate
-/// that list, so it names the list in what the Mac could read and in the `--stolen` line, and on
+/// that list, so it names the list in what the Mac could read and in the `--stolen` line (which
+/// files the `[everyone]` credential it could read for rotation in m7's need ledger), and on
 /// the next vault pass one of the list's own members mints its next epoch without the Mac. (Here
 /// an admin is in the list, so its mirror also moves the list's entries to `[m22]`; a list with
 /// no admin in it has only its members' pass.)
@@ -1706,8 +1710,21 @@ fn a_host_list_the_remover_cannot_open_is_named_and_rotated_by_its_members() {
         "{:?}",
         removal.could_read
     );
-    let line = removal.needs_you.expect("a NEEDS YOU line");
-    assert!(line.contains(&ring.header()), "{line}");
+    let line = removal.rotation.expect("a rotation line");
+    assert!(
+        line.contains(&ring.header())
+            && line.contains("entry:shared")
+            && !line.contains("NEEDS YOU"),
+        "{line}"
+    );
+    let filed = crate::need::peek(m7).expect("m7's ledger");
+    assert!(
+        filed.iter().any(|need| need.want.key() == "entry:shared"
+            && need.purpose == crate::need::Purpose::StolenRotation
+            && need.exposed == ["[everyone]"]
+            && !need.posted),
+        "{filed:?}"
+    );
 
     // m22's pass runs the tender at the wall clock: m7, the remover, cannot carry the list, so
     // its one holder m22 ranks first with no grace and mints at once; a pass past every rank's

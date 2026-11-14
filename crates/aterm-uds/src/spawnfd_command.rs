@@ -1455,6 +1455,14 @@ impl Command {
                 Kind::Inherit => Source::Inherit,
                 Kind::Null => Source::Null,
                 Kind::Piped => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "spawnfd's own piped stdio is not kept out: a mark would make \
+                                  every piped spawn hold the spawn lock exclusively, at the pipe's \
+                                  creation and again to hand the child its end \
+                                  (spawn_lock::handing); close-on-exec keeps both ends out of \
+                                  other spawns' programs"
+                    )]
                     let (read, write) = io::pipe()?;
                     let (mine, theirs) = if target == 0 {
                         (OwnedFd::from(write), OwnedFd::from(read))
@@ -1710,6 +1718,11 @@ impl ExecStatus {
     /// copy until it ends, which delays the status's end, as it does on Linux.
     fn new() -> io::Result<Self> {
         use std::os::fd::FromRawFd as _;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the exec status is not kept out (above): a mark would make each tethered \
+                      spawn hold the spawn lock exclusively to hand the tether its write end"
+        )]
         let (read, write) = std::io::pipe()?;
         let mut write = OwnedFd::from(write);
         if write.as_raw_fd() < 3 {

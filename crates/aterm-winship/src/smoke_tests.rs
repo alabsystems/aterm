@@ -236,6 +236,7 @@ fn aliases_are_every_image_but_the_front_door_the_window_and_the_console_host() 
         "aterm.exe",
         "aterm-gui.exe",
         "OpenConsole.exe",
+        "aterm-bootstrap-verify.exe",
         "aterm-ctl.exe",
         "atpkg.EXE",
         "README.txt",

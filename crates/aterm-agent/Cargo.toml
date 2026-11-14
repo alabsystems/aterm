@@ -223,6 +223,11 @@ aterm-net = { workspace = true }
 # graph (aterm and aterm-gui link it); unix-only, as the crate is.
 aterm-mesh = { workspace = true }
 
+# The sign-in window's wire and verb (`harness/signin_window.rs`): the window itself is hosted
+# by the `aterm` executable, which this crate starts and drives over its pipes.
+[target.'cfg(target_os = "macos")'.dependencies]
+aterm-signin-window = { workspace = true }
+
 [dev-dependencies]
 # aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
 aterm-cores = { workspace = true }

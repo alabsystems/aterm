@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! This Mac's network place as the window reports it (`aterm_netplace`): `status`'s `net=…`
-//! fields, `sys`'s `place` line and object, the network deck's summary and the menu bar's Network
-//! row, every one in aterm-netplace's words, so none of them can say something else about where
+//! fields, `sys`'s `place` line and object, the network deck's summary and the menu bar's first
+//! line, every one in aterm-netplace's words, so none of them can say something else about where
 //! this Mac is.
 //!
 //! The event loop reads no file for it: [`latest`] answers the place the last background read
@@ -665,23 +665,22 @@ pub(crate) fn sys_view() -> Option<aterm_vitals::PlaceView> {
     latest().map(|place| sys_view_of(&place, &Words::now()))
 }
 
-/// The menu bar's Network row: the place's summary ([`words::summary`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MenuLine {
-    /// `Network — <summary>`.
-    pub label: String,
-}
-
-/// [`MenuLine`] for `place` at `words`.
-pub(crate) fn menu_line_of(place: &Place, words: &Words<'_>) -> MenuLine {
-    MenuLine {
-        label: format!("Network \u{2014} {}", words::summary(place, words)),
+/// Where `place` is, as the menu-bar menu's first line ends: the place
+/// ([`words::where_words`]), and the internet only where it was measured down
+/// ([`words::internet_short`]): `ALab LAN`, `remote (phone hotspot) · internet down`. An
+/// internet nothing measured (the path is up, or nothing says) is no finding and adds no word.
+pub(crate) fn identity_words_of(place: &Place) -> String {
+    let at = words::where_words(place);
+    if place.internet.state == aterm_netplace::InternetState::Down {
+        format!("{at} \u{b7} {}", words::internet_short(place))
+    } else {
+        at
     }
 }
 
-/// The menu bar's Network row now; `None` until a place was read.
-pub(crate) fn menu_line() -> Option<MenuLine> {
-    latest().map(|place| menu_line_of(&place, &Words::now()))
+/// [`identity_words_of`] the place now; `None` until a place was read.
+pub(crate) fn identity_words() -> Option<String> {
+    latest().map(|place| identity_words_of(&place))
 }
 
 #[cfg(all(test, unix))]

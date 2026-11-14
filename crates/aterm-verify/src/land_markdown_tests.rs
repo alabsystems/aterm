@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MARKDOWN COMPOSE (`docs/DESIGN-landing-economy.md` §2.1, slice 1): a moved main whose
-//! only shared paths are Markdown no build, include or test reads is merged and rechecked with
-//! the source readers, never judged in full; every other shared path is judged in full. Each
-//! test sits beside the control that shows the rule bites.
+//! THE ROUND (`docs/DESIGN-landing-economy.md` §2.1): a moved main that shares paths with a
+//! judged branch is merged and the merge judged over the cone of those paths, the judgment
+//! standing for the tree it ran on. Shared Markdown no build, include or test reads is in no
+//! cone, so the round's source readers alone answer for it, and such Markdown that a file may
+//! read, or that is no regular file on every side, is judged in full. Each test sits beside the
+//! control that shows the rule bites.
 
 use super::*;
 use aterm_types::land_trailer::Rechecked;
@@ -90,7 +92,7 @@ pub(super) fn rival_does(world: &World, edit: impl FnOnce(&Path)) -> String {
     git(&world.rival, &["rev-parse", "HEAD"])
 }
 
-/// A recheck that ran the source readers and passed.
+/// A round whose cone held no crate: the source readers ran and passed.
 pub(super) fn rechecked() -> Judged {
     ran(
         exit::PASS,
@@ -104,8 +106,8 @@ pub(super) fn rechecked() -> Judged {
 /// on the merge of the judged commit and that main; the recheck's tree is stated as
 /// `Aterm-Rechecked` and no second judgment runs. A main that moves again while the recheck runs,
 /// disjointly, composes onto the rechecked merge at once. NEGATIVE CONTROL: the same Markdown
-/// move beside a move of a code file the branch also changed is judged in full and nothing is
-/// rechecked.
+/// move beside a move of a file the branch also changed, whose reach is every crate, is judged
+/// in full and nothing is rechecked.
 #[test]
 fn a_markdown_only_overlap_composes_after_a_recheck_and_a_later_disjoint_move_composes_too() {
     let world = markdown_world(&[]);
@@ -209,20 +211,23 @@ fn a_markdown_only_overlap_composes_after_a_recheck_and_a_later_disjoint_move_co
             }
             Ran::Ended(green())
         },
-        |base| panic!("Markdown beside a shared code file is never rechecked ({base})"),
+        |base| panic!("shared paths that reach every crate are never rechecked ({base})"),
     );
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert!(rechecks.is_empty(), "{said:#?}");
     assert_eq!(bases.len(), 2, "judged in full: {said:#?}");
 }
 
-/// Every shared path outside the class, or in it but no regular file on all three sides, or
-/// named by code, is judged in full: an image, a fork's or a package's Markdown, TOML, an
-/// executable, Markdown a Rust string names, a lock beside Markdown, and a rename on either
-/// side. NEGATIVE CONTROL: [`DOC`] alone, named only by a comment and by census's guards,
-/// composes after one recheck.
+/// A shared path a crate may own (an image, a fork's or a package's Markdown, TOML, a lock
+/// beside Markdown) does not throw the judgment away: the judgment stands, and one round judges
+/// the merge, the reach asked only where a shared path is one a crate may own.
+/// The round's rows, a package's among them, are stated as `Aterm-Rechecked`. NEGATIVE CONTROLS:
+/// shared no-reach Markdown that is executable, that a Rust string names, or that either side
+/// renames is in no cone and not the source readers' alone to answer for, so it is judged in
+/// full and nothing is rechecked; and [`DOC`] alone, named only by a comment and by census's
+/// guards, is answered by a round that asks no reach.
 #[test]
-fn a_shared_path_outside_the_markdown_rule_is_judged_in_full() {
+fn a_shared_code_path_is_judged_over_its_cone_on_the_merge() {
     let named = "pub const NAMED: &str = \"docs/NAMED.md\";\n";
     let cases: [Case<'_>; 10] = [
         (
@@ -283,6 +288,14 @@ fn a_shared_path_outside_the_markdown_rule_is_judged_in_full() {
         ("main renames", vec![], vec![DOC], true),
     ];
     for (case, files, shared, rename) in cases {
+        // Why the case is judged in full, where it is.
+        let whole = match case {
+            "an executable" | "the branch renames" | "main renames" => {
+                Some("is not one regular file in")
+            }
+            "named in code" => Some("is named in crates/b/src/lib.rs's code"),
+            _ => None,
+        };
         let world = markdown_world(&files);
         commit(&world.work, "a/x.txt", "a2\n");
         let branch_renames = case == "the branch renames";
@@ -294,11 +307,20 @@ fn a_shared_path_outside_the_markdown_rule_is_judged_in_full() {
                 edit_line(&world.work, file, 1, "one");
             }
         }
-        let (code, said, bases, rechecks) = land_rechecking(
+        let asked = RefCell::new(Vec::new());
+        let reach = |paths: Option<&[String]>| match paths {
+            None => reaches(&["a", "b"]),
+            Some(paths) => {
+                asked.borrow_mut().push(paths.to_vec());
+                reaches(&["b"])
+            }
+        };
+        let deltas = RefCell::new(Vec::new());
+        let (code, said, bases, rechecks) = land_reaching(
             &world,
-            &git_cmd,
             crates(&["a"]),
             Lane::Pass,
+            &reach,
             |_, n, _| {
                 if n == 0 {
                     rival_does(&world, |rival| {
@@ -314,60 +336,108 @@ fn a_shared_path_outside_the_markdown_rule_is_judged_in_full() {
                 }
                 Ran::Ended(green())
             },
-            |base| panic!("{case}: never rechecked ({base})"),
+            |_, delta| {
+                assert!(whole.is_none(), "{case}: never rechecked");
+                deltas.borrow_mut().push(delta.shared.clone());
+                ran(
+                    exit::PASS,
+                    vec![
+                        row("fmt", "ok"),
+                        row("census", "ok"),
+                        row("export-scan", "ok"),
+                        row("lint", "ok"),
+                        row("test", "ok"),
+                    ],
+                    4,
+                )
+            },
         );
         assert_eq!(code, exit::PASS, "{case}: {said:#?}");
-        assert!(rechecks.is_empty(), "{case}: {said:#?}");
-        assert_eq!(bases.len(), 2, "{case}: judged in full: {said:#?}");
-        // Where every shared path is Markdown, the line names the part of the rule that failed.
-        let why = match case {
-            "a fork's Markdown" | "a package's docs" => Some("is not Markdown no build"),
-            "an executable" | "the branch renames" | "main renames" => {
-                Some("is not one regular file in")
-            }
-            "named in code" => Some("is named in crates/b/src/lib.rs's code"),
-            _ => None,
-        };
-        if let Some(why) = why {
+        let receipt = stated(&world, &origin_main(&world)).expect("stated");
+        if let Some(why) = whole {
+            assert!(rechecks.is_empty(), "{case}: {said:#?}");
+            assert_eq!(bases.len(), 2, "{case}: judged in full: {said:#?}");
             assert!(
                 said.iter()
                     .any(|line| line.contains("does not compose") && line.contains(why)),
                 "{case}: {said:#?}"
             );
+            assert!(receipt.rechecked.is_empty(), "{case}");
+            assert!(asked.borrow().is_empty(), "{case}: no reach is asked");
+            continue;
         }
-        let receipt = stated(&world, &origin_main(&world)).expect("stated");
-        assert!(receipt.rechecked.is_empty(), "{case}");
+        assert_eq!(
+            (bases.len(), rechecks.len()),
+            (1, 1),
+            "{case}: the judgment stands and one round follows: {said:#?}"
+        );
+        let all: Vec<String> = shared.iter().map(|path| (*path).to_owned()).collect();
+        assert_eq!(*deltas.borrow(), std::slice::from_ref(&all), "{case}");
+        let owned: Vec<String> = all.into_iter().filter(|path| path != DOC).collect();
+        assert!(
+            !asked.borrow().is_empty() && asked.borrow().iter().all(|paths| *paths == owned),
+            "{case}: the reach is asked of the paths a crate may own: {:?}",
+            asked.borrow()
+        );
+        assert_eq!(receipt.checked.len(), 1, "{case}");
+        assert_eq!(receipt.rechecked.len(), 1, "{case}");
+        assert!(
+            receipt.rechecked[0]
+                .rows
+                .iter()
+                .any(|row| row.check == "test" && row.word == "ok"),
+            "{case}: the round's package rows are stated"
+        );
     }
 
     let control = markdown_world(&[]);
     commit(&control.work, "a/x.txt", "a2\n");
     edit_line(&control.work, DOC, 1, "one");
-    let (code, said, bases, rechecks) = land_rechecking(
+    let (code, said, bases, rechecks) = land_reaching(
         &control,
-        &git_cmd,
         crates(&["a"]),
         Lane::Pass,
+        &|paths| match paths {
+            None => reaches(&["a"]),
+            Some(paths) => panic!("Markdown no code reads has no reach to ask ({paths:?})"),
+        },
         |_, n, _| {
             if n == 0 {
                 rival_does(&control, |rival| drop(edit_line(rival, DOC, 8, "eight")));
             }
             Ran::Ended(green())
         },
-        |_| rechecked(),
+        |_, delta| {
+            assert_eq!(delta.shared, [DOC]);
+            rechecked()
+        },
     );
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_eq!((bases.len(), rechecks.len()), (1, 1), "{said:#?}");
 }
 
-/// A recheck reads the merge with main's own rules: a census rule main added beside its
-/// Markdown edit fails the branch's Markdown there, and nothing is pushed. Any red counts (no
-/// lane is read), a check that did not run or was skipped, or a run of other checks, could not
-/// run, and a checkout that changed during the recheck pushes nothing. The control is the green
-/// recheck of the first test.
+/// A round reads the merge with main's own rules: a census rule main added beside its Markdown
+/// edit fails the branch's Markdown there, and nothing is pushed. A red counts as in a judgment
+/// (a package's too, where main's lane does not name it), a source reader that did not run, was
+/// skipped or is missing from the run could not run, and a checkout that changed during the
+/// round pushes nothing. NEGATIVE CONTROL: the source readers' passes beside other rows that
+/// passed or were skipped land.
 #[test]
 fn a_recheck_red_pushes_nothing_and_one_that_did_not_run_could_not_run() {
     let rule = "crates/aterm-census/src/guards/new_rule.rs";
-    let reds: [(&str, Judged, i32); 5] = [
+    let readers = || {
+        vec![
+            row("fmt", "ok"),
+            row("census", "ok"),
+            row("export-scan", "ok"),
+        ]
+    };
+    let with = |more: Vec<CheckRow>| {
+        let mut rows = readers();
+        rows.extend(more);
+        rows
+    };
+    let reds: [(&str, Judged, i32); 7] = [
         (
             "main's new rule fails the branch's Markdown",
             ran(
@@ -408,14 +478,40 @@ fn a_recheck_red_pushes_nothing_and_one_that_did_not_run_could_not_run() {
             exit::COULD_NOT_RUN,
         ),
         (
-            "another set of checks ran",
-            ran(exit::PASS, vec![row("fmt", "ok"), row("census", "ok")], 3),
+            "a source reader is missing from the run",
+            ran(
+                exit::PASS,
+                vec![row("fmt", "ok"), row("census", "ok"), row("test", "ok")],
+                3,
+            ),
             exit::COULD_NOT_RUN,
+        ),
+        (
+            "a package's test fails",
+            ran(
+                exit::FAILED,
+                with(vec![red("test", &["-p a --lib -- mine"])]),
+                3,
+            ),
+            exit::FAILED,
         ),
         (
             "the checkout changed meanwhile",
             rechecked(),
             exit::COULD_NOT_RUN,
+        ),
+        (
+            "other rows passed or were skipped",
+            ran(
+                exit::PASS,
+                with(vec![
+                    row("lint", "skip"),
+                    row("test", "ok"),
+                    row("doc", "ok"),
+                ]),
+                3,
+            ),
+            exit::PASS,
         ),
     ];
     for (case, judged, want) in reds {
@@ -441,16 +537,22 @@ fn a_recheck_red_pushes_nothing_and_one_that_did_not_run_could_not_run() {
             |_| {
                 assert!(
                     world.work.join(rule).exists(),
-                    "{case}: the recheck runs on the merge, main's rules in it"
+                    "{case}: the round runs on the merge, main's rules in it"
                 );
                 if case == "the checkout changed meanwhile" {
                     write(&world.work, "stray.txt", "x\n");
                 }
-                judged.borrow_mut().take().expect("one recheck")
+                judged.borrow_mut().take().expect("one round")
             },
         );
         assert_eq!(code, want, "{case}: {said:#?}");
         assert_eq!((bases.len(), rechecks.len()), (1, 1), "{case}: {said:#?}");
+        if want == exit::PASS {
+            let receipt = stated(&world, &origin_main(&world)).expect("stated");
+            assert_eq!(receipt.rechecked.len(), 1, "{case}");
+            assert_eq!(receipt.rechecked[0].rows.len(), 6, "{case}");
+            continue;
+        }
         assert_eq!(
             origin_main(&world),
             moved.borrow().as_str(),
@@ -460,6 +562,86 @@ fn a_recheck_red_pushes_nothing_and_one_that_did_not_run_could_not_run() {
             said.iter().any(|line| line.contains("nothing was pushed")),
             "{case}: {said:#?}"
         );
+    }
+}
+
+/// A round inherits as a judgment does: a red main's lane named red at the tip the round merged,
+/// in a crate outside the branch's own, is inherited, named and stated, and the merge lands.
+/// NEGATIVE CONTROLS: the same red on a main the lane judged green counts, as does a red the
+/// lane names in one of the branch's crates; nothing is pushed.
+#[test]
+fn a_round_inherits_a_main_red_outside_the_branchs_crates_as_a_judgment_does() {
+    let mine = "-p a --lib -- mine";
+    let named = || Lane::Red([THEIRS.to_owned(), mine.to_owned()].into());
+    for (case, lane, id, want) in [
+        (
+            "the lane names it outside the branch",
+            named(),
+            THEIRS,
+            exit::PASS,
+        ),
+        (
+            "the lane judged the tip green",
+            Lane::Pass,
+            THEIRS,
+            exit::FAILED,
+        ),
+        (
+            "the lane names it in the branch's crate",
+            named(),
+            mine,
+            exit::FAILED,
+        ),
+    ] {
+        let world = markdown_world(&[]);
+        commit(&world.work, "a/x.txt", "a2\n");
+        edit_line(&world.work, DOC, 1, "one");
+        let moved = RefCell::new(String::new());
+        let (code, said, bases, rechecks) = land_rechecking(
+            &world,
+            &git_cmd,
+            crates(&["a"]),
+            lane,
+            |_, n, _| {
+                if n == 0 {
+                    *moved.borrow_mut() =
+                        rival_does(&world, |rival| drop(edit_line(rival, DOC, 8, "eight")));
+                }
+                Ran::Ended(green())
+            },
+            |_| {
+                ran(
+                    exit::FAILED,
+                    vec![
+                        row("fmt", "ok"),
+                        row("census", "ok"),
+                        row("export-scan", "ok"),
+                        red("test", &[id]),
+                    ],
+                    3,
+                )
+            },
+        );
+        assert_eq!(code, want, "{case}: {said:#?}");
+        assert_eq!((bases.len(), rechecks.len()), (1, 1), "{case}: {said:#?}");
+        let moved = moved.into_inner();
+        if want == exit::PASS {
+            let line = format!(
+                "verify land: INHERITED {id} (main's lane named it red at {moved}, outside the \
+                 branch's crates)"
+            );
+            assert!(said.contains(&line), "{case}: {said:#?}");
+            let receipt = stated(&world, &origin_main(&world)).expect("stated");
+            assert_eq!(receipt.inherited, [id], "{case}");
+            assert_eq!(receipt.rechecked.len(), 1, "{case}");
+        } else {
+            assert_eq!(origin_main(&world), moved, "{case}: nothing pushed");
+            assert!(
+                said.iter()
+                    .any(|line| line.contains("FAIL — the round of") && line.contains("test")),
+                "{case}: {said:#?}"
+            );
+        }
     }
 }
 
@@ -494,8 +676,9 @@ fn a_markdown_only_tip_does_not_interrupt_the_running_judgment() {
     assert!(receipt.interrupted.is_empty());
 }
 
-/// A worktree merge whose tree is not the one the Markdown rule tested (here a merge driver that
-/// keeps the branch's side, which only the tool's own merge sees) is judged in full, as one re-judge, and nothing is rechecked.
+/// A worktree merge whose tree is not the one the shared paths were read from (here a merge
+/// driver that keeps the branch's side, which only the tool's own merge sees) is judged in full,
+/// as one re-judge, and nothing is rechecked.
 /// The control is the first test: the same move, merged as tested, is rechecked.
 #[test]
 fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
@@ -537,14 +720,17 @@ fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
             },
             branch: &mut |_: &Path, _: &str| crates(&["a"]),
             lane: &mut |_: &Path, _: &str| Lane::Pass,
-            recheck: &mut |_: &Path, _: &Path, _: &str| {
+            reach: &|_: &Path, _: &str, _: Option<&[String]>| {
+                panic!("shared Markdown no code reads has no reach to ask")
+            },
+            recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| {
                 panic!("a merge unlike the tested tree is judged")
             },
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| {
                 // The rule has tested the plumbing's tree: only the worktree merge after it
                 // sees the attribute.
-                if line.contains("composes once") {
+                if line.contains("the judgment stands for the tree it ran on") {
                     armed.set(true);
                 }
                 said.borrow_mut().push(line.to_owned());
@@ -558,7 +744,8 @@ fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
     assert_eq!(judged.get(), 2, "{said:#?}");
     assert!(
         said.iter()
-            .any(|line| line.contains("the Markdown rule tested: it is judged in full")),
+            .any(|line| line
+                .contains("the tree the shared paths were read from: it is judged in full")),
         "{said:#?}"
     );
     let receipt = stated(&world, &origin_main(&world)).expect("stated");
@@ -566,18 +753,26 @@ fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
     assert_eq!(receipt.rejudges(), 1);
 }
 
-/// Rechecks count toward [`COMPOSES`] with compositions: a main that keeps moving its Markdown
-/// stops the landing after that many rechecks, merged and rechecked, with nothing pushed.
+/// A round that passes renews the composition bound ([`COMPOSES`]): it judged the merge of the
+/// tip that raced the push, so a main that moves its Markdown during the judgment and during
+/// each of more rounds than the bound holds is merged and judged by one round each time, and
+/// the landing lands once main rests, never stopped at the bound. The control is the bound
+/// itself, which a main that only composes still reaches
+/// (`a_main_that_moves_before_every_push_is_composed_onto_and_lands_within_the_bound`).
 #[test]
-fn rechecks_count_toward_the_composition_bound() {
+fn a_round_that_passes_renews_the_composition_bound() {
+    const ROUNDS: usize = COMPOSES + 2;
     let world = markdown_world(&[]);
     commit(&world.work, "a/x.txt", "a2\n");
     edit_line(&world.work, DOC, 1, "one");
     let moves = std::cell::Cell::new(0);
     let move_doc = || {
+        if moves.get() == ROUNDS {
+            return;
+        }
         moves.set(moves.get() + 1);
         let text = format!("eight {}", moves.get());
-        rival_does(&world, |rival| drop(edit_line(rival, DOC, 8, &text)))
+        rival_does(&world, |rival| drop(edit_line(rival, DOC, 8, &text)));
     };
     let (code, said, bases, rechecks) = land_rechecking(
         &world,
@@ -593,16 +788,16 @@ fn rechecks_count_toward_the_composition_bound() {
             rechecked()
         },
     );
-    assert_eq!(code, STOPPED, "{said:#?}");
-    assert_eq!((bases.len(), rechecks.len()), (1, COMPOSES), "{said:#?}");
-    assert_eq!(
-        origin_main(&world),
-        git(&world.rival, &["rev-parse", "HEAD"])
-    );
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    assert_eq!((bases.len(), rechecks.len()), (1, ROUNDS), "{said:#?}");
     assert!(
-        said.iter()
-            .any(|line| line.contains(&format!("STOPPED after {COMPOSES} push/composition races"))),
+        !said.iter().any(|line| line.contains("STOPPED")),
         "{said:#?}"
+    );
+    let receipt = stated(&world, &origin_main(&world)).expect("stated");
+    assert_eq!(
+        (receipt.checked.len(), receipt.rechecked.len()),
+        (1, ROUNDS)
     );
 }
 
@@ -650,10 +845,11 @@ fn move_into(dir: &Path, from: &str, to: &str, extra: &[(&str, &str)]) {
 
 /// merge-ort follows renames, so the shared paths are also the paths the merge holds unlike
 /// both sides: a Markdown file one side moves into a crate that `include_str!`s it, while the
-/// other edits it at its old path, is judged in full for the crate's copy, whichever side moves
-/// it; and with `merge.directoryRenames`, a file the branch adds under a directory main moves
-/// into a crate is judged in full though no path is shared by name but [`DOC`], which alone
-/// composes. The control is the first test's compose.
+/// other edits it at its old path, is judged in full, whichever side moves it, since its old
+/// path is in no cone and no regular file on every side; and with `merge.directoryRenames`, a
+/// file the branch adds under a directory main moves into a crate is judged in full for the
+/// path the branch gave it, though no path is shared by name but [`DOC`], which alone is
+/// answered by a round. The control is the first test's round.
 #[test]
 fn a_rename_into_a_crate_is_judged_in_full_whichever_side_makes_it() {
     let moved = "crates/c/NOTES.md";
@@ -661,7 +857,8 @@ fn a_rename_into_a_crate_is_judged_in_full_whichever_side_makes_it() {
         "crates/c/src/lib.rs",
         "pub const NOTES: &str = include_str!(\"../NOTES.md\");\n",
     );
-    let why = format!("{moved} is not Markdown no build, include or test reads");
+    // The Markdown's old path is in no cone, and one side no longer holds it.
+    let why = format!("{DOC} is not one regular file in");
 
     let world = markdown_world(&[]);
     commit(&world.work, "a/x.txt", "a2\n");
@@ -703,7 +900,7 @@ fn a_rename_into_a_crate_is_judged_in_full_whichever_side_makes_it() {
             move_into(rival, "docs/old", "crates/c/docs", &[]);
             drop(edit_line(rival, DOC, 8, "eight"));
         },
-        "crates/c/docs/new.md is not Markdown no build, include or test reads",
+        "docs/old/new.md is not one regular file in",
     );
 }
 

@@ -36,6 +36,7 @@ use aterm_secrets::commons::bootstrap::Device;
 use aterm_secrets::discover;
 use aterm_secrets::members::join::{self, Dial, Heard, Stream};
 use aterm_secrets::members::joiner::Joining;
+use aterm_secrets::membership_log::Evidence;
 use aterm_secrets::phrase::Phrase;
 
 const USAGE: &str = "aterm members: Macs joining ALab and the members that let them in
@@ -45,11 +46,15 @@ const USAGE: &str = "aterm members: Macs joining ALab and the members that let t
                         the vault removed, which the run restores)
   invite                show a phrase for whichever Mac types it next
   ignore <name>         hide that Mac's request on this Mac
-  list                  the members and the Macs the vault removed, as this Mac's log says
+  list                  the members and the Macs the vault removed, as this Mac's log says:
+                        who let each in, the day (UTC), how (`how=phrase` a person's Allow,
+                        `manual` the member by itself, `listed` the genesis), whether its
+                        seat holds a fleet node key, and each pair of seats the log ties
+                        (`split`)
   remove <name> [--stolen]
                         take that Mac out of ALab as this Mac, rotating the fleet code
                         (--stolen: also deny-list its labels and node in the roster, and
-                        name what to rotate at the providers)
+                        file each credential it could read for rotation in the need ledger)
   undo [<name>]         the Undo rows this Mac shows for <name>'s removals; a person's
                         press of the row on the Machines view signs this Mac's share
   join [<phrase>] [--member <name>] [--at <host:port>]... [--no-wait]
@@ -311,9 +316,11 @@ fn seats_by_label(paths: &Paths) -> BTreeMap<String, (String, Option<String>)> {
         .collect()
 }
 
-/// `list`'s lines: one per member, then one per Mac the log removed, then one per pair of
-/// standing seats the log ties ([`client::Split::line`]: one Mac seated twice, or a Mac that asked
-/// under another standing seat's label).
+/// `list`'s lines: one per member (who let it in, the UTC day its entry was signed, how the
+/// member knew to, and whether the log holds a fleet node key for its seat), then one per Mac the
+/// log removed, then one per pair of standing seats the log ties ([`client::Split::line`]: one
+/// Mac seated twice, a writer successor beside a seat of its line, or a Mac that asked under
+/// another standing seat's label).
 fn list_said(paths: &Paths) -> Result<Vec<String>, String> {
     let listed = client::member_list(paths)
         .map_err(|error| error.to_string())?
@@ -321,27 +328,53 @@ fn list_said(paths: &Paths) -> Result<Vec<String>, String> {
     let splits = client::seat_splits(paths).map_err(|error| error.to_string())?;
     Ok(listed
         .iter()
-        .map(|mac| match &mac.removed {
-            Some(note) => format!(
-                "{} {} code={} removed by={}{}",
-                mac.label,
-                mac.name,
-                mac.code,
-                note.by.join(","),
-                if note.quorum { " quorum" } else { "" }
-            ),
-            None => format!(
-                "{} {} code={}{}",
-                mac.label,
-                mac.name,
-                mac.code,
-                mac.admitted_by
-                    .as_ref()
-                    .map_or(" founder".to_owned(), |by| format!(" admitted by={by}"))
-            ),
-        })
+        .map(listed_line)
         .chain(splits.iter().map(client::Split::line))
         .collect())
+}
+
+/// One Mac's `list` line: a member's says who let it in, the UTC day its entry was signed, how
+/// the member knew to (`how=phrase`: a person's Allow; `how=manual`: the member by itself, on a
+/// proof, a person's `aterm secrets approve` or a writer succession; `how=listed`: the genesis
+/// listed it) and whether the log holds a fleet node key for its seat; a removed Mac's says who
+/// removed it.
+fn listed_line(mac: &client::ListedMac) -> String {
+    match &mac.removed {
+        Some(note) => format!(
+            "{} {} code={} removed by={}{}",
+            mac.label,
+            mac.name,
+            mac.code,
+            note.by.join(","),
+            if note.quorum { " quorum" } else { "" }
+        ),
+        None => format!(
+            "{} {} code={}{}{}{} node={}",
+            mac.label,
+            mac.name,
+            mac.code,
+            mac.admitted_by
+                .as_ref()
+                .map_or(" founder".to_owned(), |by| format!(" admitted by={by}")),
+            signed_day(mac.admitted_ms).map_or(String::new(), |day| format!(" on={day}")),
+            mac.how.map_or("", |how| match how {
+                Evidence::Phrase => " how=phrase",
+                Evidence::Manual => " how=manual",
+                Evidence::Listed => " how=listed",
+            }),
+            if mac.node { "yes" } else { "no" }
+        ),
+    }
+}
+
+/// The UTC day `ms` falls on, as `YYYY-MM-DD`; `None` for an entry whose record this Mac's log
+/// does not hold (0).
+fn signed_day(ms: u64) -> Option<String> {
+    (ms > 0).then(|| {
+        let days = i64::try_from(ms / 86_400_000).unwrap_or(i64::MAX);
+        let (year, month, day) = aterm_types::rfc3339::civil_from_days(days);
+        format!("{year:04}-{month:02}-{day:02}")
+    })
 }
 
 /// What a person's removal resolves its word to ([`crate::fleet_member::removal_seat`], live):
@@ -351,7 +384,8 @@ pub(crate) type SeatOf<'a> =
     &'a dyn Fn(&str) -> Result<Option<crate::fleet_member::RemovalSeat>, String>;
 
 /// `remove`'s lines: what was removed and rotated, the log name and node id it acted on (§4.16),
-/// what the Mac could read, and on `--stolen` the one `NEEDS YOU:` line. Where `seat_of` names a
+/// what the Mac could read, and on `--stolen` the one line naming what was filed for rotation in
+/// this Mac's need ledger. Where `seat_of` names a
 /// seat (live: for a node id or a registry label, B12) that seat is removed
 /// ([`client::remove_seat`]), and where it refuses nothing is signed; any other word is resolved
 /// by [`client::remove_member`].
@@ -401,7 +435,7 @@ pub(crate) fn remove_said(
         lines.push("rotated aterm-fleet-code".to_owned());
     }
     lines.extend(removal.envelope_notes);
-    lines.extend(removal.needs_you);
+    lines.extend(removal.rotation);
     Ok(lines)
 }
 
@@ -1003,11 +1037,12 @@ fn join_tried(
         let _ = writeln!(err, "aterm members join: {words}");
         return Tried::Dropped;
     }
-    // A lab identity (one a test, a debug build, a lab lane or a VM made) never asks the live
-    // ALab, whose members a browse of `_alab._tcp` finds: with no `--at` it refuses before it
-    // looks for a member or dials one, and before the vault half joins ALab's vault. A lab's own
-    // members service (`ATERM_LAB_MEMBER_SERVICE`) or the members a person names with `--at`
-    // are asked as before, and a member on the live genesis refuses the marked ask itself.
+    // A lab identity (one a test, a debug build, a lab lane, a VM or a process in a foreign home
+    // made) never asks the live ALab, whose members a browse of `_alab._tcp` finds: with no
+    // `--at` it refuses before it looks for a member or dials one, and before the vault half
+    // joins ALab's vault. A lab's own members service (`ATERM_LAB_MEMBER_SERVICE`) or the members
+    // a person names with `--at` are asked as before, and a member on the live genesis refuses
+    // the marked ask itself.
     if args.at.is_empty()
         && let Err(error) = client::refuse_lab_member_browse(&me.paths)
     {

@@ -198,7 +198,7 @@ fn two_lines_are_invalid() {
 }
 
 #[test]
-fn a_child_that_cannot_start_names_auth_add() {
+fn a_child_that_cannot_start_names_the_vault_token() {
     let root = common::scratch("import-nochild");
     let fake = FakeGithub::start();
     let (mut ctx, captured, _fx) = scripted_ctx(root.path(), &fake, Vec::new());
@@ -206,10 +206,7 @@ fn a_child_that_cannot_start_names_auth_add() {
     assert_eq!(exit, 3, "{}", captured.stderr_text());
     let error = common::error_json(&captured.stderr_text());
     let next = error["next"].as_str().unwrap_or_default();
-    assert!(
-        next.contains("agh auth add dev2 --file PATH --tier dev"),
-        "{next}"
-    );
+    assert!(next.contains("aterm secrets need gh:dev"), "{next}");
     assert!(!Dirs::under(root.path()).config_file().exists());
 }
 

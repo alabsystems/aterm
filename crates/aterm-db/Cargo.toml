@@ -19,6 +19,10 @@ dev-seams = []
 # in amacs's spreadsheet mode comes back exactly as the grid committed it.
 amacs.workspace = true
 aterm-db-core.workspace = true
+# Shared files' reader: the snapshot, status and face codecs the materializer writes through.
+aterm-file.workspace = true
+# The text guard every typed cell applies, shared with aterm-file's outbox.
+aterm-value-guard.workspace = true
 aterm-secrets.workspace = true
 # The update record type `alab::journal::upd` publishes (the updater itself is no dependency).
 aterm-update-core.workspace = true

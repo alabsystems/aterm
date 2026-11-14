@@ -26,7 +26,7 @@ fn fixture(body: &str) -> (aterm_tempfile::TempDir, PathBuf, PathBuf) {
 fn run(tool: &Path, artifact: &Path, bound: Duration) -> Result<(), String> {
     notary_accept(
         artifact,
-        &NotaryAuth::KeychainProfile("fake".into()),
+        &NotaryAuth::keychain_profile("fake"),
         tool.to_str().unwrap(),
         bound,
         Duration::ZERO,
@@ -49,7 +49,7 @@ fn hostile_clock_advance_at_accepted_response_refuses() {
     let bound = Duration::from_secs(60);
     let error = notary_accept_with_clock(
         &artifact,
-        &NotaryAuth::KeychainProfile("fake".into()),
+        &NotaryAuth::keychain_profile("fake"),
         tool.to_str().unwrap(),
         bound,
         Duration::ZERO,

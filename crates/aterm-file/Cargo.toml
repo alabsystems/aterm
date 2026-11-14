@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-file"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared files (docs/DESIGN-shared-files-2026-11-11.md): a file's name, its local layout, its snapshot and state codecs, and the read that answers in every custody state"
+
+# No aterm-db, aterm-secrets or astream dependency, by design (section 4, Read): no session,
+# vault or generation code can reach a read of a shared file. aterm-db's materializer writes what
+# this crate reads, through this crate's own writer.
+[dependencies]
+aterm-json.workspace = true
+aterm-digest.workspace = true
+aterm-codec.workspace = true
+# The whole-file atomic writer, the lock file a recording pass holds, and the answer writer.
+aterm-uds.workspace = true
+# The home directory `~/.aterm/files` sits under.
+aterm-types.workspace = true
+# The `SharedFile` anchor on `File::read`: `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor.workspace = true
+# The text guard an intent's values are held to before the outbox accepts one (§5, rule 6).
+aterm-value-guard.workspace = true
+
+[dev-dependencies]
+aterm-tempfile.workspace = true
+
+[lints]
+workspace = true

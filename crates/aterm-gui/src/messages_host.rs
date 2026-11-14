@@ -1100,16 +1100,6 @@ impl App {
         self.dispatch_native_view_event(wid, view, action).is_ok()
     }
 
-    /// Opens Settings ▸ Messages at entry `id` in the frontmost (or newly created) window.
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn open_messages_entry_anywhere(&mut self, id: u64) -> Option<WindowId> {
-        let wid = self
-            .frontmost_window
-            .or_else(|| self.windows.keys().next().copied())?;
-        self.open_messages_entry(wid, MessageId::from_raw(id))
-            .then_some(wid)
-    }
-
     /// Invokes action `act_index` on message entry `id` from Settings ▸ Messages.
     pub(crate) fn perform_message_act(
         &mut self,

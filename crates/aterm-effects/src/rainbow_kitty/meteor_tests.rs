@@ -2073,6 +2073,126 @@ fn the_reduced_motion_burst_is_a_still_star() {
     assert!(sc.out.is_empty(), "the static star outlived the horizon");
 }
 
+/// Every probed cell of the landing row blank.
+const OPEN_ROW: u32 = (1 << (2 * JET_PROBE_CELLS + 1)) - 1;
+
+/// The landing row of a line of words: each fourth cell from the landing's a gap, the rest
+/// letters.
+fn row_of_words() -> u32 {
+    (-JET_PROBE_CELLS..=JET_PROBE_CELLS)
+        .filter(|k| k.rem_euclid(4) == 0)
+        .fold(0, |row, k| row | 1 << (k + JET_PROBE_CELLS))
+}
+
+/// A dark jet's two sections meet where the first ends and the second begins, and a section
+/// shorter than two of the jet's lattice pitches still draws: one jet straight along the row,
+/// at every phase of its root on the lattice and from a pitch and a fifth to five pitches long,
+/// lays light on every pixel column from its root to the end of its first section. The jet
+/// from the lattice alone ended the first section at its last station short of the end and
+/// began the second at the first past it, a gap a pitch long, and laid nothing for a section
+/// that held fewer than two stations.
+#[test]
+fn a_dark_jet_s_sections_meet_and_a_short_one_draws() {
+    let cfg = config();
+    for g in [owner_geom(), geom()] {
+        let (_m, mut l, arrival) = landed(40, &cfg, g, true);
+        l.sky = Some(SkyMask { row: OPEN_ROW });
+        let ctx = ctx_on(arrival, &cfg, (5, 40), g);
+        let pitch = g.cw as f32 / JET_STATIONS_PER_CELL as f32;
+        for pitches in [1.2_f32, 1.9, 2.5, 5.0] {
+            for phase in 0..8 {
+                let root = BURST_CORE_CH * g.ch as f32 + pitch * phase as f32 / 8.0;
+                let tip = root + pitches * pitch;
+                let s1 = root + (tip - root) * JET_SEC_SHARE[0];
+                let mut sc = Scratch::default();
+                burst_jet(
+                    &mut sc.frame(),
+                    &ctx,
+                    &l,
+                    (1.0, 0.0),
+                    root,
+                    tip,
+                    150.0,
+                    None,
+                    &mut None,
+                );
+                let cols: std::collections::BTreeSet<i32> = sc
+                    .out
+                    .iter()
+                    .flat_map(|q| i32::from(q.x)..i32::from(q.x) + i32::from(q.w))
+                    .collect();
+                let (from, to) = ((l.x + root).floor() as i32, (l.x + s1).floor() as i32);
+                let holes: Vec<i32> = (from..=to).filter(|x| !cols.contains(x)).collect();
+                assert!(
+                    holes.is_empty(),
+                    "cw{} ch{}: a jet {pitches} pitches long, its root {phase}/8 of a pitch on, \
+                     leaves columns {holes:?} of {from}..={to} dark",
+                    g.cw,
+                    g.ch
+                );
+            }
+        }
+    }
+}
+
+/// Each pixel's lightings over a landing burst's life past the core star's reach (the round
+/// star's lances end inside it), every 16 ms frame: the jets, and on paper their light squares.
+fn jet_lightings(cfg: &Config, row: u32) -> usize {
+    let g = owner_geom();
+    let (_m, mut l, arrival) = landed(40, cfg, g, true);
+    l.sky = Some(SkyMask { row });
+    let b = l.burst.expect("a 40-cell nav landing bursts");
+    let reach = BURST_CORE_CH * g.ch as f32 + BURST_SEC_THICK_CH[0] * g.ch as f32;
+    let mut sc = Scratch::default();
+    let frames: Vec<_> = (0..=(b.ms as u64 / 16) + 1)
+        .map(|f| {
+            burst_only(&mut sc, &l, cfg, g, arrival, f * 16);
+            let mut now = light_map(&sc.out, &[]);
+            now.retain(|&(x, _), _| (f32::from(x) + 0.5 - l.x).abs() > reach);
+            now
+        })
+        .collect();
+    assert!(
+        frames.iter().any(|f| !f.is_empty()),
+        "the jets drew nothing past the core star"
+    );
+    lightings(frames).values().copied().max().unwrap_or(0)
+}
+
+/// A landing burst's jets, and on paper their light squares, stand on a lattice from the
+/// landing, so as the ring grows no pixel of them goes dark and lit again: over an open row
+/// and a line of words (the jets break over each letter), on a dark page and on paper, a pixel
+/// is lit once. Control: spread over each section from its moving start
+/// ([`with_bursts_spread`]), the stations slide, a square's edge falls on and off a pixel and
+/// a station crosses between a gap and a letter, the jet's piece in the gap lit again.
+#[test]
+fn a_burst_s_jets_light_each_pixel_once_as_the_ring_grows() {
+    let dark = config();
+    let paper = Config {
+        dark_theme: false,
+        theme_fg: 0x0024_292F,
+        theme_bg: 0x00FF_FFFF,
+        ..config()
+    };
+    for (cfg, page) in [(&dark, "dark"), (&paper, "paper")] {
+        for (row, name) in [
+            (OPEN_ROW, "an open row"),
+            (row_of_words(), "a line of words"),
+        ] {
+            let once = jet_lightings(cfg, row);
+            assert_eq!(
+                once, 1,
+                "{page}, {name}: a pixel of the jets lit {once} times"
+            );
+        }
+        let spread = with_bursts_spread(|| jet_lightings(cfg, row_of_words()));
+        assert!(
+            spread > 1,
+            "control: {page}, spread over its sections, no pixel of the jets lit twice"
+        );
+    }
+}
+
 #[test]
 fn a_jet_is_probed_over_its_whole_capped_reach() {
     for g in [owner_geom(), geom()] {
@@ -2285,10 +2405,11 @@ fn a_spark_is_culled_exactly_where_the_cadence_law_says_it_is() {
 
 /// On a dark page the sparks are haloed stars: a 48-cell jump (landed ten
 /// cells in so the leftward half is on the glass) throws at least sixty
-/// sparks, and at `T + 150` at least fifty chromatic halos are on the
-/// frame and at least forty sparks stand ≥ 5 px on both axes (replaces
-/// the pruned `the_sparks_are_haloed_stars_twice_the_bold_round_s_count`;
-/// 60, 64 and 60 at Prism Glass P0.11).
+/// sparks, and once the last is born ([`SPARK_STAND_LAST_MS`]) at least
+/// fifty chromatic halos are on the frame and at least forty sparks stand
+/// ≥ 5 px on both axes (replaces the pruned
+/// `the_sparks_are_haloed_stars_twice_the_bold_round_s_count`; 60, 64 and
+/// 60 at Prism Glass P0.11).
 #[test]
 fn the_dark_sparks_are_haloed_stars_twice_the_bold_round_s_count() {
     let cfg = config();
@@ -2307,16 +2428,17 @@ fn the_dark_sparks_are_haloed_stars_twice_the_bold_round_s_count() {
         "a 48-cell landing throws {} sparks, not twice the bold round's thirty",
         l.sparks
     );
-    sc.emit(&mut m, &ctx_at(arrival + ms(150), &cfg, (5, 10), 0.25));
+    let born = SPARK_STAND_LAST_MS.ceil() as u64;
+    sc.emit(&mut m, &ctx_at(arrival + ms(born), &cfg, (5, 10), 0.25));
     let halos = sc.halos.iter().filter(|h| is_chromatic(h.color)).count();
     assert!(
         halos >= 50,
-        "{halos} chromatic halos at T + 150: the sparks have none"
+        "{halos} chromatic halos at T + {born}: the sparks have none"
     );
     let cell_sized = |q: &GlowQuad| usize::from(q.w) == g.cw && usize::from(q.h) == g.ch;
     let mut big = 0_usize;
     for spark in l.spark.iter().take(usize::from(l.sparks)) {
-        let Some(((dx, dy), _)) = spark_at(*spark, 150.0, ch) else {
+        let Some(((dx, dy), _)) = spark_at(*spark, born as f32, ch) else {
             continue;
         };
         let (px, py) = ((l.x + dx).round() as i32, (l.y + dy).round() as i32);
@@ -2338,7 +2460,7 @@ fn the_dark_sparks_are_haloed_stars_twice_the_bold_round_s_count() {
     }
     assert!(
         big >= 40,
-        "only {big} sparks stand ≥ 5 × 5 px at T + 150: points, not stars"
+        "only {big} sparks stand ≥ 5 × 5 px at T + {born}: points, not stars"
     );
 }
 
@@ -2425,6 +2547,244 @@ fn a_party_landing_is_a_fan_off_the_glass_inside_315_ms() {
     );
 }
 
+/// Each pixel's light on a frame, `0..=255`, added up: a quad's ink alpha on paper or its
+/// brightest channel of added light on a dark page, and a halo's peak under the renderer's
+/// falloff ([`aterm_render::halo_weight`]).
+fn light_map(out: &[GlowQuad], halos: &[RainHalo]) -> BTreeMap<(u16, u16), u32> {
+    let mut light: BTreeMap<(u16, u16), u32> = BTreeMap::new();
+    for q in out {
+        let (r, g, b) = chan(q.color);
+        let v = u32::from(q.alpha).max(r.max(g).max(b));
+        for x in q.x..q.x + q.w {
+            for y in q.y..q.y + q.h {
+                *light.entry((x, y)).or_default() += v;
+            }
+        }
+    }
+    for h in halos {
+        let (r, g, b) = chan(h.color);
+        let peak = r.max(g).max(b);
+        let (rx2, ry2) = (i32::from(h.rx.max(1)).pow(2), i32::from(h.ry.max(1)).pow(2));
+        for x in h.x..h.x + h.w {
+            for y in h.y..h.y + h.h {
+                let ny = aterm_render::halo_row_ny(i32::from(y) - i32::from(h.cy), ry2);
+                let w = aterm_render::halo_weight(i32::from(x) - i32::from(h.cx), ny, rx2);
+                *light.entry((x, y)).or_default() += peak * w as u32 / 256;
+            }
+        }
+    }
+    for v in light.values_mut() {
+        *v = (*v).min(255);
+    }
+    light
+}
+
+/// How many times each pixel lights over `frames` ([`light_map`]s), as the flash law reads a
+/// turn: its light rises a tenth of full or more over the least it has held since it last
+/// fell, and falls when it drops a tenth or more under the most it held since it lit (an
+/// antialiased edge wavering a few steps is no turn).
+fn lightings(
+    frames: impl IntoIterator<Item = BTreeMap<(u16, u16), u32>>,
+) -> BTreeMap<(u16, u16), usize> {
+    const TENTH: u32 = 26;
+    // Per pixel: lit, the least (dark) or most (lit) since its last turn, and its lightings.
+    let mut at: BTreeMap<(u16, u16), (bool, u32, usize)> = BTreeMap::new();
+    for frame in frames {
+        for &px in frame.keys() {
+            at.entry(px).or_insert((false, 0, 0));
+        }
+        for (px, (lit, edge, n)) in &mut at {
+            let v = frame.get(px).copied().unwrap_or(0);
+            if !*lit {
+                *edge = (*edge).min(v);
+                if v >= *edge + TENTH {
+                    (*lit, *edge, *n) = (true, v, *n + 1);
+                }
+            } else {
+                *edge = (*edge).max(v);
+                if v + TENTH <= *edge {
+                    (*lit, *edge) = (false, v);
+                }
+            }
+        }
+    }
+    at.into_iter().map(|(px, (_, _, n))| (px, n)).collect()
+}
+
+/// A landing's sparks stand, so no pixel of the shower goes dark and lit again more than three
+/// times in a second (the flash law's bound): a 48-cell jump on a dark page, every 16 ms frame
+/// of the sparks alone, a pixel lit when a star's quad or its halo covers it. Control: thrown
+/// ([`with_sparks_thrown`]), forty to sixty stars cross the pixels round the landing in turn.
+#[test]
+fn a_shower_lights_no_pixel_more_than_three_times_a_second() {
+    let cfg = config();
+    let to = (5_u16, 10_u16);
+    let most_lit = || {
+        let t0 = Instant::now();
+        let mut m = Meteors::new();
+        let ctx = ctx_at(t0, &cfg, to, 0.25);
+        let spawn = m.on_event(&mv((5, 58), to), t0, &ctx).expect("fly");
+        let arrival = t0 + spawn.t_flight;
+        let mut sc = Scratch::default();
+        sc.emit(&mut m, &ctx_at(arrival, &cfg, to, 0.25));
+        let l = m.landings[0];
+        let frames = (0..=(SPARK_LIFE_MAX_MS as u64 / 16)).map(|f| {
+            let ctx = ctx_at(arrival + ms(f * 16), &cfg, to, 0.25);
+            let mut sp = Scratch::default();
+            draw_sparks(&l, &ctx, &mut sp.frame(), SPARK_HALO_CAP);
+            assert!(
+                sp.halos.len() <= SPARK_HALO_CAP,
+                "{} halo quads, over the cap",
+                sp.halos.len()
+            );
+            light_map(&sp.out, &sp.halos)
+        });
+        lightings(frames).values().copied().max().unwrap_or(0)
+    };
+    let standing = most_lit();
+    assert!(
+        (1..=3).contains(&standing),
+        "a pixel of the shower is lit {standing} times in its life (a second at most)"
+    );
+    let thrown = with_sparks_thrown(most_lit);
+    assert!(
+        thrown > 3,
+        "control: thrown, the shower lights a pixel at most {thrown} times"
+    );
+}
+
+/// Per landing, each spark's (bright frames, halo frames, lightings); and a frame's most spark
+/// halo quads ([`spark_halo_film`]).
+type HaloFilm = (Vec<Vec<(usize, usize, usize)>>, usize);
+
+/// The spark halos of a 48-cell jump's landing and, when `back_ms` is given, of a jump back keyed
+/// that long after the first lands, drawn in frames 16 ms apart with the frame's halos held to
+/// `cap` ([`draw_sparks`]). Per landing, each spark's bright frames (its star at or over
+/// [`SPARK_SHRINK_ALPHA`]), the frames it wore its halo and the times its halo lit; and the most
+/// spark halo quads one frame laid.
+fn spark_halo_film(back_ms: Option<u64>, cap: usize) -> HaloFilm {
+    let cfg = config();
+    let (a, b) = ((5_u16, 58_u16), (5_u16, 10_u16));
+    let t0 = Instant::now();
+    let mut m = Meteors::new();
+    let flight = m
+        .on_event(&mv(a, b), t0, &ctx_at(t0, &cfg, b, 0.25))
+        .expect("a 48-cell jump flies")
+        .t_flight;
+    let back = back_ms.map(|gap| t0 + flight + ms(gap));
+    let g = SPARK_G_CH_PER_S2 * geom().ch as f32 * (1.0 / 1_000_000.0);
+    let mut caret = b;
+    let mut seen: BTreeMap<Instant, Vec<(usize, usize, usize, bool)>> = BTreeMap::new();
+    let mut most = 0;
+    for f in 0..=150_u64 {
+        let at = t0 + ms(f * 16);
+        if caret == b && back.is_some_and(|back| at >= back) {
+            caret = a;
+            m.on_event(&mv(b, a), at, &ctx_at(at, &cfg, a, 0.25))
+                .expect("the jump back flies");
+        }
+        let ctx = ctx_at(at, &cfg, caret, 0.25);
+        Scratch::default().emit(&mut m, &ctx);
+        let mut sp = Scratch::default();
+        {
+            let mut fr = sp.frame();
+            for l in &m.landings {
+                draw_sparks(l, &ctx, &mut fr, cap);
+            }
+        }
+        most = most.max(sp.halos.len());
+        for l in &m.landings {
+            let n = usize::from(l.sparks);
+            let age = ms_since(l.pin.at, at);
+            let film = seen
+                .entry(l.pin.at)
+                .or_insert_with(|| vec![(0, 0, 0, false); n]);
+            for (s, r) in l.spark.iter().zip(film.iter_mut()) {
+                let seen_at = spark_at_with_gravity(*s, age, g);
+                let on = seen_at.is_some_and(|((dx, dy), _)| {
+                    let (x, y) = ((l.x + dx).round(), (l.y + dy).round());
+                    sp.halos
+                        .iter()
+                        .any(|h| f32::from(h.cx) == x && f32::from(h.cy) == y)
+                });
+                r.0 += usize::from(seen_at.is_some_and(|(_, alpha)| alpha >= SPARK_SHRINK_ALPHA));
+                r.1 += usize::from(on);
+                r.2 += usize::from(on && !r.3);
+                r.3 = on;
+            }
+        }
+    }
+    let landings = seen
+        .into_values()
+        .map(|v| v.into_iter().map(|(b, w, l, _)| (b, w, l)).collect())
+        .collect();
+    (landings, most)
+}
+
+/// A landing's bright spark frames without a halo, and its bright spark frames.
+fn bare_of(landing: &[(usize, usize, usize)]) -> (usize, usize) {
+    landing.iter().fold((0, 0), |(bare, bright), &(b, w, _)| {
+        (bare + b.saturating_sub(w), bright + b)
+    })
+}
+
+/// A spark's halo is lit for one stretch of its bright life, granted when its landing comes, so
+/// it lights once whatever the sparks and landings before it do, and with no cap on the frame
+/// every live landing's halos keep under [`SPARK_HALO_CAP`]'s quads: a 48-cell jump on a dark
+/// page alone, and with a jump back landing among its bright halos or after them. A lone shower,
+/// and the jump back after the first's halos are out, wear their halos for four fifths of their
+/// bright frames at least. Controls: every bright spark wearing a halo while the frame has room
+/// ([`with_halos_regranted`]) lights one more than once; halos granted whole or not at all
+/// ([`with_halos_whole_or_none`]) leave over a fifth of a lone shower's bright frames bare.
+#[test]
+fn a_spark_s_halo_lights_once_and_lasts_most_of_its_bright_life() {
+    // Read with no cap on the frame, the grants alone keep the halos under it.
+    let films = |cap| [None, Some(100), Some(250)].map(|back| spark_halo_film(back, cap));
+    let lit_most = |films: &[HaloFilm]| {
+        films
+            .iter()
+            .flat_map(|(ls, _)| ls.iter().flatten())
+            .map(|&(_, _, lit)| lit)
+            .max()
+            .unwrap_or(0)
+    };
+    let read = films(usize::MAX);
+    for (back, (landings, most)) in ["none", "100 ms", "250 ms"].iter().zip(&read) {
+        assert_eq!(
+            landings.len(),
+            1 + usize::from(*back != "none"),
+            "back {back}"
+        );
+        assert!(
+            *most <= SPARK_HALO_CAP,
+            "back {back}: a frame laid {most} spark halo quads, over the cap's {SPARK_HALO_CAP}"
+        );
+    }
+    let once = lit_most(&read);
+    assert_eq!(once, 1, "a spark's halo lit {once} times");
+    // A lone shower, and a jump back landing once the first's halos are out: no more than a fifth
+    // of a bright star's frames go without its halo. A jump back landing among the first's bright
+    // halos shares the cap with them and is held to the once law alone.
+    for (what, landing) in [("lone", &read[0].0[0]), ("back", &read[2].0[1])] {
+        let (bare, bright) = bare_of(landing);
+        assert!(
+            5 * bare <= bright,
+            "{what}: {bare} of {bright} bright spark frames wore no halo"
+        );
+    }
+    let regranted = lit_most(&with_halos_regranted(|| films(SPARK_HALO_CAP)));
+    assert!(
+        regranted > 1,
+        "control: every bright spark wearing a halo while the frame had room lit none twice"
+    );
+    let whole = with_halos_whole_or_none(|| films(usize::MAX));
+    let (bare, bright) = bare_of(&whole[0].0[0]);
+    assert!(
+        5 * bare > bright,
+        "control: halos whole or none left only {bare} of {bright} bright frames bare"
+    );
+}
+
 #[test]
 fn the_shower_stops_where_the_hand_stopped() {
     let cfg = config();
@@ -2508,10 +2868,13 @@ fn the_shower_stops_where_the_hand_stopped() {
 
     let (free_min, _, free_station, free_seen) = run(false);
     assert_eq!(free_seen, seen, "the wall must not cost the shower a spark");
+    // A spark stands at one point of its throw (spread over the shower's area), so the free
+    // shower's leftmost spark stands short of where the leftmost thrown one was last seen
+    // (column 18 when they flew).
     assert!(
-        free_min <= 20 && free_station <= 21,
-        "with no floor the shower reached column {free_min} (stations {free_station}); \
-         it used to reach 18"
+        free_min <= 22 && free_station <= 22,
+        "with no floor the shower reached column {free_min} (stations {free_station}), \
+         not six cells past the floor"
     );
 }
 

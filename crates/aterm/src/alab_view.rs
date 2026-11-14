@@ -2,26 +2,41 @@
 // Copyright 2026 Andrew Yates
 
 //! LabView's cache (`docs/DESIGN-alab-lab-model-2026-11-01.md` §7, step 11): the harness's
-//! `aterm_agent::harness::alab_roster::Source`, filled from
-//! `aterm_db::alab::Registry::observe_installed_projection`.
+//! `aterm_agent::harness::alab_roster::Source`, served from this Mac's shared files
+//! (`docs/DESIGN-shared-files-2026-11-11.md` §4 and §11, SF-04).
 //!
-//! A projection is read as an observer, writes nothing and calls no provider. The first caller in
-//! a process projects once; after that a background thread reads the registry's log and its
-//! source revision every five minutes, while every caller gets the held projection at once.
-//! Each projection keeps the exact native source it came from. A failed or partial
-//! read retains an existing projection. Without one the source is pending, so neither naming
-//! nor account discovery can interpret uncertainty as an absent registry binding,
-//! and a caller looks again after 15 seconds. Syncs, the accounts list, mail routes and first-name
-//! creation ask, never a typing path, so typing never waits on it. `[alab] roster = false` in `aterm.toml` turns the source
-//! off on this Mac. A test, a debug build and a build tool's run hold no lab (inert, as the other
-//! lab hooks are), so no test reads this Mac's registry.
-//! Every getter admits current local policy before exposing a held projection. Unavailable
-//! policy hides the projection and blocks automatic fallback without erasing its history.
-//! Native receipt admission retains both physical replicas and the local vault observation.
-//! An installation that never configured a Commons is absent, read at once. Inside an
-//! established vault a missing projection stays pending: the catalog's separate local-absence
-//! capability is not yet a receipt capability here, and cannot authorize a fallback through
-//! this cache.
+//! The lab is read from the snapshots of `ai/accounts`, `ai/links` and `lab/machines`
+//! (`aterm_file::File::read`, through `aterm_db::alab::view::LabView::of_files`): local files
+//! that answer in every custody state, so the lab is served across a restart while the registry
+//! refuses every strict reader (a pending writer succession, ATERM-KI-1109-1), and a held
+//! snapshot is served as it is. A read opens no custody, takes no vault and calls no provider;
+//! each caller reads the snapshots' status files, and the snapshots themselves only once a pass
+//! moved them. No thread looks at the registry on a timer: the materializer
+//! (`aterm_db::file::materialize`) moves the snapshots after the registry grows. With no
+//! snapshot here the source is absent only on an installation that never configured a Commons,
+//! and pending otherwise, so neither naming nor account discovery reads uncertainty as an
+//! absent registry binding; a file whose last pass says `off` (`[commons]` keeps the registry
+//! from this Mac) is no source either.
+//!
+//! A preference orders a pool and never limits it (`link_never_limits`): the harness's sync
+//! keeps every row this Mac holds whatever the lab says (`alab_roster::retain`), so an empty,
+//! stale, held or missing snapshot removes nothing and signs nothing out.
+//!
+//! What no shared file carries is still read from the registry, strictly, as a sign-in's
+//! mailbox always was (§10): the mail metadata (mailboxes, where an address's codes arrive, the
+//! alias links), whose collections hold `Secret` columns (LT-04), and the registry table a
+//! peer's round settled here. It is read when the snapshots' records move, and again 15
+//! seconds after a refusal; a refusal leaves the mail routes empty and the lab unsettled, and
+//! never withholds the lab. Writers stay strict: a receipt decided from the served lab is saved
+//! only under the registry's admitted projection, and only where that projection makes the same
+//! lab (`NativeReceiptGuard`). Reveals read the registry as they always did.
+//!
+//! Syncs, the accounts list, mail routes and first-name creation ask, never a typing path.
+//! `[alab] roster = false` in `aterm.toml` turns the source off on this Mac. A test, a debug
+//! build and a build tool's run hold no lab (inert, as the other lab hooks are), so no test
+//! reads this Mac's registry. Every getter admits current local policy before exposing a held
+//! projection. Unavailable policy hides the projection and blocks automatic fallback without
+//! erasing its history.
 //!
 //! [`round`] records, per registry table, that an authenticated peer reported exactly this Mac's
 //! retained registry operations in a round that completed (`RepairRound::matching_inventory`, the
@@ -57,18 +72,12 @@ use aterm_db::alab::{
     view::{LabView, MachineNickname},
 };
 use aterm_db::catalog::Policy;
+use aterm_file::{File, Word};
 use aterm_secrets::client::Paths;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-/// The least time between two looks at the registry's source.
-const LOOK_EVERY: Duration = Duration::from_secs(300);
-
-/// The least time between two looks while no projection is held because a read failed: until
-/// one succeeds the harness reads no sheet ([`alab_roster::pending`]), so it looks again sooner.
-const RETRY_FAILED: Duration = Duration::from_secs(15);
 
 /// Whether this process may hold a lab: a release build outside a build tool's tests, with no
 /// scratch state root and no CI. The lab's roster source here, [`crate::alab_mailbox`],
@@ -411,9 +420,8 @@ struct Projected<S> {
 struct Held<S> {
     /// A projection and its source are installed, retained and cleared together.
     projected: Option<Projected<S>>,
-    looked: Option<Instant>,
-    /// No complete projection or successful absence has been observed, or an unreadable,
-    /// partial read left no projection to use.
+    /// No snapshot or successful absence has been observed, or an unreadable read left no
+    /// projection to use.
     pending: bool,
 }
 
@@ -424,10 +432,9 @@ impl<S> Held<S> {
     }
 }
 
-/// One look's change to what is held, from what it `read`, at `now`. Only a complete projection
-/// or a successful absence resolves a first read. Uncertainty retains an existing projection.
-fn look<S>(held: &mut Held<S>, read: Result<Option<Projected<S>>, String>, now: Instant) {
-    held.looked = Some(now);
+/// One read's change to what is held. Only a snapshot or a successful absence resolves a first
+/// read. Uncertainty retains an existing projection.
+fn look<S>(held: &mut Held<S>, read: Result<Option<Projected<S>>, String>) {
     held.pending = read.is_err() && held.projected.is_none();
     match read {
         Ok(projected) => held.projected = projected,
@@ -437,20 +444,37 @@ fn look<S>(held: &mut Held<S>, read: Result<Option<Projected<S>>, String>, now: 
     }
 }
 
-/// Whether a caller looks at the registry at `now`: at the first look, and once [`RETRY_FAILED`]
-/// passed since one that left the source pending; the refresher looks otherwise.
-fn due(looked: Option<Instant>, pending: bool, now: Instant) -> bool {
-    looked.is_none_or(|at| pending && now.saturating_duration_since(at) >= RETRY_FAILED)
+/// The least time between two reads of the registry's mail metadata after one was refused.
+const RETRY_MAIL: Duration = Duration::from_secs(15);
+
+/// What one shared file's status says of its snapshot: its frontier's fingerprint, its revision
+/// and the last pass's word. Equal marks mean the same snapshot of the same records.
+type Mark = Option<(String, u64, Option<Word>)>;
+
+/// What a held lab was read from: the marks of `ai/accounts`, `ai/links` and `lab/machines`,
+/// and the registry read its mail metadata came from, where one answered.
+#[derive(Clone)]
+struct Seen {
+    files: [Mark; 3],
+    mail: Option<ProjectionRead>,
 }
 
-struct Cache<S = ProjectionRead> {
+/// The three shared files the lab is read from, in [`Seen::files`]' order.
+const FILES: [&aterm_db::file::Type; 3] = [
+    &aterm_db::file::ACCOUNTS,
+    &aterm_db::file::LINKS,
+    &aterm_db::file::MACHINES,
+];
+
+struct Cache<S = Seen> {
     paths: Paths,
     config: PathBuf,
     settled: Option<PathBuf>,
     held: Mutex<Held<S>>,
     /// Keep an older in-flight read from replacing a newer projection.
     refreshing: Mutex<()>,
-    refresher: OnceLock<()>,
+    /// When the registry last refused a read of its mail metadata.
+    mail_refused: Mutex<Option<Instant>>,
 }
 
 /// A source's immutable scope identity, without opening its native storage.
@@ -458,9 +482,14 @@ trait CachedSource: Clone {
     fn included_by(&self, policy: &Policy) -> bool;
 }
 
-impl CachedSource for ProjectionRead {
+/// The snapshots answer whatever `[commons]` says (a pass under an excluding policy records
+/// `off`, which a read takes as no source); the registry read the mail metadata came from is
+/// held to the current policy as a native source is.
+impl CachedSource for Seen {
     fn included_by(&self, policy: &Policy) -> bool {
-        self.source().included_by(policy)
+        self.mail
+            .as_ref()
+            .is_none_or(|mail| mail.source().included_by(policy))
     }
 }
 
@@ -575,68 +604,162 @@ impl<S: CachedSource> Cache<S> {
         {
             return;
         }
-        look(&mut held, read, Instant::now());
+        look(&mut held, read);
+    }
+}
+
+/// The parts of `lab` a native receipt is decided from: everything but the mail routes, which
+/// no receipt reads.
+fn decided(lab: &Lab) -> Lab {
+    Lab {
+        aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Placements::default(),
+        ..lab.clone()
     }
 }
 
 impl Cache {
-    fn lab_for_source(&self, source: &SourceRead) -> Arc<Lab> {
-        let settled = self
-            .settled
+    /// Whether `table` is the registry table a peer's completed round settled here.
+    fn settled_for(&self, table: &[u8; 32]) -> bool {
+        self.settled
             .as_ref()
-            .is_some_and(|dir| settled_in(dir, &source.table()));
-        let mail = lab_mail(source.mailboxes());
+            .is_some_and(|dir| settled_in(dir, table))
+    }
+
+    /// The lab the shared files' `view` and the registry's mail metadata (`mail`, where a read
+    /// answered) say: accounts, machines, links and this Mac's binding from the snapshot, and the
+    /// mail routes and the settled witness, which no shared file carries, from the registry.
+    fn lab_of(&self, view: &LabView, mail: Option<&SourceRead>) -> Lab {
+        let Some(source) = mail else {
+            return harness_lab_with_placed(view, &BTreeMap::new(), false, &BTreeMap::new());
+        };
+        let held = lab_mail(source.mailboxes());
         let toml = mailbox_logins(source.addresses(), &mailbox_names(&self.paths));
-        Arc::new(harness_lab(
+        let logins = logins_of(&held, &toml);
+        let placed = if logins.is_empty() {
+            BTreeMap::new()
+        } else {
+            source.view().mailboxes()
+        };
+        let mut lab =
+            harness_lab_with_placed(view, &placed, self.settled_for(&source.table()), &logins);
+        lab.aliases = source.view().aliases();
+        lab
+    }
+
+    /// The lab as the registry projects it now (`source`): what a receipt's admission compares
+    /// the captured lab with.
+    fn lab_for_source(&self, source: &SourceRead) -> Lab {
+        harness_lab(
             source.view(),
-            settled,
-            &logins_of(&mail, &toml),
-        ))
+            self.settled_for(&source.table()),
+            &BTreeMap::new(),
+        )
+    }
+
+    /// Whether a read of the registry's mail metadata is due though the snapshot did not move:
+    /// [`RETRY_MAIL`] after the last one was refused.
+    fn mail_due(&self) -> bool {
+        self.mail_refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none_or(|at| at.elapsed() >= RETRY_MAIL)
+    }
+
+    /// Read the registry's mail metadata strictly, as a sign-in's mailbox has always been read
+    /// (docs/DESIGN-shared-files-2026-11-11.md §10): its collections hold `Secret` columns, so
+    /// no shared file carries them yet (LT-04). `None` on an installation with no Commons, and
+    /// where the registry refuses, which is noted for [`Self::mail_due`].
+    fn read_mail(&self) -> Option<ProjectionRead> {
+        let read = Registry::at(self.paths.clone()).observe_installed_projection(&self.config);
+        *self
+            .mail_refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = read.is_err().then(Instant::now);
+        match read {
+            Ok(mail) => mail,
+            Err(why) => {
+                aterm_log::debug!("lab view: the registry's mail metadata: {why}");
+                None
+            }
+        }
+    }
+
+    /// Read the lab from this Mac's shared files: no custody, no vault and no registry
+    /// session, so it answers while every strict reader refuses (a pending writer succession,
+    /// ATERM-KI-1109-1). A snapshot answers whatever word its last pass recorded (`live` or
+    /// `held`); with none here the source is absent only on an installation that never
+    /// configured a Commons, and pending otherwise. A file whose last pass says `off` is no
+    /// source: `[commons]` keeps the registry from this Mac.
+    fn read(&self) -> Result<Option<Projected<Seen>>, String> {
+        let root = aterm_db::file::root(&self.paths);
+        let files = FILES.map(|file| File::at(&root, &file.file()));
+        let marks: [Mark; 3] = files.each_ref().map(|file| {
+            file.state()
+                .map(|state| (state.fingerprint, state.rev, state.word))
+        });
+        if marks
+            .iter()
+            .flatten()
+            .any(|(_, _, word)| *word == Some(Word::Off))
+        {
+            return Err("[commons] keeps the registry's shared files off on this Mac".into());
+        }
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .projected
+            .clone()
+            .filter(|held| held.source.files == marks);
+        // A settlement recorded since the lab was read rebuilds it from the same reads.
+        let settled_moved = |held: &Projected<Seen>| {
+            held.source
+                .mail
+                .as_ref()
+                .is_some_and(|mail| self.settled_for(&mail.source().table()) != held.lab.settled)
+        };
+        // Nothing moved: the held lab stands, unless its mail metadata is still to be read.
+        if let Some(held) = &held
+            && !settled_moved(held)
+            && (held.source.mail.is_some() || !self.mail_due())
+        {
+            return Ok(Some(held.clone()));
+        }
+        let [accounts, links, machines] = files.map(|file| file.read());
+        if [&accounts, &links, &machines]
+            .iter()
+            .any(|read| read.snapshot.is_none())
+        {
+            return match Registry::at(self.paths.clone()).never_configured() {
+                Ok(true) => Ok(None),
+                Ok(false) => Err("no snapshot of the registry's shared files is here yet".into()),
+                Err(why) => Err(why.to_string()),
+            };
+        }
+        let mail = match held.and_then(|held| held.source.mail) {
+            Some(mail) => Some(mail),
+            None => self.read_mail(),
+        };
+        let view = LabView::of_files(&accounts, &links, &machines);
+        let lab = self.lab_of(&view, mail.as_ref().map(ProjectionRead::source));
+        Ok(Some(Projected {
+            lab: Arc::new(lab),
+            source: Seen { files: marks, mail },
+        }))
     }
 
     fn refresh(&self) {
-        self.refresh_with(|| {
-            let Some(source) = Registry::at(self.paths.clone())
-                .observe_installed_projection(&self.config)
-                .map_err(|why| why.to_string())?
-            else {
-                return Ok(None);
-            };
-            let lab = self.lab_for_source(source.source());
-            Ok(Some(Projected { lab, source }))
-        });
-    }
-
-    fn start_refresher(&'static self) {
-        self.refresher.get_or_init(|| {
-            let _ = std::thread::Builder::new()
-                .name("alab-view".into())
-                .spawn(move || {
-                    loop {
-                        std::thread::sleep(LOOK_EVERY);
-                        self.refresh();
-                    }
-                });
-        });
-    }
-    fn refresh_if_due(&'static self) {
-        let due = {
-            let held = self
-                .held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            due(held.looked, held.pending, Instant::now())
-        };
-        if due {
-            self.refresh();
-            self.start_refresher();
-        }
+        self.refresh_with(|| self.read());
     }
 }
 
+/// A receipt decided from the lab the shared files serve is saved only where the registry,
+/// read strictly under admission, projects that same lab now: writers stay strict (design §4,
+/// "Callers moved off the strict path"), and a held or stale snapshot admits no receipt.
 struct NativeReceiptGuard {
     cache: &'static Cache,
-    source: ProjectionRead,
     /// This callback saves only local metadata. Its vault is the native
     /// projection's own context, never an inferred credential candidate root.
     vault_config: aterm_secrets::client::Config,
@@ -654,7 +777,6 @@ impl alab_roster::SourceGuard for NativeReceiptGuard {
     fn same_source(&self, other: &dyn alab_roster::SourceGuard) -> bool {
         other.as_any().downcast_ref::<Self>().is_some_and(|other| {
             std::ptr::eq(self.cache, other.cache)
-                && self.source.revision() == other.source.revision()
                 && self.vault_config == other.vault_config
                 && self.lab == other.lab
                 && self.config_image == other.config_image
@@ -667,12 +789,11 @@ impl alab_roster::SourceGuard for NativeReceiptGuard {
         &self,
         save: Box<dyn FnOnce() -> Result<(), SyncError> + '_>,
     ) -> Result<(), SyncError> {
-        let entered = std::cell::Cell::new(false);
-        let result = Registry::at(self.cache.paths.clone()).with_admitted_projection(
+        Registry::at(self.cache.paths.clone()).with_admitted_projection(
             &self.cache.config,
             &self.cache.paths,
             &self.vault_config,
-            Some(self.source.revision()),
+            None,
             |projection, _reader| {
                 // Metadata persistence does not read credentials. A future
                 // credential decision must receive this borrowed reader and
@@ -692,36 +813,19 @@ impl alab_roster::SourceGuard for NativeReceiptGuard {
                     || caller.as_ref().ok() != Some(&self.caller_image)
                     || !caller_permitted
                     || !permitted
-                    || self.cache.lab_for_source(current) != self.lab
+                    || decided(&self.cache.lab_for_source(current)) != decided(&self.lab)
                 {
                     return Ok(Err(SyncError::retry(Retry::Changed, "native account source or local policy changed before receipt admission")));
                 }
-                entered.set(true);
                 Ok(save())
             },
-        ).map_err(|why| SyncError::retry(Retry::Unavailable, why.to_string())).and_then(|result| result);
-        // A refusal before the save asks for a new observation without discarding
-        // retained history or invalidating a newer entry installed meanwhile.
-        if result.is_err() && !entered.get() {
-            let mut held = self
-                .cache
-                .held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if held.projected.as_ref().is_some_and(|held| {
-                held.source.revision() == self.source.revision()
-                    && Arc::ptr_eq(&held.lab, &self.lab)
-            }) {
-                held.looked = None;
-            }
-        }
-        result
+        ).map_err(|why| SyncError::retry(Retry::Unavailable, why.to_string())).and_then(|result| result)
     }
 }
 
 impl alab_roster::Source for &'static Cache {
     fn snapshot(&self) -> SourceSnapshot {
-        self.refresh_if_due();
+        self.refresh();
         self.projection()
     }
 
@@ -730,7 +834,7 @@ impl alab_roster::Source for &'static Cache {
     }
 
     fn capture_for(&self, caller_config: &Path) -> alab_roster::SourceCapture {
-        self.refresh_if_due();
+        self.refresh();
         let (snapshot, projected, config_image) = self.capture_with_image();
         let caller_image = if caller_config == self.config.as_path() {
             config_image.clone()
@@ -761,7 +865,6 @@ impl alab_roster::Source for &'static Cache {
             snapshot,
             alab_roster::ReceiptGuard::new(NativeReceiptGuard {
                 cache: self,
-                source: projected.source,
                 vault_config,
                 lab: projected.lab,
                 config_image,
@@ -772,10 +875,11 @@ impl alab_roster::Source for &'static Cache {
     }
 
     fn mail(&self) -> Vec<LabMailbox> {
-        self.refresh_if_due();
+        self.refresh();
         Cache::capture(self)
             .1
-            .map(|projected| lab_mail(projected.source.source().mailboxes()))
+            .and_then(|projected| projected.source.mail)
+            .map(|mail| lab_mail(mail.source().mailboxes()))
             .unwrap_or_default()
     }
 
@@ -868,11 +972,10 @@ pub(crate) fn install() {
         settled: settled_dir(),
         held: Mutex::new(Held {
             projected: None,
-            looked: None,
             pending: true,
         }),
         refreshing: Mutex::new(()),
-        refresher: OnceLock::new(),
+        mail_refused: Mutex::new(None),
     });
     let _ = alab_roster::install(Box::new(cache));
 }

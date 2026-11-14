@@ -123,16 +123,31 @@ impl FabricSession for crate::SessionCtx {
     }
 
     /// One drive of `node` as `aterm ctl --host <node>` dials it, bounded by its deadline, which
-    /// writes `request` and reads the one line that answers it.
+    /// writes `request` and reads the one line that answers it. The drive is this session's
+    /// mail, so its requester line names this session: both Macs' fleet activity records then
+    /// say which session sent it, as they do for a request `aterm ctl` carried.
     #[cfg(unix)]
     fn fleet_drive(&self, node: &str, request: &str) -> Result<String, String> {
+        let by = self.self_id.as_str();
         let link = aterm_agent::drive_fleet(
             node,
-            &aterm_types::control_verbs::Requester::default(),
+            &aterm_types::control_verbs::Requester::of(Some(by), None, None, None),
             FLEET_MAIL_WITHIN,
         )
         .map_err(|r| r.why)?;
-        ask_one_line(link.stream, &link.label, request)
+        let (peer, label) = (link.node.clone(), link.label.clone());
+        let answer = ask_one_line(link.stream, &label, request)?;
+        // Mail this window sent another Mac passes no `aterm ctl`: its row of the fleet activity
+        // record is written here, from the answer's verdict and never from the mail.
+        if let Some(peer) = peer {
+            crate::fleet_activity::note(crate::fleet_activity::sent(
+                (&peer, &label),
+                Some(by),
+                request,
+                &answer,
+            ));
+        }
+        Ok(answer)
     }
 }
 

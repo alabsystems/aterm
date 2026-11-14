@@ -20,7 +20,8 @@ struct World {
     sessions: usize,
     merges: usize,
     rechecks: usize,
-    interrupted: bool,
+    /// How many qualifications in a row a main tip interrupts, each naming a new tip.
+    interrupted: usize,
     refuse_at: Option<usize>,
     refuse_admission: bool,
     mismatch: bool,
@@ -28,6 +29,12 @@ struct World {
     elsewhere_at: Option<String>,
     /// Whether this image cannot recheck: the host yields every recheck to another image.
     recheck_elsewhere: bool,
+    /// Whether the host's rule answers for no recheck: each is left to a whole qualification.
+    recheck_whole: bool,
+    /// Whether a qualification answers as only a recheck may ([`Judgment::Whole`]).
+    qualify_whole: bool,
+    /// The main tip whose merge stops on a conflict, with exit 1.
+    conflicts_at: Option<String>,
 }
 impl World {
     fn new() -> Self {
@@ -40,17 +47,19 @@ impl World {
             sessions: 0,
             merges: 0,
             rechecks: 0,
-            interrupted: false,
+            interrupted: 0,
             refuse_at: None,
             refuse_admission: false,
             mismatch: false,
             elsewhere_at: None,
             recheck_elsewhere: false,
+            recheck_whole: false,
+            qualify_whole: false,
+            conflicts_at: None,
         }
     }
     fn limits() -> Limits {
         Limits {
-            rejudges: 3,
             composes: 10,
             stopped: 75,
             unjudged: 2,
@@ -70,15 +79,22 @@ impl Host for World {
         if self.elsewhere_at.as_ref() == Some(&revision.at) {
             return Ok(Judgment::Elsewhere);
         }
+        if self.qualify_whole {
+            return Ok(Judgment::Whole);
+        }
         self.runs.push(revision.clone());
-        if std::mem::take(&mut self.interrupted) {
-            return Ok(Judgment::Interrupted("main1".into()));
+        if self.interrupted > 0 {
+            self.interrupted -= 1;
+            return Ok(Judgment::Interrupted(format!("main{}", self.runs.len())));
         }
         Ok(Judgment::Passed(Qualified(revision.clone())))
     }
     fn recheck(&mut self, revision: &Revision) -> Result<Judgment<Qualified>, String> {
         if self.recheck_elsewhere {
             return Ok(Judgment::Elsewhere);
+        }
+        if self.recheck_whole {
+            return Ok(Judgment::Whole);
         }
         self.rechecks += 1;
         Ok(Judgment::Passed(Qualified(revision.clone())))
@@ -88,6 +104,9 @@ impl Host for World {
     }
     fn merge(&mut self, tip: &str) -> Result<Merge, String> {
         self.merges += 1;
+        if self.conflicts_at.as_deref() == Some(tip) {
+            return Ok(Merge::Exit(1));
+        }
         self.head = format!("merge-{tip}");
         Ok(Merge::Clean)
     }
@@ -254,7 +273,7 @@ fn refused_admission_never_creates_a_session_or_calls_publication() {
 fn overlapping_or_interrupted_revision_requires_a_new_actual_qualification() {
     for interrupted in [false, true] {
         let mut world = World::new();
-        world.interrupted = interrupted;
+        world.interrupted = usize::from(interrupted);
         if !interrupted {
             world.replies.push_back(Publication::Moved("main1".into()));
             world
@@ -327,16 +346,31 @@ fn partial_recheck_keeps_the_same_admitted_push_session_and_deadline() {
     );
 }
 
+/// No count of qualifications ends the loop: a main that interrupts qualification after
+/// qualification is merged and qualified each time, each merge of the tip that interrupted the
+/// one before, and the first that passes is published. NEGATIVE CONTROL: the composition bound
+/// still stops a push that main keeps racing
+/// ([`a_recheck_checkpoint_carries_its_composition_count_and_the_hosts_session`]).
 #[test]
-fn exhaustion_stops_without_another_publication() {
+fn no_count_of_qualifications_ends_the_landing() {
+    let interrupts = 7;
     let mut world = World::new();
-    world.interrupted = true;
+    world.interrupted = interrupts;
     let mut host = Script::new(world);
-    let mut limits = World::limits();
-    limits.rejudges = 0;
-    assert_eq!(run(&mut host, World::initial(), limits), exit(75));
-    assert!(host.world.sends.is_empty());
-    assert_eq!(host.world.merges, 0);
+    assert_eq!(run(&mut host, World::initial(), World::limits()), exit(0));
+    assert_eq!(host.world.merges, interrupts);
+    assert_eq!(host.world.runs.len(), interrupts + 1);
+    for (turn, revision) in host.world.runs.iter().enumerate().skip(1) {
+        assert_eq!(
+            *revision,
+            Revision {
+                at: format!("merge-main{turn}"),
+                base: format!("main{turn}"),
+            },
+            "each turn merges the tip that interrupted the one before"
+        );
+    }
+    assert_eq!(host.world.sends, [(format!("main{interrupts}"), 1)]);
 }
 
 #[test]
@@ -386,8 +420,66 @@ fn only_a_known_presend_obstruction_retries_under_one_shared_budget() {
     }
 }
 
+/// A recheck that passes renews the composition budget in the push session it began in: it
+/// judged the merge of the tip that sent the loop round, so the races before it are spent.
+/// NEGATIVE CONTROL: the same moves with the last recheck replaced by a composition stop at the
+/// bound, nothing more pushed.
 #[test]
-fn only_a_new_whole_qualification_starts_a_new_composition_epoch() {
+fn a_passed_recheck_renews_the_composition_budget_in_its_push_session() {
+    for rechecks in [true, false] {
+        let mut world = World::new();
+        world.replies.extend([
+            Publication::Moved("main1".into()),
+            Publication::Moved("main2".into()),
+            Publication::Moved("main3".into()),
+            Publication::Moved("main4".into()),
+        ]);
+        let composes = |why: &str| Composition::Composes {
+            tree: "merged-tree".into(),
+            why: why.into(),
+        };
+        world.compositions.extend([
+            composes("first race"),
+            if rechecks {
+                Composition::Rechecks {
+                    tree: "merged-tree".into(),
+                    shared: vec!["crates/a/src/lib.rs".into()],
+                }
+            } else {
+                composes("second race")
+            },
+            composes("after the recheck"),
+            composes("after the recheck, again"),
+        ]);
+        let mut host = Script::new(world);
+        let mut limits = World::limits();
+        limits.composes = 2;
+        let ran = run(&mut host, World::initial(), limits);
+        assert_eq!(host.world.runs.len(), 1, "no whole qualification follows");
+        assert_eq!(host.world.sessions, 1, "one push session throughout");
+        if rechecks {
+            assert_eq!(ran, exit(0));
+            assert_eq!(host.world.rechecks, 1);
+            assert_eq!(
+                host.world.sends,
+                [
+                    ("main0".into(), 1),
+                    ("main1".into(), 1),
+                    ("main2".into(), 1),
+                    ("main3".into(), 1),
+                    ("main4".into(), 1)
+                ]
+            );
+        } else {
+            assert_eq!(ran, exit(75));
+            assert_eq!(host.world.rechecks, 0);
+            assert_eq!(host.world.sends.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn a_new_whole_qualification_starts_a_new_composition_epoch_and_push_session() {
     let mut world = World::new();
     world.replies.extend([
         Publication::Moved("main1".into()),
@@ -422,6 +514,127 @@ fn only_a_new_whole_qualification_starts_a_new_composition_epoch() {
     );
 }
 
+/// A tip that conflicts with the revision and keeps its qualification ([`Composition::Held`])
+/// is no race of the push: it spends none of the composition bound, the loop merges it, and the
+/// host's merge, which stops on the conflict, ends the landing with its exit; nothing is
+/// qualified or published after it. NEGATIVE CONTROL: the same tip as a composition, the bound
+/// already spent, stops the landing at the bound with nothing merged.
+#[test]
+fn a_held_tip_is_merged_at_the_push_and_consumes_no_composition() {
+    for held in [true, false] {
+        let mut world = World::new();
+        world.conflicts_at = Some("main2".into());
+        world.replies.extend([
+            Publication::Moved("main1".into()),
+            Publication::Moved("main2".into()),
+        ]);
+        world.compositions.extend([
+            Composition::Composes {
+                tree: "merged-tree".into(),
+                why: "the one race the bound allows".into(),
+            },
+            if held {
+                Composition::Held("the merge conflicts in \"shared.txt\"".into())
+            } else {
+                Composition::Composes {
+                    tree: "merged-tree".into(),
+                    why: "one race too many".into(),
+                }
+            },
+        ]);
+        let mut host = Script::new(world);
+        let mut limits = World::limits();
+        limits.composes = 1;
+        let ran = run(&mut host, World::initial(), limits);
+        assert_eq!(host.world.runs.len(), 1, "nothing is qualified again");
+        assert_eq!(host.world.sends.len(), 2);
+        if held {
+            assert_eq!(ran, exit(1), "the merge's own exit ends the landing");
+            assert_eq!(host.world.merges, 1);
+            assert_eq!(host.world.head, "checked", "a conflict commits no merge");
+        } else {
+            assert_eq!(ran, exit(75));
+            assert_eq!(host.world.merges, 0);
+        }
+    }
+}
+
+/// A recheck the host's rule does not answer for ([`Judgment::Whole`]) is a whole
+/// qualification of the same revision, in the loop and at a resumed recheck alike: nothing is
+/// rechecked, the merge is qualified over the tip it merged and published in a push session of
+/// its own. NEGATIVE CONTROLS: the same recheck that passes qualifies nothing more and keeps
+/// the session; and a qualification that gives that answer is an error, never a pass.
+#[test]
+fn a_recheck_the_host_does_not_answer_for_is_a_whole_qualification() {
+    let merge = Revision {
+        at: "merge-main1".into(),
+        base: "main1".into(),
+    };
+    for whole in [true, false] {
+        let mut world = World::new();
+        world.recheck_whole = whole;
+        world.replies.push_back(Publication::Moved("main1".into()));
+        world.compositions.push_back(Composition::Rechecks {
+            tree: "merged-tree".into(),
+            shared: vec!["Cargo.lock".into()],
+        });
+        let mut host = Script::new(world);
+        assert_eq!(run(&mut host, World::initial(), World::limits()), exit(0));
+        if whole {
+            assert_eq!(host.world.runs, [World::initial(), merge.clone()]);
+            assert_eq!(host.world.rechecks, 0);
+            assert_eq!(
+                host.world.sends,
+                [("main0".into(), 1), ("main1".into(), 2)],
+                "a whole qualification pushes in its own session"
+            );
+        } else {
+            assert_eq!(host.world.runs, [World::initial()]);
+            assert_eq!(host.world.rechecks, 1);
+            assert_eq!(host.world.sends, [("main0".into(), 1), ("main1".into(), 1)]);
+        }
+
+        let mut resumed = World::new();
+        resumed.recheck_whole = whole;
+        resumed.head = merge.at.clone();
+        let mut host = Script::new(resumed);
+        let checkpoint = Checkpoint {
+            step: Step::Recheck,
+            revision: merge.clone(),
+            composes: 0,
+        };
+        assert_eq!(
+            resume(&mut host, checkpoint, Some(7), World::limits()),
+            exit(0)
+        );
+        if whole {
+            assert_eq!(host.world.runs, std::slice::from_ref(&merge));
+            assert_eq!(host.world.rechecks, 0);
+            assert_eq!(host.world.sends, [("main1".into(), 1)]);
+        } else {
+            assert!(host.world.runs.is_empty());
+            assert_eq!(host.world.rechecks, 1);
+            assert_eq!(
+                host.world.sends,
+                [("main1".into(), 7)],
+                "the carried session"
+            );
+        }
+    }
+
+    let mut world = World::new();
+    world.qualify_whole = true;
+    let mut host = Script::new(world);
+    assert_eq!(
+        run(&mut host, World::initial(), World::limits()),
+        Err(WHOLE_QUALIFICATION.into())
+    );
+    assert!(host.world.sends.is_empty());
+}
+
+/// A running qualification is cut only by a tip the host's rule dooms: one that composes, one a
+/// recheck answers and one whose conflict keeps the qualification ([`Composition::Held`]) are
+/// each read once and interrupt nothing.
 #[test]
 fn polling_keeps_composable_tips_and_cuts_only_a_new_incompatible_tip() {
     let mut watch = Watch::new("main0");
@@ -447,6 +660,19 @@ fn polling_keeps_composable_tips_and_cuts_only_a_new_incompatible_tip() {
         1,
         "the same observed composable tip needs no repeated composition read"
     );
+    let held = Cell::new(0);
+    for _ in 0..2 {
+        assert!(!watch.poll(
+            &mut moot,
+            &mut |_| Ok("main-conflicting".into()),
+            &mut |_| {
+                held.set(held.get() + 1);
+                Ok(Composition::Held("the merge conflicts".into()))
+            },
+            &mut |_| panic!("unexpected failed read")
+        ));
+    }
+    assert_eq!(held.get(), 1, "a held tip is tested once and cuts nothing");
     assert!(watch.poll(
         &mut moot,
         &mut |_| Ok("main2".into()),
@@ -501,14 +727,13 @@ fn failed_or_moot_remote_reads_never_supply_a_tip_or_repeated_diagnostic() {
 }
 
 /// A qualification the host cannot run in this image yields before it runs: the loop ends
-/// with that step's checkpoint (its revision, the re-judges spent and no composition count)
-/// and no session, having begun no push. NEGATIVE CONTROL: the same world qualifying here
+/// with that step's checkpoint (its revision and no composition count) and no session, having begun no push. NEGATIVE CONTROL: the same world qualifying here
 /// merges, qualifies again and publishes.
 #[test]
 fn a_host_that_cannot_qualify_here_yields_before_the_qualification() {
     for yields in [true, false] {
         let mut world = World::new();
-        world.interrupted = true;
+        world.interrupted = 1;
         if yields {
             world.elsewhere_at = Some("merge-main1".into());
         }
@@ -524,7 +749,6 @@ fn a_host_that_cannot_qualify_here_yields_before_the_qualification() {
                             at: "merge-main1".into(),
                             base: "main1".into(),
                         },
-                        rejudges: 1,
                         composes: 0,
                     },
                     session: None,
@@ -542,35 +766,10 @@ fn a_host_that_cannot_qualify_here_yields_before_the_qualification() {
     }
 }
 
-/// A resumed qualification keeps the re-judges spent before it: at the bound, the next
-/// interruption stops the landing with nothing merged. NEGATIVE CONTROL: one re-judge fewer
-/// merges the tip and qualifies again.
-#[test]
-fn a_resumed_qualify_keeps_the_rejudge_count() {
-    for (rejudges, want, merges) in [(3, 75, 0), (2, 0, 1)] {
-        let mut world = World::new();
-        world.interrupted = true;
-        let mut host = Script::new(world);
-        let checkpoint = Checkpoint {
-            step: Step::Qualify,
-            revision: World::initial(),
-            rejudges,
-            composes: 0,
-        };
-        assert_eq!(
-            resume(&mut host, checkpoint, None, World::limits()),
-            exit(want),
-            "rejudges {rejudges}"
-        );
-        assert_eq!(host.world.merges, merges, "rejudges {rejudges}");
-        assert_eq!(host.world.runs.len(), 1 + merges, "rejudges {rejudges}");
-    }
-}
-
 /// A recheck the host cannot run here yields with the compositions spent since the last whole
 /// qualification and the host's own push session. Resumed in another world, the recheck runs
-/// once, publication reuses that session (no new one begins) and the composition bound goes on
-/// from the carried count: exactly the remaining races compose before the landing stops.
+/// once, publication reuses that session (no new one begins) and the recheck that passed renews
+/// the composition bound: the whole bound of races composes before the landing stops.
 #[test]
 fn a_recheck_checkpoint_carries_its_composition_count_and_the_hosts_session() {
     let composed = 2;
@@ -599,7 +798,6 @@ fn a_recheck_checkpoint_carries_its_composition_count_and_the_hosts_session() {
             at: format!("merge-{tip}"),
             base: tip.clone(),
         },
-        rejudges: 0,
         composes: composed + 1,
     };
     assert_eq!(
@@ -612,7 +810,7 @@ fn a_recheck_checkpoint_carries_its_composition_count_and_the_hosts_session() {
     assert_eq!(host.world.rechecks, 0);
 
     let limits = World::limits();
-    let remaining = limits.composes - (composed + 1);
+    let remaining = limits.composes;
     let mut resumed = World::new();
     resumed.head = format!("merge-{tip}");
     for race in 0..=remaining {
@@ -633,41 +831,35 @@ fn a_recheck_checkpoint_carries_its_composition_count_and_the_hosts_session() {
     assert_eq!(host.world.sends[0].0, tip);
 }
 
-/// A checkpoint is refused, before any step runs, past this image's re-judge or composition
-/// bound, with a session a qualification never carries or without the one a recheck needs,
+/// A checkpoint is refused, before any step runs, past this image's composition bound, with a
+/// session a qualification never carries or without the one a recheck needs,
 /// or with a composition count before a qualification: [`admit`] names the same refusal, so a
 /// host can tell it from what a resumed step does.
 #[test]
 fn a_checkpoint_past_this_images_bounds_or_missing_its_session_is_refused() {
-    let point = |step, rejudges, composes| Checkpoint {
+    let point = |step, composes| Checkpoint {
         step,
         revision: World::initial(),
-        rejudges,
         composes,
     };
     for (checkpoint, session, why) in [
         (
-            point(Step::Qualify, 4, 0),
-            None,
-            "the landing was handed over at re-judge 4, past this image's bound of 3",
-        ),
-        (
-            point(Step::Recheck, 0, 11),
+            point(Step::Recheck, 11),
             Some(1),
             "landing race count exceeds its original bound",
         ),
         (
-            point(Step::Qualify, 0, 0),
+            point(Step::Qualify, 0),
             Some(1),
             "a qualify checkpoint carries no push session",
         ),
         (
-            point(Step::Qualify, 0, 1),
+            point(Step::Qualify, 1),
             None,
             "a qualify checkpoint carries no composition count",
         ),
         (
-            point(Step::Recheck, 0, 1),
+            point(Step::Recheck, 1),
             None,
             "a recheck checkpoint carries no push session",
         ),
@@ -699,7 +891,6 @@ fn resume_reads_the_checkout_before_its_step() {
             let checkpoint = Checkpoint {
                 step,
                 revision: World::initial(),
-                rejudges: 0,
                 composes: 0,
             };
             assert_eq!(

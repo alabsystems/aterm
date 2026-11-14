@@ -34,6 +34,9 @@ use crate::occupancy_host::Arming;
 use crate::sys_host::PaneFact;
 use strip::StripStore;
 
+#[path = "vitals_assessment.rs"]
+mod assessment;
+
 /// A reading a second while a focused window shows the Deck.
 pub(crate) const FOCUSED_PERIOD: Duration = Duration::from_secs(1);
 /// One every five seconds while aterm is in the background.
@@ -282,6 +285,7 @@ pub(crate) static PROC_EDGE: ProcEdge = ProcEdge::new();
 pub(crate) struct Handover {
     snap: Option<Arc<Snapshot>>,
     sampled_at: Option<Instant>,
+    jobs_continuous: bool,
     cpu_leases: Option<Arc<crate::native_allocation::ObservedCpu>>,
     /// When the probe thread began the oldest reading, handed over since the loop last adopted one,
     /// that carries `snap`'s jobs view, so the view is dated no later than its making. A reading
@@ -474,6 +478,8 @@ pub(crate) struct Request {
     /// The closed tabs the host told of, by key ([`VitalsHost::left_told`]): the leftover pass
     /// keeps them told ([`crate::vitals_left::LeftPass::keep_told`]).
     pub(crate) left_told: Vec<u64>,
+    /// Internal completion pull: publish the finished assessment without offering it again.
+    pub(crate) assessment_only: bool,
 }
 
 /// One agent session's token totals and when the footer's resolver last read them.
@@ -765,6 +771,7 @@ pub(crate) enum Msg {
     Read(Box<Request>),
     Facts(Box<Request>),
     Pull,
+    AssessmentReady,
     CpuPolicy(aterm_vitals::sys::json::Jv),
     Name(Box<crate::sys_naming::Request>),
     /// The host's tellings at once, as the next request would carry them ([`Request::left_told`]).
@@ -774,6 +781,7 @@ pub(crate) enum Msg {
 /// The loop's side of the probe thread.
 pub(crate) struct VitalsHost {
     tx: Option<SyncSender<Msg>>,
+    assessment_wake: Option<Arc<SyncSender<Msg>>>,
     sent_layout: Option<u64>,
     layout_looked: Option<Instant>,
     sys: Option<&'static crate::sys_host::Shared>,
@@ -792,6 +800,7 @@ pub(crate) struct VitalsHost {
     pub(crate) snapshot: Option<Arc<Snapshot>>,
     /// Worker read start, never the later UI adoption time.
     pub(crate) sampled_at: Option<Instant>,
+    jobs_continuous: bool,
     pub(crate) cpu_leases: Option<Arc<crate::native_allocation::ObservedCpu>>,
     /// When the held snapshot's jobs view was adopted: what a reading no window shows counts its
     /// next from ([`Self::windowless_due`]).
@@ -887,6 +896,7 @@ impl Default for VitalsHost {
     fn default() -> Self {
         Self {
             tx: None,
+            assessment_wake: None,
             sent_layout: None,
             layout_looked: None,
             sys: None,
@@ -896,6 +906,7 @@ impl Default for VitalsHost {
             latest: Arc::default(),
             snapshot: None,
             sampled_at: None,
+            jobs_continuous: false,
             cpu_leases: None,
             adopted_at: None,
             read_began: None,
@@ -957,7 +968,7 @@ impl VitalsHost {
 
     /// Adopts the thread's newest snapshot if newer than the held one, along with its job events.
     pub(crate) fn adopt(&mut self, now: Instant) -> bool {
-        let (fresh, began, words, events, leases, sampled_at) = {
+        let (fresh, began, words, events, leases, sampled_at, jobs_continuous) = {
             let mut h = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
             (
                 h.snap.take(),
@@ -966,6 +977,7 @@ impl VitalsHost {
                 std::mem::take(&mut h.job_events),
                 h.cpu_leases.take(),
                 h.sampled_at.take(),
+                h.jobs_continuous,
             )
         };
         if leases.is_some() {
@@ -996,7 +1008,11 @@ impl VitalsHost {
                     self.parked = snap
                         .jobs
                         .as_deref()
-                        .map(|view| Parked::of(view, &words, now))
+                        .zip(began)
+                        .filter(|(_, at)| {
+                            now.saturating_duration_since(*at) <= crate::vitals_jobs::JOBS_FRESH
+                        })
+                        .map(|(view, at)| Parked::of(view, &words, at))
                         .unwrap_or_default();
                 }
                 if !snap.machine_only {
@@ -1012,6 +1028,7 @@ impl VitalsHost {
                 ));
                 self.prev_snapshot = self.snapshot.clone();
                 self.sampled_at = sampled_at;
+                self.jobs_continuous = jobs_continuous;
                 self.read_began = began;
                 self.snapshot = Some(crate::strain_script::adopt(snap, now));
                 true
@@ -1076,6 +1093,10 @@ impl VitalsHost {
         self.tx.is_some()
     }
 
+    pub(crate) const fn jobs_view_continuous(&self) -> bool {
+        self.reader_runs() && self.jobs_continuous
+    }
+
     fn edge_at(&self, now: Instant) -> Option<Instant> {
         if !self.edge || self.windowed {
             return None;
@@ -1126,6 +1147,8 @@ impl VitalsHost {
         self.tried = true;
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         let (ended, done) = std::sync::mpsc::channel::<()>();
+        let assessment_wake = Arc::new(tx.clone());
+        let weak_wake = Arc::downgrade(&assessment_wake);
         let latest = Arc::clone(&self.latest);
         let workers = sys.map(|shared| (shared, tx.clone()));
         let stopping = Arc::clone(&self.stopping);
@@ -1139,20 +1162,16 @@ impl VitalsHost {
             crate::qos::Role::Background,
             move || {
                 let _ended = ended;
+                let mut source = source();
+                source.install_assessment_wake(weak_wake);
                 run(
-                    &rx,
-                    &latest,
-                    &post,
-                    source(),
-                    peaks,
-                    workers,
-                    &stopping,
-                    prior,
+                    &rx, &latest, &post, source, peaks, workers, &stopping, prior,
                 );
             },
         ) {
             Ok(handle) => {
                 self.tx = Some(tx);
+                self.assessment_wake = Some(assessment_wake);
                 self.sys = sys;
                 self.thread = Some((handle, done));
             }
@@ -1171,6 +1190,7 @@ impl VitalsHost {
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(Msg::Told(self.left_told.iter().copied().collect()));
         }
+        self.assessment_wake = None;
         self.tx = None;
         if let Some(shared) = self.sys.take() {
             shared.uninstall();
@@ -1246,11 +1266,40 @@ impl VitalsHost {
     }
 }
 
-trait Source {
+trait Source: Sized {
     fn reading(&mut self, req: &Request) -> Snapshot;
     fn model(&mut self) -> &mut aterm_vitals::Vitals;
     fn machine(&self) -> Option<&Machine> {
         None
+    }
+    fn machine_at(&self) -> Option<Instant> {
+        None
+    }
+    fn jobs_at(&self) -> Option<Instant> {
+        None
+    }
+    fn left_at(&self) -> Option<Instant> {
+        None
+    }
+    fn job_words(&self) -> Option<Vec<WordSeen>> {
+        None
+    }
+    fn has_name_replies(&self) -> bool {
+        false
+    }
+
+    fn jobs_continuous(&self) -> bool {
+        true
+    }
+    fn install_assessment_wake(&mut self, _wake: std::sync::Weak<SyncSender<Msg>>) {}
+    fn assessment_work(&self) -> assessment::Work {
+        assessment::Work::None
+    }
+    fn schedule_names(&mut self, names: Vec<crate::sys_naming::Request>) -> Vec<NameReply> {
+        prepare_names(self, names)
+    }
+    fn publish_names(&mut self, replies: Vec<NameReply>) {
+        finish_names(self, replies);
     }
     fn split_cold(&self) -> bool {
         false
@@ -1324,6 +1373,13 @@ impl Source for Reader {
         Some(&self.machine)
     }
 
+    fn machine_at(&self) -> Option<Instant> {
+        self.machine_observed_at
+    }
+    fn jobs_at(&self) -> Option<Instant> {
+        self.assessment.reading().jobs_at
+    }
+
     fn split_cold(&self) -> bool {
         let now = Instant::now();
         self.split.cold(now) || self.gpu.cold(now)
@@ -1342,37 +1398,39 @@ impl Source for Reader {
     }
 
     fn note_told(&mut self, told: &[u64]) {
-        self.left
-            .keep_told(told, u64::try_from(unix_ms_now()).unwrap_or(0));
+        self.assessment
+            .note_told(told, u64::try_from(unix_ms_now()).unwrap_or(0));
     }
 
     fn at_stop(&mut self, told: &[u64]) {
-        self.left
+        self.assessment
             .at_stop(told, u64::try_from(unix_ms_now()).unwrap_or(0));
     }
 
-    fn capture_name(
-        &self,
-        session: u64,
-        target: &aterm_vitals::sys::query::NameTarget,
-    ) -> Result<aterm_vitals::jobs::NamingTicket, aterm_vitals::jobs::NamingError> {
-        self.jobs.capture_name(session, target)
+    fn left_at(&self) -> Option<Instant> {
+        self.assessment.reading().left_at
+    }
+    fn jobs_continuous(&self) -> bool {
+        self.assessment.continuous()
+    }
+    fn job_words(&self) -> Option<Vec<WordSeen>> {
+        Some(self.assessment.words())
+    }
+    fn has_name_replies(&self) -> bool {
+        self.assessment.has_name_replies()
     }
 
-    fn apply_name(
-        &mut self,
-        ticket: &aterm_vitals::jobs::NamingTicket,
-        word: aterm_vitals::jobs::TierB,
-    ) -> Result<(), aterm_vitals::jobs::NamingError> {
-        self.jobs.apply_name(ticket, word)
+    fn install_assessment_wake(&mut self, wake: std::sync::Weak<SyncSender<Msg>>) {
+        self.assessment.install_wake(wake);
     }
-
-    fn name_is_shown(
-        &self,
-        ticket: &aterm_vitals::jobs::NamingTicket,
-        word: aterm_vitals::jobs::TierB,
-    ) -> bool {
-        self.jobs.name_is_shown(ticket, word)
+    fn assessment_work(&self) -> assessment::Work {
+        self.assessment.work()
+    }
+    fn schedule_names(&mut self, names: Vec<crate::sys_naming::Request>) -> Vec<NameReply> {
+        self.assessment.schedule_names(names)
+    }
+    fn publish_names(&mut self, replies: Vec<NameReply>) {
+        self.assessment.publish_names(replies);
     }
 }
 
@@ -1382,6 +1440,7 @@ struct Asked {
     /// A [`Msg::Read`] came earlier in this drain: a later one keeps what it asked.
     asked_read: bool,
     pull: bool,
+    assessment_ready: bool,
     facts: bool,
     cpu_policy: Option<aterm_vitals::sys::json::Jv>,
     names: Vec<crate::sys_naming::Request>,
@@ -1424,6 +1483,7 @@ impl Asked {
                 self.facts = true;
             }
             Msg::Pull => self.pull = true,
+            Msg::AssessmentReady => self.assessment_ready = true,
             Msg::CpuPolicy(report) => {
                 self.cpu_policy = Some(report);
                 self.read = true;
@@ -1444,9 +1504,26 @@ type NameReply = (
 
 /// Engine calls and the nonblocking peer check stay under the active lease; process readings
 /// never do.
-fn prepare_names(
-    source: &mut impl Source,
+fn prepare_names<S: Source>(
+    source: &mut S,
     names: Vec<crate::sys_naming::Request>,
+) -> Vec<NameReply> {
+    prepare_names_on(source, names, S::capture_name, S::apply_name)
+}
+
+fn prepare_names_on<T>(
+    engine: &mut T,
+    names: Vec<crate::sys_naming::Request>,
+    capture: fn(
+        &T,
+        u64,
+        &aterm_vitals::sys::query::NameTarget,
+    ) -> Result<aterm_vitals::jobs::NamingTicket, aterm_vitals::jobs::NamingError>,
+    apply: fn(
+        &mut T,
+        &aterm_vitals::jobs::NamingTicket,
+        aterm_vitals::jobs::TierB,
+    ) -> Result<(), aterm_vitals::jobs::NamingError>,
 ) -> Vec<NameReply> {
     use crate::sys_naming::{Answer, Operation};
     names
@@ -1454,10 +1531,10 @@ fn prepare_names(
         .map(|request| {
             let answer = request.run_active(|| match &request.operation {
                 Operation::Capture { session, target } => {
-                    source.capture_name(*session, target).map(Answer::Captured)
+                    capture(engine, *session, target).map(Answer::Captured)
                 }
                 Operation::Apply { ticket, word } => {
-                    source.apply_name(ticket, *word)?;
+                    apply(engine, ticket, *word)?;
                     Ok(Answer::Applied {
                         job: ticket.job().to_owned(),
                         word: *word,
@@ -1469,26 +1546,43 @@ fn prepare_names(
         .collect()
 }
 
-/// Replies follow publication of the final reading, and an accepted name must still be visible.
-fn finish_names(source: &impl Source, replies: Vec<NameReply>) {
+fn validate_names_on<T>(
+    engine: &T,
+    replies: Vec<NameReply>,
+    shown: fn(&T, &aterm_vitals::jobs::NamingTicket, aterm_vitals::jobs::TierB) -> bool,
+) -> Vec<NameReply> {
     use crate::sys_naming::Operation;
-    for (request, mut answer) in replies {
-        if answer.is_ok()
-            && let Operation::Apply { ticket, word } = &request.operation
-        {
-            answer = request.run_active(|| {
-                if source.name_is_shown(ticket, *word) {
-                    Ok(crate::sys_naming::Answer::Applied {
-                        job: ticket.job().to_owned(),
-                        word: *word,
-                    })
-                } else {
-                    Err(aterm_vitals::jobs::NamingError::Stale)
-                }
-            });
-        }
+    replies
+        .into_iter()
+        .map(|(request, mut answer)| {
+            if answer.is_ok()
+                && let Operation::Apply { ticket, word } = &request.operation
+            {
+                answer = request.run_active(|| {
+                    if shown(engine, ticket, *word) {
+                        Ok(crate::sys_naming::Answer::Applied {
+                            job: ticket.job().to_owned(),
+                            word: *word,
+                        })
+                    } else {
+                        Err(aterm_vitals::jobs::NamingError::Stale)
+                    }
+                });
+            }
+            (request, answer)
+        })
+        .collect()
+}
+
+fn respond_names(replies: Vec<NameReply>) {
+    for (request, answer) in replies {
         request.respond(answer);
     }
+}
+
+/// Replies follow publication; an applied name must still carry its identity and episode.
+fn finish_names<S: Source>(source: &S, replies: Vec<NameReply>) {
+    respond_names(validate_names_on(source, replies, S::name_is_shown));
 }
 
 #[allow(
@@ -1545,6 +1639,15 @@ fn run(
         while let Ok(more) = rx.try_recv() {
             asked.take(more, &mut req);
         }
+        match source.assessment_work() {
+            assessment::Work::Input => asked.pull = true,
+            assessment::Work::Publish => asked.assessment_ready = true,
+            assessment::Work::None => {}
+        }
+        let assessment_only = asked.assessment_ready && !(asked.read || asked.pull);
+        if assessment_only {
+            asked.pull = true;
+        }
         // A quit's last tellings wait for the stop's one write (`Source::at_stop`).
         if !stopping.load(Ordering::Acquire) {
             source.note_told(&req.left_told);
@@ -1566,6 +1669,7 @@ fn run(
         }
         let began = Instant::now();
         crate::metrics::note_reading(crate::metrics::ReadingStep::Began);
+        req.assessment_only = assessment_only;
         let mut snap = if asked.pull {
             pull(&mut source, &mut req, last_whole, !asked.names.is_empty())
         } else {
@@ -1573,7 +1677,7 @@ fn run(
         };
         req.note_gaps.clear();
         req.note_events.clear();
-        let replies = prepare_names(&mut source, asked.names);
+        let replies = source.schedule_names(asked.names);
         if replies
             .iter()
             .any(|(_, answer)| matches!(answer, Ok(crate::sys_naming::Answer::Applied { .. })))
@@ -1589,7 +1693,9 @@ fn run(
         if !snap.machine_only {
             last_whole = Some(Instant::now());
         }
-        let words = req.ttys.iter().map(TtyWord::seen).collect();
+        let words = source
+            .job_words()
+            .unwrap_or_else(|| req.ttys.iter().map(TtyWord::seen).collect());
         let leases = req.allocation.then(|| {
             Arc::new(crate::native_allocation::ObservedCpu {
                 value: if cfg!(test) {
@@ -1603,12 +1709,34 @@ fn run(
             })
         });
         let hidden = !req.in_view;
-        let jobs_moved = hand_over_allocation(latest, &snap, words, began, leases);
+        let observed_at = source.machine_at().unwrap_or(began);
+        let jobs_moved = hand_over_allocation(
+            latest,
+            &snap,
+            words,
+            observed_at,
+            leases,
+            source.jobs_at(),
+            source.jobs_continuous(),
+        );
         crate::metrics::note_reading(crate::metrics::ReadingStep::Handed);
         if let Some(sys) = sys {
-            sys.publish(snap, source.machine().unwrap_or(&no_machine));
+            sys.publish(
+                snap,
+                source.machine().unwrap_or(&no_machine),
+                observed_at,
+                source.jobs_at(),
+                source.left_at(),
+                source.jobs_continuous(),
+            );
         }
-        if (asked.read || jobs_moved || !replies.is_empty()) && !post() {
+        if (asked.read
+            || asked.assessment_ready
+            || source.has_name_replies()
+            || jobs_moved
+            || !replies.is_empty())
+            && !post()
+        {
             for (request, _) in replies {
                 request.respond(Err(crate::sys_naming::Error::Canceled));
             }
@@ -1624,12 +1752,12 @@ fn run(
                 match msg {
                     Msg::Told(told) => req.left_told = told,
                     Msg::Read(r) | Msg::Facts(r) => req.left_told = r.left_told,
-                    Msg::Pull | Msg::CpuPolicy(_) | Msg::Name(_) => {}
+                    Msg::Pull | Msg::AssessmentReady | Msg::CpuPolicy(_) | Msg::Name(_) => {}
                 }
             }
             break;
         }
-        finish_names(&source, replies);
+        source.publish_names(replies);
         source.after_publish(hidden);
         let kept_at = Instant::now();
         if current_report.is_some() {
@@ -1728,7 +1856,7 @@ fn hand_over(
     words: Vec<WordSeen>,
     began: Instant,
 ) -> bool {
-    hand_over_allocation(latest, snap, words, began, None)
+    hand_over_allocation(latest, snap, words, began, None, None, true)
 }
 
 fn hand_over_allocation(
@@ -1737,6 +1865,8 @@ fn hand_over_allocation(
     words: Vec<WordSeen>,
     began: Instant,
     leases: Option<Arc<crate::native_allocation::ObservedCpu>>,
+    jobs_at: Option<Instant>,
+    jobs_continuous: bool,
 ) -> bool {
     let events: Vec<_> = snap
         .events
@@ -1752,12 +1882,14 @@ fn hand_over_allocation(
         (Some(held), Some(new)) => Arc::ptr_eq(held, new),
         _ => false,
     };
+    let jobs_began = jobs_at.unwrap_or(began);
     h.began = Some(match h.began {
-        Some(held) if same_view => held.min(began),
-        _ => began,
+        Some(held) if same_view => held.min(jobs_began),
+        _ => jobs_began,
     });
     h.snap = Some(Arc::clone(snap));
     h.sampled_at = Some(began);
+    h.jobs_continuous = jobs_continuous;
     h.cpu_leases = leases;
     h.words = words;
     let moved = !events.is_empty();
@@ -2815,9 +2947,8 @@ pub(crate) struct Reader {
     hardware_last: Option<(Instant, aterm_vitals::hardware::Sample)>,
     clusters: Vec<ClusterSpec>,
     vitals: aterm_vitals::Vitals,
-    jobs: crate::vitals_jobs::JobsPass,
-    /// The leftover pass (`sys left`), after the jobs pass in each whole reading.
-    left: crate::vitals_left::LeftPass,
+    assessment: assessment::Lane,
+    machine_observed_at: Option<Instant>,
     epoch: Instant,
     /// The pass's clock ([`Request::tab_reads`]): the machine's, or a test's own, which no load
     /// spaces.
@@ -2860,6 +2991,7 @@ pub(crate) struct Reader {
 /// ms past the reader's zero, each feed, and each current mode word.
 #[derive(Debug)]
 pub(crate) struct TabReads {
+    observed_at: Instant,
     at_ms: u64,
     epoch: Instant,
     feeds: Vec<(u64, crate::vitals_jobs::TabFeed)>,
@@ -2887,7 +3019,8 @@ impl Request {
     /// ([`crate::vitals_jobs::JobFeed::at_pass`]), so whatever a reader reads after the clock is
     /// stamped past it, and a line or output stamped past the clock waits for the next pass.
     pub(crate) fn tab_reads(&self, epoch: Instant, now: impl FnOnce() -> Instant) -> TabReads {
-        let at_ms = pass_ms(epoch, now());
+        let observed_at = now();
+        let at_ms = pass_ms(epoch, observed_at);
         let feeds = self
             .feeds
             .iter()
@@ -2903,6 +3036,7 @@ impl Request {
             .collect();
         let ttys = self.ttys.iter().filter_map(TtyWord::current).collect();
         TabReads {
+            observed_at,
             at_ms,
             epoch,
             feeds,
@@ -2940,7 +3074,7 @@ pub(crate) fn jobs_step(
     req: &Request,
     thrashing: bool,
 ) -> Option<Arc<aterm_vitals::jobs::JobsView>> {
-    pass.tick(
+    let view = pass.tick(
         reads.at_ms,
         || reads.now_ms(),
         sweep,
@@ -2951,7 +3085,9 @@ pub(crate) fn jobs_step(
         req.self_pid,
         thrashing,
         req.jobs_now,
-    )
+    );
+    pass.note_observed(reads.observed_at);
+    view
 }
 
 impl Reader {
@@ -3000,8 +3136,8 @@ impl Reader {
             hardware_last: None,
             clusters,
             vitals: aterm_vitals::Vitals::new(),
-            jobs: crate::vitals_jobs::JobsPass::new(),
-            left: crate::vitals_left::LeftPass::new(),
+            assessment: assessment::Lane::new(),
+            machine_observed_at: None,
             epoch: Instant::now(),
             clock: Instant::now,
             slots: aterm_sysprobe::slots::SlotReader::new(
@@ -3139,6 +3275,7 @@ impl Reader {
     /// Takes one full reading (machine counters, process sweep, split set if due, and jobs pass).
     pub(crate) fn read(&mut self, req: &Request) -> Snapshot {
         let reads = req.tab_reads(self.epoch, self.clock);
+        self.machine_observed_at = Some(reads.observed_at);
         let now = Instant::now();
         let split = self.split.due(req, now);
         let live_split = split && !self.fixture.as_ref().is_some_and(WhyFixture::is_recorded);
@@ -3244,25 +3381,24 @@ impl Reader {
         );
         let thrashing = sample.mem.is_some_and(|m| m.pressure == Pressure::Critical);
         let events_before = snap.strip_events.len();
-        self.jobs.tie_held(self.left.ties());
-        let jobs = jobs_step(
-            &mut self.jobs,
-            &reads,
-            sweep.as_ref().map(|s| s.procs.as_slice()),
-            req,
-            thrashing,
+        let complete = !sweep.as_ref().is_some_and(|s| s.truncated);
+        let assessed = self.assessment.read(
+            assessment::Input::new(
+                reads,
+                sweep.map(|s| s.procs),
+                complete,
+                req,
+                u64::try_from(at_unix_ms).unwrap_or(0),
+                thrashing,
+            ),
+            !req.assessment_only,
         );
-        let jobs_age = jobs_age_ms(jobs.as_deref(), reads.at_ms);
-        snap.set_left(self.left.tick(
-            u64::try_from(at_unix_ms).unwrap_or(0),
-            sweep.as_ref().map(|s| s.procs.as_slice()),
-            !sweep.as_ref().is_some_and(|s| s.truncated),
-            req,
-            jobs.as_deref(),
-            jobs_age,
-        ));
-        snap.set_jobs(jobs);
-        snap.jobs_age_ms = jobs_age;
+        snap.jobs_age_ms = jobs_age_ms(
+            assessed.jobs.as_deref(),
+            pass_ms(self.epoch, (self.clock)()),
+        );
+        snap.set_left(assessed.left);
+        snap.set_jobs(assessed.jobs);
         for ev in snap.strip_events[events_before..].iter().cloned() {
             self.vitals.record_strip_event(ev);
         }
@@ -3272,6 +3408,7 @@ impl Reader {
 
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
+        self.machine_observed_at = Some((self.clock)());
         let mut coalitions = self.coalitions();
         let mut sample = self.machine_sample(req, unix_ms_now(), None);
         sample.machine_only = true;
@@ -3286,21 +3423,13 @@ impl Reader {
         self.set_occupancy_facts(&mut snap);
         snap.place = crate::net_place::sys_view();
         let events_before = snap.strip_events.len();
-        let jobs = self.jobs.tick(
-            sample.at_ns / 1_000_000,
-            || sample.at_ns / 1_000_000,
-            None,
-            &req.tabs,
-            &[],
-            &[],
-            &req.grant,
-            req.self_pid,
-            false,
-            false,
+        let assessed = self.assessment.carried();
+        snap.jobs_age_ms = jobs_age_ms(
+            assessed.jobs.as_deref(),
+            pass_ms(self.epoch, (self.clock)()),
         );
-        snap.jobs_age_ms = jobs_age_ms(jobs.as_deref(), pass_ms(self.epoch, (self.clock)()));
-        snap.set_jobs(jobs);
-        snap.set_left(self.left.last());
+        snap.set_jobs(assessed.jobs);
+        snap.set_left(assessed.left);
         for ev in snap.strip_events[events_before..].iter().cloned() {
             self.vitals.record_strip_event(ev);
         }
@@ -5109,9 +5238,13 @@ impl crate::App {
     /// itself a new program and would wait in that line, so it is held until the next view that
     /// stands in none ([`Self::note_held_episode`]).
     pub(crate) fn refresh_devtools_verdict(&mut self) {
+        // Losing freshness is not a drain witness. Only a later engine view ends the hold.
         let backed_up = self
-            .jobs_view_now(Instant::now())
-            .is_some_and(|(view, _)| view.findings.program_check_episode.is_some());
+            .vitals
+            .snapshot
+            .as_ref()
+            .and_then(|snap| snap.jobs.as_ref())
+            .is_some_and(|view| view.findings.program_check_episode.is_some());
         if backed_up {
             aterm_log::info!(
                 "devtools: macOS's program check is backed up; asking macOS about aterm again \
@@ -5130,17 +5263,6 @@ impl crate::App {
         if !self.devtools_helper.refresh_verdict() {
             self.devtools_watch.hold_prime();
         }
-    }
-
-    /// The adopted jobs view while it speaks for now ([`crate::vitals_jobs::speaks_for_now`]), and
-    /// its age at `now`.
-    fn jobs_view_now(&self, now: Instant) -> Option<(&aterm_vitals::jobs::JobsView, Duration)> {
-        let snap = self.vitals.snapshot.as_ref()?;
-        let view = snap.jobs.as_deref()?;
-        let age = now.saturating_duration_since(self.vitals.adopted_at?);
-        let reader = self.vitals.reader_runs();
-        crate::vitals_jobs::speaks_for_now(view, snap.left.as_deref(), age, reader)
-            .then_some((view, age))
     }
 
     fn post_jobs_reading(&self) {
@@ -5479,6 +5601,7 @@ impl crate::App {
             note_events: Vec::new(),
             front_dir,
             left_told: self.vitals.left_told.iter().copied().collect(),
+            assessment_only: false,
         }
     }
 

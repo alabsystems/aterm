@@ -121,7 +121,9 @@ fn renewal_entry_points_reject_a_different_retained_recipe_without_rewriting_it(
         );
         codex_renewal::reconcile_restart(&opts, SID, &expected);
         assert!(codex_renewal::drive_restart(&opts, SID, &expected).is_none());
-        assert!(codex_renewal::drive_resume_only(&opts, SID, &expected).is_none());
+        assert!(
+            codex_renewal::drive_resume_only(&opts, SID, &expected, ImagePhase::Rollback).is_none()
+        );
         let (client, worker) = endpoint(|_| panic!("invalid renewal reached the wire"));
         assert!(codex_renewal::drive_connection(&opts, SID, &expected, st, client, true).is_none());
         assert!(worker.join().unwrap().is_empty(), "{case}");

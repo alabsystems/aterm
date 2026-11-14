@@ -107,9 +107,22 @@ fn node_record(log: &mut Log, by: Mac, tag: u8, at: u64) {
 /// `ME` lets `mac` in under `label`, asking as `name`, with `node_key` (the admitting member's
 /// word, which proves nothing).
 fn admit(log: &mut Log, mac: Mac, name: &str, label: &str, node_key: [u8; 32], at: u64) {
+    admit_by(log, ME, mac, name, label, node_key, at);
+}
+
+/// [`admit`], signed by `by`.
+fn admit_by(
+    log: &mut Log,
+    by: Mac,
+    mac: Mac,
+    name: &str,
+    label: &str,
+    node_key: [u8; 32],
+    at: u64,
+) {
     keep(
         log,
-        ME,
+        by,
         at,
         Body::Admit {
             entrant: Entrant {
@@ -323,6 +336,241 @@ fn a_split_the_node_key_proves_is_recorded_for_a_person_since_a_remove_cannot_fo
     assert!(
         !standing(m160),
         "and the seat its Mac runs as goes out with it: no member folds a split by itself"
+    );
+}
+
+/// ALab in small with a fourth founder, `m112`, that the genesis names `andrews-3`.
+fn alab_with_a_named_founder() -> (Log, Mac) {
+    let andrews = Mac(112);
+    let root = Root::of(ME.request().binding());
+    let founders = vec![
+        founder(ME, "m22"),
+        founder(M110, "m110"),
+        founder(M14, "m14"),
+        Founder {
+            name: "andrews-3".to_owned(),
+            ..founder(andrews, "m112")
+        },
+    ];
+    let log = Log::new(Record::genesis(&[99; 32], root, founders, 1).unwrap()).unwrap();
+    (log, andrews)
+}
+
+/// A seat its own Mac admitted on a writer-succession statement (an `Admit` that Mac's seat
+/// signed, by a person's word as the log reads it, with no fleet node key, under the name the log
+/// gave that seat) is told as its successor: the log ties the two, where a name ties nothing. So
+/// m22's successor read `by=name ... nothing proves one Mac holds both` on 2026-11-12, and a
+/// successor whose seat goes by no `m<N>` name (`andrews-3` under `m112`) was not listed at all.
+///
+/// NEGATIVE CONTROL: `splits`' successor arm cut: m170's pair reads `by: Former` and m171's is
+/// missing, so the `assert_eq!` fails on the first pair.
+#[test]
+fn a_seat_its_own_mac_admitted_is_a_split_by_successor() {
+    let (mut log, andrews) = alab_with_a_named_founder();
+    admit_by(&mut log, M14, Mac(170), "m14", "m170", [0; 32], T0);
+    admit_by(
+        &mut log,
+        andrews,
+        Mac(171),
+        "andrews-3",
+        "m171",
+        [0; 32],
+        T0 + 1,
+    );
+    assert_eq!(
+        splits(&log),
+        [
+            Split {
+                label: "m170".to_owned(),
+                of: "m14".to_owned(),
+                by: SplitBy::Successor,
+            },
+            Split {
+                label: "m171".to_owned(),
+                of: "m112".to_owned(),
+                by: SplitBy::Successor,
+            },
+        ]
+    );
+    assert_eq!(
+        splits(&log)[1].line(),
+        "split m171 of=m112 by=successor: m171 came in as a Commons writer's successor in m112's \
+         line (signed in under that seat's own name, with no fleet node key), so the log reads \
+         them as one home's"
+    );
+}
+
+/// The same two seats let in by another member are no successors: a seat that asked as `m14` is a
+/// pair by its name alone, as before, one that asked as `andrews-3` is tied to nothing, and a
+/// seat its own Mac admitted with a fleet node key (a Mac of the fleet under the same name) is
+/// no successor either.
+///
+/// NEGATIVE CONTROL: `splits` reading every same-name `Admit` as a succession (`Lineages::of`
+/// not requiring `by` to hold the name, or the arm not asking `of_member`): m172 reads
+/// `by: Successor`.
+#[test]
+fn a_same_name_seat_another_member_admitted_is_no_split_by_successor() {
+    let (mut log, andrews) = alab_with_a_named_founder();
+    admit(&mut log, Mac(172), "m14", "m172", [0; 32], T0);
+    admit(&mut log, Mac(173), "andrews-3", "m173", [0; 32], T0 + 1);
+    admit_by(
+        &mut log,
+        andrews,
+        Mac(174),
+        "andrews-3",
+        "m174",
+        node(74),
+        T0 + 2,
+    );
+    assert_eq!(
+        splits(&log),
+        [Split {
+            label: "m172".to_owned(),
+            of: "m14".to_owned(),
+            by: SplitBy::Name,
+        }]
+    );
+}
+
+/// `by` takes `seat` out, its records counting through its last one.
+fn remove_by(log: &mut Log, by: Mac, seat: Mac, at: u64) {
+    let cutoff = log
+        .records()
+        .filter(|record| *record.actor() == seat.id())
+        .last()
+        .map(|record| *record.id())
+        .unwrap();
+    keep(
+        log,
+        by,
+        at,
+        Body::Remove {
+            member: seat.id(),
+            cutoff,
+        },
+    );
+}
+
+/// A successor whose admitting seat no longer stands is still told by its line, not by its name:
+/// paired with the nearest seat above it that stands, through every one that is out (m14 admits
+/// m170, m170 admits m175, m170 is removed: m175 is m14's), and where none stands but its name's
+/// label is held again (m110 itself out, its Mac back with a new key that takes the seat's label
+/// by its node key), as a former successor of a seat that holds that label no more
+/// (`by=former`), never `by=name ... nothing proves`.
+///
+/// NEGATIVE CONTROL: the arm reading only the seats that admitted the successor themselves (no
+/// walk up the line): m175 reads `by: Name`, and the first `assert_eq!` fails. The `Former` arm
+/// printing `Name`: the second fails.
+#[test]
+fn a_successor_whose_admitter_is_out_is_told_by_its_line() {
+    let mut log = alab();
+    admit_by(&mut log, M14, Mac(170), "m14", "m170", [0; 32], T0);
+    admit_by(&mut log, Mac(170), Mac(175), "m14", "m175", [0; 32], T0 + 1);
+    remove_by(&mut log, ME, Mac(170), T0 + DAY);
+    assert_eq!(
+        splits(&log),
+        [Split {
+            label: "m175".to_owned(),
+            of: "m14".to_owned(),
+            by: SplitBy::Successor,
+        }]
+    );
+
+    let mut log = alab();
+    admit_by(&mut log, M110, Mac(176), "m110", "m176", [0; 32], T0);
+    remove_by(&mut log, ME, M110, T0 + DAY);
+    admit(&mut log, Mac(177), "m110", "m110", node(110), T0 + DAY);
+    assert_eq!(log.membership().label(&Mac(177).id()), Some("m110"));
+    let pairs = splits(&log);
+    assert_eq!(
+        pairs,
+        [Split {
+            label: "m176".to_owned(),
+            of: "m110".to_owned(),
+            by: SplitBy::Former,
+        }]
+    );
+    assert!(
+        pairs[0].line().contains("by=former") && !pairs[0].line().contains("nothing proves"),
+        "{}",
+        pairs[0].line()
+    );
+}
+
+/// What `aterm members list` prints of each member is read from the log: who let it in, the
+/// stamp of its entry, how (a person's Allow, the member by itself, the genesis) and whether a
+/// fleet node key is bound to its seat, the key an `Admit` names counting whoever let it in.
+///
+/// NEGATIVE CONTROL: `listed` reading `node` as `false` for every seat: the founder m110's row
+/// fails; reading `how` from anything but the entry's `Admit`: m181's fails.
+#[test]
+fn a_members_listed_facts_are_the_logs() {
+    let mut log = alab();
+    admit(&mut log, Mac(180), "m180", "m180", node(80), T0);
+    keep(
+        &mut log,
+        ME,
+        T0 + 1,
+        Body::Admit {
+            entrant: Entrant {
+                request: Mac(181).request(),
+                node_key: node(81),
+                name: "m181".to_owned(),
+                label: "m181".to_owned(),
+            },
+            evidence: Evidence::Phrase,
+        },
+    );
+    admit_by(&mut log, M14, Mac(170), "m14", "m170", [0; 32], T0 + 2);
+    let membership = log.membership();
+    let row = |mac: Mac| {
+        let listed =
+            super::super::remove::listed(&log, &membership, membership.get(&mac.id()).unwrap());
+        (
+            listed.label,
+            listed.admitted_by,
+            listed.admitted_ms,
+            listed.how,
+            listed.node,
+        )
+    };
+    assert_eq!(
+        row(M110),
+        ("m110".to_owned(), None, 1, None, true),
+        "a founder whose own Node record binds a key"
+    );
+    assert_eq!(row(M14), ("m14".to_owned(), None, 1, None, false));
+    assert_eq!(
+        row(Mac(180)),
+        (
+            "m180".to_owned(),
+            Some("m22".to_owned()),
+            T0,
+            Some(Evidence::Manual),
+            true
+        )
+    );
+    assert_eq!(
+        row(Mac(181)),
+        (
+            "m181".to_owned(),
+            Some("m22".to_owned()),
+            T0 + 1,
+            Some(Evidence::Phrase),
+            true
+        ),
+        "a person's Allow binds the key the ask named"
+    );
+    assert_eq!(
+        row(Mac(170)),
+        (
+            "m170".to_owned(),
+            Some("m14".to_owned()),
+            T0 + 2,
+            Some(Evidence::Manual),
+            false
+        ),
+        "a writer successor holds no node key"
     );
 }
 

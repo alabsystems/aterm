@@ -109,9 +109,9 @@ pub enum Scene {
     /// Land held by work in its repository, an untracked file (land-c, L4), named (4b): as
     /// [`Self::LandOpen`].
     LandRepo,
-    /// Land landed (land-e, L7: a task over `aterm ctl`, so the landing's Done for you row and its
-    /// tip stand): its rest and hovered title, and beside them the Overview and Settings ▸
-    /// Harness, whose state line says what aterm checked (slice 9c, [`Shots::held_extras`]).
+    /// Land landed (land-e, L7: a task over `aterm ctl`, so the landing is an end): its rest and
+    /// hovered title, and beside them the Overview and Settings ▸ Harness, whose state line says
+    /// what aterm checked (slice 9c, [`Shots::held_extras`]).
     Landed,
     /// Autopilot Off.
     Off,
@@ -217,8 +217,8 @@ const SUPERVISED: [(Scene, Plan); 7] = [
     (Scene::CruiseNeeds, Plan::Chain(Chain::CruiseN)),
     (Scene::LandOpen, Plan::Chain(Chain::LandB)),
     (Scene::LandRepo, Plan::Chain(Chain::LandC)),
-    // land-e, not land-a: its task over `aterm ctl` leaves a Done for you row, whose tip says what
-    // aterm checked (slice 9c); land-a's quick landing leaves none (no task, no end).
+    // land-e, not land-a: its task over `aterm ctl` makes its landing an end, whose state line
+    // says what aterm checked (slice 9c); land-a's quick landing is none (no task, no end).
     (Scene::Landed, Plan::Chain(Chain::LandE)),
     (Scene::Off, Plan::Chain(Chain::Off)),
     (Scene::SameLand, Plan::Chain(Chain::SameLand)),
@@ -718,7 +718,7 @@ Autopilot's scenes on every harness, side by side (design §14.2's 2b), on one p
 instance per harness and look, launched in that look (its aterm.toml's theme), so every program
 starts on the ground it is shot on. Claude Code, agy and Muse Code run the forever lab's
 chains against its stub: cruise-needs (cruise-n's two needs), land-open (land-b's open hold),
-land-repo (land-c's repository hold), landed (land-e's landing, its Done for you row standing),
+land-repo (land-c's repository hold), landed (land-e's landing, an end),
 off, and same-land (the same-reply hold, the stop said); beside same-land's, land-open's and
 land-repo's shots the Overview, Settings ▸ Harness turned to its row (the state line) and the
 Messages rows it raised; Claude Code also switch-asked (switch-over-held's repeat under Cruise,
@@ -2115,8 +2115,7 @@ impl Shots<'_> {
     /// (`…-overview.png`) and Settings ▸ Harness turned to its row (`…-page.png`), each opened on
     /// the front window, shot with `image` once it shows the session ([`HELD_HANG`] the hang
     /// detector of each wait) and closed again, and `…-held.txt` with what they, the tab's hover,
-    /// its `status`'s `landed_*` fields, its `statusmenu` rows and `ctl messages tag=harness`
-    /// read: the stop's words, the hold's quote, the ask, or what aterm checked, on every surface a
+    /// its `status`'s `landed_*` fields and `ctl messages tag=harness` read: the stop's words, the hold's quote, the ask, or what aterm checked, on every surface a
     /// person reads them on. A surface that never showed the session is NOT CAPTURED by name; a
     /// sidecar that cannot be written fails the run.
     fn held_extras(&self, lab: &dyn Lab, scene: Scene, sid: &str, label: &str) -> Result<(), Fail> {
@@ -2160,14 +2159,6 @@ impl Shots<'_> {
         said.push(format!(
             "## what a screen reader is handed (`chrome`'s `a11y` lines)\n{}",
             forever::surfaces::ax_of(&chrome, sid)
-        ));
-        said.push(format!(
-            "## the menu bar's rows naming it, with their tips\n{}",
-            chrome
-                .lines()
-                .filter(|l| l.starts_with("statusmenu ") && l.contains(label))
-                .collect::<Vec<_>>()
-                .join("\n")
         ));
         let overview = name("-overview.png");
         let opened = lab.said(&["open", "overview"]);

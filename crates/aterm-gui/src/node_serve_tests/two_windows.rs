@@ -710,6 +710,17 @@ fn the_live_launcher_knows_its_own_apps_window() {
 /// Ask this Mac's node a survey connection's `lines` over `relay_dir`'s windows, with `app` the
 /// installed app's, and read each counted answer (or one-line refusal).
 fn survey(relay_dir: &Path, app: Option<u32>, lines: &[&str]) -> Vec<String> {
+    survey_read_by(relay_dir, app, lines, (relay_dir.to_path_buf(), None))
+}
+
+/// [`survey`] over a connection whose handshake proved `reader`, this Mac's state folder
+/// `state`: where the node job's fleet activity record is.
+fn survey_read_by(
+    relay_dir: &Path,
+    app: Option<u32>,
+    lines: &[&str],
+    (state, reader): (PathBuf, Option<crate::fleet_activity::Reader>),
+) -> Vec<String> {
     let windows = WindowRelays::new(relay_dir.to_path_buf(), Arc::new(Apps { app }));
     let table = Arc::new(NodeOpenTable::default());
     let (near, mut far) = CtlStream::pair().expect("a pair");
@@ -724,7 +735,7 @@ fn survey(relay_dir: &Path, app: Option<u32>, lines: &[&str]) -> Vec<String> {
         drive: true,
         peer: None,
     };
-    spawn_node_survey(near, windows, header, open).expect("the survey starts");
+    spawn_node_survey(near, windows, header, open, (state, reader)).expect("the survey starts");
     lines
         .iter()
         .map(|line| {
@@ -798,6 +809,63 @@ fn a_survey_lists_the_sessions_of_every_window() {
     assert!(instance.contains(" sessions=1 ") && !instance.contains("instances_read"));
 }
 
+/// A SURVEY A SESSION ASKED FOR IS ONE READ IN THE NODE JOB'S RECORD, AND EVERY WINDOW HEARS IT
+/// PLAIN: the word that names the session stops at the node job, since a window may run an aterm
+/// from before the word and would answer it with its usage. The merged answer is the plain
+/// survey's, and a survey that names no session (aterm's own poll) leaves no row.
+#[test]
+fn a_sessions_survey_reaches_each_window_plain_and_is_one_read_in_the_record() {
+    use aterm_types::fleet_activity::{Outcome, Plain, Way};
+    let stand_in = StandIn::start();
+    let (older, newer) = two_pids(&stand_in);
+    let relay = crate::test_scratch::short_dir("dr1-asked");
+    let state = aterm_tempfile::tempdir().expect("a state folder");
+    let old = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
+    let new = TestWindow::open(relay.path(), newer, Holds::live(&["s-ae"]), false);
+    let asker = "s-0123456789abcdef0123";
+    let reader = crate::fleet_activity::Reader {
+        node: "05".repeat(16),
+    };
+    // The plain survey at the end is answered once the rows of the two before it were handed
+    // over: the node job takes a connection's lines one at a time.
+    let answers = survey_read_by(
+        relay.path(),
+        Some(older),
+        &[
+            "survey",
+            &format!("survey by={asker}"),
+            &format!("survey facts by={asker}"),
+            "survey",
+        ],
+        (state.path().to_path_buf(), Some(reader.clone())),
+    );
+    assert_eq!(answers[1], answers[0], "the same survey");
+    let heard = ["survey", "survey", "survey facts", "survey"];
+    assert_eq!(old.served(), heard);
+    assert_eq!(new.served(), heard);
+    aterm_ctl::fleet_activity::settle();
+    let rows = aterm_ctl::fleet_activity::Record::in_state(state.path())
+        .read(aterm_ctl::fleet_activity::now_ms())
+        .rows;
+    let reads: u32 = rows
+        .iter()
+        .map(|row| {
+            assert_eq!(
+                (row.way, row.node.as_str(), row.what, row.outcome),
+                (
+                    Way::In,
+                    reader.node.as_str(),
+                    Plain::Read,
+                    Outcome::Admitted
+                )
+            );
+            assert_eq!(row.by.as_deref(), Some(asker));
+            row.n
+        })
+        .sum();
+    assert_eq!(reads, 2, "the two surveys the session asked for: {rows:?}");
+}
+
 /// A MERGED SURVEY KEEPS ITS BOUND AS A WINDOW DOES: past the reply bound, the rows a window
 /// itself would cut first go (the least kept, the last window's latest first), the busy agent's
 /// row stays, the Mac's own lines are the first window's once, and `sessions=` still counts every
@@ -867,6 +935,40 @@ fn a_merged_survey_counts_the_cut_rows_it_sends() {
         "{fitted}"
     );
     assert!(fitted.contains(" instances_read=2\n"), "{fitted}");
+}
+
+/// A MERGED SURVEY KEEPS ONE UPDATER, ON THE FIRST WINDOW'S LINE: the first window's `instance`
+/// line is the Mac's, so where two windows answer, each having read the updater at its own moment
+/// (here a hold, then its lapse), the reader is told the one on that line, beside its `version=`
+/// and its clock, never the other window's and never both.
+/// NEGATIVE CONTROL: a merge whose instance line is the last window's fails "the first window's
+/// updater".
+#[test]
+fn a_merged_survey_keeps_the_first_windows_updater_beside_its_version() {
+    let first = "OK 2\ninstance pid=7 host=m221 version=0.178.0 sessions=1 level=facts cut=0 \
+                 at_ms=1793130000000 node=n instances=2 update=held update_at=1793129400 \
+                 update_to=0.199.0 update_until=1793130060 update_why=crash-loop \
+                 update_tries=2 update_checks=on access=read\nsession sid=s-a program_kind=shell\n"
+        .to_owned();
+    let second = "OK 2\ninstance pid=9 host=m221 version=0.198.0 sessions=1 level=facts cut=0 \
+                  at_ms=1793130120000 node=n instances=2 update=retrying update_at=1793129400 \
+                  update_to=0.199.0 update_why=crash-loop update_checks=on access=read\n\
+                  session sid=s-b program_kind=shell\n"
+        .to_owned();
+    let merged = merge_window_surveys(&[first, second], usize::MAX);
+    let lines: Vec<String> = merged.lines().skip(1).map(str::to_owned).collect();
+    assert_eq!(
+        aterm_net::fleet_member::Answerer::of(&lines),
+        aterm_net::fleet_member::Answerer::Window("0.178.0".to_owned()),
+        "{merged}"
+    );
+    let update = aterm_net::fleet_member::update_of(&lines).expect("an updater");
+    assert_eq!(
+        (update.standing.word(), update.to.as_deref(), update.said_at),
+        ("held", Some("0.199.0"), Some(1_793_130_000)),
+        "the first window's updater: {merged}"
+    );
+    assert_eq!(merged.matches(" update=").count(), 1, "{merged}");
 }
 
 /// THE NODE COUNTS EVERY WINDOW'S AGENTS (Fleet Field §11, §14): a survey of each window here,

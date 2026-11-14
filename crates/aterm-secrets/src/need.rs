@@ -25,8 +25,8 @@ pub use crate::client::version::RefusalClaim;
 pub use catalog::{Class, GhProfile, Purpose, Want};
 pub use ledger::{
     FILE as LEDGER, absorb, acknowledge_from_snapshot, list, peek, raise, raise_refused,
-    raise_refused_from_snapshot, raise_with_admission, retire, satisfied, unneeded_from_snapshot,
-    with_ledger,
+    raise_refused_from_snapshot, raise_rotations, raise_with_admission, retire, rotated, satisfied,
+    unneeded_from_snapshot, with_ledger,
 };
 
 use crate::commons::Unavailable;
@@ -267,6 +267,10 @@ pub struct Need {
     pub line: String,
     /// The vault seq the line is stated at.
     pub seq: Option<u64>,
+    /// The vault sections (`[everyone]`, `[m3 m22]`) a stolen Mac read the entry in, each
+    /// still holding the value it took until a new value is published there; empty for every
+    /// purpose but [`Purpose::StolenRotation`].
+    pub exposed: Vec<String>,
 }
 
 impl Need {
@@ -588,6 +592,7 @@ pub fn fresh(id: [u8; 16], want: Want, purpose: Purpose, facts: &Facts) -> Need 
         posted: false,
         custodian_silent: false,
         record: None,
+        exposed: Vec::new(),
     }
 }
 
@@ -800,6 +805,7 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
         Act::Flush => {
             let guard = need.state == State::Local
                 && posted_class
+                && need.purpose.asks_the_lab()
                 && facts.writer()
                 && facts.policy.allows(&need.want);
             guard.then(|| Need {
@@ -1005,6 +1011,9 @@ pub fn settle(need: &Need, facts: &Facts) -> Need {
     if need.state.ended() {
         return need.clone();
     }
+    if !need.purpose.asks_the_lab() {
+        return rotation_wait(need);
+    }
     if let Some(next) = act(need, facts, &Act::Catalog) {
         return next;
     }
@@ -1046,6 +1055,25 @@ pub fn settle(need: &Need, facts: &Facts) -> Need {
         };
     }
     act(need, facts, &Act::Refresh).unwrap_or_else(|| need.clone())
+}
+
+/// A stolen Mac's rotation stays on this Mac until a new value is published in each section it
+/// read the entry in ([`rotated`]) or it is withdrawn by hand: no Mac's copy answers it, and the
+/// vault holding the entry proves nothing.
+fn rotation_wait(need: &Need) -> Need {
+    let sections = if need.exposed.is_empty() {
+        String::new()
+    } else {
+        format!(" in {}", need.exposed.join(", "))
+    };
+    Need {
+        wait: Wait::Requester,
+        line: format!(
+            "filed for rotation: a stolen Mac could read {}{sections}; an aterm secrets set of it there on this Mac closes this",
+            entry_words(&need.want)
+        ),
+        ..need.clone()
+    }
 }
 
 /// `entry:<name>` is never posted: an AI CLI's login file is retired `never-copied`, an entry in

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! System State's access steps: the menu line, the step gating and a Needs-you
+//! System State's access steps: the signal line, the step gating and a Needs-you
 //! row's press. Nothing reaches a person's state directory or System Settings. The dialog-ownership regressions use
 //! the real process-wide guard, without raising a dialog.
 
@@ -13,9 +13,9 @@ use aterm_types::macos_setup::{
 };
 
 use super::{
-    JOIN_PENDING_KEY, RETIRED_KEYS, StepsReach, background_setup_fields, menu_line, setup_field,
+    JOIN_PENDING_KEY, RETIRED_KEYS, StepsReach, SystemStateLine, background_setup_fields,
+    setup_field, signal_line,
 };
-use crate::status_item::SystemStateLine;
 use crate::{App, InitialSetupPermissionPolicy, SetupStatus};
 
 #[cfg(target_os = "macos")]
@@ -530,18 +530,18 @@ fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
     }
 }
 
-/// The menu line says only rows the approved plan manages that need a person or failed: one is
+/// The signal line says only rows the approved plan manages that need a person or failed: one is
 /// named, several are counted; a Full Disk Access grant counts as its reading says; the Secrets
 /// row's approval code rides along.
 #[test]
-fn the_menu_line_names_what_needs_a_person() {
+fn the_signal_line_names_what_needs_a_person() {
     let dock = Subject::Setting(Setting::Dock);
     let fda = Subject::Access(Access::FullDiskAccess);
     let accessibility = Subject::Access(Access::Accessibility);
     let secrets = Subject::Setting(Setting::Secrets);
     let all = Selection::all();
 
-    assert_eq!(menu_line(&SetupStatus::default()), None);
+    assert_eq!(signal_line(&SetupStatus::default()), None);
     let settled = status(
         all,
         vec![
@@ -550,10 +550,13 @@ fn the_menu_line_names_what_needs_a_person() {
             observed(secrets, Standing::Waiting, None),
         ],
     );
-    assert_eq!(menu_line(&settled), None, "nothing needs a person");
+    assert_eq!(signal_line(&settled), None, "nothing needs a person");
 
     let one = status(all, vec![observed(dock, Standing::NeedsYou, None)]);
-    assert_eq!(menu_line(&one), line("System State: Needs you: Dock", None));
+    assert_eq!(
+        signal_line(&one),
+        line("System State: Needs you: Dock", None)
+    );
     let two = status(
         all,
         vec![
@@ -561,10 +564,13 @@ fn the_menu_line_names_what_needs_a_person() {
             observed(fda, Standing::NeedsYou, None),
         ],
     );
-    assert_eq!(menu_line(&two), line("System State: 2 need you", None));
+    assert_eq!(signal_line(&two), line("System State: 2 need you", None));
     // A failure is said as one: it may retry by itself and need no one.
     let failed = status(all, vec![observed(dock, Standing::Failed, None)]);
-    assert_eq!(menu_line(&failed), line("System State: Dock failed", None));
+    assert_eq!(
+        signal_line(&failed),
+        line("System State: Dock failed", None)
+    );
     let mixed = status(
         all,
         vec![
@@ -573,7 +579,7 @@ fn the_menu_line_names_what_needs_a_person() {
         ],
     );
     assert_eq!(
-        menu_line(&mixed),
+        signal_line(&mixed),
         line("System State: 1 needs you, 1 failed", None)
     );
     let both_failed = status(
@@ -584,14 +590,14 @@ fn the_menu_line_names_what_needs_a_person() {
         ],
     );
     assert_eq!(
-        menu_line(&both_failed),
+        signal_line(&both_failed),
         line("System State: 2 failed", None)
     );
 
     let mut unmanaged = Selection::all();
     unmanaged.set(Setting::Dock, false);
     assert_eq!(
-        menu_line(&status(
+        signal_line(&status(
             unmanaged,
             vec![observed(dock, Standing::Failed, None)]
         )),
@@ -602,7 +608,7 @@ fn the_menu_line_names_what_needs_a_person() {
     no_signouts.set(Setting::Messages, false);
     no_signouts.set(Setting::FaceTime, false);
     assert_eq!(
-        menu_line(&status(
+        signal_line(&status(
             no_signouts,
             vec![observed(accessibility, Standing::NeedsYou, None)]
         )),
@@ -610,7 +616,7 @@ fn the_menu_line_names_what_needs_a_person() {
         "Accessibility is needed only for a sign-out"
     );
     assert_eq!(
-        menu_line(&status(
+        signal_line(&status(
             all,
             vec![observed(accessibility, Standing::NeedsYou, None)]
         )),
@@ -618,21 +624,21 @@ fn the_menu_line_names_what_needs_a_person() {
     );
 
     assert_eq!(
-        menu_line(&status(all, vec![observed(fda, Standing::NeedsYou, None)])),
+        signal_line(&status(all, vec![observed(fda, Standing::NeedsYou, None)])),
         line("System State: Needs you: Full Disk Access", None),
         "a grant whose reading needs a person"
     );
 
     let code = "Approve 4F7-2KQ on an admin Mac";
     assert_eq!(
-        menu_line(&status(
+        signal_line(&status(
             all,
             vec![observed(secrets, Standing::NeedsYou, Some(code))]
         )),
         line("System State: Needs you: Secrets vault", Some(code))
     );
     assert_eq!(
-        menu_line(&status(
+        signal_line(&status(
             all,
             vec![observed(secrets, Standing::Failed, Some(code))]
         ))
@@ -642,12 +648,12 @@ fn the_menu_line_names_what_needs_a_person() {
     );
 }
 
-/// A step the last run could not finish is a failure on the menu line though no reading says so
+/// A step the last run could not finish is a failure on the signal line though no reading says so
 /// (a join the vault refused reads Not joined). A step that names a row is that row, counted once
 /// with it; any other is counted, never named; one for a group left as is, or one that only
 /// waits or was blocked, is none.
 #[test]
-fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
+fn a_step_the_run_could_not_finish_is_on_the_signal_line() {
     let secrets = Subject::Setting(Setting::Secrets);
     let dock = Subject::Setting(Setting::Dock);
     let fda = Subject::Access(Access::FullDiskAccess);
@@ -663,7 +669,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
     };
     let not_joined = || vec![observed(secrets, Standing::Differs, None)];
     assert_eq!(
-        menu_line(&ran(
+        signal_line(&ran(
             all,
             not_joined(),
             vec![step("Secrets vault", "error")]
@@ -671,7 +677,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
         line("System State: Secrets vault failed", None)
     );
     assert_eq!(
-        menu_line(&ran(
+        signal_line(&ran(
             all,
             vec![observed(secrets, Standing::Failed, None)],
             vec![step("Secrets vault", "failed")]
@@ -680,7 +686,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
         "counted once with its row"
     );
     assert_eq!(
-        menu_line(&ran(
+        signal_line(&ran(
             all,
             vec![observed(dock, Standing::Failed, None)],
             vec![step("Secrets vault", "error")]
@@ -688,7 +694,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
         line("System State: 2 failed", None)
     );
     assert_eq!(
-        menu_line(&ran(
+        signal_line(&ran(
             all,
             vec![observed(fda, Standing::NeedsYou, None)],
             vec![step("Selected Mac settings", "error")]
@@ -696,7 +702,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
         line("System State: 1 needs you, 1 failed", None)
     );
     assert_eq!(
-        menu_line(&ran(
+        signal_line(&ran(
             all,
             Vec::new(),
             vec![step(
@@ -708,7 +714,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
         "a step no row names is counted, not named"
     );
     assert_eq!(
-        menu_line(&ran(
+        signal_line(&ran(
             all,
             Vec::new(),
             vec![
@@ -721,7 +727,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
     let mut left = all;
     left.set(Setting::Secrets, false);
     assert_eq!(
-        menu_line(&ran(
+        signal_line(&ran(
             left,
             not_joined(),
             vec![step("Secrets vault", "error")]
@@ -738,7 +744,7 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
         "ok",
     ] {
         assert_eq!(
-            menu_line(&ran(all, not_joined(), vec![step("Secrets vault", quiet)])),
+            signal_line(&ran(all, not_joined(), vec![step("Secrets vault", quiet)])),
             None,
             "{quiet}"
         );
@@ -746,10 +752,10 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
 }
 
 /// A failure the run still retries by itself (a stage's error, a failed pass or row) stays off
-/// the menu line until the worker stops retrying it; a row that needs a person, or a verified
+/// the signal line until the worker stops retrying it; a row that needs a person, or a verified
 /// grant that reads off, is said at once, since no pass retries it.
 #[test]
-fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
+fn a_failure_the_run_still_retries_stays_off_the_signal_line() {
     let secrets = Subject::Setting(Setting::Secrets);
     let dock = Subject::Setting(Setting::Dock);
     let fda = Subject::Access(Access::FullDiskAccess);
@@ -782,12 +788,12 @@ fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
         ),
     ] {
         assert_eq!(
-            menu_line(&ran(observed.clone(), rows.clone(), true)),
+            signal_line(&ran(observed.clone(), rows.clone(), true)),
             None,
             "{said}: retried"
         );
         assert_eq!(
-            menu_line(&ran(observed, rows, false)),
+            signal_line(&ran(observed, rows, false)),
             line(said, None),
             "no longer retried"
         );
@@ -798,11 +804,11 @@ fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
     ];
     let failed = vec![step("Secrets vault", "error")];
     assert_eq!(
-        menu_line(&ran(person.clone(), failed.clone(), true)),
+        signal_line(&ran(person.clone(), failed.clone(), true)),
         line("System State: Needs you: Full Disk Access", None)
     );
     assert_eq!(
-        menu_line(&ran(person, failed.clone(), false)),
+        signal_line(&ran(person, failed.clone(), false)),
         line("System State: 1 needs you, 2 failed", None)
     );
 }
@@ -1725,12 +1731,12 @@ fn the_markers_are_bound_to_the_approved_revision() {
     assert!(marks.fda.starts_with("r12"), "{}", marks.fda);
 }
 
-/// A regressed grant lights the menu line once the fresh reading it asks for reads the grant off
+/// A regressed grant lights the signal line once the fresh reading it asks for reads the grant off
 /// (and ends it when that reading settles), so the line says what `setup=` says; the retired
 /// digest keys end once, withdrawn: nothing read their causes end. Negative control: the
 /// regression alone, with no reading of the grant, lights nothing.
 #[test]
-fn a_regressed_grant_lights_the_menu_line() {
+fn a_regressed_grant_lights_the_signal_line() {
     use aterm_messages::exceptions::{Entry, Family};
     use aterm_messages::need::{Reason, Then, Why};
     let mut app = App::headless_for_test();
@@ -1754,12 +1760,12 @@ fn a_regressed_grant_lights_the_menu_line() {
         "the stand-in entry is raised"
     );
     app.settle_access_steps(now);
-    assert_eq!(app.system_state_menu_line(), None);
+    assert_eq!(app.system_state_signal_line(), None);
     app.note_fda_regression(true);
     assert!(app.access_steps.fda_regressed());
     app.settle_access_steps(now);
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         None,
         "the control: no reading of the grant yet, so the line waits as `setup=` does"
     );
@@ -1769,7 +1775,7 @@ fn a_regressed_grant_lights_the_menu_line() {
     ));
     app.settle_access_steps(now);
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         line("System State: Needs you: Full Disk Access", None)
     );
     app.note_fda_regression(false);
@@ -1778,7 +1784,7 @@ fn a_regressed_grant_lights_the_menu_line() {
         vec![observed(fda, Standing::InPlace, None)],
     ));
     app.settle_access_steps(now);
-    assert_eq!(app.system_state_menu_line(), None);
+    assert_eq!(app.system_state_signal_line(), None);
     for key in RETIRED_KEYS {
         assert!(
             !app.messages.digest().entries.iter().any(|e| e.key == key),
@@ -1825,7 +1831,7 @@ fn an_older_fleet_no_route_entry_is_withdrawn() {
     );
 }
 
-/// A grant an update left off says so under the menu line while its reading needs the person, and
+/// A grant an update left off says so under the signal line while its reading needs the person, and
 /// the note ends with the regression. Negative controls: the same regression with no update says
 /// nothing more, and the update's note never goes under a line about another row.
 #[test]
@@ -1847,7 +1853,7 @@ fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
     app.note_fda_regression(true);
     app.settle_access_steps(now);
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         line("System State: Needs you: Full Disk Access", None),
         "the control: no update, no note"
     );
@@ -1865,7 +1871,7 @@ fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
     ));
     app.settle_access_steps(now);
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         line("System State: Needs you: Dock", None),
         "the control: a line about another row carries no update note"
     );
@@ -1875,14 +1881,14 @@ fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
     app.note_fda_off_after_update();
     app.settle_access_steps(now);
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         line("System State: Needs you: Full Disk Access", None),
         "not regressed: no note"
     );
     app.note_fda_regression(true);
     app.settle_access_steps(now);
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         line(
             "System State: Needs you: Full Disk Access",
             Some(FDA_AFTER_UPDATE)
@@ -1892,7 +1898,7 @@ fn a_grant_an_update_left_off_says_the_update_needs_it_re_allowed() {
     app.note_fda_regression(true);
     app.settle_access_steps(now);
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         line("System State: Needs you: Full Disk Access", None),
         "the note ended with the regression it was said of"
     );
@@ -2015,10 +2021,10 @@ fn a_persons_press_passes_not_now_and_a_clients_act_does_not() {
     );
 }
 
-/// The menu line is composed where what it reads changes — a status
+/// The signal line is composed where what it reads changes — a status
 /// publication, a regression — and never on a park.
 #[test]
-fn the_menu_line_follows_publications_not_parks() {
+fn the_signal_line_follows_publications_not_parks() {
     let mut app = App::headless_for_test();
     let now = Instant::now();
     let dock = Subject::Setting(Setting::Dock);
@@ -2026,7 +2032,7 @@ fn the_menu_line_follows_publications_not_parks() {
     app.access_steps.fda_regressed = true;
     app.settle_access_steps(now);
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         None,
         "a park composes nothing"
     );
@@ -2036,11 +2042,11 @@ fn the_menu_line_follows_publications_not_parks() {
         vec![observed(dock, Standing::NeedsYou, None)],
     ));
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         line("System State: Needs you: Dock", None)
     );
     app.publish_system_state(status(Selection::all(), Vec::new()));
-    assert_eq!(app.system_state_menu_line(), None);
+    assert_eq!(app.system_state_signal_line(), None);
 }
 
 /// An older aterm's vault-join entry carries the approval code: it stays until a
@@ -2152,7 +2158,7 @@ fn the_join_entry_ends_only_once_the_secrets_row_is_read() {
         "never filed as fixed"
     );
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         line("System State: Needs you: Secrets vault", Some(code))
     );
 }
@@ -4747,12 +4753,12 @@ fn a_walking_folder_pass_retires_on_a_revoked_permission_status() {
 /// (`asked_at` after `verified_at`) and the person answered Not now. Revision 1
 /// spends that Not now and retires the marker; the next launch under the same
 /// revision 1, whose row still says "You chose Not now" (the worker's reading honors
-/// it), finds the grant regressed but leaves the menu line dark. Revision 2
+/// it), finds the grant regressed but leaves the signal line dark. Revision 2
 /// (Permissions turned off and on again) asks again, its reading needs the person,
 /// and the line names Full Disk Access: the line follows the reading, as `setup=` does.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
+fn a_spent_card_not_now_keeps_the_signal_line_dark_in_its_own_revision() {
     use crate::consent_card::{self, AccessRecord, DecideWhy, Marker, PendingDecision};
     use crate::devtools_helper::test_arms;
     let on_record_but_lan = StepsReach {
@@ -4800,7 +4806,7 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
     let mut app = launch(1);
     app.publish_system_state(as_chosen());
     assert_ne!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         names_fda,
         "the card's Not now"
     );
@@ -4811,7 +4817,7 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
         || on_disk().is_none().then_some(()),
     );
     assert_ne!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         names_fda,
         "spent in revision 1"
     );
@@ -4823,7 +4829,7 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
     );
     app.publish_system_state(as_chosen());
     assert_ne!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         names_fda,
         "revision 1's Not now still holds: the line does not name Full Disk Access"
     );
@@ -4835,93 +4841,11 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
         vec![observed(fda, Standing::NeedsYou, None)],
     ));
     assert_eq!(
-        app.system_state_menu_line(),
+        app.system_state_signal_line(),
         names_fda,
         "a new approval asks again, and the line follows it"
     );
     test_arms::forget_fda_declines();
-}
-
-/// The status item's press with no window asks for a new one, as Cmd-N does, and answers
-/// `false`; with no event loop the ask is refused in its own message row, which is how the test
-/// sees it. A headless instance asks for none; with a window (the control) System State shows
-/// in it at once, raised.
-#[test]
-fn the_status_item_with_no_window_asks_for_a_new_one() {
-    let said_no_window = |app: &App| {
-        app.messages
-            .live_rows()
-            .any(|row| row.msg.title == "Couldn't open a new window")
-    };
-    let mut app = App::headless_for_test();
-    let wid = *app.windows.keys().next().expect("a window");
-    let _ = crate::app_tabs::take_raised_windows();
-    assert!(app.open_system_state_from_status_item());
-    assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
-
-    let mut app = App::headless_for_test();
-    app.windows.clear();
-    app.frontmost_window = None;
-    assert!(!app.open_system_state_from_status_item());
-    assert!(!said_no_window(&app), "headless: no window asked for");
-
-    app.headless = false;
-    let next = app.next_window_id;
-    assert!(!app.open_system_state_from_status_item());
-    assert_eq!(app.next_window_id, next + 1, "a new window was asked for");
-    assert!(said_no_window(&app), "the ask's own refusal row");
-}
-
-/// The window the status item asked for shows System State, raised, once its first shell lands;
-/// a window that never came shows nothing. Unix only: the session writes into
-/// `tab_spawn::tests`' libc pipe.
-#[cfg(unix)]
-#[test]
-fn the_status_items_new_window_shows_system_state_once_it_lands() {
-    use crate::tab_spawn::{SpawnAdmission, TabSpawned};
-    let mut app = App::headless_for_test();
-    let _ = crate::app_tabs::take_raised_windows();
-    let (id, wid) = crate::tab_spawn::test_support::book_window(
-        &mut app,
-        None,
-        SpawnAdmission::Plain,
-        App::system_state_once_landed(),
-    );
-    assert!(
-        !app.windows.contains_key(&wid),
-        "no window before its shell"
-    );
-    let (session, _pty) = crate::tab_spawn::tests::registered_piped_session(id);
-    assert!(app.install_spawned_tab(TabSpawned {
-        id,
-        window: wid,
-        session: Ok(session),
-        reader_gate: None,
-    }));
-    let (instance, _) = app
-        .active_native_view(wid)
-        .expect("System State is the new window's view");
-    assert_eq!(
-        app.native_runtime.app(instance).map(|a| a.kind()),
-        Some(crate::native_app::AppKind::SystemState)
-    );
-    assert!(crate::app_tabs::take_raised_windows().contains(&wid));
-
-    let windows = app.windows.len();
-    let (id, wid) = crate::tab_spawn::test_support::book_window(
-        &mut app,
-        None,
-        SpawnAdmission::Plain,
-        App::system_state_once_landed(),
-    );
-    assert!(!app.install_spawned_tab(TabSpawned {
-        id,
-        window: wid,
-        session: Err(std::io::Error::other("exec refused")),
-        reader_gate: None,
-    }));
-    assert_eq!(app.windows.len(), windows, "no window, so nothing shown");
-    assert!(!crate::app_tabs::take_raised_windows().contains(&wid));
 }
 
 /// The window's probe once a switch is on again: `enabled` or `check` off retired the cached

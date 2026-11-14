@@ -1633,6 +1633,7 @@ fn resolver_cost(n: usize) -> Result<String, Fail> {
             credits: false,
             now,
             offset: |t| aterm_agent::supervise::limit::local_offset_at(t).unwrap_or(0),
+            signing_in: None,
         });
         replay.push(t.elapsed().as_micros());
         out = Some(o.verdict);

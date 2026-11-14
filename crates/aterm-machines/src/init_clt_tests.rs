@@ -2331,8 +2331,8 @@ fn a_run_whose_claim_lost_to_the_tab_asks_nothing_and_keeps_the_tabs_line() {
 /// A pending automatic claim must not release a later explicit person's real attempt,
 /// even when the automatic sudo was proven never started afterward: B's attempt asks on while
 /// its process runs, the person's end that follows stands, and the next automatic ask waits
-/// for its pause. NEGATIVE CONTROL: where B's process is gone too, B's line was cut off, so
-/// A's release gives the record back whole, as a cut-off adds nothing.
+/// for its pause. NEGATIVE CONTROL: where B's process is gone too, B's attempt was cut off, and
+/// A's release leaves it so: due again at once, a cut-off adding no try.
 #[test]
 fn an_explicit_attempt_survives_an_older_automatic_no_start_result() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2365,8 +2365,8 @@ fn an_explicit_attempt_survives_an_older_automatic_no_start_result() {
         );
         if !b_runs {
             assert!(
-                matches!(record(&sys), Asked::Available),
-                "CONTROL: a cut-off B leaves nothing: {:?}",
+                matches!(record(&sys), Asked::Unfinished { tries: 0, due } if due <= sys.now),
+                "CONTROL: a cut-off B is asked again at once: {:?}",
                 record(&sys)
             );
             continue;

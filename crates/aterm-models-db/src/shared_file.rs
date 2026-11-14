@@ -39,18 +39,34 @@ pub const SHARED_FILE_LAWS: [(&str, &str); 16] = [
 ///    frontier at the home a pass opens now is `rfr`, and at the lineage's other home `ofr`. The
 ///    snapshot holds the home and frontier it was projected from (`sera`, `sfr`); the state word
 ///    (`word`: 0 never, 1 live, 2 held) is the last recorded pass's, with the custody that pass
-///    opened (`src`). `hera` and `hfr` are the newest home and frontier any snapshot here was
-///    ever written from. A pass replaces the snapshot only with a later home or a frontier that
-///    contains the old one, and records its word either way. The runtime's pass looks and
+///    met (`src`). `hera` and `hfr` are the newest home and frontier any snapshot here was
+///    ever written from. A pass that opened custody replaces the snapshot only with a later home
+///    or a frontier that contains the old one, and records its word either way. A pass custody
+///    refused (`custody` 3) opened nothing: it leaves the snapshot as it was and records its
+///    word all the same, so it is a recorded pass like any other. The runtime's pass looks and
 ///    records in one step (`Materialize`); `aterm file refresh` in another process takes a view
-///    (`RefreshLook`: `vera`, `vfr`, `vsrc`) and records it later (`RefreshWrite`). A view taken
-///    before a pass that has recorded since (`look` 2) is older than that pass and records
-///    nothing: without that rule a view of live custody, taken before a fence, would turn a
-///    held word live once the fenced pass had run. `older` is such a view recorded. A read
-///    (`Read`) has no custody in its guard: `answered` of `reads` answered, `opens` the custody
-///    steps a read took. A record holding a credential-shaped value can reach the replica
-///    (`PeerSecret`, `rsecret`); `ssecret` is one in the snapshot or the face. `authored` is a
-///    record or receipt written from a materializer's open.
+///    (`RefreshLook`: `vera`, `vfr`, `vsrc`, `vlacks`) and records it later (`RefreshWrite`). A
+///    view taken before a pass that has recorded since (`look` 2) is older than that pass and
+///    records nothing: without that rule a view of live custody, taken before a fence or before
+///    custody refused, would turn a held word live once the later pass had run. `older` is such
+///    a view recorded. A read (`Read`) has no custody in its guard: `answered` of `reads`
+///    answered, `opens` the custody steps a read took. A record holding a credential-shaped
+///    value can reach the replica (`PeerSecret`, `rsecret`); `ssecret` is one in the snapshot or
+///    the face. `authored` is a record or receipt written from a materializer's open.
+///
+///    **The unsettled open.** While its succession was complete the successor could author
+///    and take peers' records (`Grow` at `era` 1), none of which its fenced original holds.
+///    So an unsettled pass opens a home that can lack its own lineage's newest records: there
+///    `ofr`, the successor's frontier, counts what the successor added to the prefix it
+///    imported. `lacks` is that fact about the snapshot: it was projected from a home that
+///    lacked a record its successor held when it was read. That is what a read of an original
+///    home after an invalidated completion can mislead, and the laws bound it. HeldNeverLive:
+///    a snapshot is under a live word only where the pass that left the word opened the newest
+///    home and the snapshot lacks nothing (`src` 0, `lacks` 0), and no open authors.
+///    SnapshotMonotone: the unsettled home is the earlier one, so its view never replaces a
+///    snapshot of the successor's home, and where no pass read the successor it contains the
+///    frontier the last snapshot of that home had; the completion made again, the successor's
+///    home replaces it and the word is live once more.
 /// 2. **Writing** (`aterm_file::File::write`, `aterm_db::file::publish`,
 ///    `aterm_db_core::file_merge::settle`). Of `acc` accepted intents, `q` wait in the outbox,
 ///    `h` are held and `p` published. The intent at the head of the outbox names one register,
@@ -88,8 +104,9 @@ pub const SHARED_FILE_LAWS: [(&str, &str); 16] = [
 /// within its keep (`Keep`).
 ///
 /// Mutants, as [`SHARED_FILE_LAWS`] names them: 1 a read opens custody, and answers only where
-/// that succeeds, 2 a pass writes the view it took over a newer snapshot or a later pass's
-/// word, 3 a pass at a fenced or unsettled home is taken for a live one, 4 an intent whose
+/// that succeeds, 2 a pass that opened custody writes the view it took over a newer snapshot,
+/// and any pass its word over a later pass's, 3 a pass that opened a fenced or unsettled home
+/// is taken for a live one, 4 an intent whose
 /// register moved is dropped, 5 a retry signs an intent a record already carries, 6 the
 /// publisher writes over a register that moved, 7 the publisher signs as a fenced actor, 8 a
 /// row or an entry at another Mac's key projects, 9 an automatic cell projects on an Owner
@@ -108,8 +125,8 @@ pub fn shared_file_model() -> Model {
             var area = 0;
             var custody = 0; var era = 0;
             var rfr = 0; var ofr = 0; var sera = 0; var sfr = 0; var word = 0; var src = 0;
-            var hera = 0; var hfr = 0; var older = 0;
-            var look = 0; var vera = 0; var vfr = 0; var vsrc = 0;
+            var hera = 0; var hfr = 0; var older = 0; var lacks = 0;
+            var look = 0; var vera = 0; var vfr = 0; var vsrc = 0; var vlacks = 0;
             var reads = 0; var answered = 0; var opens = 0; var authored = 0;
             var rsecret = 0; var ssecret = 0;
             var acc = 0; var q = 0; var h = 0; var p = 0;
@@ -147,43 +164,63 @@ pub fn shared_file_model() -> Model {
             action Recover when (area == 1 && custody == 3) { custody = 0; }
 
             // 1. Reading. Only the home orders two snapshots of different homes. A pass that
-            // records makes a view taken before it the older one.
+            // records makes a view taken before it the older one, and a pass custody refused
+            // records too. At an unsettled home `ofr` is what the successor added.
             action Grow when (area == 1 && custody == 0 && 1 > rfr) { rfr = rfr + 1; }
             action PeerSecret when (area == 1 && rsecret == 0) { rsecret = 1; }
-            action Materialize when (area == 1 && custody <= 2) {
-                sera = if era > sera || (era == sera && sfr <= rfr) || Buggy == 2 {era}
+            action Materialize when (area == 1 && custody <= 3) {
+                sera = if custody <= 2
+                    && (era > sera || (era == sera && sfr <= rfr) || Buggy == 2) {era}
                     else {sera};
-                sfr = if era > sera || (era == sera && sfr <= rfr) || Buggy == 2 {rfr}
+                sfr = if custody <= 2
+                    && (era > sera || (era == sera && sfr <= rfr) || Buggy == 2) {rfr}
                     else {sfr};
-                ssecret = if era > sera || (era == sera && sfr <= rfr) || Buggy == 2 {
+                lacks = if custody <= 2
+                    && (era > sera || (era == sera && sfr <= rfr) || Buggy == 2) {
+                    if custody == 2 && ofr > 0 {1} else {0}
+                } else {lacks};
+                ssecret = if custody <= 2
+                    && (era > sera || (era == sera && sfr <= rfr) || Buggy == 2) {
                     if Buggy == 16 {rsecret} else {0}
                 } else {ssecret};
-                hera = if era > hera {era} else {hera};
-                hfr = if era > hera {rfr} else {if era == hera && rfr > hfr {rfr} else {hfr}};
-                word = if custody == 0 || Buggy == 3 {1} else {2};
+                hera = if custody <= 2 && era > hera {era} else {hera};
+                hfr = if custody <= 2 && era > hera {rfr}
+                    else {if custody <= 2 && era == hera && rfr > hfr {rfr} else {hfr}};
+                word = if custody == 0 || (Buggy == 3 && custody <= 2) {1} else {2};
                 src = custody;
-                authored = if custody > 0 && Buggy == 3 {1} else {authored};
+                authored = if custody > 0 && custody <= 2 && Buggy == 3 {1} else {authored};
                 look = if look == 1 {2} else {look};
             }
-            action RefreshLook when (area == 1 && custody <= 2 && look == 0) {
-                look = 1; vera = era; vfr = rfr; vsrc = custody;
+            action RefreshLook when (area == 1 && custody <= 3 && look == 0) {
+                look = 1; vsrc = custody;
+                vera = if custody <= 2 {era} else {0};
+                vfr = if custody <= 2 {rfr} else {0};
+                vlacks = if custody == 2 && ofr > 0 {1} else {0};
             }
             action RefreshWrite when (area == 1 && look > 0) {
-                look = 0; vera = 0; vfr = 0; vsrc = 0;
-                sera = if (look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
-                    || Buggy == 2 {vera} else {sera};
-                sfr = if (look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
-                    || Buggy == 2 {vfr} else {sfr};
-                ssecret = if (look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
-                    || Buggy == 2 {if Buggy == 16 {rsecret} else {0}} else {ssecret};
-                hera = if (look == 1 || Buggy == 2) && vera > hera {vera} else {hera};
-                hfr = if (look == 1 || Buggy == 2) && vera > hera {vfr}
-                    else {if (look == 1 || Buggy == 2) && vera == hera && vfr > hfr {vfr}
-                        else {hfr}};
-                word = if look == 1 || Buggy == 2 {if vsrc == 0 || Buggy == 3 {1} else {2}}
-                    else {word};
+                look = 0; vera = 0; vfr = 0; vsrc = 0; vlacks = 0;
+                sera = if vsrc <= 2
+                    && ((look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
+                        || Buggy == 2) {vera} else {sera};
+                sfr = if vsrc <= 2
+                    && ((look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
+                        || Buggy == 2) {vfr} else {sfr};
+                lacks = if vsrc <= 2
+                    && ((look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
+                        || Buggy == 2) {vlacks} else {lacks};
+                ssecret = if vsrc <= 2
+                    && ((look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
+                        || Buggy == 2) {if Buggy == 16 {rsecret} else {0}} else {ssecret};
+                hera = if vsrc <= 2 && (look == 1 || Buggy == 2) && vera > hera {vera}
+                    else {hera};
+                hfr = if vsrc <= 2 && (look == 1 || Buggy == 2) && vera > hera {vfr}
+                    else {if vsrc <= 2 && (look == 1 || Buggy == 2) && vera == hera
+                        && vfr > hfr {vfr} else {hfr}};
+                word = if look == 1 || Buggy == 2 {
+                    if vsrc == 0 || (Buggy == 3 && vsrc <= 2) {1} else {2}
+                } else {word};
                 src = if look == 1 || Buggy == 2 {vsrc} else {src};
-                authored = if vsrc > 0 && Buggy == 3 {1} else {authored};
+                authored = if vsrc > 0 && vsrc <= 2 && Buggy == 3 {1} else {authored};
                 older = if look == 2 && Buggy == 2 {1} else {older};
             }
             action Read when (area == 1 && reads == 0) {
@@ -275,7 +312,8 @@ pub fn shared_file_model() -> Model {
 
             invariant ReadTotal: answered == reads && opens == 0;
             invariant SnapshotMonotone: hera <= sera && hfr <= sfr && older == 0;
-            invariant HeldNeverLive: (word == 0 || word == 2 || src == 0) && authored == 0;
+            invariant HeldNeverLive: (word == 0 || word == 2 || (src == 0 && lacks == 0))
+                && authored == 0;
             invariant IntentDurable: acc == q + h + p;
             invariant PublishOnce: recs <= 1;
             invariant PublishObservedOnly: lost == 0;

@@ -374,6 +374,79 @@ fn partition_longer_than_ttl_then_heal_leaves_one_user_per_account() {
     assert!(!m1.stays_on("pool-b", after), "m1 sees pool-b held by m2");
 }
 
+/// After a Commons writer succession this Mac writes under a new seat (machine `ee01` after
+/// `aa01`), and its table read carries the newest row its earlier seat signed as this Mac's own,
+/// at counter 0, until the new seat writes one (aterm's `account_claims::carry`). A claim this Mac
+/// went on using through the succession keeps its `since`: a peer's claim on the same account made
+/// after the earlier seat's (here m4's, made while it did not yet hold that row) stays junior, so
+/// this Mac's session keeps the account at its turn end and its claim stands rather than meeting
+/// HeldElsewhere. Its first row under the new seat is written at the claim (counter 1) though the
+/// carried row held the claim already, and carries the earlier `since`, which ranks it senior on
+/// m4 too.
+///
+/// Negative controls: with no row carried (the read leaving the earlier seat's row out, as on
+/// 2026-11-13), m4's junior claim was senior here and moved this Mac's session off (`a peer's
+/// junior claim moved this Mac off the account it holds`). With `claimed` leaving a carried row
+/// unwritten when it already held the claim, nothing went out under the new seat (`left: Held`,
+/// `right: Claimed`).
+#[test]
+fn a_writer_successor_keeps_the_seniority_of_the_claims_it_still_uses() {
+    let (mut earlier, mut m4) = (Mac::new("aa01", "m1"), Mac::new("dd04", "m4"));
+    earlier.hear(&m4, NOW);
+    m4.hear(&earlier, NOW);
+    earlier.runs("pool-a", NOW);
+    assert_eq!(earlier.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    // m4 claims pool-a ten minutes later before the earlier seat's row reaches it: a junior claim.
+    m4.runs("pool-a", NOW + 10 * MIN);
+    assert_eq!(
+        m4.touch(Act::Claim("pool-a"), NOW + 10 * MIN),
+        Touched::Claimed
+    );
+    // The succession: this Mac's store goes on, its seat is new. Its replica holds m4's row and
+    // the earlier seat's row, carried as the new seat's own at counter 0.
+    let at = NOW + 20 * MIN;
+    let mut successor = Mac {
+        table: Replica::new("ee01"),
+        state: earlier.state.clone(),
+        heard: BTreeMap::from([("dd04".to_owned(), at)]),
+    };
+    replicate(&m4, &successor);
+    let carried = earlier.table.row("aa01").expect("the earlier seat's row");
+    successor.table.book.lock().expect("replica").insert(Row {
+        machine: "ee01".to_owned(),
+        counter: 0,
+        ..carried
+    });
+    successor.runs("pool-a", at);
+    assert_eq!(successor.touch(Act::Look, at), Touched::Looked);
+    assert!(
+        successor.stays_on("pool-a", at),
+        "a peer's junior claim moved this Mac off the account it holds"
+    );
+    assert_eq!(successor.touch(Act::Claim("pool-a"), at), Touched::Claimed);
+    let row = successor
+        .table
+        .row("ee01")
+        .expect("the new seat's first row");
+    assert_eq!(row.counter, 1, "the new seat's counter starts at 1");
+    assert_eq!(
+        row.claims
+            .iter()
+            .map(|claim| (claim.key.clone(), claim.since))
+            .collect::<Vec<_>>(),
+        [(key("pool-a"), NOW)],
+        "the claim it still uses keeps its since"
+    );
+    // m4 takes the new seat's row and yields pool-a to it.
+    replicate(&successor, &m4);
+    m4.hear(&successor, at + MIN);
+    assert_eq!(m4.touch(Act::Look, at + MIN), Touched::Looked);
+    assert!(
+        !m4.stays_on("pool-a", at + MIN),
+        "m4 yields to the senior claim"
+    );
+}
+
 /// After a heal, a junior whose other rows are all walled (the pool fully used, when collisions
 /// happen) still yields at its turn end, under `accounts = "wall"` too: it waits, so its turn end
 /// holds, until a row opens or the claims are read again. A low row is one to move to here, as

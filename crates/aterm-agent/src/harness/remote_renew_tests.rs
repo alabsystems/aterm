@@ -255,3 +255,38 @@ fn a_lost_start_reply_is_recovered_by_polling_without_another_start() {
         ]
     );
 }
+
+/// The renewal another Mac's request starts here opens nothing on this Mac's desk: it is marked
+/// as a peer's, which denies every sign-in it starts the sign-in window, and it removes the
+/// window's grant from what it inherits, so a grant in the serving process's own environment
+/// never reaches it.
+#[test]
+fn a_peers_renewal_is_marked_and_carries_no_grant_to_open_the_sign_in_window() {
+    let command = renewal_command(Path::new("/nonexistent/aterm"));
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args, ["harness", "accounts", "renew", "--due", "--here"]);
+    assert!(
+        command
+            .get_envs()
+            .any(|(key, value)| key == super::super::open_url::WINDOW_ENV && value.is_none()),
+        "the window's grant is not removed from the renewal's environment"
+    );
+    assert!(
+        command
+            .get_envs()
+            .any(|(key, value)| key == FOR_PEER_ENV && value == Some(std::ffi::OsStr::new("1"))),
+        "the renewal is not marked as a peer's"
+    );
+    // What the mark does: on macOS, at this Mac's own desk, the renewal it marks opens none.
+    let marked = |name: &str| (name == FOR_PEER_ENV).then(|| std::ffi::OsString::from("1"));
+    assert!(!super::super::cli::opens_sign_in_window_by(
+        true,
+        &marked,
+        &|| false
+    ));
+    assert!(super::super::cli::opens_sign_in_window_by(
+        true,
+        &|_| None,
+        &|| false
+    ));
+}

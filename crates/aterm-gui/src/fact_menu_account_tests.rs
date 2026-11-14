@@ -1459,21 +1459,19 @@ fn the_login_row_says_the_login_and_what_the_tab_runs_on() {
             "{route:?}: {rows:?}"
         );
     }
-    let rows = login(
-        Some(LoginHalf::Ended { at: Some(NOV_9) }),
-        AuthRoute::Outside,
-        true,
-    );
-    assert!(
-        rows.contains(&"Login    signed out 9 Nov".into()),
-        "{rows:?}"
-    );
-    let rows = login(
-        Some(LoginHalf::Ended { at: None }),
-        AuthRoute::Outside,
-        true,
-    );
-    assert!(rows.contains(&"Login    signed out".into()));
+    // A login whose forecast end passed is `ended`; only a recorded sign-out is `signed out`.
+    for (half, want) in [
+        (LoginHalf::Ended { at: Some(NOV_9) }, "Login    ended 9 Nov"),
+        (LoginHalf::Ended { at: None }, "Login    ended"),
+        (
+            LoginHalf::SignedOut { at: Some(NOV_9) },
+            "Login    signed out 9 Nov",
+        ),
+        (LoginHalf::SignedOut { at: None }, "Login    signed out"),
+    ] {
+        let rows = login(Some(half), AuthRoute::Outside, true);
+        assert!(rows.contains(&want.to_owned()), "{half:?}: {rows:?}");
+    }
     let rows = login(None, AuthRoute::Outside, false);
     assert!(rows.contains(&"Login    never signed in on this Mac".into()));
     let rows = login(None, AuthRoute::Outside, true);

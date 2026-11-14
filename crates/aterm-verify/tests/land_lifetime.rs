@@ -112,7 +112,7 @@ fn main() {
         let kept = std::fs::read_to_string(&notes).is_ok_and(|text| text == bytes);
         println!("notes-code={code} notes-kept={kept}");
         let file = dir.join(".git").join(aterm_verify::land::handoff::FILE);
-        publish(&file, &bytes.replace(r#""schema":1"#, r#""schema":2"#));
+        publish(&file, &bytes.replace(r#""schema":2"#, r#""schema":3"#));
         let code = resume(&file);
         println!("file-left={}", file.exists());
         std::process::exit(code);
@@ -133,17 +133,20 @@ fn main() {
             let plan = aterm_verify::NativeBuildPlan::for_default_target(&env, &dir, &dir);
             aterm_verify::native_verifier::build_command(&dir, &exe, &plan).unwrap()
         } else {
-            // A recheck's child is the same command over the source readers alone.
-            let checks: &[&str] = if std::env::var_os("LAND_LIFETIME_RECHECK").is_some() {
-                &aterm_verify::land::RECHECKS
-            } else {
-                &[]
-            };
+            // A round's child is the same command, naming the judged commit and the file of
+            // its shared paths.
+            let shared = dir.join("shared");
+            let round =
+                std::env::var_os("LAND_LIFETIME_RECHECK").map(|_| aterm_verify::land::Round {
+                    judged: "fake-judged",
+                    shared: &shared,
+                    mechanical: true,
+                });
             aterm_verify::land::judgment_command(
                 &exe,
                 &dir,
                 "fake-base",
-                checks,
+                round,
                 &dir.join("events"),
                 &aterm_verify::land::LandResources {
                     admit: Admit::Wait,
@@ -504,10 +507,10 @@ fn main() {
         if recheck {
             let args = std::fs::read_to_string(dir.join("args")).unwrap();
             assert!(
-                args.starts_with("fmt census export-scan --base fake-base --events "),
+                args.starts_with("--base fake-base --judged fake-judged --shared "),
                 "{args}"
             );
-            assert!(!args.contains(aterm_verify::cli::INPUT_DRIFT), "{args}");
+            assert!(args.contains(aterm_verify::cli::INPUT_DRIFT), "{args}");
         }
         if doomed {
             publish_pid(&dir.join("doom"));
@@ -588,7 +591,6 @@ mod handoff {
             hop: 1,
             at: "1".repeat(40),
             base: "2".repeat(40),
-            rejudges: 0,
             composes: 0,
             cone: "2".repeat(40),
             branch: None,
@@ -718,7 +720,9 @@ mod handoff {
             "{text}"
         );
         assert!(
-            text.contains("it was handed over in schema 2; this tree's verify land reads schema 1"),
+            text.contains(
+                "it was handed over in schema 3; this tree's verify land reads schemas 1 and 2"
+            ),
             "{text}"
         );
         assert!(text.contains("file-left=false"), "{text}");
@@ -845,7 +849,7 @@ fn main() {
         &executable,
         root,
         "main",
-        &[],
+        None,
         &root.join("events"),
         &verify::land::LandResources {
             admit: aterm_capacity::Admit::Wait,

@@ -11,6 +11,7 @@ use crate::admission::deadline as admission_deadline;
 use crate::{
     Error, Result,
     catalog::Directory,
+    file::materialize::Projecting,
     table::{
         Session,
         store::{Region, Store, custody},
@@ -51,6 +52,8 @@ const REFUSED: &str = "statement-refused";
 /// That this home's succession reached its completing save at least once ([`mark_completed`]):
 /// it completed, or was about to.
 const COMPLETED: &str = "completed";
+/// Why a pass admits nothing from a successor home that lost its link ([`advance_at`]).
+const UNLINKED: &str = "the successor home this writer reserved does not link to it (emptied, restored or unreadable), so no key is made there and nothing asks from it";
 const MAX_STATE: usize = 16 * 1024;
 const MAX_GENERATIONS: usize = 8;
 const ADVANCE_WITHIN: Duration = Duration::from_secs(20);
@@ -71,7 +74,7 @@ impl Budget<'_> {
 fn root(paths: &Paths) -> PathBuf {
     paths.dir.join("commons/writer-generation")
 }
-fn candidate(paths: &Paths) -> Paths {
+pub(crate) fn candidate(paths: &Paths) -> Paths {
     Paths::for_home(&root(paths).join("home"))
 }
 fn candidate_origin(paths: &Paths) -> Option<Paths> {
@@ -142,7 +145,7 @@ fn within(deadline: Instant) -> Result<()> {
 // The reservation is published under the old control writer, before candidate
 // custody. Neither it nor the child link is removed by recovery. Empty staging
 // directories do not fence an original writer whose reservation was refused.
-fn fenced(paths: &Paths) -> Result<bool> {
+pub(crate) fn fenced(paths: &Paths) -> Result<bool> {
     let root = root(paths);
     for path in [
         root.join(FENCE),
@@ -640,6 +643,19 @@ impl Observation {
         &self.paths
     }
 
+    /// The writers of the generations this home succeeds on this disk, oldest first: each
+    /// predecessor home's own binding, which this observation proved the current writer of that
+    /// home's established custody, the actor its succession record names. Each is still a
+    /// Commons member.
+    pub(crate) fn succeeded(
+        &self,
+    ) -> impl Iterator<Item = &aterm_secrets::commons::binding::Binding> {
+        self.ancestors
+            .iter()
+            .rev()
+            .map(|ancestor| ancestor.access.local().binding())
+    }
+
     pub(crate) fn local_source_reads(&self) -> Result<Vec<client::CommonsSourceRead>> {
         self.ancestors
             .iter()
@@ -755,7 +771,21 @@ impl Observation {
     /// until its successor has imported them ([`observed_generation_until`]).
     pub(crate) fn check_read(&self, deadline: Instant) -> Result<()> {
         within(deadline)?;
-        held_here(&self.paths)?;
+        held_here(&self.paths, false)?;
+        self.check_lineage(true, deadline)
+    }
+
+    /// [`Self::check_read`] for the shared-file materializer's projection
+    /// (docs/DESIGN-shared-files-2026-11-11.md §4): the same lineage checks, every predecessor's
+    /// succession complete, and the same refusal of a home a completed succession superseded,
+    /// without the refusal of a home whose own succession was completed and then invalidated
+    /// ([`Standing::Unsettled`]). What such a home holds is not known to be its lineage's
+    /// newest, so only a caller that labels what it reads `held`, authors nothing, ingests
+    /// nothing and persists no receipt may read it: `by` is that caller's proof, which only
+    /// `file::materialize` can make.
+    pub(crate) fn check_materialize(&self, deadline: Instant, _by: &Projecting) -> Result<()> {
+        within(deadline)?;
+        held_here(&self.paths, true)?;
         self.check_lineage(true, deadline)
     }
 
@@ -844,7 +874,7 @@ pub(crate) fn guard_until(paths: &Paths, authoring: bool, deadline: Instant) -> 
 /// ([`Observation::check_read`]).
 pub(crate) fn guard_read_until(paths: &Paths, deadline: Instant) -> Result<()> {
     within(deadline)?;
-    held_here(paths)?;
+    held_here(paths, false)?;
     guard_lineage_until(paths, true, deadline)
 }
 
@@ -858,18 +888,29 @@ pub(crate) fn guard_read_until(paths: &Paths, deadline: Instant) -> Result<()> {
 /// (a home whose completing save never landed holds one too, and refuses until a pass
 /// completes it). A completed succession
 /// supersedes this home, and one whose completion a later source receipt invalidated may have
-/// a successor that authored since: both refuse.
-fn held_here(paths: &Paths) -> Result<()> {
+/// a successor that authored since: both refuse. The second, and a home that holds the mark,
+/// refuse unless `unsettled`, which only the shared-file materializer's check passes
+/// ([`Observation::check_materialize`]): its walk stands both as [`Standing::Unsettled`]
+/// ([`materializer_generation_until`]), so what it projects there is `held`.
+///
+/// A home with no selection and no mark is admitted either way, and this does not say that
+/// nothing fences it: a fenced home whose selection is missing ([`fenced`]) passes here too.
+/// The materializer reads that from its walk, which stands such a home as
+/// [`Standing::Unsettled`] as well.
+fn held_here(paths: &Paths, unsettled: bool) -> Result<()> {
     match Selection::read(paths)? {
         Some(selection) if selection.complete.is_some() => {
             if selection.complete == Some(seal(paths)?) {
                 Err(Error::new(
                     "original Commons writer is fenced by succession",
                 ))
+            } else if unsettled {
+                Ok(())
             } else {
                 Err(preserving())
             }
         }
+        _ if unsettled => Ok(()),
         _ if may_have_completed(paths)? => Err(preserving()),
         _ => Ok(()),
     }
@@ -990,6 +1031,8 @@ pub(crate) fn completed_generation_until(paths: &Paths, read_by: Instant) -> Res
 }
 
 fn generation_until(paths: &Paths, read_by: Instant, completed: bool) -> Result<Paths> {
+    #[cfg(test)]
+    crate::file::seam::custody();
     // Ordinary recovery may repair local files; a public observation uses
     // only established custody, including every predecessor in the chain.
     let mut selected = paths.clone();
@@ -1020,6 +1063,149 @@ fn generation_until(paths: &Paths, read_by: Instant, completed: bool) -> Result<
     }
     Ok(selected)
 }
+
+/// This Mac's original home, whichever home of its writer lineage `paths` names: a successor's
+/// home sits inside its predecessor's vault folder ([`candidate`]), so the walk back reads no
+/// file. What is kept once per Mac rather than once per writer generation (the shared files'
+/// snapshots) is kept under this home.
+pub(crate) fn original(paths: &Paths) -> Paths {
+    let mut home = paths.clone();
+    for _ in 0..=MAX_GENERATIONS {
+        match candidate_origin(&home) {
+            Some(origin) => home = origin,
+            None => break,
+        }
+    }
+    home
+}
+
+/// How the home the shared-file materializer opens stands in this Mac's writer lineage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// No succession fences it: it holds the newest records, and a snapshot of them is `live`.
+    Newest,
+    /// A succession whose import has never completed fences it (FL-14): every record it held
+    /// at the fence is still here, its successor has authored nothing, and a snapshot of them
+    /// is `held`, never `live`.
+    Preserving,
+    /// A succession fences it, and whether its successor has authored is not known. Either the
+    /// succession completed and a later source receipt invalidated that completion, or the home
+    /// holds the completion mark ([`may_have_completed`]) beside a selection that holds no
+    /// completion, or the home is fenced ([`fenced`]) and has no selection to say how its
+    /// succession stands: the
+    /// selection is the last file a reservation writes, after the reservation and the
+    /// successor's link, so a reservation cut short leaves none, and a selection lost after a
+    /// completion leaves the other two behind it. The walk stops here until the import
+    /// completes, or completes again. The successor may have authored and taken peers'
+    /// records, none of which is here, and this home may hold a record its successor has not
+    /// imported (the receipt that invalidated a completion, a record still awaiting its
+    /// witness). So no home of the lineage is known to hold its newest records; a snapshot of
+    /// this one is `held`, never `live`, and never replaces one taken at the successor's home
+    /// ([`Held::era`]).
+    Unsettled,
+}
+
+/// The home the shared-file materializer opens ([`materializer_generation_until`]).
+#[derive(Clone, Debug)]
+pub(crate) struct Held {
+    pub paths: Paths,
+    /// How many completed successions lead from this Mac's original home to `paths`: 0 the
+    /// original. A snapshot taken at a later home is never replaced by an earlier one's.
+    pub era: u64,
+    pub standing: Standing,
+    /// The actor this Mac's writer lineage began as, lower-case hex, where the original home
+    /// records it (its succession's selection does); `None` where the original has started no
+    /// succession, and the actor of `paths` is the lineage's first.
+    pub origin: Option<String>,
+}
+
+/// The home `file::materialize` projects shared files from
+/// (docs/DESIGN-shared-files-2026-11-11.md §4), and how it stands: the walk of
+/// [`observed_generation_until`], which also says how far it went and why it stopped. Each
+/// completed selection is followed to its successor. A succession whose import has never
+/// completed stops the walk at the home it fences, [`Standing::Preserving`], as every reader's
+/// walk does (FL-14), unless that home holds the completion mark ([`may_have_completed`]). One
+/// whose completion was invalidated, or that holds the mark, stops it there too, as
+/// [`Standing::Unsettled`], where every other reader's walk refuses: the materializer alone
+/// reads that home, because it alone labels what it reads `held` and keeps the snapshot of a
+/// later home over it. An incomplete candidate is never named.
+///
+/// A home with no selection is [`Standing::Newest`] only where nothing fences it. The fence is
+/// three files ([`fenced`]): the reservation, the successor's link and the selection, written
+/// in that order, and recovery removes neither of the first two. A home that holds the
+/// reservation, or whose successor holds its link, and has no selection is fenced all the
+/// same, and the walk stops there as [`Standing::Unsettled`], since nothing here says whether
+/// its succession ever completed.
+///
+/// `by` is the caller's proof that it is `file::materialize` (a pass, and the standing it
+/// answers the registry views with): it authors nothing, ingests nothing and persists no
+/// receipt.
+pub(crate) fn materializer_generation_until(
+    paths: &Paths,
+    read_by: Instant,
+    _by: &Projecting,
+) -> Result<Held> {
+    #[cfg(test)]
+    crate::file::seam::custody();
+    let mut held = Held {
+        paths: paths.clone(),
+        era: 0,
+        standing: Standing::Newest,
+        origin: None,
+    };
+    for depth in 0..=MAX_GENERATIONS {
+        within(read_by)?;
+        let Some(selection) = Selection::read(&held.paths)? else {
+            if fenced(&held.paths)? || may_have_completed(&held.paths)? {
+                held.standing = Standing::Unsettled;
+            }
+            break;
+        };
+        if depth == 0 {
+            held.origin = Some(selection.actor.clone());
+        }
+        if depth == MAX_GENERATIONS {
+            return Err(fail());
+        }
+        if selection.complete != Some(seal(&held.paths)?) {
+            // A selection that holds no completion in a home that holds the mark may be one
+            // written again after a completed succession lost it ([`may_have_completed`]).
+            held.standing = if selection.complete.is_some() || may_have_completed(&held.paths)? {
+                Standing::Unsettled
+            } else {
+                Standing::Preserving
+            };
+            break;
+        }
+        held.paths = candidate(&held.paths);
+        held.era += 1;
+    }
+    Ok(held)
+}
+
+/// Observe the home [`materializer_generation_until`] named, as [`observe_generation`] observes
+/// the one a reader's walk names: each predecessor observed and the chain complete, under
+/// [`Observation::check_materialize`], which also admits a home whose own completion was
+/// invalidated. The session a pass opens on this observation is an observer's: a fenced home
+/// refuses every authoring and mutation check whatever its succession came to
+/// ([`Observation::check`], [`guard_until`]).
+pub(crate) fn observe_materializer(
+    selected: &Paths,
+    read_by: Instant,
+    wait: &dyn Fn() -> Instant,
+    by: &Projecting,
+) -> Result<Observation> {
+    let observation = Observation::observe_within(selected, read_by, wait)?;
+    observation.check_materialize(read_by, by)?;
+    Ok(observation)
+}
+
+/// Seams of the shared files' tests (`crate::file`'s, and through [`crate::file::fixture`]
+/// another crate's), which take a stand-in home through the writer-succession states a shared
+/// file's read must answer in. Absent from release builds.
+#[cfg(any(test, debug_assertions))]
+#[path = "generation_file_seams_tests.rs"]
+pub(crate) mod file_seams;
 
 /// Observe the generation [`observed_generation_until`] named, under
 /// [`Observation::observe_within`]'s two bounds: each predecessor observed and the chain
@@ -1416,7 +1602,7 @@ fn selected_at(paths: &Paths, depth: usize, deadline: Option<Instant>) -> Result
     selected_at(&candidate(paths), depth + 1, deadline)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn reserve(paths: &Paths, config: &Path, bootstrap: &Bootstrap) -> Result<Selection> {
     reserve_until(paths, config, bootstrap, admission_deadline())
 }
@@ -1486,7 +1672,7 @@ fn reserve_until(
     Ok(selection)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn import(selection: &mut Selection) -> Result<()> {
     import_until(selection, &|| Ok(()), admission_deadline())
 }
@@ -1752,9 +1938,10 @@ fn admit_by_statement(selection: &Selection, budget: &Budget<'_>) -> Result<()> 
 /// Keep, beside the fence of `paths`, why the statement admitted nothing on this pass, or
 /// forget it once it has (`refused` is `None`): what [`status`] reports as `statement_refused`,
 /// so `aterm db commons-status` on a Mac that stays pending names the reason (a full record
-/// budget, a vault read from a path, a freshness read nobody answered, another key named).
+/// budget, a vault read from a path, a freshness read nobody answered, another key named, a
+/// successor home that lost its link).
 /// Written only when the reason changes. A reason that cannot be kept changes nothing else:
-/// the pass goes on to the plain ask either way.
+/// the pass goes on as it would have (to the plain ask, or to its refusal for a lost link).
 fn note_statement(paths: &Paths, refused: Option<&Error>) {
     let path = root(paths).join(REFUSED);
     let held = fsx::read_private(&path, MAX_STATE).ok().flatten();
@@ -1852,6 +2039,17 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
     selection.authorize_until(budget.until)?;
     budget.check()?;
     let next = candidate(paths);
+    // The successor home is judged once, before either route to a seat. A kept selection
+    // reserved it by its link ([`reserve_until`]), and a home that no longer links to this
+    // selection (emptied, restored from a copy, unreadable) holds no successor of this writer.
+    // The statement names one successor key for good, so a key made there now is admitted on
+    // nothing, and a plain ask under it would be one more identity under this Mac's name at
+    // every loss. Neither runs, and the reason is kept for `status`.
+    if !matches!(linked(&next), Ok(Some(link)) if link.original == selection.original) {
+        let lost = Error::new(UNLINKED);
+        note_statement(paths, Some(&lost));
+        return Err(lost);
+    }
     let original_config = client::config(paths)
         .map_err(crate::table::failure)?
         .ok_or_else(fail)?;
@@ -1923,4 +2121,4 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
 pub(crate) mod seams;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

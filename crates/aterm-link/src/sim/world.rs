@@ -538,6 +538,24 @@ pub(crate) enum Mutant {
     /// unit test and
     /// `a_held_lanes_receipt_or_keyed_post_the_replay_read_back_is_retired_where_it_landed`.
     HeldRecordWaitsForTheHold,
+    /// A retry whose words no longer match its pin (`Bridge::unverified_publication`'s case 1)
+    /// reads nothing back and publishes its current words at its pin
+    /// (`Bridge::reworded_landing`, ATERM-KI-1111-7): past a cut that dropped the dedup key of
+    /// a first attempt that landed, retention still holding its record, that attempt is
+    /// published a second time. No sim world cuts there, so its control is the bridge unit test
+    /// `a_reworded_retry_past_a_cut_reads_its_landed_attempt_back`.
+    RewordedWithoutReadingBack,
+    /// A retry whose words no longer match its pin reads nothing back and holds its lane, as
+    /// every build before ATERM-KI-1111-7 did (`Bridge::reworded_landing`): its post is never
+    /// settled while aterm lists it. Its control is every arm of the reworded world
+    /// (`a_retry_whose_words_left_its_pin_is_read_back_and_never_held_for_good`).
+    HoldAReworded,
+    /// An owed receipt's pin keeps no head beside it (`StateDir::receipt_pin`, as before
+    /// ATERM-KI-1111-7): its retry reads back only from its record in flight while one stands.
+    /// Used with `ReceiptRetiredAtAck`, whose hole a head narrows: a retry at a pin with a head
+    /// reads the record back until a cut gives it up
+    /// (`a_landed_receipts_entry_stands_until_aterm_retired_it`).
+    ReceiptPinKeepsNoHead,
     /// The attach's replay holds a later entry by its record's `from=`, whatever aterm's outbox
     /// lists (`Bridge::replay_in_flight`'s point 5 as F21 first cut it): an entry whose post
     /// already left the outbox, its record given up by retention, is dropped and never
@@ -574,6 +592,11 @@ pub(crate) enum Mutant {
     /// replay published there, its answer unknown, is published again once a cut dropped its
     /// dedup key.
     PinHeadGoneOnAnotherLog,
+    /// A key's own post whose pin is rebuilt from its key's (its own pin's write refused after
+    /// the key's took) keeps the key pin's missing head, as every build before it did: no retry
+    /// of it reads its attempt back, so past a cut that carried that attempt unread and dropped
+    /// its dedup key, the retry at the pin lands a second copy of its key.
+    OwnersPinFromItsKeyHeadless,
 }
 
 /// What one run is.
@@ -4879,6 +4902,135 @@ pub(crate) fn run_reclaim_across_a_cut(opts: &Opts) -> ReclaimedAcrossACut {
         violations: w.violations,
         pinned_at_the_cut,
         subjects,
+        trace,
+    }
+}
+
+/// What [`run_reworded`] found.
+#[derive(Debug)]
+pub(crate) struct Reworded {
+    pub(crate) violations: Vec<String>,
+    /// The post was pinned, its first attempt landed or refused as the scenario asked, and its
+    /// `re=` rewritten before its retry.
+    pub(crate) reworded: bool,
+    /// The copies of the post on the bus once the world settled.
+    pub(crate) copies: usize,
+    /// Whether aterm retired the post.
+    pub(crate) retired: bool,
+    pub(crate) trace: Vec<String>,
+}
+
+/// A RETRY WHOSE WORDS NO LONGER MATCH ITS PIN (ATERM-KI-1111-7): aterm opens two sessions
+/// beside its two, and the first posts a reply (`re=`) to the second (`other_node` false: one of
+/// this node's own lanes) or to the person (`other_node`: a lane of another principal's, where
+/// nothing is journaled in flight). Its first attempt takes a pin and then either lands
+/// (`landed`: aterm answers its `outbox sent` as for a session it no longer finds,
+/// [`super::endpoint::EpState::unretired`], so the post stays queued at its pin, and the bridge
+/// is killed) or is refused (the broker rolls its batches back until the seam, [`bus::Broker::refuse_mail`]).
+/// Then the seam: aterm lists the post with another `re=` (as a mesh route maps a reply's offset
+/// to another Mac's, or a newer build encodes the post otherwise), so its retry encodes words its
+/// pin does not name (`Bridge::unverified_publication`'s case 1). The world settles, and every law
+/// is judged: a hold that never ends fails `liveness`, and a second copy `dup post`.
+pub(crate) fn run_reworded(opts: &Opts, other_node: bool, landed: bool) -> Reworded {
+    let _slot = WorldSlot::take();
+    let mut w = World::new(Opts {
+        lossless_device: true,
+        ..opts.clone()
+    });
+    w.launch();
+    w.settle();
+    let (sender, recipient) = (w.open_session(), w.open_session());
+    w.settle();
+    let (Some(from), Some(to)) = (w.ep.sid(sender), w.ep.sid(recipient)) else {
+        unreachable!("the two sessions just opened are hosted");
+    };
+    let (address, target) = if other_node {
+        (PERSON.to_string(), None)
+    } else {
+        (format!("@{to}"), Some(to.clone()))
+    };
+    if landed {
+        lock(&w.ep.state).unretired.insert(from.clone());
+    } else {
+        w.core.broker.refuse_mail(true);
+    }
+    w.post_as(sender, &from, &address, "note", target);
+    let marker = format!("m{}", w.marker);
+    let id = w
+        .sent
+        .get(&marker)
+        .and_then(|s| s.post.as_ref())
+        .map(|(_, id)| *id);
+    let set_re = |w: &World, re: u64| {
+        let mut s = lock(&w.ep.state);
+        if let Some(p) = s
+            .sessions
+            .values_mut()
+            .filter(|x| x.sid == from)
+            .flat_map(|x| x.posts.iter_mut())
+            .find(|p| Some(p.id) == id)
+        {
+            p.re = Some(re);
+        }
+    };
+    set_re(&w, 1);
+    let pinned = |w: &World| {
+        id.is_some_and(|id| {
+            crate::state::StateDir::peek(&w.cfg.state_dir)
+                .post_pin(&from, id)
+                .is_ok_and(|pin| pin.is_some())
+        })
+    };
+    // Until the first attempt is pinned and concluded: answered (aterm asked to retire it), or
+    // refused.
+    let asked = id.map(|id| format!("ctl outbox sent {from} {id} "));
+    let mut concluded = false;
+    for _ in 0..1_000 {
+        concluded = pinned(&w)
+            && if landed {
+                asked
+                    .as_ref()
+                    .is_some_and(|asked| w.core.trace().iter().any(|l| l.starts_with(asked)))
+            } else {
+                w.core.broker.mail_refused() > 0
+            };
+        if concluded || w.live.is_none() {
+            break;
+        }
+        match w.core.readable().first() {
+            Some(&(conn, _)) => {
+                w.core.pump(conn);
+            }
+            None => w.pass(),
+        }
+        w.collect_notes();
+        w.check_always();
+    }
+    let first = w.bus_markers().get(&marker).map_or(0, Vec::len);
+    let reworded = concluded && first == usize::from(landed);
+    set_re(&w, 2);
+    w.note(format!("seam: {from}'s post {id:?} now lists re=2"));
+    if landed {
+        w.kill();
+        lock(&w.ep.state).unretired.remove(&from);
+        w.launch();
+    } else {
+        w.core.broker.refuse_mail(false);
+    }
+    w.settle();
+    w.collect_notes();
+    w.check_settled();
+    let copies = w.bus_markers().get(&marker).map_or(0, Vec::len);
+    let retired = id.is_some_and(|id| w.ep.retired(&from, id).is_some());
+    let trace = w.core.trace();
+    if let Some(live) = w.live.take() {
+        live.process.kill();
+    }
+    Reworded {
+        violations: w.violations,
+        reworded,
+        copies,
+        retired,
         trace,
     }
 }

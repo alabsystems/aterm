@@ -171,15 +171,20 @@ fn page_state_line(app: &mut App, session: u64) -> Option<String> {
         .state_line()
 }
 
-fn done_row(app: &App, session: u64) -> Option<crate::status_item::DoneRow> {
-    let glance = app.status_glance();
-    let mut rows = glance.done.iter().filter(|row| {
-        matches!(row.at, crate::status_item::DoneAt::Go(at)
-            if glance.go[usize::from(at)] == session)
-    });
-    let row = rows.next().cloned();
-    assert!(rows.next().is_none(), "one row per session");
-    row
+/// When `session`'s landing that nobody has looked at was told (unix milliseconds); `None`
+/// where no end stands unseen.
+fn unseen_landing(app: &App, session: u64) -> Option<i64> {
+    if !app.end_unseen(session) {
+        return None;
+    }
+    app.pool
+        .get(session)
+        .expect("pooled")
+        .ctx
+        .timeline
+        .lock()
+        .expect("timeline")
+        .task_face_at(TaskFace::Landed)
 }
 
 fn uncheered(app: &App, session: u64) -> Option<u32> {
@@ -336,10 +341,9 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         [ChipLevel::Done, ChipLevel::Off, ChipLevel::Off],
         "PRECONDITION: its `•`"
     );
-    let row = done_row(&parent, 0).expect("PRECONDITION: its Done for you row");
+    let landed_at = unseen_landing(&parent, 0).expect("PRECONDITION: its unseen landing");
     assert_eq!(
-        (row.landed, row.since_unix_ms),
-        (true, u64::try_from(at_1742).expect("after the epoch")),
+        landed_at, at_1742,
         "PRECONDITION: landed, at its instant (17:42:37.123, not its minute)"
     );
     tell(&mut parent, &working_sid, Some(TaskFace::Open));
@@ -378,14 +382,11 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         line.contains(r#"states=[["selected"], ["done"], []]"#),
         "{line}"
     );
-    let carried = done_row(&next, finished).expect("the Done for you row crossed");
     assert_eq!(
-        (carried.landed, carried.since_unix_ms),
-        (row.landed, row.since_unix_ms),
-        "the row the parent showed"
+        unseen_landing(&next, finished),
+        Some(landed_at),
+        "the unseen landing the parent held crossed, at its instant"
     );
-    let line = next.status_item_chrome_line();
-    assert!(line.contains(" done=1 "), "{line}");
     assert_eq!(uncheered(&next, finished), None, "a carried end is cheered");
     tell(&mut next, &finished_sid, Some(TaskFace::Landed));
     let stamp = crate::harness_glass::Stamp::at(at_1742.div_euclid(1000));
@@ -403,9 +404,9 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         Some(1)
     );
     assert_eq!(
-        done_row(&next, finished).map(|row| row.since_unix_ms),
-        Some(row.since_unix_ms),
-        "the restated landing keeps the row's instant"
+        unseen_landing(&next, finished),
+        Some(landed_at),
+        "the restated landing keeps its instant"
     );
     tell(&mut next, &working_sid, Some(TaskFace::Open));
     work(&mut next, working, 10 * SEC);
@@ -416,8 +417,10 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         "25 s + 10 s: a new end"
     );
     assert_eq!(landings(&next), 1, "counted under Land");
-    let line = next.status_item_chrome_line();
-    assert!(line.contains(" done=2 "), "{line}");
+    assert!(
+        next.end_unseen(working),
+        "the new end stands unseen beside it"
+    );
     let mut t = Instant::now();
     with_the_pet(&mut next, &mut t);
     assert!(
@@ -454,9 +457,7 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     let (mut bare, ids) = successor(&unstamped, &host);
     let (finished, working) = (ids[0], ids[1]);
     assert_eq!(marks(&bare), [ChipLevel::Off; 3], "CONTROL: no `•`");
-    assert_eq!(done_row(&bare, finished), None, "CONTROL: no row");
-    let line = bare.status_item_chrome_line();
-    assert!(line.contains(" done=0 "), "CONTROL: {line}");
+    assert_eq!(unseen_landing(&bare, finished), None, "CONTROL: no end");
     tell(&mut bare, &finished_sid, Some(TaskFace::Landed));
     let (_, at) = bare
         .pool

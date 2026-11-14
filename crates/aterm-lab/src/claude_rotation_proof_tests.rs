@@ -1057,15 +1057,17 @@ fn the_keychain_judge_reads_each_ask_by_the_launch_that_made_it() {
 
 /// `aterm harness accounts --json` just before R5a's sign-in as lab-b, each row cut to the fields
 /// [`listed`] reads (and `active`): lab-b's login gone since R4, its automatic sign-in failed.
-const LISTING_A_DEFAULT: &str = r#"{"accounts":[{"active":true,"auth":"ok","condition":"limited","label":"lab-a","login":"ok","sign_in_attempt":null},{"active":false,"auth":"ok","condition":"not-enrolled","label":"lab-b","login":"ok","sign_in_attempt":{"outcome":"no-route","since":1793124278}},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"idle","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
+/// These listings say `login` as the report now does: `signed-out` for a row with no login to
+/// run on here, which the run's own listing said `expired`, `idle` or `ok` of.
+const LISTING_A_DEFAULT: &str = r#"{"accounts":[{"active":true,"auth":"ok","condition":"limited","label":"lab-a","login":"ok","sign_in_attempt":null},{"active":false,"auth":"ok","condition":"not-enrolled","label":"lab-b","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793124278}},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
 
 /// The listing after R5a's turn, which is also the one before R5b's sign-in as lab-a: lab-a
-/// displaced, so signed out with its login expired and its automatic sign-in failed (the owner's
+/// displaced, so signed out with no login here and its automatic sign-in failed (the owner's
 /// `m2-2`).
-const LISTING_B_DEFAULT: &str = r#"{"accounts":[{"active":false,"auth":"ok","condition":"usable","label":"lab-b","login":"ok","sign_in_attempt":null},{"active":true,"auth":"signed-out","condition":"not-enrolled","label":"lab-a","login":"expired","sign_in_attempt":{"outcome":"no-route","since":1793124568}},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"idle","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
+const LISTING_B_DEFAULT: &str = r#"{"accounts":[{"active":false,"auth":"ok","condition":"usable","label":"lab-b","login":"ok","sign_in_attempt":null},{"active":true,"auth":"signed-out","condition":"not-enrolled","label":"lab-a","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793124568}},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
 
 /// The listing after R5b's turn: lab-a usable on the default login again, lab-b displaced.
-const LISTING_A_AGAIN: &str = r#"{"accounts":[{"active":true,"auth":"ok","condition":"usable","label":"lab-a","login":"ok","sign_in_attempt":null},{"active":false,"auth":"signed-out","condition":"not-enrolled","label":"lab-b","login":"expired","sign_in_attempt":null},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"idle","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
+const LISTING_A_AGAIN: &str = r#"{"accounts":[{"active":true,"auth":"ok","condition":"usable","label":"lab-a","login":"ok","sign_in_attempt":null},{"active":false,"auth":"signed-out","condition":"not-enrolled","label":"lab-b","login":"signed-out","sign_in_attempt":null},{"active":false,"auth":"unseen","condition":"not-enrolled","label":"lab-c","login":"signed-out","sign_in_attempt":{"outcome":"no-route","since":1793123908}}]}"#;
 
 /// rp3's stub log over R5a's, R5b's and R2's P7 turns (their tails cut).
 const STUB_LOG_R5: &str = r#"11:09:28.947 POST /v1/messages -> 200 body=54362B mode=ok kind=main model=claude-opus-5-5 stream=true max_tokens=128000 msgs=14 tools=13 sys=6082c last_user="Write one sentence about anchors, then stop." auth=oat:lab-b sse=4 deltas
@@ -1157,7 +1159,7 @@ fn the_instances_listing_reads_as_each_rows_words() {
         listed(LISTING_B_DEFAULT, LABEL_A),
         Some(Listed {
             auth: "signed-out".into(),
-            login: "expired".into(),
+            login: "signed-out".into(),
             condition: "not-enrolled".into(),
             sign_in: "no-route".into(),
         })
@@ -1173,7 +1175,7 @@ fn the_instances_listing_reads_as_each_rows_words() {
     );
     assert_eq!(
         listed(LISTING_A_DEFAULT, LABEL_C).map(|r| (r.auth, r.login)),
-        Some(("unseen".into(), "idle".into()))
+        Some(("unseen".into(), "signed-out".into()))
     );
     assert_eq!(listed(LISTING_B_DEFAULT, "lab-d"), None);
     assert_eq!(listed("ERR no such session", LABEL_A), None);
@@ -1229,7 +1231,7 @@ fn r5_passes_on_the_runs_own_displacements_and_fails_on_a_stale_row_or_a_turn_el
     assert_eq!(held.verdict, Verdict::Ok, "{}", held.evidence);
     assert!(
         held.evidence.contains(
-            "lab-b was auth ok login ok not-enrolled sign-in no-route, now auth ok login ok usable"
+            "lab-b was auth ok login signed-out not-enrolled sign-in no-route, now auth ok login ok usable"
         ),
         "{}",
         held.evidence
@@ -1238,7 +1240,7 @@ fn r5_passes_on_the_runs_own_displacements_and_fails_on_a_stale_row_or_a_turn_el
     assert_eq!(held.verdict, Verdict::Ok, "{}", held.evidence);
     assert!(
         held.evidence
-            .contains("lab-a was auth signed-out login expired"),
+            .contains("lab-a was auth signed-out login signed-out"),
         "{}",
         held.evidence
     );
@@ -1248,13 +1250,13 @@ fn r5_passes_on_the_runs_own_displacements_and_fails_on_a_stale_row_or_a_turn_el
         assert!(j.evidence.contains(says), "{says}: {}", j.evidence);
     };
     // The owner's second incident as a sync with no fix leaves it: the row the default login
-    // names again still listed signed out, expired, with its failed sign-in.
+    // names again still listed signed out, with no login here and its failed sign-in.
     let stale = Leg {
         listing: LISTING_B_DEFAULT.into(),
         ..r5b.clone()
     };
     fails(&ev, &stale, R5B, "lab-a listed auth signed-out");
-    fails(&ev, &stale, R5B, "lab-a listed login expired");
+    fails(&ev, &stale, R5B, "lab-a listed login signed-out");
     fails(&ev, &stale, R5B, "lab-a listed a failed sign-in (no-route)");
     // The turn after the sign-in served under the displaced row's credential.
     let mut elsewhere = ev.clone();

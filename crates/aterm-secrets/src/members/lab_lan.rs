@@ -19,8 +19,8 @@
 //! ([`aterm_netplace::facts::here_now`], which no seam file scripts), takes an Ethernet or Wi-Fi
 //! interface (`en` and a number, not point to point, no tunnel holding the default route) at an
 //! address inside the CIDR. The home is then this Mac at that address under the CIDR's mask
-//! ([`HomeNet::at`]), so a proof from another host inside the CIDR is from the home LAN, and one
-//! from this Mac's own address, from loopback or from outside the CIDR is not.
+//! ([`HomeNet::of`]), so a proof from another host inside the CIDR is from the home LAN, and one
+//! from any of this Mac's own addresses, from loopback or from outside the CIDR is not.
 //!
 //! A release build compiles none of this module (`members.rs` declares it under
 //! `cfg(any(test, debug_assertions))`, and `desk::Local::of` reads it only there), so a file
@@ -186,7 +186,7 @@ pub fn home(paths: &Paths, config: Option<&Config>, live_genesis: bool) -> Resul
 
 /// This Mac's home under `cidr` where `here` puts its default route ([`route_in`]).
 fn home_in(cidr: &Cidr, here: &Here) -> Option<HomeNet> {
-    route_in(cidr, here).map(|own| HomeNet::at(own, cidr.mask()))
+    route_in(cidr, here).map(|own| HomeNet::of(own, cidr.mask(), &here.own))
 }
 
 /// This Mac's address on the home `cidr` names, where `here` puts its default route on an

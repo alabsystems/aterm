@@ -79,10 +79,60 @@ impl SourceRepo {
 
 static MAIN_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Remove ambient credentials and all inherited trace selectors before a credential helper
-/// runs: what a network git's environment drops, whichever helper it mounts.
+/// Remove ambient credentials, injected command-scope config, TLS overrides and all inherited
+/// trace selectors before a credential helper runs: what a network git's environment drops,
+/// whichever helper it mounts.
 pub(crate) fn git_environment_removals() -> Vec<String> {
     git_environment_removals_from(std::env::vars_os().map(|(key, _)| key))
+}
+
+/// The unscoped `-c` pairs a network git that hands over a credential carries, as agh's own git
+/// runner pins them: TLS verification on and no HTTP redirect, so a credential answered for one
+/// URL is never sent on to another. They override an unscoped key (`http.sslVerify=false`) in
+/// any config scope, since git reads the command line last; `GIT_SSL_NO_VERIFY`, which git
+/// reads over any config, is one of [`git_environment_removals`]. They do not override a key
+/// scoped to a URL the remote matches (`http."https://github.com".sslVerify=false`), which git
+/// ranks above an unscoped one whatever its scope: a git given a URL also carries
+/// [`git_tls_pins_at`] that URL. agh's runner needs no scoped pair, since it reads neither the
+/// user's nor the system's config and refuses a clone whose own config holds an `http.*` key
+/// other than transport tuning (`http.postBuffer`, the low-speed and keep-alive limits).
+pub(crate) const GIT_TLS_PINS: [&str; 4] = [
+    "-c",
+    "http.sslVerify=true",
+    "-c",
+    "http.followRedirects=false",
+];
+
+/// [`GIT_TLS_PINS`]' keys scoped to exactly `url`, the URL a network git is given: git resolves
+/// `http.<url>.*` by URL match, and `url` itself is the most specific key its remote can match
+/// (a key with a longer path is no prefix of it, one with a user name matches only a URL that
+/// names that user, and one with a wildcard host is no longer than the exact host), so a key at
+/// an equally specific spelling of it, in the user's, the system's or the checkout's config or
+/// an inherited command-scope variable, ties, and git takes the command line's value, read last.
+/// Nothing for a URL git does not fetch over HTTP (an SSH or `file://` remote). This pins the URL git is given: a
+/// `url.<base>.insteadOf` rewrite of it to another HTTP URL reaches that URL with the unscoped
+/// pins alone, so a caller that cannot rule a rewrite out (the harness fetch does, comparing
+/// `git remote get-url`, which expands every rewrite, with its development repository) says so.
+/// # Errors
+/// A `url` holding `=`, which would end a `-c` key early.
+pub(crate) fn git_tls_pins_at(url: &str) -> std::result::Result<Vec<String>, String> {
+    let http = url.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")
+    });
+    if !http {
+        return Ok(Vec::new());
+    }
+    if url.contains('=') {
+        return Err(format!(
+            "{url} cannot be pinned as a git config key: it holds '='"
+        ));
+    }
+    Ok(vec![
+        "-c".into(),
+        format!("http.{url}.sslVerify=true"),
+        "-c".into(),
+        format!("http.{url}.followRedirects=false"),
+    ])
 }
 
 /// Environment overrides also disable Trace2 targets enabled by system/global Git config.
@@ -99,17 +149,29 @@ pub(crate) fn git_tracing_environment() -> Vec<(String, OsString)> {
     .into()
 }
 
-/// The removals for an environment holding `names`: the fixed ambient-token, verbose and shell
-/// start-up selectors, every `GIT_TRACE*`, `GH_*`, `GITHUB_*` and `AGH_GIT_*` name present, and
-/// `ATPKG_PUBLISH_GIT_TOKEN`, the variable the token host's helper reads its token from. An
-/// `AGH_GIT_*` name is what agh's git runner hands its own credential helper (a grant, the
-/// loose policy, its directories), so agh's helper mounted on a git without the runner routes
-/// from this process's own agh directories, with no grant and agh.toml's strict policy.
-fn git_environment_removals_from(names: impl IntoIterator<Item = OsString>) -> Vec<String> {
+/// The removals for an environment holding `names`: the fixed ambient-token, injected-config,
+/// verbose and shell start-up selectors, every `GIT_TRACE*`, `GIT_SSL_*`, `GIT_CONFIG_KEY_*`,
+/// `GIT_CONFIG_VALUE_*`, `GH_*`, `GITHUB_*` and `AGH_GIT_*` name present, and
+/// `ATPKG_PUBLISH_GIT_TOKEN`, the variable the token host's helper reads its token from.
+/// `GIT_CONFIG_PARAMETERS`, and `GIT_CONFIG_COUNT` with its `GIT_CONFIG_KEY_<n>` and
+/// `GIT_CONFIG_VALUE_<n>` pairs, are config git reads in command scope, as it reads `-c`, so an
+/// inherited one could carry a URL-scoped `http.*` key or a `url.*.insteadOf` rewrite past a
+/// git's own words; agh's own runner never passes them. A `GIT_SSL_*` name overrides git's TLS
+/// configuration from the environment (`GIT_SSL_NO_VERIFY` turns verification off over any
+/// config, `GIT_SSL_CAINFO` and `GIT_SSL_CAPATH` choose whom it trusts), which agh's own runner
+/// never passes. An `AGH_GIT_*` name is what agh's git runner hands its own credential helper (a
+/// grant, the loose policy, its directories), so agh's helper mounted on a git without the
+/// runner routes from this process's own agh directories, with no grant, and by agh.toml's
+/// strict policy unless the caller sets the loose one itself (`agh::git::LOOSE_VAR`).
+pub(crate) fn git_environment_removals_from(
+    names: impl IntoIterator<Item = OsString>,
+) -> Vec<String> {
     let mut remove = std::collections::BTreeSet::from([
         "ATPKG_PUBLISH_GIT_TOKEN".to_owned(),
         "GITHUB_TOKEN".into(),
         "GH_TOKEN".into(),
+        "GIT_CONFIG_COUNT".into(),
+        "GIT_CONFIG_PARAMETERS".into(),
         "GIT_CURL_VERBOSE".into(),
         "BASH_ENV".into(),
         "ENV".into(),
@@ -119,6 +181,9 @@ fn git_environment_removals_from(names: impl IntoIterator<Item = OsString>) -> V
     for name in names {
         if let Some(name) = name.to_str()
             && (name.starts_with("GIT_TRACE")
+                || name.starts_with("GIT_SSL_")
+                || name.starts_with("GIT_CONFIG_KEY_")
+                || name.starts_with("GIT_CONFIG_VALUE_")
                 || name.starts_with("GH_")
                 || name.starts_with("GITHUB_")
                 || name.starts_with("AGH_GIT_"))

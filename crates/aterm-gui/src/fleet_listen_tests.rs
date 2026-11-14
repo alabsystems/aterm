@@ -1490,6 +1490,7 @@ fn facts_push_stores_locally_or_over_fleet_and_rejects_forged_node() {
         home: None,
         home_free_mb: None,
         repos: None,
+        update: None,
     };
     let holder_payload = holder_facts.to_survey_reply(
         100,
@@ -1588,6 +1589,7 @@ fn facts_push_stores_locally_or_over_fleet_and_rejects_forged_node() {
         home: None,
         home_free_mb: None,
         repos: None,
+        update: None,
     };
     let member_payload = member_facts.to_survey_reply(
         200,

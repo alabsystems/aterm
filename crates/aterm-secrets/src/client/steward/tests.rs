@@ -559,12 +559,13 @@ fn an_admin_whose_person_turned_vault_sync_off_is_no_steward() {
 /// revoked Mac's `m<N>` label + aliases on `deny_labels`, its `node_id` on `deny_nodes`, removing
 /// its `SwarmMember` row, releasing its `ai-pool.toml` warm slots, leases, and `last_heard`, and
 /// rotating `aterm-fleet-code`, preserving `@<host>:<port>`, as every removal does, F16);
-/// `admin_revoke_stolen` rotates it again and emits a single-line `NEEDS YOU:` provider rotation
-/// notice naming exposed credentials and warm AI accounts.
+/// `admin_revoke_stolen` rotates it again and files each credential the Mac could read for
+/// rotation in the admin Mac's need ledger, never posted, naming the warm AI accounts in its one
+/// line; a later `set` of an entry closes its filing.
 ///
 /// NEGATIVE CONTROL: rotate the code on `stolen` alone, and the plain revoke leaves it as it was.
 #[test]
-fn revoke_runs_the_full_swarm_cascade_and_stolen_rotates_fleet_code_with_needs_you() {
+fn revoke_runs_the_full_swarm_cascade_and_stolen_files_its_credentials_for_rotation() {
     let lab = lab("steward-revoke-cascade");
     let m2 = lab.machine("m2", false);
     let m3 = lab.machine("m3", false);
@@ -649,6 +650,12 @@ used = [150, 250]
         .unwrap();
         doc.set_entry(&Audience::Everyone, "gh_access_token", b"gho_test")
             .unwrap();
+        doc.set_entry(
+            &Audience::Hosts(vec!["m1".into(), "m3".into()]),
+            "gh_access_token",
+            b"gho_list",
+        )
+        .unwrap();
         doc.set_entry(&Audience::Everyone, "ai-mailbox.toml", b"imap = true\n")
             .unwrap();
         admin_publish(&lab.m1, &opened, &doc).unwrap();
@@ -692,21 +699,60 @@ used = [150, 250]
             StewardRevoke::Current(_)
         ));
 
-        // 2. Stolen `admin_revoke_stolen` on m3: rotates fleet code + emits single-line NEEDS YOU.
+        // 2. Stolen `admin_revoke_stolen` on m3: rotates the fleet code and files its credentials.
         let opened = admin_open(&lab.m1).unwrap();
         let stolen = admin_revoke_stolen(&lab.m1, &opened, "m3", true).unwrap();
         assert!(stolen.revocation.fleet_code_rotated);
+        let line = &stolen.rotation_line;
         assert!(
-            stolen.needs_you_line.starts_with("NEEDS YOU:")
-                && !stolen.needs_you_line.contains('\n')
-                && stolen.needs_you_line.contains("m3")
-                && stolen.needs_you_line.contains("gh tokens")
-                && stolen.needs_you_line.contains("mailbox")
-                && stolen.needs_you_line.contains("claude:a@example.com")
-                && stolen.needs_you_line.contains("claude:b@example.com"),
-            "{}",
-            stolen.needs_you_line
+            line.starts_with("m3's credentials filed for rotation")
+                && !line.contains("NEEDS YOU")
+                && !line.contains('\n')
+                && line.contains("entry:gh_access_token")
+                && line.contains("entry:ai-mailbox.toml")
+                && !line.contains("ai-pool.toml")
+                && !line.contains(fleet::FLEET_CODE_ENTRY)
+                && line.contains("claude:a@example.com")
+                && line.contains("claude:b@example.com"),
+            "{line}"
         );
+        let filed: Vec<crate::need::Need> = crate::need::peek(&lab.m1)
+            .unwrap()
+            .into_iter()
+            .filter(|need| need.purpose == crate::need::Purpose::StolenRotation)
+            .collect();
+        let keys: Vec<String> = filed.iter().map(|need| need.want.key()).collect();
+        assert_eq!(
+            keys,
+            ["entry:ai-mailbox.toml", "entry:gh_access_token"],
+            "{filed:?}"
+        );
+        assert!(
+            filed
+                .iter()
+                .all(|need| need.state == crate::need::State::Local && !need.posted),
+            "{filed:?}"
+        );
+        // m3 read gh_access_token in [everyone] and in [m1 m3], which is [m1] once it is out:
+        // the filing closes only once a new value is published in both.
+        let gh = filed
+            .iter()
+            .find(|need| need.want.key() == "entry:gh_access_token")
+            .unwrap();
+        assert_eq!(gh.exposed, ["[everyone]", "[m1]"], "{gh:?}");
+        let rotated = |section: &str| crate::need::rotated(&lab.m1, "gh_access_token", section);
+        let elsewhere = rotated("[m5]").unwrap().expect("the filing was open");
+        assert_eq!(elsewhere.exposed, ["[everyone]", "[m1]"], "{elsewhere:?}");
+        let one = rotated("[everyone]").unwrap().expect("the filing was open");
+        assert_eq!(
+            (one.state, one.exposed.as_slice()),
+            (crate::need::State::Local, &["[m1]".to_owned()][..]),
+            "{one:?}"
+        );
+        assert!(one.line.contains("[m1]"), "{}", one.line);
+        let closed = rotated("[m1]").unwrap().expect("the filing was open");
+        assert_eq!(closed.state, crate::need::State::Retired, "{closed:?}");
+        assert_eq!(rotated("[m1]").unwrap(), None, "closed once");
         let rotated_bytes = lab.fleet_code().unwrap();
         let rotated_str = std::str::from_utf8(&rotated_bytes).unwrap();
         assert!(rotated_str != initial_code && rotated_str != after_plain);

@@ -604,6 +604,7 @@ fn the_covered_rows_say_which_logins_this_mac_holds() {
                 logins,
                 now: i64::try_from(NOW).unwrap(),
                 offers: true,
+                enrolled: &accounts::enrolled,
             })
         });
         assert_eq!(rows.len(), 3, "{rows:?}");
@@ -700,6 +701,7 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
                         logins: &logins,
                         now: i64::try_from(NOW).unwrap(),
                         offers,
+                        enrolled: &accounts::enrolled,
                     },
                     &vault,
                 )

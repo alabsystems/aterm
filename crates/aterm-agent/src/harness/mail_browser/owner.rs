@@ -253,8 +253,16 @@ impl RemoteTransport {
         }
         let (reader, mut writer) = aterm_uds::kept_out(CtlStream::pair)?;
         writer.set_nonblocking(true)?;
-        let mut command = aterm_uds::spawnfd::command(std::env::current_exe()?);
+        // The owner is `aterm email --transport-owner`, so it is started by aterm's own file
+        // and not by the name this process was started under: under a sign-in's opener that
+        // name is `aterm-open-url`, which answers as the opener again, fails on these
+        // arguments and records that failure as the waiting sign-in's own
+        // (`open_url::publish_failed_exit`), which ends the sign-in with no reason. It takes
+        // no part in a sign-in, so it is not told where one's outcome or code goes.
+        let mut command = aterm_uds::spawnfd::command(crate::own_exe().map_err(io::Error::other)?);
         command
+            .env_remove(super::super::open_url::OUTCOME_ENV)
+            .env_remove(super::super::open_url::CODE_ENV)
             .arg("email")
             .arg("--transport-owner")
             .arg(&self.home)

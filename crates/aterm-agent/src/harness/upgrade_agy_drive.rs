@@ -462,7 +462,9 @@ pub(super) fn after_exit_onto(
     twin: Option<PathBuf>,
     k: &dyn AgyKernel,
 ) -> Report {
-    use super::super::relaunch::{CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL, ExitRecord};
+    use super::super::relaunch::{
+        CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CAUSE_RENEWAL, CAUSE_STALL, ExitRecord,
+    };
     let tab = snap.tab.clone();
     let session_key = key(&tab);
     let from = snap.version.clone().unwrap_or_else(|| "-".to_string());
@@ -666,6 +668,7 @@ pub(super) fn after_exit_onto(
             ExitCause::Stall => CAUSE_STALL,
             ExitCause::Asked => CAUSE_ASKED,
             ExitCause::HostEnded => CAUSE_HOST,
+            ExitCause::Renewal => CAUSE_RENEWAL,
             ExitCause::Exit | ExitCause::Carried => CAUSE_EXIT,
         }
         .to_string(),

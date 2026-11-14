@@ -4,4 +4,5 @@
 //! Combined Tier-0 model test binary for `aterm-models-aos`.
 
 mod derived_hold;
+mod derived_pane;
 mod derived_publication;

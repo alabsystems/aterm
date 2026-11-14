@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use aterm_types::machine_name::Number;
+use aterm_types::update_standing::{UpdateFact, version_word};
 use aterm_uds::stop::Stop;
 use rustls::ClientConnection;
 
@@ -1757,14 +1758,6 @@ fn same_host(a: &str, b: &str) -> bool {
             })
     };
     bare_of(a, b) || bare_of(b, a)
-}
-
-fn version_word(version: &str) -> Option<String> {
-    ((1..=64).contains(&version.len())
-        && version
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_')))
-    .then(|| version.to_owned())
 }
 
 fn fields(rest: &str) -> Vec<(&str, &str)> {
@@ -8276,6 +8269,9 @@ pub struct Checked {
     pub proven: bool,
     /// The instance that answered, as its reply's `instance` line says it ([`Answerer::of`]).
     pub answerer: Answerer,
+    /// Where that instance's updater stands, as the same line says it (its `update*=` words,
+    /// [`UpdateFact::of_fields`]); `None` where it says nothing of it (an aterm older than them).
+    pub update: Option<UpdateFact>,
 }
 
 /// The instance that answered a survey, as the reply's first `instance` line says it. A Mac's
@@ -8339,7 +8335,7 @@ pub struct Surveyed {
 
 impl Surveyed {
     /// What a check reads of it: the level, the address, the node, whether it is proved, and
-    /// what its `instance` line says of the instance that answered.
+    /// what its first `instance` line says of the instance that answered and of its updater.
     #[must_use]
     pub fn checked(&self) -> Checked {
         Checked {
@@ -8348,8 +8344,24 @@ impl Surveyed {
             node: self.node.clone(),
             proven: self.proven,
             answerer: Answerer::of(&self.lines),
+            update: update_of(&self.lines),
         }
     }
+}
+
+/// What `lines` (a survey reply after its `OK <n>` head) say of the answering instance's updater:
+/// its first `instance` line's `update*=` words, each pct-decoded, as [`UpdateFact::of_fields`]
+/// reads them.
+#[must_use]
+pub fn update_of(lines: &[String]) -> Option<UpdateFact> {
+    let line = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("instance "))?;
+    let said: Vec<(&str, String)> = fields(line)
+        .into_iter()
+        .map(|(k, v)| (k, aterm_codec::pct::decode(v)))
+        .collect();
+    UpdateFact::of_fields(&said)
 }
 
 /// The fleet read (`aterm ctl survey --fleet`, design §3): every target asked `survey`, at
@@ -9232,7 +9244,16 @@ fn ask_at(
         },
         |peer| answered_as(target, keys, to, peer),
         |transport| {
-            ask_lines(transport, Some(request), deadline, reply_head).map(|(_, lines)| lines)
+            let asked = ask_lines(transport, Some(request), deadline, reply_head);
+            // An aterm from before a survey named the session that asked for it answers that
+            // word with its usage and keeps the connection: it is asked again without the word.
+            let asked = match (asked, aterm_types::fleet_activity::survey_unmarked(request)) {
+                (Err(Asked::Failed(why)), Some(plain)) if why.starts_with(SURVEY_USAGE) => {
+                    ask_lines(transport, Some(&plain), deadline, reply_head)
+                }
+                (asked, _) => asked,
+            };
+            asked.map(|(_, lines)| lines)
         },
     )
     .and_then(
@@ -9270,6 +9291,10 @@ fn ask_at(
         },
     )
 }
+
+/// How [`reply_head`] says a peer answered a survey line with its usage: an aterm that does not
+/// know a word of it.
+const SURVEY_USAGE: &str = "refused the survey: ERR usage: survey";
 
 fn reply_node(
     answered: Option<(String, bool)>,

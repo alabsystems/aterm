@@ -1478,9 +1478,9 @@ fn tools_there(missing: &crate::SetupStatus) -> crate::SetupStatus {
     status
 }
 
-/// The menu line the page's status says now, label and note.
+/// The signal line the page's status says now, label and note.
 fn menu(app: &App) -> Option<(String, Option<String>)> {
-    crate::system_state_access::menu_line(app.system_state_host.latest_status())
+    crate::system_state_access::signal_line(app.system_state_host.latest_status())
         .map(|line| (line.label, line.note))
 }
 
@@ -1489,7 +1489,7 @@ fn shown(app: &App) -> Option<ToolsInstall> {
 }
 
 /// The tab's program outlives the installer it ran: it reads the tools back and says so. Nothing
-/// asks for a password then, so the row stays calm, and so do the menu line and the diamond. A
+/// asks for a password then, so the row stays calm, and so do the signal line and the diamond. A
 /// tab that never saw an installer run is still asking for the password.
 #[test]
 fn the_tab_outliving_the_installer_stays_calm() {
@@ -2693,7 +2693,7 @@ fn low_data_mode_spends_no_automatic_opening() {
     let missing = tools_missing(&mut app);
     app.publish_system_state(missing);
     assert_eq!(shown(&app), Some(ToolsInstall::LowData));
-    assert_eq!(menu(&app), None, "a calm wait: no menu line");
+    assert_eq!(menu(&app), None, "a calm wait: no signal line");
     assert!(
         !app.developer_tools_install_due(false),
         "the automatic tab waits while Low Data Mode is on"
@@ -2924,7 +2924,7 @@ fn low_data_mode_spends_no_automatic_opening() {
 }
 
 /// An account that is none of the Mac's administrators may not install the tools, as the tab's
-/// program found: the row says so in place of Install…, with no menu line, and no tab opens by
+/// program found: the row says so in place of Install…, with no signal line, and no tab opens by
 /// itself again.
 #[test]
 fn a_non_administrator_is_told_and_no_tab_opens_by_itself() {

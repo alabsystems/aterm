@@ -10,10 +10,13 @@
 //!   controlling terminal, so nothing it writes reaches the person's tab. Its environment is
 //!   [`child_env`]: [`super::login_drive::passed_unrouted`], a fixed `PATH`, `TERM=dumb`, both
 //!   Claude homes on a fresh 0700 scratch folder ([`Scratch`]) and the telemetry opt-outs; no
-//!   credential, no `BROWSER`, no route and no aterm session variable.
+//!   credential, no route and no aterm session variable. Its page opens in the person's
+//!   default browser (no `BROWSER`), or, where this Mac makes the token by itself, in aterm's
+//!   own sign-in window ([`WindowRoute`], [`window_env`]).
 //! - **The default route only.** A verb whose own environment names a route
 //!   ([`super::netwatch::names_a_route`]) is refused before anything is made ([`route_in`]).
-//! - **The authorize URL is never relayed.** The child opens it; the capture checks each
+//! - **The authorize URL is never relayed.** The child opens it (by itself, or through
+//!   aterm's opener, which it starts with the URL); the capture checks each
 //!   authorization request the child shows ([`admit_url`]: claude.com's or claude.ai's authorize
 //!   path, the `user:inference` scope alone, the setup-token lifetime where the URL names one)
 //!   and ends the child at any other.
@@ -22,7 +25,8 @@
 //!   of [`BUFFER`] bytes, made at that size and wiped when it drops; no `String` of child bytes
 //!   is made, and past [`BUFFER`] without a verdict the capture stops.
 //! - **The grammar is closed** ([`Judge`]): the paste prompt becomes the verb's own hidden prompt
-//!   ([`Person::paste`]); success is Claude Code's success marker, then a token, then its export
+//!   ([`Person::paste`]), or, in the sign-in window, the code the window's page ended on
+//!   ([`WindowWaiter`]); success is Claude Code's success marker, then a token, then its export
 //!   line, with every token-shaped value the same one; failure is one of [`Failure`]'s
 //!   phrases; any other end is [`Error::NoToken`].
 //! - **Errors carry no child bytes**: each is a fixed sentence ([`Error`]).
@@ -109,6 +113,9 @@ pub enum Error {
     WrongAccount(String),
     /// One of Claude Code's own failures.
     Failed(Failure),
+    /// The sign-in in aterm's own window ended without authorizing: what its opener met, in
+    /// the opener's own closed words ([`super::open_url::Met::words`]).
+    Window(String),
 }
 
 /// Claude Code's own failures, as 2.1.318 words them ([`FAILURES`]).
@@ -207,6 +214,10 @@ impl std::fmt::Display for Error {
                 "Claude Code made a token for another account; sign in as {email}"
             ),
             Self::Failed(failure) => failure.fmt(f),
+            Self::Window(why) => write!(
+                f,
+                "the sign-in in aterm's sign-in window did not complete: {why}; nothing was made"
+            ),
         }
     }
 }
@@ -298,6 +309,115 @@ pub trait Person: Sync {
     ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>>;
     /// Whether the person stopped it (Ctrl-C).
     fn stopped(&self) -> bool;
+    /// Why the sign-in this capture waits on ended without authorizing, where something other
+    /// than the child says so (aterm's sign-in window's opener); a person's browser says none.
+    fn failed(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Aterm's own sign-in window as the place a capture's page opens ([`Capture::window`]): the
+/// opener the child starts with its authorization URL, and the two files of this capture's
+/// own private folder the opener answers in.
+pub struct WindowRoute {
+    /// Aterm's opener ([`super::open_url::OPENER`]), the child's `BROWSER`.
+    pub opener: PathBuf,
+    /// Where the opener records a sign-in that ended without authorizing
+    /// ([`super::open_url::OUTCOME_ENV`]).
+    pub outcome: PathBuf,
+    /// Where the opener hands a hosted flow's code ([`super::open_url::CODE_ENV`]).
+    pub code: PathBuf,
+}
+
+/// What the child's environment holds beside [`child_env`] where its page opens in aterm's
+/// sign-in window: the opener as its `BROWSER`, the window's grant
+/// ([`super::open_url::WINDOW_ENV`]), the account to sign in as, the two files the opener
+/// answers in, and the sign-in's trace file where the verb named one.
+#[must_use]
+pub fn window_env(
+    route: &WindowRoute,
+    sign_in_as: &str,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, OsString)> {
+    let env = vec![
+        ("BROWSER", route.opener.as_os_str().to_owned()),
+        (super::open_url::WINDOW_ENV, OsString::from("1")),
+        (super::open_url::EMAIL_ENV, OsString::from(sign_in_as)),
+        (
+            super::open_url::OUTCOME_ENV,
+            route.outcome.as_os_str().to_owned(),
+        ),
+        (super::open_url::CODE_ENV, route.code.as_os_str().to_owned()),
+    ];
+    #[cfg(target_os = "macos")]
+    let env = {
+        let mut env = env;
+        if let Some(trace) = var(super::signin_window::TRACE_ENV).filter(|v| !v.is_empty()) {
+            env.push((super::signin_window::TRACE_ENV, trace));
+        }
+        env
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = var;
+    env
+}
+
+/// The capture's person where nobody is asked: the sign-in runs in aterm's own window, which
+/// finishes it by itself. A hosted flow's code is the one the window's opener handed over
+/// ([`WindowRoute::code`]), taken once; a sign-in the opener ended without authorizing ends
+/// the capture with what it met ([`Person::failed`]).
+pub struct WindowWaiter<'a> {
+    route: &'a WindowRoute,
+}
+
+impl<'a> WindowWaiter<'a> {
+    /// The waiter on `route`'s files.
+    #[must_use]
+    pub const fn new(route: &'a WindowRoute) -> Self {
+        Self { route }
+    }
+}
+
+impl Person for WindowWaiter<'_> {
+    /// Nobody asked for this run's lines, and its standard error is whatever started it: a
+    /// line is written with each address in it as `<address>`.
+    fn say(&self, line: &str) {
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "{}", super::open_url::without_addresses(line));
+    }
+
+    fn paste(
+        &self,
+        _prompt: &str,
+        cancelled: &AtomicBool,
+    ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+        loop {
+            if cancelled.load(Ordering::SeqCst) || self.failed().is_some() {
+                return Ok(None);
+            }
+            match super::open_url::take_oauth_code(self.route.code.clone()) {
+                Ok(Some(code)) => {
+                    let code = Zeroizing::new(code);
+                    return Ok(Some(Zeroizing::new(code.as_bytes().to_vec())));
+                }
+                Ok(None) => {}
+                Err(why) => return Err(std::io::Error::other(why)),
+            }
+            std::thread::sleep(READ_TICK);
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        false
+    }
+
+    fn failed(&self) -> Option<String> {
+        super::open_url::read_terminal_outcome(&self.route.outcome).map(|failure| {
+            failure
+                .0
+                .map_or_else(|| "its opener stopped".to_owned(), |met| met.words())
+        })
+    }
 }
 
 /// The variable of the verb's environment `env` that names a route, by name: the first
@@ -407,6 +527,9 @@ pub struct Capture<'a> {
     pub sign_in_as: &'a str,
     /// The verb's own environment.
     pub env: &'a [(OsString, OsString)],
+    /// Aterm's own sign-in window, where the child's page opens there; none opens it in the
+    /// person's default browser.
+    pub window: Option<&'a WindowRoute>,
     /// The hang detector ([`super::login_drive::HANG`] from the verb's start), on both clocks.
     pub deadline: WakeDeadline,
 }
@@ -426,7 +549,10 @@ pub fn capture(run: &Capture<'_>, person: &dyn Person) -> Result<Minted, Error> 
             .find(|(key, _)| key.to_str() == Some(name))
             .map(|(_, value)| value.clone())
     };
-    let env = child_env(&var, scratch.path());
+    let mut env = child_env(&var, scratch.path());
+    if let Some(route) = run.window {
+        env.extend(window_env(route, run.sign_in_as, &var));
+    }
     let mut child = Child::spawn(run.program, &env, scratch.path())?;
     let cancel = AtomicBool::new(false);
     let minted = std::thread::scope(|scope| drive(run, person, &mut child, &cancel, scope));
@@ -626,6 +752,9 @@ fn drive<'scope>(
         if person.stopped() {
             return Err(Error::Stopped);
         }
+        if let Some(why) = person.failed() {
+            return Err(Error::Window(why));
+        }
         if run.deadline.passed() {
             return Err(Error::Hang);
         }
@@ -663,11 +792,18 @@ fn drive<'scope>(
         }
         if judge.url_ok && !told {
             told = true;
-            person.say(&format!(
-                "a browser window opened on {}: sign in as {} there, then come back here \
-                 (Ctrl-C stops)",
-                judge.host, run.sign_in_as
-            ));
+            person.say(&if run.window.is_some() {
+                format!(
+                    "aterm's sign-in window opened on {} and authorizes the account by itself",
+                    judge.host
+                )
+            } else {
+                format!(
+                    "a browser window opened on {}: sign in as {} there, then come back here \
+                     (Ctrl-C stops)",
+                    judge.host, run.sign_in_as
+                )
+            });
         }
         if judge.asks && judge.url_ok && !asked {
             asked = true;

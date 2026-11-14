@@ -1170,9 +1170,10 @@ impl Sim {
              as deep as a real one, asked and saying words near the 400-byte excerpt record (a \
              long report with its result at its end): so the read is over its budget, as the \
              end use's is, and the cut is held to the client's fill order — every machine's \
-             header and agent lines, the shells folded first and each machine's home and \
-             checkout lines next, a line at a time, the asking sessions' words, then a round \
-             robin over the machines — its marks and its use of the budget, and up to \
+             header and agent lines, the shells folded first and each machine's home, checkout \
+             and quota lines next, a line at a time, each machine's most pressing agent's \
+             leading line, the asking sessions' words, then a round robin over the machines — \
+             its marks and its use of the budget, and up to \
              {EVERY_TOP_UP_TO} machines every machine's most pressing agent keeps its words; an \
              idle turn's cut `said:` keeps its end.\n",
             peer = hostile_peer(n)

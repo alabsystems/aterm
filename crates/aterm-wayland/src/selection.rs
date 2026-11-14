@@ -503,6 +503,12 @@ impl Dropped {
 /// `receive` on `offer`: a fresh pipe, its write end sent, its read end
 /// returned.
 fn receive(kind: Kind, offer: Proxy, mime_type: &CStr) -> io::Result<PipeReader> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this crate links aterm-dl and aterm-log, not aterm-uds; on Linux, where it runs, \
+                  std's pipe is close-on-exec at creation and no FD_CLOFORK exists, so a kept-out \
+                  pipe would add nothing there"
+    )]
     let (reader, writer) = io::pipe()?;
     // SAFETY: the live offer; libwayland duplicates the descriptor for the send, and this end closes when `writer` drops.
     unsafe {

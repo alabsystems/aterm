@@ -881,7 +881,7 @@ pub fn program_line(dialect: Dialect, program: &Path, args: &[String]) -> Result
 }
 
 /// Program, environment, and argv flags carried from a starter onto a worker's launch line.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Starter {
     pub exe: PathBuf,
     pub env: Vec<(String, String)>,
@@ -890,6 +890,20 @@ pub struct Starter {
     /// Variables the worker's line removes from its environment: a pooled login's
     /// ([`super::relaunch::pool_args`]), none of a starter's own.
     pub unset: Vec<&'static str>,
+}
+
+impl std::fmt::Debug for Starter {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A prepared source environment and config overrides can contain
+        // credentials. Routine diagnostics describe the launch, not its values.
+        out.debug_struct("Starter")
+            .field("exe", &self.exe)
+            .field("environment_entries", &self.env.len())
+            .field("argument_count", &self.args.as_ref().ok().map(Vec::len))
+            .field("arguments_valid", &self.args.is_ok())
+            .field("unset_entries", &self.unset.len())
+            .finish()
+    }
 }
 
 impl WorkerCli {

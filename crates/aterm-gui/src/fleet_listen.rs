@@ -1917,7 +1917,8 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                         "[fleet] lowered its level while it was admitted",
                     ));
                 };
-                if !crate::control::attach_fleet_connection(near, (content, drive), peer) {
+                let reader = crate::fleet_activity::Reader::of(served.peer_node());
+                if !crate::control::attach_fleet_connection(near, (content, drive), peer, reader) {
                     return Err(std::io::Error::other(
                         "this aterm's control server is not serving",
                     ));

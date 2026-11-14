@@ -61,6 +61,9 @@ pub(crate) struct CwdReport {
 pub(crate) struct PaneFacts {
     /// Its session key.
     pub(crate) key: u64,
+    /// Its session id: what a program started in it reads as `ATERM_PARENT_SESSION_ID`, and so
+    /// the `session` of a build-start line ([`atpkg::build_start`]) a build in it left.
+    pub(crate) session: String,
     /// Its shell, s.
     pub(crate) shell_pid: u32,
     /// The program in front, f: `tcgetpgrp(master)` where it is above 0, else s.

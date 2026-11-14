@@ -421,6 +421,7 @@ impl App {
         let can_rename = wid.is_some_and(|wid| self.can_rename_session(wid));
         let front_person_hold = wid.is_some_and(|wid| self.front_person_hold(wid));
         let front_remote_hold = wid.is_some_and(|wid| self.front_remote_hold(wid));
+        let any_person_hold = self.any_person_hold();
         #[cfg(target_os = "macos")]
         let menu_accels = Vec::new();
         #[cfg(not(target_os = "macos"))]
@@ -472,6 +473,7 @@ impl App {
                 && crate::menu::local_file_picker_available(),
             front_person_hold,
             front_remote_hold,
+            any_person_hold,
             stats_bars: Some(self.stats_bars_form()),
             deck_size: Some(self.deck_size_pref()),
             agents: self.agents_live(),
@@ -798,6 +800,9 @@ impl App {
             }
             PaletteTarget::Menu(crate::menu::MenuAction::HandBack) => {
                 self.hand_back(wid);
+            }
+            PaletteTarget::Menu(crate::menu::MenuAction::HandBackAll) => {
+                self.hand_back_all();
             }
             PaletteTarget::Menu(crate::menu::MenuAction::Find) => {
                 self.clear_move_license_from(wid, crate::cursor_glow::BoundaryOrigin::Palette);

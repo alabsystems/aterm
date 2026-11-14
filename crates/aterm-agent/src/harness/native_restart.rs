@@ -29,6 +29,11 @@ pub(super) use observation::observe_live;
 #[path = "native_retirement_debt_tests.rs"]
 mod retirement_debt_tests;
 
+// The closed fixtures name a restart plan and a live Unix shell, as the pending fixture does.
+#[cfg(all(test, unix))]
+#[path = "native_closed_tests.rs"]
+pub(super) mod closed_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Recovery {
     Legacy,
@@ -44,9 +49,27 @@ pub(super) enum Recovery {
     /// claims nothing about the operation's other effects: it may have signalled the old agent
     /// or typed its launcher line, so its lane ends and a later pass plans afresh.
     Lapsed,
+    /// The host proved the saved restart reached its close uncommitted (`state=closed`): no host
+    /// epoch will commit, roll back or recover it, and an exec grant under it may have run. Its
+    /// prepare and binding are dropped and the record keeps the closed prepare as a watch
+    /// ([`St::native_closed`]): the lane adopts the relaunched agent it observes, or ends once
+    /// nothing the restart may have started runs, and plans nothing afresh before
+    /// ([`closed_watch`]).
+    Closed,
 }
 
 pub(super) const WAIT_RETIRED_UNISSUED: &str = "wait:native-retired-unissued";
+/// The wait of a lane whose saved restart closed ([`Recovery::Closed`]) while its watch holds.
+pub(super) const WAIT_CLOSED: &str = "wait:native-closed";
+/// The end of a lane whose closed restart's watch saw nothing it may have started run: the shell
+/// it typed at is back with no child running an image the restart's grant may run, so nothing is
+/// left to adopt.
+pub(super) const FAILED_CLOSED: &str = "failed:native-closed";
+/// The refusal of a fresh plan while a closed restart's watch is kept ([`St::native_closed`]): a
+/// process its exec grant started may still run.
+pub(super) const CLOSED_GRANTEE: &str = "native-closed-grantee";
+/// The lane's wait on [`CLOSED_GRANTEE`], as `wait:` spells every refusal word.
+pub(super) const WAIT_CLOSED_GRANTEE: &str = "wait:native-closed-grantee";
 /// The wait of a lane whose saved prepare the host proved never admitted ([`Recovery::Unadmitted`]).
 pub(super) const WAIT_UNADMITTED: &str = "wait:native-unadmitted";
 /// The wait of a lane whose saved prepare the host proved can grant no exec ([`Recovery::Lapsed`]).
@@ -66,6 +89,7 @@ pub(super) const fn refusal_word(admission: Result<Recovery, &'static str>) -> &
         Ok(Recovery::Unadmitted) => "native-unadmitted",
         Ok(Recovery::Lapsed) => "native-lapsed",
         Ok(Recovery::Cancelled) => "native-cancelled",
+        Ok(Recovery::Closed) => "native-closed",
         Ok(
             Recovery::Legacy
             | Recovery::Admitted
@@ -86,7 +110,346 @@ pub(super) fn coordinated(st: &St) -> bool {
         || st.native_completed_prepare.is_some()
         || st.native_noexec_prepare.is_some()
         || st.native_observation.is_some()
+        || st.native_closed.is_some()
         || super::native_record::was_coordinated(st)
+}
+
+/// Refuse a fresh plan while the record keeps a closed restart's watch ([`St::native_closed`]):
+/// an exec grant of that restart may have started a process that still runs, which only
+/// [`closed_watch`] read by a lane with a kernel may adopt or rule out.
+const fn closed_refusal(st: &St) -> Result<(), &'static str> {
+    if st.native_closed.is_some() {
+        Err(CLOSED_GRANTEE)
+    } else {
+        Ok(())
+    }
+}
+
+/// What a closed restart's watch reads now ([`closed_watch`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Watch {
+    /// A live process registered on the conversation is the closed restart's relaunch: a child
+    /// of its shell other than its old agent, while that shell no longer holds the tab, or, once
+    /// that shell is gone, the conversation's one live registered holder. Adopting it takes the
+    /// place of the commit the host never made.
+    Adopt(Box<super::upgrade::SessionFile>),
+    /// Nothing the closed restart may have started runs: its shell, still the process it named,
+    /// has no live child that runs an image the restart's grant may run, its other children (a
+    /// prompt helper, a job of the person's) being no grantee; or that shell is gone, its old
+    /// agent too, and no live process holds the conversation; or the machine booted since.
+    Clear,
+    /// Anything else, a fact that did not read included: a process the restart's exec grant
+    /// started may still run, so nothing plans afresh.
+    Hold,
+}
+
+/// Read the watch of `closed`, a restart that reached its close uncommitted ([`Recovery::Closed`]):
+/// `files` are the registered session files (`None`: unread), and `conversation` the session id
+/// its relaunch registers (`None`: a fresh start's, whose agent registers another). It reads the
+/// restart's own shell and old agent from its plan, never the record's current ones, so a record
+/// moved on since judges the same processes. A later boot than the one the prepare names ended
+/// them all. While the shell is the process it typed at, the grantee is its child that runs the
+/// restart's launcher or a command its grant execs ([`grant_images`]), and no other child of it;
+/// once it is gone by its kernel start it led its terminal's session, whose hangup ends a
+/// foreground job that holds no conversation, so only the conversation's live registered holder
+/// can be the grantee ([`orphaned`]). It grants nothing.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeClosedWatch",
+        action = "Adopt",
+        project = "aterm_agent::harness::native_restart::closed_tests::watch_model::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeClosedWatch",
+        action = "Clear",
+        project = "aterm_agent::harness::native_restart::closed_tests::watch_model::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "Launch",
+        reason = "The line the restart typed starts its grantee as the shell's child, and only before the close: the host delivers no grant past the deadline"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "Register",
+        reason = "The grantee writes its session file on the conversation; the watch reads the registered files"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "Exit",
+        reason = "The grantee exits, and its shell takes its tab back; the kernel reads the shell's children and its tab"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "Spawn",
+        reason = "The shell keeps another child that runs no image the restart's grant may run, a prompt helper or a job of the person's; the kernel reads the shell's children and each one's mapped image"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "SpawnAlike",
+        reason = "The person starts, in the restart's shell, another child that runs an image the restart's grant may run; the kernel reads its mapped image, which the watch cannot tell from the grantee's"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "OtherExits",
+        reason = "The shell's other child exits; the kernel reads the shell's children"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "ShellExits",
+        reason = "The restart's shell, its terminal's session leader, exits or is reaped; the kernel reads its pid free or born at another time"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "Reboot",
+        reason = "The machine boots again; the kernel reads another boot than the prepare's stamp"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeClosedWatch",
+        action = "Close",
+        reason = "The host answers closed for the restart past its close, which terminal_reply keeps as the record's watch (NativeRetirementDebt's Closed)"
+    )
+)]
+pub(super) fn closed_watch(
+    closed: &Prepare,
+    k: &dyn upgrade_drive::Kernel,
+    files: Option<&[super::upgrade::SessionFile]>,
+    conversation: Option<&str>,
+) -> Watch {
+    let NativePlan::Restart {
+        process: old,
+        shell,
+        launcher,
+        forward,
+        rollback,
+        ..
+    } = &closed.plan
+    else {
+        return Watch::Hold;
+    };
+    if closed
+        .boot
+        .as_ref()
+        .is_some_and(|then| k.machine_boot().is_some_and(|now| now != *then))
+    {
+        return Watch::Clear;
+    }
+    match runs(shell, k) {
+        Some(true) => {}
+        Some(false) => return orphaned(old, k, files, conversation),
+        None => return Watch::Hold,
+    }
+    // Unread files hide no relaunch from the children's read below, which they cannot clear.
+    if let Some(relaunched) = files.into_iter().flatten().find(|sf| {
+        conversation.is_none_or(|conversation| sf.session_id == conversation)
+            && sf.pid != old.pid
+            && super::relaunch::relaunch_by_parent(k.parent(sf.pid), shell.pid)
+                == super::relaunch::Relaunch::Ours
+    }) {
+        return if k.shell_holds_tab(shell.pid) == Some(false) {
+            Watch::Adopt(Box::new(relaunched.clone()))
+        } else {
+            Watch::Hold
+        };
+    }
+    // The line the restart typed runs as the shell's child, and the host grants an exec only to
+    // that child while it runs the restart's launcher: with that same shell alive none of its
+    // children was reparented away, so the grantee, if it runs, is a child of the shell running
+    // the launcher or a command the grant execs ([`grant_images`]). Past the close no grant is
+    // delivered, so a child that runs none of those (a prompt helper, a job of the person's, a
+    // fork of the shell that never reached the launcher) never becomes the agent: once every
+    // child reads as one, the restart left nothing running, whoever holds the conversation now.
+    // A child whose image does not read may be the grantee.
+    let images = grant_images(launcher, forward, rollback.as_deref());
+    match k.children(shell.pid) {
+        Some(children)
+            if children.iter().all(|&child| {
+                k.image_file(child)
+                    .is_some_and(|image| !images.contains(&image))
+            }) =>
+        {
+            Watch::Clear
+        }
+        _ => Watch::Hold,
+    }
+}
+
+/// The images a closed restart's grantee may run while it lives, by file identity: the restart's
+/// `launcher` until its Execute grant, then the `forward` or `rollback` command that grant execs
+/// in the same pid, the command's own image and the image it settles on
+/// ([`native_act::RestartCommand::settled`]). A cold restart's resolved command agrees with its
+/// forward seed on both ([`native_act::RestartCommand::cold_resolution_agrees`]), and a source
+/// constructor's command with the plan's, so the plan names every image a grant may run.
+fn grant_images(
+    launcher: &Image,
+    forward: &native_act::RestartCommand,
+    rollback: Option<&native_act::RestartCommand>,
+) -> Vec<super::agent_image::FileId> {
+    let id = |image: &Image| super::agent_image::FileId {
+        dev: image.device,
+        ino: image.inode,
+    };
+    std::iter::once(id(launcher))
+        .chain(
+            std::iter::once(forward)
+                .chain(rollback)
+                .flat_map(|command| [id(&command.image), id(command.settled())]),
+        )
+        .collect()
+}
+
+/// Whether `process`'s pid still names it by its kernel start (`None`: not read): a free pid, a
+/// zombie or a pid that names a process born at another time is its exit.
+fn runs(process: &Process, k: &dyn upgrade_drive::Kernel) -> Option<bool> {
+    if k.holds_pid(process.pid) == Some(false) {
+        return Some(false);
+    }
+    let now = k.process_start(process.pid)?;
+    let start = vendor_start(process);
+    (!start.is_empty()).then(|| upgrade_drive::squash(&now) == upgrade_drive::squash(&start))
+}
+
+/// Whether the process a session file names is the one that wrote it (`None`: not read): alive
+/// with the kernel start the file records.
+fn registered_runs(
+    sf: &super::upgrade::SessionFile,
+    k: &dyn upgrade_drive::Kernel,
+) -> Option<bool> {
+    if k.holds_pid(sf.pid) == Some(false) {
+        return Some(false);
+    }
+    let now = k.process_start(sf.pid)?;
+    let start = upgrade_drive::squash(&sf.proc_start);
+    (!start.is_empty()).then(|| upgrade_drive::squash(&now) == start)
+}
+
+/// The watch once the restart's shell is gone by its kernel start ([`closed_watch`]), on the boot
+/// the restart ran in. That shell led its terminal's session, and its exit hung the terminal up:
+/// the grantee, its foreground job, ends with it unless it outlives the hangup, and then only a
+/// grantee registered on the conversation is a second agent of the lane. Adopt the
+/// conversation's one live registered holder; Clear once none holds it and the old agent is gone
+/// by its start; Hold where a fact did not read or two processes hold it. A fresh start's watch
+/// (`conversation` `None`) reads no conversation: its grantee, if it outlived its terminal,
+/// runs on one of its own that no fresh plan of the lane resumes.
+fn orphaned(
+    old: &Process,
+    k: &dyn upgrade_drive::Kernel,
+    files: Option<&[super::upgrade::SessionFile]>,
+    conversation: Option<&str>,
+) -> Watch {
+    if runs(old, k) != Some(false) {
+        return Watch::Hold;
+    }
+    let Some(conversation) = conversation else {
+        return Watch::Clear;
+    };
+    let Some(files) = files else {
+        return Watch::Hold;
+    };
+    let mut holder = None;
+    for sf in files.iter().filter(|sf| sf.session_id == conversation) {
+        match registered_runs(sf, k) {
+            Some(false) => {}
+            Some(true) if holder.is_none() => holder = Some(sf),
+            Some(true) | None => return Watch::Hold,
+        }
+    }
+    holder.map_or(Watch::Clear, |sf| Watch::Adopt(Box::new(sf.clone())))
+}
+
+/// What a fresh plan is about to do while the record may keep a closed restart's watch
+/// ([`settle_closed`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Fresh<'a> {
+    /// A move signals the live agent `pid`, which holds `conversation`.
+    Signal { pid: u32, conversation: &'a str },
+    /// The exit lane starts the conversation's agent again (`conversation`: `None` where the
+    /// closed restart started its agent afresh, on another conversation).
+    Start { conversation: Option<&'a str> },
+}
+
+/// Settle the record's closed restart watch ([`St::native_closed`]) before a fresh plan: `Ok`
+/// where none is kept or it is cleared now, the plan going on; else the refusal it takes instead.
+/// The watch clears where nothing the closed restart may have started runs, or, before a signal,
+/// where its relaunch is the very agent the move signals, observed and the move's own subject
+/// rather than a second process. A relaunch that holds the conversation keeps it for the exit
+/// lane, which would start another. `files` reads the registered session files only when a watch
+/// is kept.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeClosedWatch",
+        action = "Start",
+        project = "aterm_agent::harness::native_restart::closed_tests::watch_model::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeClosedWatch",
+        action = "SignalAdopted",
+        project = "aterm_agent::harness::native_restart::closed_tests::watch_model::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeClosedWatch",
+        action = "SignalOther",
+        project = "aterm_agent::harness::native_restart::closed_tests::watch_model::project"
+    )
+)]
+pub(super) fn settle_closed(
+    st: &mut St,
+    fresh: Fresh<'_>,
+    files: impl FnOnce() -> Option<Vec<super::upgrade::SessionFile>>,
+    k: &dyn upgrade_drive::Kernel,
+) -> Result<(), &'static str> {
+    let Some(closed) = st.native_closed.as_deref() else {
+        return Ok(());
+    };
+    let (conversation, signalled) = match fresh {
+        Fresh::Signal { pid, conversation } => (Some(conversation), Some(pid)),
+        Fresh::Start { conversation } => (conversation, None),
+    };
+    match closed_watch(closed, k, files().as_deref(), conversation) {
+        Watch::Clear => {}
+        Watch::Adopt(relaunched) if Some(relaunched.pid) == signalled => {}
+        Watch::Adopt(_) | Watch::Hold => return Err(CLOSED_GRANTEE),
+    }
+    st.native_closed = None;
+    Ok(())
 }
 
 pub(super) fn constructor_enabled(client: &mut Client, tab: &str) -> bool {
@@ -159,6 +522,14 @@ fn legacy_before_prepare(opts: &Opts, client: &mut Client, st: &St) -> Result<bo
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
+        machine = "NativeRetirementDebt",
+        action = "Closed",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ColdRetirementRecovery",
         action = "PriorRetirement",
         project = "aterm_agent::harness::native_restart::retirement_debt_tests::cold_transition"
@@ -189,6 +560,15 @@ pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
             {
                 Some(Recovery::Completed)
             }
+            // A repeated closed answer acknowledges the watch it already left, never another id.
+            Reply::Closed(id)
+                if st
+                    .native_closed
+                    .as_ref()
+                    .is_some_and(|closed| closed.id == *id) =>
+            {
+                Some(Recovery::Closed)
+            }
             _ => None,
         };
     }
@@ -197,6 +577,9 @@ pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
         if noexec.id == active.id {
             return None;
         }
+    }
+    if let Reply::Closed(id) = reply {
+        return closed(st, id);
     }
     if matches!(
         reply,
@@ -269,6 +652,34 @@ pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
         st.stop("native-cohort-retired", upgrade_drive::now_s());
     }
     Some(outcome)
+}
+
+/// Record that the retained restart `id` reached its close uncommitted ([`Recovery::Closed`]): its
+/// prepare, binding and rollback go, and the prepare stays as the watch the lane reads
+/// ([`closed_watch`]) before anything plans afresh. Nothing is recorded completed, no observation
+/// is kept and no rollback stays possible. A cold restart's executed account is unknown, since
+/// its host names it only in a committed reply: its forward attribution goes, and the account is
+/// learned again from the agent the lane observes. Only the exact retained restart's id may; a
+/// terminal record of that id keeps the record as it is.
+fn closed(st: &mut St, id: &str) -> Option<Recovery> {
+    let prepare = retained_prepare(st).ok()?;
+    if prepare.id != id
+        || !matches!(prepare.plan, NativePlan::Restart { .. })
+        || [&st.native_noexec_prepare, &st.native_completed_prepare]
+            .into_iter()
+            .flatten()
+            .any(|done| done.id == id)
+    {
+        return None;
+    }
+    if matches!(prepare.plan, NativePlan::Restart { cold: Some(_), .. }) {
+        st.account_intent = None;
+    }
+    st.native = None;
+    st.native_prepare.clear();
+    st.native_rollback = false;
+    st.native_closed = Some(prepare);
+    Some(Recovery::Closed)
 }
 
 #[cfg(test)]
@@ -468,6 +879,7 @@ pub(super) fn begin(
         if st.native_rollback {
             return Err("native-unresolved-operation");
         }
+        closed_refusal(st)?;
         let previous = st
             .native_completed_prepare
             .as_deref()
@@ -512,6 +924,7 @@ pub(super) fn begin_relaunch(
     if !coordinated(st) {
         return begin(opts, client, st, session, duty, target, command, rollback);
     }
+    closed_refusal(st)?;
     if checked.is_none() {
         return Err("native-checked-source-unavailable");
     }
@@ -603,6 +1016,7 @@ pub(super) fn begin_crash(
     if st.native.is_some() || !st.native_prepare.is_empty() {
         return replay_retained(opts, client, st, session);
     }
+    closed_refusal(st)?;
     if cold.is_some() {
         require_cold_constructor(opts, client, st)?;
     } else if legacy_before_prepare(opts, client, st)? {
@@ -638,6 +1052,7 @@ pub(super) fn begin_completed_rollback(
     if st.native_retired_unissued {
         return Ok(Recovery::Held);
     }
+    closed_refusal(st)?;
     if legacy_before_prepare(opts, client, st)? {
         return Ok(Recovery::Legacy);
     }
@@ -776,6 +1191,8 @@ fn begin_plan(
     if st.native.is_some() || !st.native_prepare.is_empty() {
         return replay_retained(opts, client, st, session);
     }
+    // No plan is minted over a process a closed restart's exec grant may have started.
+    closed_refusal(st)?;
     // CLI/operator constructors preserve their independent legacy authority. Only the real
     // private host opts contain this token; holder/as=person words never select this branch.
     if asked.is_some() || checked.is_some() {
@@ -989,7 +1406,7 @@ pub(super) fn replay_retained_at(
 ) -> Result<Recovery, &'static str> {
     let recovered = recover(opts, session, client, tab, st);
     let saved = upgrade_drive::save_checked(opts, session, st);
-    if recovered == Ok(Recovery::Lapsed) && saved.is_err() {
+    if matches!(recovered, Ok(Recovery::Lapsed | Recovery::Closed)) && saved.is_err() {
         return Err("native-unsaved");
     }
     match recovered {
@@ -998,7 +1415,8 @@ pub(super) fn replay_retained_at(
             | Recovery::Unadmitted
             | Recovery::Completed
             | Recovery::Retired
-            | Recovery::Held),
+            | Recovery::Held
+            | Recovery::Closed),
         ) => Ok(outcome),
         Ok(Recovery::Cancelled) => Err("native-cancelled"),
         Ok(Recovery::Admitted | Recovery::Legacy) | Err(_) => Err("native-unresolved-operation"),
@@ -1133,7 +1551,7 @@ pub(super) fn recover(
         },
     )?;
     if matches!(&reply, Reply::Admitted(binding) | Reply::Pending(binding) if binding.id != expected_id)
-        || matches!(&reply, Reply::Unadmitted(id) | Reply::Lapsed(id) if *id != expected_id)
+        || matches!(&reply, Reply::Unadmitted(id) | Reply::Lapsed(id) | Reply::Closed(id) if *id != expected_id)
     {
         return Err("native-unknown");
     }
@@ -1212,7 +1630,14 @@ pub(super) fn abort(
         Ok(outcome @ (Recovery::Cancelled | Recovery::Unadmitted | Recovery::Lapsed)) => {
             return Some(outcome);
         }
-        Ok(Recovery::Completed | Recovery::Retired | Recovery::Held | Recovery::Legacy)
+        // A closed restart ended after its signal, not before: its watch stays with the record.
+        Ok(
+            Recovery::Completed
+            | Recovery::Retired
+            | Recovery::Held
+            | Recovery::Legacy
+            | Recovery::Closed,
+        )
         | Err(_) => return None,
         Ok(Recovery::Admitted) => {}
     }
@@ -1302,6 +1727,42 @@ pub(super) fn complete(
     tab: &str,
     st: &mut St,
 ) -> bool {
+    poll_completion(opts, session, client, tab, st).completed
+}
+
+/// One completion poll ([`poll_completion`]): whether the operation completed and, when it did
+/// not, the phase whose launch its Query proved unissued.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Poll {
+    pub(super) completed: bool,
+    pub(super) unissued: Option<ImagePhase>,
+}
+
+/// [`complete`], keeping the phase a Query proved unissued for a caller that paces its Resumes
+/// by it: that phase's line may be typed again.
+pub(super) fn poll_completion(
+    opts: &Opts,
+    session: &str,
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> Poll {
+    let mut unissued = None;
+    let completed = complete_observing(opts, session, client, tab, st, &mut unissued);
+    Poll {
+        completed,
+        unissued,
+    }
+}
+
+fn complete_observing(
+    opts: &Opts,
+    session: &str,
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+    unissued: &mut Option<ImagePhase>,
+) -> bool {
     if st.native_retired_unissued {
         return false;
     }
@@ -1321,6 +1782,9 @@ pub(super) fn complete(
                 st.stop("native-cancelled-before-mutation", upgrade_drive::now_s());
             }
             return outcome == Recovery::Completed;
+        }
+        if let Reply::Unissued(launch) = &reply {
+            *unissued = Some(*launch);
         }
         match reply {
             Reply::Resumed(ImagePhase::Rollback) => {
@@ -1437,8 +1901,13 @@ pub(super) fn retire(
         // reconciles the kept binding as before.
         match recover(opts, session, client, tab, st) {
             Ok(Recovery::Admitted) => {}
+            // A closed restart is terminal too: its watch, not its binding, stays with the record.
             Ok(
-                Recovery::Retired | Recovery::Cancelled | Recovery::Unadmitted | Recovery::Lapsed,
+                Recovery::Retired
+                | Recovery::Cancelled
+                | Recovery::Unadmitted
+                | Recovery::Lapsed
+                | Recovery::Closed,
             ) => return true,
             Err(_) if st.native.is_some() => {}
             Ok(Recovery::Completed | Recovery::Held | Recovery::Legacy) | Err(_) => return false,
@@ -1458,7 +1927,12 @@ pub(super) fn retire(
     native_act::exchange(client, tab, &Request::Reconcile(binding))
         .ok()
         .and_then(|reply| terminal_reply(st, &reply))
-        .is_some_and(|outcome| matches!(outcome, Recovery::Retired | Recovery::Cancelled))
+        .is_some_and(|outcome| {
+            matches!(
+                outcome,
+                Recovery::Retired | Recovery::Cancelled | Recovery::Closed
+            )
+        })
 }
 
 pub(super) fn read(value: &aterm_json::Value) -> Option<Option<Binding>> {

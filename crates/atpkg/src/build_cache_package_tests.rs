@@ -237,7 +237,7 @@ fn advisory_package_inventory_admits_a_producer_while_cleanup_excludes_it() {
                         target: &probe.target,
                         manifest: &probe.manifest,
                         preserve_if_present: &probe.preserve,
-                        budget: 1 << 30,
+                        budget: 1,
                         attempt: SECOND,
                         producer_pid: 100,
                         producer_group: 101,
@@ -267,9 +267,9 @@ fn advisory_package_inventory_admits_a_producer_while_cleanup_excludes_it() {
         OUTPUT.take().expect("the inventory callback ran")
     }
     let mut world = World::new();
-    world.admit(FIRST, 1 << 30).unwrap();
+    world.admit(FIRST, 1).unwrap();
     world.output(64);
-    world.settle(FIRST, true).unwrap();
+    world.settle(FIRST, false).unwrap();
     world.held.take();
     let probe = Probe {
         home: world.home.clone(),
@@ -280,26 +280,39 @@ fn advisory_package_inventory_admits_a_producer_while_cleanup_excludes_it() {
     };
     let payload = std::fs::read(world.target.join("debug/deps/unit")).unwrap();
     let _clear = Clear;
+    let mut planned = Vec::new();
     assert_eq!(
         observe(probe.clone(), || {
-            let _ = super::super::plan(&world.home, std::time::SystemTime::now());
+            planned = super::super::plan(&world.home, std::time::SystemTime::now());
         }),
         Observation::Admitted
     );
+    assert!(matches!(
+        planned.as_slice(),
+        [candidate] if candidate.path == world.target && matches!(
+            candidate.why,
+            super::super::super::Unused::PackageBudget { budget: 1, allocated, .. } if allocated > 1
+        )
+    ));
     assert_eq!(
         world.receipt().package.unwrap().last_settled.as_deref(),
         Some(SECOND)
     );
     assert_eq!(
-        observe(probe, || {
-            assert!(world.reclaim(&Fence::default()).is_empty());
-        }),
-        Observation::Busy
-    );
-    assert_eq!(
         std::fs::read(world.target.join("debug/deps/unit")).unwrap(),
         payload
     );
+    assert_eq!(
+        observe(probe, || {
+            assert!(matches!(
+                world.reclaim(&Fence::default()).as_slice(),
+                [(path, super::super::super::Unused::PackageBudget { budget: 1, .. })]
+                    if path == &world.target
+            ));
+        }),
+        Observation::Busy
+    );
+    assert!(!world.target.exists());
 }
 
 #[test]

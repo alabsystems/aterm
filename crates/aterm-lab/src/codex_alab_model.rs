@@ -130,8 +130,8 @@ static WORKER_LAND_HELD: AtomicBool = AtomicBool::new(false);
 
 /// What holds the worker's land act's answer while [`WORKER_LAND_HELD`]: so its Land hold (the
 /// land act typed, the yield not yet judged) stands until `codex-alab-proof --window-only` read
-/// its row under its manager say `landing`, which a 2 s read of a hold of a second or two catches
-/// only by luck. The gate's own wait is a one-minute hang detector.
+/// its status tell the hold, which a 2 s read of a hold of a second or two catches only by
+/// luck. The gate's own wait is a one-minute hang detector.
 static WORKER_LAND: OnceLock<Arc<ResponseGate>> = OnceLock::new();
 
 /// From now on, the worker's land act's answer waits for [`release_worker_land`].

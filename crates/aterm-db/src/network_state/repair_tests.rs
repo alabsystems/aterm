@@ -118,7 +118,7 @@ fn repair_history_preserves_failure_without_refreshing_contact_or_relabelling_a_
     let mut observer = Observer::open(&config, published.clone()).unwrap();
     let peer = identity(2);
     let now = Instant::now();
-    observer.local(identity(1), trust()).unwrap();
+    observer.local(identity(1), trust(), Vec::new).unwrap();
     observer.repair(&peer, failed(1500), now);
     assert!(
         observer.state.peers.is_empty(),
@@ -172,7 +172,7 @@ fn repair_history_preserves_failure_without_refreshing_contact_or_relabelling_a_
     assert_eq!(observer.state.peers[0].last_repair, Some(failed(500)));
     let mut new_local = identity(1);
     new_local.incarnation = [2; 16];
-    observer.local(new_local, trust()).unwrap();
+    observer.local(new_local, trust(), Vec::new).unwrap();
     assert!(observer.state.peers[0].last_repair.is_none());
     assert!(observer.repair_sampled.is_empty());
 }

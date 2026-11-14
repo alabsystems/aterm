@@ -5675,15 +5675,20 @@ fn oauth_recoverable_bot_read_and_semantic_failures_are_not_browser_control() {
 }
 
 /// A Claude sign-in waits on Cloudflare's bot check without charging its reads to the step cap,
-/// and one that does not clear ends there, as a page stop on this machine's own record
-/// ([`Met::stopped`], which holds the row out of the background): nothing is asked of another
-/// Mac, and no browser opens anywhere. CONTROLS: a check that clears after three reads, or
-/// after more reads than the drive's steps, reaches the callback; a page that only loads, or
-/// loads on another host between two reads of a check, counts its steps and ends `stall`,
-/// which is no page stop.
+/// and one that stands ends the drive on the page it met: the headless drive opens nothing
+/// after it, even where a window sign-in is there to be had (here, the substituted one, which
+/// is never asked). CONTROLS: a
+/// check that clears after three reads, or after more reads than the drive's steps, reaches the
+/// callback; a page that only loads, or loads on another host between two reads of a check,
+/// counts its steps and ends `stall`.
 #[test]
-fn a_claude_bot_check_waits_and_one_that_stands_ends_as_a_page_stop() {
-    use super::super::headless_oauth::{BLOCK_PAGE_MET, BOT_CHECK_UNCLEARED};
+fn a_claude_bot_check_waits_and_ends_the_headless_drive_on_the_page_it_met() {
+    use super::super::headless_oauth::{
+        BLOCK_PAGE_MET, BOT_CHECK_UNCLEARED, VisibleDone, set_visible_sign_in_for_tests,
+        take_visible_sign_ins_for_tests,
+    };
+    let _there = set_visible_sign_in_for_tests(Ok(VisibleDone::Delivered));
+    let _ = take_visible_sign_ins_for_tests();
     let at = |state: &str, url: &str| aterm_json::json!({"state": state, "url": url});
     let short = Duration::from_millis(500);
     let tick = Duration::from_millis(20);
@@ -5706,12 +5711,16 @@ fn a_claude_bot_check_waits_and_one_that_stands_ends_as_a_page_stop() {
         let (res, delivered, _, met) = drive_bot_check(state, short, tick);
         assert_eq!(res, Err(BOT_CHECK_UNCLEARED), "{what}");
         assert!(delivered.is_empty(), "{what}");
+        let met = met.expect(what);
         assert_eq!(
             met,
-            Some(Met::new(MetWord::BotCheck, Some("claude.ai"))),
+            Met::new(MetWord::BotCheck, Some("claude.ai")),
             "{what}"
         );
-        assert!(met.is_some_and(|met| met.stopped()), "{what}");
+        assert!(
+            met.stopped() && !met.ended_at_the_sign_in_window(),
+            "{what}"
+        );
     }
 
     let clears = move |n: usize| {
@@ -5751,7 +5760,10 @@ fn a_claude_bot_check_waits_and_one_that_stands_ends_as_a_page_stop() {
     assert_eq!(res, Err(BLOCK_PAGE_MET));
     assert_eq!(reads, 1, "a block page ends the drive at once");
     assert_eq!(met, Some(Met::new(MetWord::BlockPage, Some("claude.ai"))));
-    assert!(met.is_some_and(|met| met.stopped()));
+    assert!(
+        take_visible_sign_ins_for_tests().is_empty(),
+        "the headless drive hands nothing to the sign-in window"
+    );
 
     let loading = move |_: usize| at("loading", "https://claude.com/cai/oauth/authorize?x=1");
     let elsewhere = move |n: usize| {
@@ -5866,10 +5878,33 @@ fn the_outcome_file_holds_one_closed_word_and_a_host() {
     }
 }
 
+/// WHAT STOPS A ROW UNTIL SOMETHING CHANGES is what another try by itself does not pass:
+/// Cloudflare's pages, the consent page's human check, another account's consent page, a
+/// session with no desktop and a window a person closed. A sign-in in the window that failed
+/// for any other reason (a page that did not load, a mailbox that did not answer, a deadline)
+/// ended at the window and stops nothing: its row is tried again on the ordinary backoff.
 #[test]
-fn only_cloudflares_pages_stop_a_sign_in() {
+fn only_what_another_try_does_not_pass_stops_a_sign_in() {
     assert!(Met::new(MetWord::BotCheck, Some("claude.ai")).stopped());
     assert!(Met::new(MetWord::BlockPage, None).stopped());
+    for word in [
+        MetWord::WindowNoDesktop,
+        MetWord::WindowBotCheck,
+        MetWord::WindowBlockPage,
+        MetWord::WindowHumanCheck,
+        MetWord::WindowClosed,
+        MetWord::WindowWrongAccount,
+    ] {
+        let met = Met::new(word, None);
+        assert!(
+            met.stopped() && met.ended_at_the_sign_in_window(),
+            "{word:?}"
+        );
+    }
+    let failed = Met::new(MetWord::BrowserSignIn, None).because("its page did not load");
+    assert!(!failed.stopped());
+    assert!(failed.ended_at_the_sign_in_window());
+    assert!(!failed.takes_a_person());
     assert!(!Met::new(MetWord::Stall, Some("claude.ai")).stopped());
     assert!(!Met::new(MetWord::BrowserStart, None).stopped());
     assert!(!Met::new(MetWord::BrowserControl, None).stopped());
@@ -5880,6 +5915,7 @@ fn local_browser_outcomes_are_hostless_even_with_public_fields() {
     for (word, token) in [
         (MetWord::BrowserStart, "browser-start"),
         (MetWord::BrowserControl, "browser-control"),
+        (MetWord::BrowserSignIn, "browser-sign-in"),
     ] {
         let expected = Met::new(word, None);
         assert_eq!(Met::parse(&format!("{token}\n")), Some(expected.clone()));
@@ -5893,6 +5929,7 @@ fn local_browser_outcomes_are_hostless_even_with_public_fields() {
             let forged = Met {
                 word,
                 host: Some(host.to_owned()),
+                why: None,
             };
             assert_eq!(forged.line(), token);
             assert_eq!(forged.words(), expected.words());
@@ -5923,7 +5960,7 @@ fn opener_outcome_phases_preserve_diagnostics_and_only_explicit_ends_are_termina
         write_outcome(&path, &met);
         assert_eq!(
             read_terminal_outcome(&path),
-            Some(TerminalOutcome::Failed(Some(met)))
+            Some(TerminalFailure(Some(met)))
         );
     }
     for bad in [
@@ -5961,49 +5998,445 @@ fn a_profile_fallback_retains_its_headless_diagnostic_without_stopping_success()
         assert_eq!(read_outcome(&path), Some(met.clone()));
         assert_eq!(
             read_terminal_outcome(&path),
-            (code != 0).then(|| TerminalOutcome::Failed(Some(met.clone())))
+            (code != 0).then(|| TerminalFailure(Some(met.clone())))
         );
     }
 }
 
-/// An account service that could not admit work is a deferral, not a failed login and not a
-/// page stop: its outcome file says so, and no profile fallback starts.
+/// THE SIGN-IN WINDOW OPENS ONLY ON THE GRANT A LOCAL SIGN-IN SETS: one variable set to `1`,
+/// read from the opener's environment and nowhere else; unset, empty or any other value opens
+/// no window, and neither does anything else the environment holds. CONTROL: a headless
+/// attempt that failed lets the named-profile opener continue, with its record made terminal
+/// only where that opener fails too.
 #[cfg(unix)]
 #[test]
-fn an_unavailable_service_is_typed_deferred_without_a_profile_fallback() {
-    let met = Met::new(MetWord::ServiceUnavailable, None);
-    assert!(met.is_service_unavailable());
-    assert!(!met.stopped());
+fn the_sign_in_window_opens_only_on_its_grant() {
+    let var = |value: Option<&'static str>| {
+        move |name: &str| {
+            (name == WINDOW_ENV)
+                .then_some(value)
+                .flatten()
+                .map(OsString::from)
+        }
+    };
+    assert!(window_granted_by(&var(Some("1"))));
+    for ungranted in [None, Some(""), Some("0"), Some("true"), Some("1 ")] {
+        assert!(!window_granted_by(&var(ungranted)), "{ungranted:?}");
+    }
+    assert!(!window_granted_by(&|name: &str| {
+        (name == NO_HEADLESS_ENV || name == "BROWSER").then(|| OsString::from("1"))
+    }));
+
+    let stall = Met::new(MetWord::Stall, None);
+    assert!(!stall.ended_at_the_sign_in_window());
     let tmp = aterm_tempfile::tempdir().unwrap();
     let path = tmp.path().join("outcome");
-    write_outcome(&path, &met);
-    assert_eq!(read_outcome(&path), Some(met.clone()));
+    let opened = std::cell::Cell::new(false);
+    let result = profile_fallback_outcome(Some(&path), Some(&stall), || {
+        opened.set(true);
+        assert_eq!(read_terminal_outcome(&path), None, "it is not terminal yet");
+        (0, None)
+    });
+    assert_eq!(result, (0, None));
+    assert!(opened.get());
+    let result = profile_fallback_outcome(Some(&path), Some(&stall), || (1, None));
+    assert_eq!(result, (1, None));
     assert_eq!(
         read_terminal_outcome(&path),
-        Some(TerminalOutcome::Deferred(met.clone()))
+        Some(TerminalFailure(Some(stall)))
     );
-    let result = profile_fallback_outcome(Some(&path), Some(&met), || {
-        panic!("an unavailable service cannot start a profile fallback")
-    });
-    assert_eq!(result.0, 1);
 }
 
+/// WHAT STOPPED A SIGN-IN IN ATERM'S WINDOW HAS ITS OWN WORD: a session with no desktop,
+/// Cloudflare's check that did not clear and its block page each end the opener with a closed
+/// word the renewal reads back from the outcome file, whose words say what a person can do.
+/// Each is the opener's terminal failure: no other browser opens after it, and no headless
+/// retry is due. The missing desktop and the check are a person's to clear; the block page is
+/// not.
 #[cfg(unix)]
 #[test]
-fn deferred_opener_records_require_the_exact_service_cause_and_closed_grammar() {
+fn a_sign_in_stopped_in_the_sign_in_window_names_what_stopped_it() {
+    use super::super::headless_oauth::{
+        VisibleStop, WINDOW_BLOCK_PAGE, WINDOW_BOT_CHECK, WINDOW_NO_DESKTOP, take_callback_offered,
+        take_met,
+    };
+    let host = || Some("claude.ai".to_owned());
+    let _ = (take_callback_offered(), take_met());
+    for (stop, word, kept_host, person, says) in [
+        (
+            VisibleStop::NoDesktop,
+            MetWord::WindowNoDesktop,
+            None,
+            true,
+            "no desktop to open aterm's sign-in window on",
+        ),
+        (
+            VisibleStop::BotCheck(host()),
+            MetWord::WindowBotCheck,
+            Some("claude.ai"),
+            true,
+            "Cloudflare's check on claude.ai did not clear in aterm's sign-in window",
+        ),
+        (
+            VisibleStop::BlockPage(host()),
+            MetWord::WindowBlockPage,
+            Some("claude.ai"),
+            false,
+            "Cloudflare's block page on claude.ai in aterm's sign-in window",
+        ),
+        (
+            VisibleStop::HumanCheck(host()),
+            MetWord::WindowHumanCheck,
+            Some("claude.ai"),
+            true,
+            "the consent page on claude.ai held Authorize behind a human check (hCaptcha)",
+        ),
+        (
+            VisibleStop::Closed,
+            MetWord::WindowClosed,
+            None,
+            false,
+            "aterm's sign-in window was closed before the sign-in finished",
+        ),
+        (
+            VisibleStop::WrongAccount,
+            MetWord::WindowWrongAccount,
+            None,
+            false,
+            "named another account, so nothing was authorized",
+        ),
+    ] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let path = tmp.path().join("outcome");
+        assert_eq!(finish_window_sign_in(Err(stop), Some(&path)), 1);
+        assert!(!take_callback_offered());
+        let Some(TerminalFailure(Some(met))) = read_terminal_outcome(&path) else {
+            panic!("{word:?}: a terminal record");
+        };
+        assert_eq!(met, Met::new(word, kept_host));
+        assert!(met.stopped() && met.ended_at_the_sign_in_window());
+        assert_eq!(met.takes_a_person(), person, "{word:?}");
+        assert!(met.words().contains(says), "{}", met.words());
+        assert!(!met.words().contains("Safari"), "{}", met.words());
+        assert_eq!(Met::parse(&met.line()), Some(met.clone()));
+    }
+    // Each word's text is one run of single spaces: none was folded with its indentation.
+    for words in [
+        WINDOW_NO_DESKTOP,
+        WINDOW_BOT_CHECK,
+        WINDOW_BLOCK_PAGE,
+        super::super::headless_oauth::WINDOW_HUMAN_CHECK,
+        super::super::headless_oauth::WINDOW_CLOSED,
+        super::super::headless_oauth::WINDOW_WRONG_ACCOUNT,
+    ] {
+        assert!(!words.contains("  "), "{words}");
+    }
+    // A sign-in that failed in the window for another reason is a terminal record that
+    // stops nothing, with why.
     let tmp = aterm_tempfile::tempdir().unwrap();
     let path = tmp.path().join("outcome");
-    for record in [
-        "opener-outcome=1\nphase=deferred\nmet=bot-check claude.ai\n",
-        "opener-outcome=1\nphase=failed\nmet=service-unavailable\n",
-        "opener-outcome=1\nphase=continuing\nmet=service-unavailable\n",
-        "opener-outcome=1\nphase=deferred\nmet=service-unavailable claude.ai\n",
-        "opener-outcome=1\nphase=deferred\nmet=service-unavailable\nextra=true\n",
+    assert_eq!(
+        finish_window_sign_in(
+            Err(VisibleStop::Failed(
+                "the sign-in window's page did not load (error -1009)".into()
+            )),
+            Some(&path)
+        ),
+        1
+    );
+    let Some(TerminalFailure(Some(met))) = read_terminal_outcome(&path) else {
+        panic!("a terminal record");
+    };
+    assert_eq!(met.word, MetWord::BrowserSignIn);
+    assert!(!met.stopped() && met.ended_at_the_sign_in_window());
+    assert!(met.words().contains("did not load"), "{}", met.words());
+    assert!(WINDOW_NO_DESKTOP.contains("no desktop"));
+    assert!(WINDOW_BOT_CHECK.contains("Cloudflare") && WINDOW_BOT_CHECK.contains("never operates"));
+    assert!(WINDOW_BLOCK_PAGE.contains("Cloudflare"));
+    assert!(
+        super::super::headless_oauth::WINDOW_HUMAN_CHECK.contains("never operates"),
+        "the human check's words say aterm does not operate it"
+    );
+    assert_eq!(
+        Met::parse("window-no-desktop claude.ai"),
+        None,
+        "it keeps no host"
+    );
+}
+
+/// A SIGN-IN IN ATERM'S WINDOW ENDS THE OPENER ITSELF: a loopback callback the window's page
+/// delivered is exit 0 with nothing more handed over; a stop is exit 1 with its closed word as
+/// the terminal record; a hosted callback with no renewal waiting on a code file is exit 1
+/// with that reason, and its code reaches no record.
+#[cfg(unix)]
+#[test]
+fn the_opener_ends_a_window_sign_in_with_its_outcome() {
+    use super::super::headless_oauth::{VisibleDone, VisibleStop, take_callback_offered, take_met};
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    let _ = (take_callback_offered(), take_met());
+    assert_eq!(
+        finish_window_sign_in(Ok(VisibleDone::Delivered), Some(&path)),
+        0
+    );
+    assert!(take_callback_offered());
+    assert_eq!(read_outcome(&path), None);
+    assert!(!path.with_extension("code").exists());
+
+    assert_eq!(
+        finish_window_sign_in(Err(VisibleStop::NoDesktop), Some(&path)),
+        1
+    );
+    assert!(!take_callback_offered());
+    assert_eq!(
+        read_terminal_outcome(&path),
+        Some(TerminalFailure(Some(Met::new(
+            MetWord::WindowNoDesktop,
+            None
+        ))))
+    );
+    let other = tmp.path().join("other");
+    assert_eq!(
+        finish_window_sign_in(Err(VisibleStop::Failed("the page".into())), Some(&other)),
+        1
+    );
+    assert_eq!(
+        read_terminal_outcome(&other),
+        Some(TerminalFailure(Some(
+            Met::new(MetWord::BrowserSignIn, None).because("the page")
+        ))),
+        "the record keeps the opener's own reason"
+    );
+    assert_eq!(take_met(), None, "what it met is recorded once");
+
+    if std::env::var_os(CODE_ENV).is_none() {
+        let hosted = tmp.path().join("hosted");
+        assert_eq!(
+            finish_window_sign_in(
+                Ok(VisibleDone::Callback(
+                    "https://platform.claude.com/oauth/code/callback?code=made-up&state=made-up"
+                        .into()
+                )),
+                Some(&hosted)
+            ),
+            1
+        );
+        assert!(!take_callback_offered());
+        let record = std::fs::read_to_string(&hosted).unwrap();
+        assert!(record.contains("no renewal input channel"), "{record}");
+        assert!(!record.contains("made-up"), "{record}");
+    }
+}
+
+/// A REASON IS ONE LINE THAT HOLDS NOTHING SECRET: a URL is cut to its host (or dropped where
+/// the host is not one a [`Met`] keeps), a file path, an address, a code and a token are named
+/// by what they are, control characters and other scripts fall out, and whole words are kept up
+/// to [`Met::WHY_MAX`] bytes. What it returns is its own fixed point, which is how the outcome
+/// file's reader admits one. Negative control: the same text kept as written holds the query's
+/// `code=made-up`.
+#[test]
+fn a_reason_keeps_no_url_path_address_code_or_token() {
+    for (said, kept) in [
+        (
+            "Continue with email was pressed and no code page followed",
+            Some("Continue with email was pressed and no code page followed"),
+        ),
+        (
+            "the page left https://claude.ai/login?code=made-up#frag for\tnothing",
+            Some("the page left claude.ai for nothing"),
+        ),
+        (
+            "http://127.0.0.1:9123/callback?code=made-up&state=made-up",
+            Some("127.0.0.1"),
+        ),
+        ("see https://someone:made-up@claude.ai/x", Some("see <url>")),
+        ("see https://Claude.AI/x", Some("see <url>")),
+        (
+            "mail to someone@example.test failed",
+            Some("mail to <address> failed"),
+        ),
+        (
+            "the code 123456 did not stay",
+            Some("the code <redacted> did not stay"),
+        ),
+        (
+            "token made-up-abcdefghijklmnopqrstuvwx0 ended",
+            Some("token <redacted> ended"),
+        ),
+        (
+            "read /Users//someone/.claude/x and ~/y and file=/tmp/z (/a) at claude.ai/login and/or /",
+            Some("read <path> and <path> and <path> <path> at claude.ai/login and/or /"),
+        ),
+        ("one\u{7}two \u{1b}[31mthree", Some("one two [31mthree")),
+        (" \n\t ", None),
+    ] {
+        let reason = Met::reason(said);
+        assert_eq!(reason.as_deref(), kept, "{said:?}");
+        if let Some(reason) = &reason {
+            assert_eq!(Met::reason(reason).as_ref(), Some(reason), "{said:?}");
+            assert!(!reason.contains("made-up"), "{reason}");
+        }
+    }
+    // A reason cut at its bound says so: it ends `...`, never mid-sentence as if whole.
+    let long = "word ".repeat(100);
+    let bounded = Met::reason(&long).unwrap();
+    assert!(
+        bounded.len() <= Met::WHY_MAX && bounded.ends_with(" word ..."),
+        "{bounded}"
+    );
+    assert_eq!(Met::reason(&bounded), Some(bounded));
+    // CONTROL: a reason that fits exactly is whole, with no mark.
+    let whole = format!("{} end", "w".repeat(Met::WHY_MAX - 4));
+    assert_eq!(Met::reason(&whole), Some(whole.clone()));
+    let over = format!("{whole}s");
+    let cut = Met::reason(&over).unwrap();
+    assert!(cut.ends_with(" ...") && cut.len() <= Met::WHY_MAX, "{cut}");
+    assert_eq!(Met::reason(&cut), Some(cut));
+}
+
+/// A REASON GOES ONLY WITH A WORD THAT LEAVES IT UNSAID, AND THE FIRST ONE STAYS: Cloudflare's
+/// pages, a missing desktop and a stall are each their whole reason, so they
+/// take none; a browser that could not start or be reached, a window sign-in that returned no
+/// callback and an opener that authorized nothing say why after their words.
+#[test]
+fn a_reason_goes_with_the_words_that_leave_it_unsaid() {
+    let mut took = Vec::new();
+    for word in MetWord::ALL {
+        let met = Met::new(word, None).because("the page closed");
+        if met.why.is_some() {
+            took.push(word);
+            assert_eq!(met.why.as_deref(), Some("the page closed"));
+            assert!(
+                met.words().ends_with(": the page closed"),
+                "{}",
+                met.words()
+            );
+            assert_eq!(
+                met.clone().because("a later reason").why,
+                met.why,
+                "the first reason is the nearest to what happened"
+            );
+            assert_eq!(met.readmitted(), Some(met.clone()));
+        } else {
+            assert_eq!(met, Met::new(word, None));
+            assert!(!met.words().contains("the page closed"));
+        }
+        assert_eq!(
+            met.line(),
+            word.as_str(),
+            "the reason is no part of its line"
+        );
+    }
+    assert_eq!(
+        took,
+        [
+            MetWord::BrowserStart,
+            MetWord::BrowserControl,
+            MetWord::BrowserSignIn,
+            MetWord::NotAuthorized
+        ]
+    );
+    let forged = Met {
+        word: MetWord::BrowserSignIn,
+        host: None,
+        why: Some("see https://claude.ai/login?code=made-up".into()),
+    };
+    assert_eq!(
+        forged.readmitted(),
+        Some(Met::new(MetWord::BrowserSignIn, None).because("see claude.ai")),
+        "a reason a host constructed is admitted again, never kept as written"
+    );
+}
+
+/// THE OUTCOME FILE CARRIES THE REASON TO THE RENEWAL, AND ITS READER ADMITS ONLY ONE THE OPENER
+/// COULD HAVE WRITTEN: a record round-trips its word, host and reason; a `why=` line that is not
+/// its own fixed point (a URL with a query), one on a word that takes none, one with a line
+/// after it, and a record past the reader's bound are each no record at all.
+#[test]
+fn the_outcome_file_carries_the_reason_and_refuses_one_it_would_not_write() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    for met in [
+        Met::new(MetWord::BrowserSignIn, None)
+            .because("Continue with email was pressed and no code page followed"),
+        Met::new(MetWord::NotAuthorized, None).because("the sign-in page did not load"),
+        Met::new(MetWord::BrowserSignIn, None),
+        Met::new(MetWord::BotCheck, Some("claude.ai")),
+    ] {
+        write_outcome(&path, &met);
+        assert_eq!(read_outcome(&path), Some(met.clone()), "{met:?}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.contains("\nwhy="),
+            met.why.is_some(),
+            "the reason's line is there only where there is one: {text:?}"
+        );
+    }
+    let head = "opener-outcome=1\nphase=failed\n";
+    for (what, record) in [
+        (
+            "a URL's query",
+            format!("{head}met=browser-sign-in\nwhy=see https://claude.ai/login?code=made-up\n"),
+        ),
+        (
+            "a word that takes no reason",
+            format!("{head}met=bot-check claude.ai\nwhy=the page\n"),
+        ),
+        (
+            "no outcome to give a reason for",
+            format!("{head}met=\nwhy=the page\n"),
+        ),
+        (
+            "a line after the reason",
+            format!("{head}met=browser-sign-in\nwhy=the page\nmore\n"),
+        ),
+        (
+            "an empty reason",
+            format!("{head}met=browser-sign-in\nwhy=\n"),
+        ),
+        (
+            "a record past the bound",
+            format!("{head}met=browser-sign-in\nwhy={}\n", "w ".repeat(400)),
+        ),
     ] {
         std::fs::write(&path, record).unwrap();
-        assert_eq!(read_outcome(&path), None);
-        assert_eq!(read_terminal_outcome(&path), None);
+        assert_eq!(read_outcome(&path), None, "{what}");
     }
+    std::fs::write(&path, format!("{head}met=browser-sign-in\nwhy=the page\n")).unwrap();
+    assert_eq!(
+        read_outcome(&path),
+        Some(Met::new(MetWord::BrowserSignIn, None).because("the page")),
+        "negative control: the same record with an admitted reason is read"
+    );
+}
+
+/// THE WAITING SIGN-IN'S OWN ANSWER SHOWS A LOOPBACK CALLBACK WAS DELIVERED: the page its
+/// listener sends a browser on to, and nothing that merely resembles it. A hosted flow has no
+/// listener, so no page of its is that answer.
+#[test]
+fn the_listeners_answer_is_recognised_exactly() {
+    let loopback = MailboxFlow::new(BOT_AUTHORIZE).unwrap();
+    for answered in [
+        "https://platform.claude.com/oauth/code/success",
+        "https://platform.claude.com/oauth/code/success?app=claude-code",
+        "https://platform.claude.com/buy_credits?returnUrl=/oauth/code/success%3Fapp%3Dclaude-code",
+    ] {
+        assert!(loopback.answered_by_listener(answered), "{answered}");
+        assert!(loopback.on_listeners_host(answered), "{answered}");
+    }
+    for other in [
+        "https://platform.claude.com/oauth/code/successful",
+        "https://platform.claude.com/oauth/code/callback?code=x&state=y",
+        "https://platform.claude.com.example.invalid/oauth/code/success",
+        "http://platform.claude.com/oauth/code/success",
+        "https://claude.ai/oauth/code/success",
+        "https://platform.claude.com/oauth/code/success?app=claude-code extra",
+        "",
+    ] {
+        assert!(!loopback.answered_by_listener(other), "{other}");
+    }
+    assert!(loopback.on_listeners_host("https://platform.claude.com/settings"));
+    assert!(!loopback.on_listeners_host("https://platform.claude.com.example.invalid/"));
 }
 
 /// A FAILING OPENER'S EXIT IS TERMINAL EVEN WHERE IT MET NOTHING (ATERM-KI-1105-14): with no
@@ -6020,10 +6453,7 @@ fn a_failing_opener_exit_is_terminal_even_where_it_met_nothing() {
         std::fs::read_to_string(&path).unwrap(),
         "opener-outcome=1\nphase=failed\nmet=\n"
     );
-    assert_eq!(
-        read_terminal_outcome(&path),
-        Some(TerminalOutcome::Failed(None))
-    );
+    assert_eq!(read_terminal_outcome(&path), Some(TerminalFailure(None)));
     assert_eq!(read_outcome(&path), None);
 
     let met = Met::new(MetWord::BotCheck, Some("claude.ai"));
@@ -6031,21 +6461,21 @@ fn a_failing_opener_exit_is_terminal_even_where_it_met_nothing() {
     publish_failed_exit(&path, false);
     assert_eq!(
         read_terminal_outcome(&path),
-        Some(TerminalOutcome::Failed(Some(met.clone())))
+        Some(TerminalFailure(Some(met.clone())))
     );
     let stall = Met::new(MetWord::Stall, None);
     write_outcome(&path, &stall);
     publish_failed_exit(&path, false);
     assert_eq!(
         read_terminal_outcome(&path),
-        Some(TerminalOutcome::Failed(Some(stall)))
+        Some(TerminalFailure(Some(stall)))
     );
-    let unavailable = Met::new(MetWord::ServiceUnavailable, None);
-    write_outcome(&path, &unavailable);
+    let consent = Met::new(MetWord::WindowNoDesktop, None);
+    write_outcome_phase(&path, &consent, OutcomePhase::Continuing);
     publish_failed_exit(&path, false);
     assert_eq!(
         read_terminal_outcome(&path),
-        Some(TerminalOutcome::Deferred(unavailable))
+        Some(TerminalFailure(Some(consent)))
     );
 
     let offered = tmp.path().join("offered");
@@ -6055,6 +6485,47 @@ fn a_failing_opener_exit_is_terminal_even_where_it_met_nothing() {
     publish_failed_exit(&offered, true);
     assert_eq!(read_terminal_outcome(&offered), None);
     assert_eq!(read_outcome(&offered), Some(met));
+}
+
+/// A REFUSAL AFTER THE CALLBACK WAS HANDED TO THE CLI STOPS NO PROVIDER: the CLI may hold the
+/// code and be exchanging it, so the record says what was met and is not terminal. A hand-over
+/// that wrote nothing offered nothing: its failure is the opener's own and terminal. CONTROL:
+/// the same refusal with no callback handed over is terminal.
+#[cfg(unix)]
+#[test]
+fn a_refusal_after_the_callback_was_handed_over_is_not_terminal() {
+    use super::super::headless_oauth::{note_callback_offered, take_callback_offered, take_met};
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("outcome");
+    let _ = (take_callback_offered(), take_met());
+    let met = Met::new(MetWord::NotAuthorized, None).because("the page closed");
+
+    note_refused(Some(&path), "the page closed");
+    assert_eq!(
+        read_terminal_outcome(&path),
+        Some(TerminalFailure(Some(met.clone()))),
+        "CONTROL: nothing was handed over"
+    );
+
+    let offered = tmp.path().join("offered");
+    note_callback_offered();
+    note_refused(Some(&offered), "the page closed");
+    assert_eq!(read_terminal_outcome(&offered), None);
+    assert_eq!(read_outcome(&offered), Some(met));
+    assert!(take_callback_offered(), "the refusal's look takes nothing");
+
+    // This test's environment names no code file, so the hand-over has no channel; neither
+    // that nor a callback with no code is an offer.
+    for callback in [
+        "https://platform.claude.com/oauth/code/callback?code=c&state=s",
+        "https://platform.claude.com/oauth/code/callback?state=s",
+    ] {
+        assert!(hand_over_hosted(callback).is_err());
+        assert!(
+            !take_callback_offered(),
+            "a hand-over that wrote nothing was noted as an offer"
+        );
+    }
 }
 
 /// ONLY A FAILURE MAY RECORD THAT IT MET NOTHING: an empty `met=` is read under `phase=failed`
@@ -6067,7 +6538,7 @@ fn only_a_failure_may_record_that_it_met_nothing() {
     for (record, terminal) in [
         (
             "opener-outcome=1\nphase=failed\nmet=\n",
-            Some(TerminalOutcome::Failed(None)),
+            Some(TerminalFailure(None)),
         ),
         ("opener-outcome=1\nphase=continuing\nmet=\n", None),
         ("opener-outcome=1\nphase=deferred\nmet=\n", None),

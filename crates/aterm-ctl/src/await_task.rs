@@ -355,7 +355,7 @@ const AGAIN_FOR: Duration = Duration::from_secs(60);
 /// leg's own); a peer that took the connection and sent no handshake within it keeps that cause
 /// (exit 2 before the baseline, and past it asked again).
 fn driven_leg(
-    drive: crate::FleetDriveFn,
+    asking: &Asking,
     (host, request): (&str, &str),
     wait: Duration,
     (cut, longer): (Option<(Instant, Duration)>, Option<crate::remote::Longer>),
@@ -375,7 +375,7 @@ fn driven_leg(
         return Leg::Spent(crate::remote::closed(host, request, said, TimedOut.into()));
     }
     let ends = instant_after(Instant::now(), within);
-    match driven_exchange(drive, (host, request), within, said) {
+    match driven_exchange(asking, (host, request), within, said) {
         Leg::Failed(e) | Leg::Again(e) | Leg::Silent(e)
             if matches!(said, Within::Timeout(..))
                 && !crate::is_unserved(&e)
@@ -387,12 +387,55 @@ fn driven_leg(
     }
 }
 
-fn driven_exchange(
+/// HOW ONE WAIT DIALS THE MACS IT ASKS. A wait over a drive is cut into legs of at most
+/// [`DRIVEN_LEG_MAX`], each a drive of its own; they are aterm's re-asks of one request, so
+/// the wait is one read of each Mac in both Macs' fleet activity records. Until a Mac answers
+/// a leg, the legs name the session that waits (`drive`, its requester line); the first leg it
+/// answers is noted here, and the legs after it dial naming no session
+/// ([`crate::DriveLink::unnamed`]), which the driven Mac counts as no request.
+struct Asking {
     drive: crate::FleetDriveFn,
+    /// Each Mac that answered a leg of this wait, with the dial that names no session where
+    /// its link gave one.
+    answered: std::sync::Mutex<Vec<(String, Option<crate::FleetDriveFn>)>>,
+}
+
+impl Asking {
+    fn by(drive: crate::FleetDriveFn) -> Self {
+        Self {
+            drive,
+            answered: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The dial of the next leg to `host`, and whether `host` already answered a leg of this
+    /// wait: that leg was the wait's read of it.
+    fn dial(&self, host: &str) -> (crate::FleetDriveFn, bool) {
+        let answered = self.answered.lock().unwrap_or_else(|p| p.into_inner());
+        answered
+            .iter()
+            .find(|(held, _)| held == host)
+            .map_or((self.drive, false), |(_, unnamed)| {
+                (unnamed.unwrap_or(self.drive), true)
+            })
+    }
+
+    /// `host` answered a leg, over a link whose later dial is `unnamed`.
+    fn answered(&self, host: &str, unnamed: Option<crate::FleetDriveFn>) {
+        let mut answered = self.answered.lock().unwrap_or_else(|p| p.into_inner());
+        if !answered.iter().any(|(held, _)| held == host) {
+            answered.push((host.to_owned(), unnamed));
+        }
+    }
+}
+
+fn driven_exchange(
+    asking: &Asking,
     (host, request): (&str, &str),
     within: Duration,
     cut: crate::remote::Within,
 ) -> Leg {
+    let (drive, counted) = asking.dial(host);
     let mut link = match drive(host, within) {
         Ok(link) => link,
         Err(refused) if refused.ungranted => {
@@ -405,6 +448,8 @@ fn driven_exchange(
         Err(refused) if refused.silent => return Leg::Silent(io::Error::other(refused)),
         Err(refused) => return Leg::Failed(io::Error::other(refused)),
     };
+    let unnamed = link.unnamed;
+    let asked = crate::remote::Asked::of(&link);
     let label = link.label;
     if let Err(e) = io::Write::write_all(&mut link.stream, request.as_bytes())
         .and_then(|()| io::Write::flush(&mut link.stream))
@@ -425,6 +470,12 @@ fn driven_exchange(
             ))
         },
     );
+    // The first leg the peer answers is the wait's one read of it, for the session that waits;
+    // a wait the board's keeper makes names no session and is not counted.
+    if matches!(leg, Leg::Answered(_) | Leg::TimedOut(_)) && !counted {
+        asked.note(Some(aterm_types::fleet_access::DriveKind::Read), "OK");
+        asking.answered(host, unnamed);
+    }
     match leg {
         Leg::Failed(e)
             if e.to_string()
@@ -1220,10 +1271,11 @@ fn driven_wait_any(
     } else {
         "any".to_owned()
     };
+    let asking = Asking::by(drive);
     let legs = Legs {
         max: DRIVEN_LEG_MAX,
         send: Arc::new(move |peer_host: &str, req: &str, wait: Duration| {
-            driven_leg(drive, (peer_host, req), wait, (cut, longer))
+            driven_leg(&asking, (peer_host, req), wait, (cut, longer))
         }),
         again: (AGAIN_AFTER, AGAIN_FOR),
     };
@@ -1290,10 +1342,11 @@ fn driven_wait(
         })
         .collect();
     let host = host.to_owned();
+    let asking = Asking::by(drive);
     let legs = Legs {
         max: DRIVEN_LEG_MAX,
         send: Arc::new(move |peer_host: &str, request: &str, wait: Duration| {
-            driven_leg(drive, (peer_host, request), wait, (cut, longer))
+            driven_leg(&asking, (peer_host, request), wait, (cut, longer))
         }),
         again: (AGAIN_AFTER, AGAIN_FOR),
     };
@@ -1407,17 +1460,17 @@ fn reach_name(reach: &Reach, rows: &[crate::board::Row]) -> String {
     }
 }
 
-/// One leg to `reach`: over its socket, over a drive (`drive`, cut by `cut`), or nowhere.
+/// One leg to `reach`: over its socket, over a drive (`asking`'s, cut by `cut`), or nowhere.
 fn reach_leg(
     reach: &Reach,
-    drive: Option<crate::FleetDriveFn>,
+    asking: Option<&Asking>,
     (request, wait): (&str, Duration),
     (cut, longer): (Option<(Instant, Duration)>, Option<crate::remote::Longer>),
 ) -> Leg {
-    match (reach, drive) {
+    match (reach, asking) {
         (Reach::Socket(sock), _) => socket_leg(sock, request, wait),
-        (Reach::Drive(host), Some(drive)) => {
-            driven_leg(drive, (host, request), wait, (cut, longer))
+        (Reach::Drive(host), Some(asking)) => {
+            driven_leg(asking, (host, request), wait, (cut, longer))
         }
         (Reach::Drive(_), None) => Leg::Silent(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1591,12 +1644,13 @@ pub(crate) fn run_board_wait(
         .iter()
         .map(|(key, reach)| (key.clone(), reach_name(reach, &open)))
         .collect();
+    let asking = drive.map(Asking::by);
     let legs = Legs {
         max: DRIVEN_LEG_MAX,
         // A key no reach names is a local instance's successor (`Redial`), at its socket.
         send: Arc::new(move |key: &str, req: &str, wait: Duration| {
             match reaches.iter().find(|(k, _)| k == key) {
-                Some((_, reach)) => reach_leg(reach, drive, (req, wait), (cut, longer)),
+                Some((_, reach)) => reach_leg(reach, asking.as_ref(), (req, wait), (cut, longer)),
                 None => socket_leg(key, req, wait),
             }
         }),
@@ -1782,6 +1836,7 @@ fn keep_group(
     drive: Option<crate::FleetDriveFn>,
     wait: Duration,
 ) -> (Vec<String>, Vec<String>) {
+    let asking = drive.map(Asking::by);
     let mut seen = Vec::new();
     let unanswered = || match reach {
         Reach::Drive(host) => vec![host.clone()],
@@ -1789,7 +1844,7 @@ fn keep_group(
     };
     while !targets.is_empty() {
         let request = leg_request(targets.iter(), Combine::Any, false, wait);
-        match reach_leg(reach, drive, (&request, wait), (None, None)) {
+        match reach_leg(reach, asking.as_ref(), (&request, wait), (None, None)) {
             Leg::Answered(rows) | Leg::TimedOut(rows)
                 if rows.len() == targets.len()
                     && rows

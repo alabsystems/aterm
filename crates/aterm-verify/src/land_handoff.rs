@@ -9,9 +9,20 @@
 //! then one build's, the build of the tree it judges.
 //!
 //! The file is the only thing that crosses builds. [`SCHEMA`] numbers its encoding, and a
-//! receiver of another schema refuses it by name. No reader of an older schema is kept: the
-//! remedy is always to run `targo --unverified verify land` again, from the merge the checkout
-//! holds, committed. A change to the encoding bumps [`SCHEMA`].
+//! receiver that does not read a schema refuses it by name: the remedy is then to run
+//! `targo --unverified verify land` again, from the merge the checkout holds, committed. A
+//! change to the encoding, or to what a step it names means, bumps [`SCHEMA`]. Schema 2
+//! carries no count of re-judges, since no such count ends a landing, and its recheck step is
+//! a round: the receiver judges the merge beyond the source readers, by its own reading of
+//! the commit and the receipt.
+//!
+//! This build also reads the schema before it ([`EARLIER`]), whose handoff differs only in
+//! carrying that count, which is dropped: every branch cut before this build reached main
+//! hands its landing over in it, at the first merge that brings this build in. Its judgment
+//! step means what this build's does. Its recheck step meant the source readers alone, and
+//! this build runs it as a round, which re-derives what it judges and never judges less. The
+//! reverse is refused by the earlier build itself, which reads its own schema alone, so a
+//! round is never run as a recheck of the source readers.
 
 use super::Branch;
 use crate::exit;
@@ -21,8 +32,12 @@ use aterm_types::land_trailer::{self, Stated};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// The handoff encoding's number: a receiver reads this one alone.
-pub const SCHEMA: u64 = 1;
+/// The handoff encoding's number, which this build writes.
+pub const SCHEMA: u64 = 2;
+/// The encoding before it, which this build also reads: [`SCHEMA`]'s fields and [`REJUDGES`].
+const EARLIER: u64 = 1;
+/// The field only an [`EARLIER`] handoff holds: the count of re-judges its sender had spent.
+const REJUDGES: &str = "rejudges";
 /// The `land` flag that resumes a landing from its handoff: the landing's own word to the
 /// image it hands itself to, which a person never types.
 pub const RESUME: &str = "--resume";
@@ -30,10 +45,10 @@ pub const RESUME: &str = "--resume";
 pub const FILE: &str = "aterm-land-handoff.json";
 /// The most a handoff may hold.
 const MAX_BYTES: u64 = 1 << 20;
-/// Every field of a schema-1 handoff.
-const FIELDS: [&str; 13] = [
-    "schema", "root", "image", "words", "step", "hop", "at", "base", "rejudges", "composes",
-    "cone", "branch", "stated",
+/// Every field of a schema-2 handoff.
+const FIELDS: [&str; 12] = [
+    "schema", "root", "image", "words", "step", "hop", "at", "base", "composes", "cone", "branch",
+    "stated",
 ];
 
 /// A verifier executable and its sha256 digest.
@@ -65,9 +80,6 @@ pub struct Handoff {
     pub at: String,
     /// The main commit the step's cone starts at.
     pub base: String,
-    /// The re-judges this landing spent before the step. A landing resumed from a kept
-    /// judgment counts from 0 again, so its receipt may hold more judgments than this.
-    pub rejudges: usize,
     /// The compositions spent since the last whole judgment (0 before a judgment).
     pub composes: usize,
     /// The main commit the landing's first judgment merged: the cone the branch's crates are
@@ -86,6 +98,12 @@ impl Handoff {
     /// # Errors
     /// The checkout's path is not UTF-8, or a count does not fit.
     pub fn encode(&self) -> Result<Vec<u8>, String> {
+        self.encoded(SCHEMA, None)
+    }
+
+    /// [`Self::encode`]'s bytes as a sender of `schema` wrote them: with `rejudges`, the count
+    /// an [`EARLIER`] handoff carried.
+    fn encoded(&self, schema: u64, rejudges: Option<u64>) -> Result<Vec<u8>, String> {
         let root = self
             .root
             .to_str()
@@ -102,8 +120,8 @@ impl Handoff {
                 Value::from(why.as_str()),
             )])),
         };
-        let value = Value::Object(Map::from([
-            ("schema".to_owned(), Value::from(SCHEMA)),
+        let mut fields = Map::from([
+            ("schema".to_owned(), Value::from(schema)),
             ("root".to_owned(), Value::from(root)),
             ("image".to_owned(), Value::from(self.image.as_str())),
             ("words".to_owned(), Value::from(self.words.clone())),
@@ -111,46 +129,54 @@ impl Handoff {
             ("hop".to_owned(), Value::from(count(self.hop)?)),
             ("at".to_owned(), Value::from(self.at.as_str())),
             ("base".to_owned(), Value::from(self.base.as_str())),
-            ("rejudges".to_owned(), Value::from(count(self.rejudges)?)),
             ("composes".to_owned(), Value::from(count(self.composes)?)),
             ("cone".to_owned(), Value::from(self.cone.as_str())),
             ("branch".to_owned(), branch),
             ("stated".to_owned(), Value::from(self.stated.trailers())),
-        ]));
+        ]);
+        if let Some(rejudges) = rejudges {
+            fields.insert(REJUDGES.to_owned(), Value::from(rejudges));
+        }
+        let value = Value::Object(fields);
         Ok(format!("{value}\n").into_bytes())
     }
 
-    /// The handoff `bytes` hold: exactly [`Self::encode`]'s bytes of a schema-1 handoff whose
-    /// step and receipt agree.
+    /// The handoff `bytes` hold: exactly [`Self::encode`]'s bytes of a schema-2 handoff whose
+    /// step and receipt agree, or those of the schema before it ([`EARLIER`]), whose count of
+    /// re-judges is read and dropped.
     ///
     /// # Errors
-    /// Why not, naming the field: not JSON or not an object, another schema, a missing or
-    /// unknown field, a root that is not absolute, an image that is no sha256 digest, words
-    /// that are not strings, an unknown step, a hop that is no count from 1, a re-judge or
-    /// composition count that is no count, an `at`, `base` or `cone` that is no object id, a
-    /// composition count at a judgment, a receipt that does not read, branch crates before any
-    /// judgment, a recheck whose receipt holds no passed judgment, a receipt holding fewer
-    /// judgments than the re-judges before the step need (one more at a recheck, the judgment
-    /// it extends), a cone other than the base before any judgment, or bytes that are not the
-    /// handoff's own encoding.
+    /// Why not, naming the field: not JSON or not an object, a schema this build does not
+    /// read, a missing or unknown field, a root that is not absolute, an image that is no
+    /// sha256 digest, words that are not strings, an unknown step, a hop that is no count from
+    /// 1, a composition or re-judge
+    /// count that is no count, an `at`, `base` or `cone` that is no object id, a composition
+    /// count at a judgment, a receipt that does not read, branch crates before any judgment, a
+    /// recheck whose receipt holds no passed judgment (the one it extends), a cone other than
+    /// the base before any judgment, or bytes that are not the handoff's own encoding.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let value: Value =
             aterm_json::from_slice(bytes).map_err(|error| format!("it is not JSON: {error}"))?;
         let Value::Object(map) = &value else {
             return Err("it is not a JSON object".into());
         };
-        match map.get("schema") {
+        let schema = match map.get("schema") {
             None => return Err("it names no schema".into()),
-            Some(schema) if schema.as_u64() == Some(SCHEMA) => {}
-            Some(schema) => {
-                return Err(format!(
-                    "it was handed over in schema {schema}; this tree's verify land reads schema \
-                     {SCHEMA}"
-                ));
-            }
-        }
+            Some(schema) => match schema.as_u64() {
+                Some(schema @ (SCHEMA | EARLIER)) => schema,
+                _ => {
+                    return Err(format!(
+                        "it was handed over in schema {schema}; this tree's verify land reads \
+                         schemas {EARLIER} and {SCHEMA}"
+                    ));
+                }
+            },
+        };
         let held: BTreeSet<&str> = map.keys().map(String::as_str).collect();
-        let want: BTreeSet<&str> = FIELDS.into_iter().collect();
+        let mut want: BTreeSet<&str> = FIELDS.into_iter().collect();
+        if schema == EARLIER {
+            want.insert(REJUDGES);
+        }
         if let Some(missing) = want.difference(&held).next() {
             return Err(format!("it lacks its `{missing}` field"));
         }
@@ -203,7 +229,14 @@ impl Handoff {
                 .and_then(|count| usize::try_from(count).ok())
                 .ok_or_else(|| format!("its `{key}` is not a count"))
         };
-        let rejudges = count("rejudges")?;
+        let rejudges = match schema {
+            EARLIER => Some(
+                map[REJUDGES]
+                    .as_u64()
+                    .ok_or_else(|| format!("its `{REJUDGES}` is not a count"))?,
+            ),
+            _ => None,
+        };
         let composes = count("composes")?;
         if step == Step::Qualify && composes != 0 {
             return Err(format!(
@@ -235,14 +268,6 @@ impl Handoff {
         if step == Step::Recheck && stated.checked.is_empty() {
             return Err("a recheck's receipt holds no passed judgment".into());
         }
-        let extends = usize::from(step == Step::Recheck);
-        if judged < rejudges.saturating_add(extends) {
-            return Err(format!(
-                "its receipt holds {judged} judgments, too few for {rejudges} re-judges before \
-                 its {}",
-                step_word(step)
-            ));
-        }
         let (at, base, cone) = (commit("at")?, commit("base")?, commit("cone")?);
         if judged == 0 && cone != base {
             return Err(format!(
@@ -257,13 +282,12 @@ impl Handoff {
             hop,
             at,
             base,
-            rejudges,
             composes,
             cone,
             branch,
             stated,
         };
-        if handoff.encode()? != bytes {
+        if handoff.encoded(schema, rejudges)? != bytes {
             return Err("it is not in the handoff's own encoding".into());
         }
         Ok(handoff)

@@ -1589,6 +1589,21 @@ fn a_pending_viewport_restore_keeps_no_pty_master_open() {
     assert_eq!(held_read, -1, "the live sink keeps the pipe open");
     assert_eq!(held_error.kind(), std::io::ErrorKind::WouldBlock);
     drop(sink);
+    // A child another test forked holds a copy of the write end until its
+    // exec (close-on-exec closes it only there), so the hang-up is waited
+    // for, never sampled: a descriptor the watch kept would give none.
+    let mut hung_up = libc::pollfd {
+        fd: read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live pollfd; a minute is a hang detector, not a budget.
+    assert_eq!(
+        unsafe { libc::poll(&raw mut hung_up, 1, 60_000) },
+        1,
+        "the master closed when its tab did, import pending"
+    );
+    // SAFETY: the pipe's read descriptor is live and byte is a writable one-byte buffer.
     let n = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
     assert_eq!(
         n, 0,

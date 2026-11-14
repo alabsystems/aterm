@@ -246,17 +246,32 @@ pub(crate) fn clear_check_note() {
 
 /// Atomically write the status record (temp + rename).
 pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
+    record_with(staging, current_build, outcome, None);
+}
+
+/// [`record`] with `note` as its delivery note in place of the one this check set
+/// ([`set_delivery_note`]): a mark of this one record alone, which no later record of this process
+/// carries, as a strand's ([`crate::unreadable::NOTE`]) is.
+pub(crate) fn record_noted(staging: &Staging, current_build: u64, outcome: &str, note: &str) {
+    record_with(staging, current_build, outcome, Some(note));
+}
+
+/// [`record`], its delivery note `note` where one is given, else this check's.
+fn record_with(staging: &Staging, current_build: u64, outcome: &str, note: Option<&str>) {
     let ready = crate::manifest::Ready::read_publishable(staging);
     let noted;
-    let note = check_note();
-    let outcome = match note.as_deref() {
-        Some(note) if !outcome.contains(note) => {
-            noted = format!("{outcome} · {note}");
+    let check = check_note();
+    let outcome = match check.as_deref() {
+        Some(check) if !outcome.contains(check) => {
+            noted = format!("{outcome} · {check}");
             noted.as_str()
         }
         _ => outcome,
     };
-    let delivery = with_delivery(|delivery| delivery.clone());
+    let mut delivery = with_delivery(|delivery| delivery.clone());
+    if let Some(note) = note {
+        delivery.note = Some(note.to_owned());
+    }
     let latest = delivery.latest.or_else(|| read_latest(staging));
     let updated_at = crate::install::now_rfc3339();
     let checked_at = crate::check_receipt::completed_at(staging);

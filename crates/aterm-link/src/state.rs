@@ -742,6 +742,8 @@ pub struct StateDir {
     #[cfg(test)]
     keep_refused_drops: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    receipt_heads_off: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     hand_off_without_heads: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     stop_leaves_the_heads_unflushed: std::sync::atomic::AtomicBool,
@@ -831,7 +833,9 @@ pub(crate) struct PublishPin {
     /// NEVER IN THE TEXT FORM ([`PublishPin::render`]), which every build parses strictly: a
     /// journal record carries it after its body ([`journal`]'s tail, which a reader of an
     /// earlier build skips), and a stop's hand-off beside the files
-    /// ([`StateDir::hand_posts_to_files`]); a receipt's or key's pin file holds none.
+    /// ([`StateDir::hand_posts_to_files`]); a receipt's is kept in a file beside its pin's,
+    /// with its pin's sequence and the log it is an offset of ([`ACK_HEADS`]), and a key's pin
+    /// file holds none.
     pub at: Option<u64>,
 }
 
@@ -1262,11 +1266,12 @@ impl TornKind {
 }
 
 /// Where the dir keeps files that serve one session each, by its sid (`<place>/<sid>`, and
-/// `acks/<sid>.<rid>`), with the [`TornKind`] a torn one is set aside as:
-/// [`StateDir::sweep_sessions_of_an_earlier_boot`] unlinks them.
-const SESSION_PLACES: [(&str, Option<TornKind>); 5] = [
+/// `acks/<sid>.<rid>` and `ack-heads/<sid>.<rid>`), with the [`TornKind`] a torn one is set
+/// aside as: [`StateDir::sweep_sessions_of_an_earlier_boot`] unlinks them.
+const SESSION_PLACES: [(&str, Option<TornKind>); 6] = [
     ("keys", Some(TornKind::Keys)),
     ("acks", Some(TornKind::Acks)),
+    (ACK_HEADS, None),
     ("unhandled", Some(TornKind::Unhandled)),
     ("seen", None),
     ("topics", None),
@@ -1388,6 +1393,27 @@ struct QuarantineCopy {
 
 /// Where [`StateDir::set_aside_torn`] keeps what it moves aside, inside the dir.
 pub const QUARANTINE: &str = "quarantine";
+
+/// WHERE AN OWED RECEIPT'S PIN KEEPS ITS HEAD ([`PublishPin::at`], ATERM-KI-1111-7):
+/// `ack-heads/<sid>.<rid>`, beside the pin file `acks/<sid>.<rid>`, whose text form every build
+/// parses strictly and holds none: the pin's sequence, the log the head is an offset of, and
+/// the head ([`parse_head`]), so a file a build before it left in place past a re-pin or a log
+/// move is never read for another pin or on another log as it stands
+/// ([`StateDir::receipt_head`]). A retry reads its attempt back from it
+/// (`Bridge::landed_at_its_pin`), on another node's lane too, where no
+/// in-flight entry names one.
+pub(crate) const ACK_HEADS: &str = "ack-heads";
+
+/// A head file's text ([`ACK_HEADS`]): `<seq> <log> <at>`, the pin's sequence, the log its head
+/// is an offset of and the head, and the newline every write ends with, or `None` for anything
+/// else (a torn write among it).
+fn parse_head(text: &str) -> Option<(u64, astream_broker::LogIdentity, u64)> {
+    let mut words = text.strip_suffix('\n')?.split(' ');
+    let seq = crate::parse_uint(words.next()?)?;
+    let log = astream_broker::LogIdentity::parse(words.next()?)?;
+    let at = crate::parse_uint(words.next()?)?;
+    words.next().is_none().then_some((seq, log, at))
+}
 
 /// The bus mirror's pin ([`StateDir::logpin`]).
 pub(crate) const LOGPIN: &str = "logpin";
@@ -1640,6 +1666,8 @@ impl StateDir {
             #[cfg(test)]
             keep_refused_drops: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            receipt_heads_off: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             hand_off_without_heads: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             stop_leaves_the_heads_unflushed: std::sync::atomic::AtomicBool::new(false),
@@ -1682,6 +1710,25 @@ impl StateDir {
     pub(crate) fn keep_refused_drops(&self, on: bool) {
         self.keep_refused_drops
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// No receipt's head is kept, written or unlinked ([`ACK_HEADS`]), as before
+    /// ATERM-KI-1111-7 (`crate::sim::world::Mutant::ReceiptPinKeepsNoHead`).
+    #[cfg(test)]
+    pub(crate) fn receipt_heads_off(&self, on: bool) {
+        self.receipt_heads_off
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether receipts keep their heads ([`StateDir::receipt_heads_off`]).
+    fn keeps_receipt_heads(&self) -> bool {
+        #[cfg(test)]
+        let off = self
+            .receipt_heads_off
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let off = false;
+        !off
     }
 
     /// The negative control of a hand-off whose heads the disk refused: the journal goes all
@@ -3343,14 +3390,60 @@ impl StateDir {
         self.hand_asks_to_files()
     }
 
+    /// Owed receipt `rid` of `sid`'s sequence reservation, as its pin file holds it: with no head
+    /// ([`PublishPin::render`]), which is kept beside it ([`StateDir::receipt_head`]).
     pub(crate) fn receipt_pin(&self, sid: &str, rid: u64) -> io::Result<Option<PublishPin>> {
         self.read_reservation(&format!("acks/{sid}.{rid}"))?
             .map(|s| PublishPin::parse(&s))
             .transpose()
     }
 
-    pub(crate) fn set_receipt_pin(&self, sid: &str, rid: u64, pin: &PublishPin) -> io::Result<()> {
+    /// The head kept beside owed receipt `rid` of `sid`'s pin ([`ACK_HEADS`]), for its pin at
+    /// sequence `seq`: the log it was written on and its offset there, which the bridge reads on
+    /// the log it reads now as an in-flight entry's (`Bridge::read_back_from`). `None` for no
+    /// head, one that does not read whole, and one written for another sequence: a build
+    /// before the heads neither moves nor removes the file, so it can outlive its pin, and name
+    /// an offset of a log that build has since moved past.
+    pub(crate) fn receipt_head(
+        &self,
+        sid: &str,
+        rid: u64,
+        seq: u64,
+    ) -> io::Result<Option<(astream_broker::LogIdentity, u64)>> {
+        Ok(self
+            .read_reservation(&format!("{ACK_HEADS}/{sid}.{rid}"))?
+            .as_deref()
+            .and_then(parse_head)
+            .and_then(|(of, log, at)| (of == seq).then_some((log, at))))
+    }
+
+    /// Reserve `pin` for owed receipt `rid` of `sid`'s, before it is published: its head first,
+    /// where it names one and the log it is an offset of (`log`), beside the pin file
+    /// ([`ACK_HEADS`]), then the pin. A stop between them leaves a head with no pin, or one
+    /// written for the pin before, each naming a sequence the pin file does not, so read as no
+    /// head ([`StateDir::receipt_head`]).
+    pub(crate) fn set_receipt_pin(
+        &self,
+        sid: &str,
+        rid: u64,
+        pin: &PublishPin,
+        log: Option<astream_broker::LogIdentity>,
+    ) -> io::Result<()> {
+        let head = format!("{ACK_HEADS}/{sid}.{rid}");
+        match (pin.at, log) {
+            _ if !self.keeps_receipt_heads() => {}
+            (Some(at), Some(log)) => self.write(&head, &format!("{} {log} {at}", pin.seq))?,
+            _ => self.remove_head(&head)?,
+        }
         self.write(&format!("acks/{sid}.{rid}"), &pin.render())
+    }
+
+    /// Unlink a receipt's head file ([`ACK_HEADS`]) where it is there.
+    fn remove_head(&self, rel: &str) -> io::Result<()> {
+        match self.remove_path(&self.path(rel)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     pub(crate) fn key_pin(&self, sid: &str, key: &str) -> io::Result<Option<PublishPin>> {
@@ -3480,7 +3573,7 @@ impl StateDir {
 
     /// What a moved generation resets in the reservations: each `original-off` the new log does
     /// not vouch for (at or above `keep_below`, or any where it is `None`), taken out; and each
-    /// head ([`PublishPin::at`]) past where the new log continues the old, brought down to it,
+    /// head ([`PublishPin::at`]; not a receipt's, kept with its log, [`ACK_HEADS`]) past where the new log continues the old, brought down to it,
     /// brought to the log's start on `another_log`, and taken out where the log continues none
     /// and is not another (aterm-link B05 review; ATERM-KI-1111-4). A head is an offset of the
     /// log the pin was made on, and past the fork the new log's offsets name records published
@@ -4522,9 +4615,10 @@ impl StateDir {
                 }
             };
             for (name, rel) in files {
-                let sid = match kind {
-                    Some(TornKind::Acks) => name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s),
-                    _ => name.as_str(),
+                let sid = if place == "acks" || place == ACK_HEADS {
+                    name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s)
+                } else {
+                    name.as_str()
                 };
                 if live.contains(sid) {
                     continue;
@@ -6049,12 +6143,16 @@ impl StateDir {
 
     /// Reserve a sequence for one owed receipt before it is published ([`StateDir::receipt_seq`]).
     pub fn set_receipt_seq(&self, sid: &str, rid: u64, seq: u64) -> io::Result<()> {
+        self.remove_head(&format!("{ACK_HEADS}/{sid}.{rid}"))?;
         self.write(&format!("acks/{sid}.{rid}"), &seq.to_string())
     }
 
-    /// Forget a retired receipt's sequence.
+    /// Forget a retired receipt's sequence, and its head ([`ACK_HEADS`]).
     pub fn clear_receipt_seq(&self, sid: &str, rid: u64) {
         let _ = self.remove_path(&self.path(&format!("acks/{sid}.{rid}")));
+        if self.keeps_receipt_heads() {
+            let _ = self.remove_head(&format!("{ACK_HEADS}/{sid}.{rid}"));
+        }
     }
 
     /// The producer sequence a session's `post key=<key>` reserved, if any post under that key did.

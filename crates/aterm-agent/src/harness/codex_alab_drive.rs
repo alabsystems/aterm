@@ -287,6 +287,26 @@ pub(super) fn self_claimed_plan(
     })
 }
 
+/// The writer lock Codex holds on conversation `thread` under `home` while it runs it.
+fn thread_lock(home: &Path, thread: &str) -> PathBuf {
+    home.join("thread-writer-locks")
+        .join(format!("{thread}.lock"))
+}
+
+/// Whether a process other than the agent `source` names holds the writer lock of the
+/// conversation `resume` resumes ([`super::renewal_conversation_taken`]): only once that agent
+/// is gone, by pid and kernel start, since the lock is its own while it runs.
+pub(super) fn conversation_taken(
+    source: &super::super::self_claimed::Copy,
+    resume: &super::super::self_claimed::Resume,
+    k: &dyn AlabKernel,
+) -> bool {
+    let gone =
+        !(k.alive(source.pid) && k.birth(source.pid).as_deref() == Some(source.start.as_str()));
+    gone && k.writer_owner(&thread_lock(&source.home, &resume.session))
+        == aterm_uds::ownerlock::Owner::Live
+}
+
 /// THE CRASH RULE'S RELAUNCH (the self-claim contract, §4; [`super::super::self_claimed`]).
 pub(super) fn self_claimed_after_exit(
     opts: &Opts,
@@ -295,7 +315,7 @@ pub(super) fn self_claimed_after_exit(
     cause: ExitCause,
     k: &dyn AlabKernel,
 ) -> Report {
-    use super::super::relaunch::{CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL};
+    use super::super::relaunch::{CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CAUSE_RENEWAL, CAUSE_STALL};
     let tab = snap.tab.clone();
     let session = key(&tab);
     let from = snap.version.clone().unwrap_or_else(|| "-".to_string());
@@ -333,6 +353,7 @@ pub(super) fn self_claimed_after_exit(
         ExitCause::Stall => CAUSE_STALL,
         ExitCause::Asked => CAUSE_ASKED,
         ExitCause::HostEnded => CAUSE_HOST,
+        ExitCause::Renewal => CAUSE_RENEWAL,
         ExitCause::Exit | ExitCause::Carried => CAUSE_EXIT,
     };
     // The receipt an earlier record of this very exit read from its restart's stamp, which that
@@ -482,9 +503,7 @@ fn relaunch_held(
             "the conversation's rollout is gone",
         );
     }
-    let lock = home
-        .join("thread-writer-locks")
-        .join(format!("{}.lock", st.thread));
+    let lock = thread_lock(&home, &st.thread);
     let lock_free =
         |k: &dyn AlabKernel| -> bool { k.writer_owner(&lock) == aterm_uds::ownerlock::Owner::Dead };
     if !lock_free(k) {

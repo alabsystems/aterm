@@ -931,3 +931,21 @@ fn windows_os_random_succeeds() {
         "8-byte BCryptGenRandom read failed"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_scratch_root_holding_a_sealed_directory_is_removed_whole() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempdir().unwrap();
+    let path = root.path().to_path_buf();
+    let image = path.join("store/images/digest");
+    fs::create_dir_all(&image).unwrap();
+    fs::write(image.join("aterm"), b"image").unwrap();
+    fs::set_permissions(&image, fs::Permissions::from_mode(0o500)).unwrap();
+    drop(root);
+    assert!(
+        !path.exists(),
+        "the sealed store kept {} alive",
+        path.display()
+    );
+}

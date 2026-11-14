@@ -74,6 +74,11 @@ pub struct HoldEnds {
 /// close-on-fork or made non-blocking.
 pub fn hold_ends() -> std::io::Result<HoldEnds> {
     use std::os::fd::{AsRawFd as _, OwnedFd};
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the hold's read end stays forkable: a std command's fork hands it to the shell \
+                  and copies no close-on-fork end, so only the write end is marked (HoldPipe)"
+    )]
     let HoldPipe { shell, host } =
         aterm_uds::kept_out(|| std::io::pipe().map(|(shell, host)| HoldPipe { shell, host }))?;
     let host = OwnedFd::from(host);

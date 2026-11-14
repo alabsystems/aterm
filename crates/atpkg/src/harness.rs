@@ -40,7 +40,7 @@ pub const fn is_harness(program: &str) -> bool {
 }
 
 /// The harness a vendor program's `agents/` twin hands its session to once that harness is
-/// installed, as `(program, tool)` (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step 6). A
+/// installed, as `(program, tool)` (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D32). A
 /// claiming harness also joins `crates/aterm-agent/src/harness/contract.rs`'s `ROSTER` in the
 /// same change. kimi-alab claims `relaunch,upgrade`; its process handoff also needs the Kimi
 /// program mapping in `aterm-agent-names`.

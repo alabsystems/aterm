@@ -18,7 +18,9 @@ use aterm_update_core::github_rest::{Answer, Client, Method, Origins, RestError,
 use aterm_update_core::release_asset::{Asset, AssetError, Reader};
 
 use super::{HostError, Probe, RETRY_PAUSE, Release, ReleaseHost, Replace, STAGED, Slug};
-use crate::git::{git_environment_removals, git_tracing_environment};
+use crate::git::{
+    GIT_TLS_PINS, git_environment_removals, git_tls_pins_at, git_tracing_environment,
+};
 
 const PER_PAGE: usize = 100;
 /// An anonymous Git child that produces neither captured bytes nor descendant CPU/I/O progress
@@ -453,18 +455,19 @@ impl RestHost {
             .map_err(|e| host_error(&e))
     }
 
-    fn git(&self, args: &[OsString]) -> Result<(), HostError> {
-        self.git_output(args).map(|_| ())
+    /// [`Self::git_output`], its output dropped.
+    fn git(&self, args: &[OsString], url: Option<&str>) -> Result<(), HostError> {
+        self.git_output(args, url).map(|_| ())
     }
 
     /// One canonical tokenless Git-over-HTTPS read under the shared anonymous budget. A
     /// credentialed or custom-origin operation retains the existing transport.
     fn git_network(&self, args: &[OsString], url: &str, waiting_on: &str) -> Result<(), HostError> {
         if !self.canonical_anonymous_git(url)? {
-            return self.git(args);
+            return self.git(args, Some(url));
         }
         anonymous_git_read(
-            |_, trace| self.git_attempt(args, trace, waiting_on),
+            |_, trace| self.git_attempt(args, url, trace, waiting_on),
             |retry| {
                 if !self.retry_pause.is_zero() {
                     std::thread::sleep(retry.pause);
@@ -478,6 +481,7 @@ impl RestHost {
     fn git_attempt(
         &self,
         args: &[OsString],
+        url: &str,
         trace: aterm_update_core::git_https::Trace<'_>,
         waiting_on: &str,
     ) -> std::result::Result<(), aterm_update_core::git_https::Failure> {
@@ -486,7 +490,7 @@ impl RestHost {
             return transport.run(args, trace, waiting_on);
         }
         let mut command = self
-            .git_command(args)
+            .git_command(args, Some(url))
             .map_err(|error| aterm_update_core::git_https::Failure::local(error.to_string()))?;
         trace.configure(&mut command);
         let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
@@ -529,17 +533,23 @@ impl RestHost {
             && aterm_update_core::git_https::is_anonymous_https_url(url))
     }
 
-    /// `git <args…>` with this host's auth, within [`super::agh::LANE_GIT_BUDGET`], the bound a
+    /// `git <args…>` ([`Self::git_command`]) within [`super::agh::LANE_GIT_BUDGET`], the bound a
     /// lane's clone or fetch through agh has ([`crate::git::output_within`]).
-    fn git_output(&self, args: &[OsString]) -> Result<std::process::Output, HostError> {
-        let out =
-            crate::git::output_within(&mut self.git_command(args)?, super::agh::LANE_GIT_BUDGET)
-                .map_err(|e| match e {
-                    aterm_uds::deadline::CompleteOutputError::Run(
-                        aterm_uds::deadline::RunError::Spawn(e),
-                    ) => HostError::Unreachable(format!("spawn git: {e}")),
-                    other => HostError::Unreachable(format!("git: {other}")),
-                })?;
+    fn git_output(
+        &self,
+        args: &[OsString],
+        url: Option<&str>,
+    ) -> Result<std::process::Output, HostError> {
+        let out = crate::git::output_within(
+            &mut self.git_command(args, url)?,
+            super::agh::LANE_GIT_BUDGET,
+        )
+        .map_err(|e| match e {
+            aterm_uds::deadline::CompleteOutputError::Run(
+                aterm_uds::deadline::RunError::Spawn(e),
+            ) => HostError::Unreachable(format!("spawn git: {e}")),
+            other => HostError::Unreachable(format!("git: {other}")),
+        })?;
         if out.status.success() {
             return Ok(out);
         }
@@ -553,10 +563,22 @@ impl RestHost {
         )))
     }
 
-    fn git_command(&self, args: &[OsString]) -> Result<Command, HostError> {
+    /// `git <args…>` with this host's auth and agh's TLS pins: the unscoped [`GIT_TLS_PINS`],
+    /// and for a network git the same pins at `url`, the remote it is given
+    /// ([`git_tls_pins_at`]), which hold over a key the user's, the system's or the checkout's
+    /// config scopes to a URL it matches. An inherited command-scope config variable is
+    /// removed with the rest of [`git_environment_removals`]. A `url.*.insteadOf` rewrite in
+    /// that config (`fetch_main` lets a checkout's mirror transport objects) is followed, and an
+    /// HTTP URL it rewrites to has the unscoped pins alone.
+    fn git_command(&self, args: &[OsString], url: Option<&str>) -> Result<Command, HostError> {
         let auth = GitAuth::new(self.token()?, &self.git_base);
+        let scoped = url
+            .map(git_tls_pins_at)
+            .transpose()
+            .map_err(HostError::Refused)?
+            .unwrap_or_default();
         let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
-        cmd.args(auth.arguments());
+        cmd.args(auth.arguments()).args(GIT_TLS_PINS).args(scoped);
         for name in git_environment_removals() {
             cmd.env_remove(name);
         }
@@ -958,9 +980,9 @@ impl ReleaseHost for RestHost {
         let url = self.git_url(slug);
         if !self.canonical_anonymous_git(&url)? {
             let mut args: Vec<OsString> = vec!["clone".into(), "--quiet".into(), "--".into()];
-            args.push(url.into());
+            args.push(url.clone().into());
             args.push(dest.as_os_str().to_owned());
-            return self.git(&args);
+            return self.git(&args, Some(&url));
         }
         match std::fs::symlink_metadata(dest) {
             Ok(_) => {
@@ -1000,7 +1022,7 @@ impl ReleaseHost for RestHost {
                     url.clone().into(),
                     attempt_dest.as_os_str().to_owned(),
                 ];
-                self.git_attempt(&args, trace, "anonymous GitHub clone")?;
+                self.git_attempt(&args, &url, trace, "anonymous GitHub clone")?;
                 Ok(attempt_dest)
             },
             |retry| {
@@ -1048,9 +1070,15 @@ impl ReleaseHost for RestHost {
         let url = self.git_url(slug);
         let mut args: Vec<OsString> = vec!["-C".into(), dir.as_os_str().to_owned()];
         args.extend(
-            ["fetch", "--quiet", "--tags", "--force"]
-                .iter()
-                .map(OsString::from),
+            [
+                "fetch",
+                "--quiet",
+                "--tags",
+                "--force",
+                "--recurse-submodules=no",
+            ]
+            .iter()
+            .map(OsString::from),
         );
         args.push(url.clone().into());
         args.push("+refs/heads/*:refs/remotes/origin/*".into());
@@ -1088,9 +1116,15 @@ impl ReleaseHost for RestHost {
         let url = self.git_url(slug);
         let mut args: Vec<OsString> = vec!["-C".into(), dir.as_os_str().to_owned()];
         args.extend(
-            ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"]
-                .iter()
-                .map(OsString::from),
+            [
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--recurse-submodules=no",
+            ]
+            .iter()
+            .map(OsString::from),
         );
         args.push(url.clone().into());
         args.push(format!("+refs/heads/main:{into}").into());
@@ -1101,13 +1135,16 @@ impl ReleaseHost for RestHost {
                 }
                 other => other,
             })?;
-        let fetched = self.git_output(&[
-            "-C".into(),
-            dir.as_os_str().to_owned(),
-            "rev-parse".into(),
-            "--verify".into(),
-            into.into(),
-        ]);
+        let fetched = self.git_output(
+            &[
+                "-C".into(),
+                dir.as_os_str().to_owned(),
+                "rev-parse".into(),
+                "--verify".into(),
+                into.into(),
+            ],
+            None,
+        );
         let checked = fetched.and_then(|out| {
             let actual = String::from_utf8_lossy(&out.stdout);
             if actual.trim() == expected {
@@ -1121,13 +1158,16 @@ impl ReleaseHost for RestHost {
             }
         });
         if let Err(why) = checked {
-            let dropped = self.git(&[
-                "-C".into(),
-                dir.as_os_str().to_owned(),
-                "update-ref".into(),
-                "-d".into(),
-                into.into(),
-            ]);
+            let dropped = self.git(
+                &[
+                    "-C".into(),
+                    dir.as_os_str().to_owned(),
+                    "update-ref".into(),
+                    "-d".into(),
+                    into.into(),
+                ],
+                None,
+            );
             return Err(HostError::Unreachable(match dropped {
                 Ok(()) => format!("could not bind {slug}'s main of record: {why}"),
                 Err(drop) => format!(

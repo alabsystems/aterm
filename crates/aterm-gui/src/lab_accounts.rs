@@ -205,6 +205,7 @@ fn project_with(
                 facts.push(("Recorded sign-in task".into(), match task.action {
                     SignInAction::Browser => "Browser sign-in requested on record",
                     SignInAction::Login => "CLI sign-in requested on record",
+                    SignInAction::Renew => "Renewal at this Mac's terminal requested on record",
                 }.into()));
                 facts.push(("Sign-in task observed".into(), observation_time(Some(task.at), now)));
                 facts.push(("Sign-in task applicability".into(), if current_task.is_some() {

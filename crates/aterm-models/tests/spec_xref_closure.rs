@@ -94,6 +94,15 @@ fn spec_xref_closure() {
     #[cfg(unix)]
     std::hint::black_box(aterm_db::replica::db_repair_policy_environment as fn());
     #[cfg(unix)]
+    std::hint::black_box((
+        aterm_db::file::publish::shared_file_environment as fn(),
+        aterm_db::file::publish::shared_file_later_slices as fn(),
+        aterm_db::file::publish::pass as *const (),
+        aterm_db::file::materialize::pass as *const (),
+        // `aterm file`'s own entry reaches the read and the accept in `aterm-file`.
+        aterm_db::file::command::main_entry as *const (),
+    ));
+    #[cfg(unix)]
     std::hint::black_box(aterm_db::accounts::claims::db_claim_ring_environment as fn());
     #[cfg(unix)]
     std::hint::black_box(aterm_db::clock::db_claim_clock_environment as fn());

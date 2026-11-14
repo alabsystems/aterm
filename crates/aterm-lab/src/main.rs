@@ -130,7 +130,6 @@ mod fleet_fixture;
 #[cfg(target_os = "macos")]
 mod fleet_judge;
 #[cfg(target_os = "macos")]
-mod fleet_menu;
 #[cfg(target_os = "macos")]
 mod fleet_probe;
 #[cfg(target_os = "macos")]
@@ -867,9 +866,6 @@ Outside any lab (no jail, no stub):
                                  --peer-cycle: stop the source, restart the observer with that peer absent, then reconnect; saves retained-history/account, reachability and Overview evidence;
                                  --peer-details: requires --peer-cycle and a bundled app; adds selected-peer images after one owned-bundle reopen with identity/focus checks;
                                  --local-follower: adds a fresh window on the source vault with a separate configuration; checks its live owner, exact table inventory and native Network State)
-  fleet-menu <aterm> <new-output-directory>
-                                 run an isolated reader window and a peer with a sibling on loopback; retain the
-                                 peer's two-instance survey, the reader's menu dump and frame (all private worlds kept)
   local-signins [--aterm PATH] [--n N] [--hold S] [--keep] [--out FILE]
                                  one-mesh E4: two jailed private aterms on loopback, each with claude, codex, grok and
                                  agy logins signed in, out and expired; judge that survey, report, upkeep and fleet
@@ -1039,10 +1035,10 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW (with --window): verify zero re-grid flap across fenced/harness turns and a lease (~2 min)
   look-away [--aterm PATH] [--keep]
                                  OPENS A WINDOW (~30 s): its front tab's task is marked done while Calculator, opened and
-                                 quit by PID here, is the active app; wants the Done for you row to stand (done=1), still
-                                 to stand after `ctl focus in` and another done, to go once aterm is active again, and a
-                                 done while aterm is active seen as it lands even after `ctl focus out` (§14.11;
-                                 --aterm main's build is the negative control)
+                                 quit by PID here, is the active app; wants the done to stand unseen (`status done_unseen=1`, a
+                                 development build's field), still unseen after `ctl focus in` and another done, seen once
+                                 aterm is active again, and a done while aterm is active seen as it lands even after
+                                 `ctl focus out` (§14.11; --aterm picks a build to read as the negative control)
   meta-keys --window [--layout ID]... [--aterm PATH] [--keep] | meta-keys --plan [--layout ID]... | meta-keys --restore
                                  OPENS A WINDOW (with --window): verify Option chords and dead keys across U.S., German, and French layouts (~1 min)
   meta-keys --current-control     read the selected layout's first composition control as JSON; changes no input sources
@@ -1062,7 +1058,7 @@ Outside any lab (no jail, no stub):
                                  absent, automatic crash repair, then a live handoff; --restart-only: an explicit restart
                                  after recent person input, preserving its conversation and selected executable;
                                  --window-only: the window
-                                 pass, four tabs' chip lines, pads, state lines, hovers, This Mac and menu rows, judged by
+                                 pass, four tabs' chip lines, pads, state lines, hovers and statuses, judged by
                                  what the package's build tells, then END's idle window with Settings ▸ Harness open and
                                  shut; the default run leaves it out; --capacity-only: the full proof's last leg alone,
                                  the package's `codex exec` recovering from a 503 with Retry-After and from a 429
@@ -1084,7 +1080,7 @@ Outside any lab (no jail, no stub):
                                  with no claim step, or a step left open (the wait for the last close a one-minute hang
                                  detector too)
   harness-proof <id> --repo DIR [--aterm PATH] [--target-dir DIR.noindex]
-                                 the harness proof (design harness-repos §9 step 2) of a rostered harness built from its
+                                 the harness proof (design harness-repos §9) of a rostered harness built from its
                                  checkout (muse-alab; the others are NOT RUN until the stand-in plays their vendor) in a
                                  private headless jailed aterm against the stand-in vendor laid into a scratch atpkg store
                                  as two builds: the proven scoped claim, a crash relaunch, no move while a draft or a
@@ -1303,7 +1299,6 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "tables-page" => tables_page::cmd(args),
         "service-acceptance" => service_acceptance::cmd(args),
         "artifact-serve" => artifact_serve::cmd(args),
-        "fleet-menu" => fleet_menu::cmd(args),
         "local-signins" => local_signins::cmd(args),
         "setup-token-lab" => setup_token_lab::cmd(args),
         "reveal-tab" => reveal_tab::cmd(args),

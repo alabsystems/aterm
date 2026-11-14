@@ -1493,11 +1493,7 @@ fn a_batch_its_sender_cannot_read_fails_the_round_since_an_empty_one_says_nothin
         round.send_batch(
             &mut stream,
             receiver_actor,
-            |session| {
-                round.prepare_batch(session, id, &held, |session, store, key| {
-                    Ok(store.wire(session, key)?.unwrap().to_vec())
-                })
-            },
+            |session| round.prepare_operations(session, id, &held),
             BatchKind::Operation,
             &mut report,
         )

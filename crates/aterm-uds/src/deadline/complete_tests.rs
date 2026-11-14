@@ -877,6 +877,69 @@ fn complete_stdout_reads_a_pipe_no_writer_holds_to_its_end() {
     assert_eq!(drain.collect(&grace).unwrap(), b"owned prefix");
 }
 
+/// A live group alone does not establish that a complete pipe will outlive the caller's
+/// budget. The cancellation poll gates collection after the short grace, without a sleep.
+#[cfg(unix)]
+#[test]
+fn complete_stdout_waits_for_a_group_writer_within_the_callers_budget() {
+    use std::io::Write as _;
+
+    // SAFETY: getpgrp only reads this process's group and accepts no pointers.
+    let group = u32::try_from(unsafe { libc::getpgrp() }).expect("positive process group");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
+    writer.write_all(b"one ").expect("prefix");
+    let pipe = pipe_end(&reader);
+    let drain = drain_stdout(pipe, reader).expect("reader");
+    let (said, heard) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let collecting = std::thread::spawn(move || {
+        let mut polls = 0;
+        let mut stopped = || {
+            polls += 1;
+            if polls == 2 {
+                said.send(true).expect("collection is still waiting");
+                held.recv_timeout(HANG).expect("release the collector");
+            }
+            false
+        };
+        let grace = Grace {
+            by: Instant::now(),
+            until: Instant::now() + HANG,
+            group: Some(group),
+        };
+        let result = drain.collect_unless(&grace, &mut Some(&mut stopped));
+        let _ = said.send(false);
+        result
+    });
+    let awaiting_eof = heard.recv_timeout(HANG);
+    writer.write_all(b"two").expect("suffix");
+    drop(writer);
+    let _ = release.send(());
+    let result = collecting.join().expect("collector");
+    assert_eq!(
+        awaiting_eof,
+        Ok(true),
+        "collection ended at the short grace"
+    );
+    assert_eq!(result.expect("complete stdout"), b"one two");
+
+    // A writer that remains open past the actual collection budget still supplies no EOF.
+    let (reader, writer) = crate::pipe().expect("open pipe");
+    let pipe = pipe_end(&reader);
+    let drain = drain_stdout(pipe, reader).expect("second reader");
+    let now = Instant::now();
+    let refused = drain.collect(&Grace {
+        by: now,
+        until: now,
+        group: Some(group),
+    });
+    drop(writer);
+    assert!(matches!(
+        refused,
+        Err(CompleteOutputError::StdoutIncomplete)
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn complete_stdout_reads_a_pipe_held_outside_the_childs_group_until_it_lets_go() {
@@ -1019,4 +1082,48 @@ fn strict_record_stream_never_offers_an_unterminated_tail() {
     );
     assert!(matches!(result, Err(CompleteOutputError::StdoutIncomplete)));
     assert_eq!(observed, [b"complete".to_vec()]);
+}
+
+/// The complete-stdout collector ([`capture_progress_with`]: the publication engine's origin
+/// read, agh's record spool) as a [`crate::deadline::tests::StopCollector`].
+#[cfg(unix)]
+fn complete_stdout_collector(
+    cmd: &mut crate::spawnfd::Command,
+    now: &mut dyn FnMut() -> Instant,
+    work: &mut dyn FnMut(u32) -> Option<u64>,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Vec<u8>, String> {
+    capture_progress_with(
+        cmd,
+        Duration::from_secs(60),
+        "the collector fixture".to_owned(),
+        drain_stdout,
+        Some(stopped),
+        now,
+        work,
+    )
+    .map(|out| out.stdout)
+    .map_err(|error| format!("{error:?}"))
+}
+
+/// [`crate::deadline::tests::a_collector_holding_a_stop_reads_once_a_tick`] for the
+/// complete-stdout collector.
+#[cfg(unix)]
+#[test]
+fn the_complete_stdout_collector_holding_a_stop_reads_the_tree_once_a_tick() {
+    crate::deadline::tests::a_collector_holding_a_stop_reads_once_a_tick(
+        "complete-progress-stop-cadence",
+        complete_stdout_collector,
+    );
+}
+
+/// [`crate::deadline::tests::a_collector_reads_no_reaped_tree`] for the complete-stdout
+/// collector.
+#[cfg(unix)]
+#[test]
+fn the_complete_stdout_collector_reads_no_reaped_tree() {
+    crate::deadline::tests::a_collector_reads_no_reaped_tree(
+        "complete-progress-reaped",
+        complete_stdout_collector,
+    );
 }

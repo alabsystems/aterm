@@ -13,6 +13,21 @@ fn result(world: &std::path::Path, text: String) -> std::io::Result<()> {
     std::fs::rename(world.join("result.pending"), world.join("result"))
 }
 
+fn release(
+    world: &std::path::Path,
+    name: &str,
+    hang: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + hang;
+    while !world.join(name).exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("controller did not release fixture's {name} phase").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 pub fn entry(argv: &[OsString]) -> Option<ExitCode> {
     if argv.get(1)?.to_str()? != "__source_image_fixture" {
         return None;
@@ -35,17 +50,16 @@ fn run(argv: &[OsString]) -> Result<ExitCode, Box<dyn std::error::Error>> {
     std::fs::write(world.join("ready"), "original producer executed\n")?;
     // A hang detector, never a latency budget.
     let hang = std::time::Duration::from_secs(60);
-    let deadline = std::time::Instant::now() + hang;
-    while !world.join("go").exists() {
-        if std::time::Instant::now() >= deadline {
-            return Err("controller did not release fixture".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    // The controller may still be qualifying the replacement image's first execution.
+    release(&world, "go", aterm_uds::deadline::FIRST_EXEC_HANG + hang)?;
     let retained = aterm_uds::tether::prepared_executable()?.ok_or("no prepared helper")?;
     if atpkg::native_launcher_for_test(retained) {
         return Err("retained helper was admitted as original producer".into());
     }
+    // The late helper has proved execution; the controller starts its consumer hang
+    // detector only after this receipt.
+    std::fs::write(world.join("consumer-ready"), "retained helper executed\n")?;
+    release(&world, "consume", hang)?;
     let lost = argv.get(3).is_some_and(|arg| arg == "lost");
     if lost {
         if !retained.starts_with(&world) || retained == original {

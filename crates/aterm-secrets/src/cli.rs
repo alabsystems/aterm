@@ -134,8 +134,9 @@ admin (a machine in [admins]):
                                          log's, never the registry's); else, as an admin (first
                                          retiring its Commons membership, denying its swarm
                                          label/node, and releasing its pool slots); either way
-                                         it rotates aterm-fleet-code; --stolen also prints a
-                                         NEEDS YOU: provider rotation list; a section naming
+                                         it rotates aterm-fleet-code; --stolen also files each
+                                         credential it could read for rotation in this Mac's
+                                         need ledger (need ls); a section naming
                                          only it must be empty unless --drop-sections drops it
                                          too (an admin's edit)
   aterm secrets retire <host|code|age1...>... permanently retire Commons membership alone;
@@ -4140,6 +4141,7 @@ mod unix {
         // A person's save settles a conflict the log holds for this entry.
         admin.resolving(&audience(hosts), name);
         let done = client::admin_publish(paths, &admin, &doc)?;
+        close_rotation(paths, name, &audience(hosts), fill);
         let gaps = match (fill.if_absent, anchor) {
             (false, _) => String::new(),
             (true, None) => " (written only where the machine has no file of its own)".to_string(),
@@ -4187,10 +4189,26 @@ mod unix {
             ""
         };
         println!("{line}{gaps}");
+        // Only a write a server took is the vault's; a signed or waiting one may yet be overtaken.
         if written == client::MemberWritten::Posted {
             apply_member_write(paths);
+            close_rotation(paths, name, &Audience::Everyone, fill);
         }
         Ok(ExitCode::SUCCESS)
+    }
+
+    /// A new value of `name` published in `audience` counts toward the rotation a stolen Mac's
+    /// removal filed for it on this Mac ([`crate::need::rotated`]); a fill-only write sets no new
+    /// value.
+    fn close_rotation(paths: &Paths, name: &str, audience: &Audience, fill: &Fill) {
+        if fill.if_absent {
+            return;
+        }
+        match crate::need::rotated(paths, name, &audience.header()) {
+            Ok(Some(need)) => println!("{}", need.line),
+            Ok(None) => {}
+            Err(error) => println!("the rotation filed for {name} stays open ({error})"),
+        }
     }
 
     /// `unset <name> [--for ...]`: a plain unset of a shared name on a vault with a membership log
@@ -4727,13 +4745,9 @@ mod unix {
         }
         let (n, list) = (held.len(), held.join(", "));
         Some(if admin {
-            format!(
-                "{host} was an admin, so it could read every secret ({n}: {list}); rotate them if it was lost or compromised"
-            )
+            format!("{host} was an admin, so it could read every secret ({n}: {list})")
         } else {
-            format!(
-                "{host} could read {n} secrets ({list}); rotate them if it was lost or compromised"
-            )
+            format!("{host} could read {n} secrets ({list})")
         })
     }
 
@@ -4795,7 +4809,7 @@ mod unix {
             );
             if !done.could_read.is_empty() {
                 println!(
-                    "{} could read {} secrets ({}); rotate them if it was lost or compromised",
+                    "{} could read {} secrets ({})",
                     done.label,
                     done.could_read.len(),
                     done.could_read.join(", ")
@@ -4807,7 +4821,7 @@ mod unix {
             for note in &done.envelope_notes {
                 println!("{note}");
             }
-            if let Some(line) = done.needs_you {
+            if let Some(line) = done.rotation {
                 println!("{line}");
             }
             return Ok(ExitCode::SUCCESS);
@@ -4861,7 +4875,7 @@ mod unix {
             if let Some(held) = held {
                 println!("{held}");
             }
-            println!("{}", done.needs_you_line);
+            println!("{}", done.rotation_line);
             return Ok(code);
         }
         let done = client::admin_revoke(paths, &admin, host, drop_sections)?;

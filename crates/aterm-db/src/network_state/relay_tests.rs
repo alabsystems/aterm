@@ -267,6 +267,7 @@ fn observer_rollback_history_round_trips_without_replacing_live_inventory_with_d
                 authority: [2; 32],
                 genesis: [3; 32],
             },
+            Vec::new,
         )
         .unwrap();
     let at = Instant::now();

@@ -197,6 +197,9 @@ pub fn bar(f: &Facts) -> Option<Bar> {
         crate::harness::accounts::SignInAction::Browser if cli.renews_headlessly() => {
             Step::Browser(cli, label.to_owned()).to_string()
         }
+        crate::harness::accounts::SignInAction::Renew => {
+            Step::Renew(cli, label.to_owned()).to_string()
+        }
         _ => Step::Login(cli, label.to_owned()).to_string(),
     };
     Some(Bar {

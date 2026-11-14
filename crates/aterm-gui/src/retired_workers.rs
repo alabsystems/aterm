@@ -73,6 +73,11 @@ impl RetiredWorkers {
         self.rows.drain(..over).collect()
     }
 
+    /// Every row kept, oldest first.
+    pub(crate) fn rows(&self) -> impl Iterator<Item = &Retired> {
+        self.rows.iter()
+    }
+
     /// The row of session `sid`.
     pub(crate) fn by_sid(&self, sid: &SessionId) -> Option<&Retired> {
         self.rows.iter().find(|row| &row.sid == sid)
@@ -158,7 +163,8 @@ impl RetiredWorkers {
     /// Keep the rows an outgoing process carried ([`Self::carry_rows`]), read at `now` with result
     /// paths held under `tasks`, each listed on no page and keyed by its sid alone: a row that does
     /// not read, names no session id, or repeats one is skipped, and none past [`RETIRED_MAX`] is
-    /// kept. Returns how many were kept.
+    /// kept. A row whose result is known to be gone from `tasks` is kept naming none
+    /// ([`TaskRecord::settle_result`]). Returns how many were kept.
     pub(crate) fn adopt(
         &mut self,
         rows: &[String],
@@ -183,9 +189,10 @@ impl RetiredWorkers {
             let Some(closed_unix_ms) = field("closed").and_then(|ms| ms.parse().ok()) else {
                 continue;
             };
-            let Some(record) = TaskRecord::from_carry_row(line, tasks, now, now_unix_ms) else {
+            let Some(mut record) = TaskRecord::from_carry_row(line, tasks, now, now_unix_ms) else {
                 continue;
             };
+            record.settle_result(tasks);
             self.rows.push_back(Retired {
                 sid: SessionId::new(sid),
                 local: None,
@@ -203,10 +210,13 @@ impl RetiredWorkers {
     }
 }
 
-/// Remove the result files `rows` kept, their rows dropped: nothing answers for them now.
-pub(crate) fn forget_results(rows: &[Retired]) {
+/// Remove the result files `rows` kept, their rows dropped from `store`: nothing answers for them
+/// now. A row's results are those its session's ID names and the one its record names under an
+/// earlier ID of its tab (a worker a restore brought back before aterm closed it), which stays
+/// where another record in `store` names it (`task_launch::retire_result_files`).
+pub(crate) fn forget_results(store: &crate::session_store::Store, rows: &[Retired]) {
     for row in rows {
-        crate::task_launch::retire_result_files(&row.sid);
+        crate::task_launch::retire_result_files(store, &row.sid, row.record.result_path.as_deref());
     }
 }
 

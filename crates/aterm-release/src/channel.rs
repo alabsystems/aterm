@@ -301,25 +301,27 @@ pub fn provenance_asset_name(version: &str) -> String {
     format!("aterm-{version}-build.txt")
 }
 
-/// Prove a release's real remote asset listing is exactly the set this cut publishes.
+/// Prove a release's real remote asset listing is exactly the set this cut publishes: the
+/// required set and `handoff`, the native assets its Linux and Windows handoffs froze.
 pub fn validate_channel_asset_set(
     names: &[String],
     version: &str,
     signed: bool,
     rostered: bool,
-    linux: &[String],
+    handoff: &[String],
 ) -> Result<()> {
     let mut required = required_asset_names(version, signed, rostered);
-    let canonical = linux_asset_names(version);
-    for name in linux {
+    let mut canonical = linux_asset_names(version);
+    canonical.extend(windows_asset_names(version));
+    for name in handoff {
         if !canonical.contains(name) {
             return Err(Error::new(
-                "noncanonical Linux asset requested for the channel",
+                "noncanonical Linux or Windows asset requested for the channel",
             ));
         }
         if required.contains(name) {
             return Err(Error::new(
-                "duplicate Linux asset requested for the channel",
+                "duplicate Linux or Windows asset requested for the channel",
             ));
         }
         required.push(name.clone());
@@ -447,13 +449,33 @@ pub fn is_source_shape(name: &str) -> bool {
         || name == aterm_update_core::roster::ROSTER_SIG_ASSET
 }
 
-/// Every name a cut of `version` can publish, whatever its signing, roster or Linux shape.
+/// Every name a cut of `version` can publish, whatever its signing, roster, Linux or Windows
+/// shape.
 #[must_use]
 pub fn publishable_asset_names(version: &str) -> Vec<String> {
     let mut names = required_asset_names(version, true, true);
     names.push(crate::service_qualification::REPORT_ASSET.to_string());
     names.extend(linux_asset_names(version));
+    names.extend(windows_asset_names(version));
     names.sort_unstable();
+    names
+}
+
+/// The Windows assets a cut of `version` can publish: each target's portable zip
+/// (`aterm_update_core::windows::WindowsTarget::asset_name`) and the Windows bootstrap verifier
+/// get-aterm.ps1 runs (`aterm_bootstrap_verify::pin::windows_asset_name`). The signed appcast
+/// carries the digest and size of each, so neither has a `.sha256` sidecar, as a raw Linux
+/// executable has none.
+#[must_use]
+pub fn windows_asset_names(version: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for target in aterm_update_core::windows::WindowsTarget::ALL {
+        names.push(target.asset_name(version));
+        names.push(aterm_bootstrap_verify::pin::windows_asset_name(
+            version,
+            target.arch(),
+        ));
+    }
     names
 }
 

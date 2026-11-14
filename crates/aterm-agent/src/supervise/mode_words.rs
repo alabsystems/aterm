@@ -8,7 +8,7 @@
 //! against the same rows. The table lives beside [`Autopilot`] so both read the one source.
 
 use super::Autopilot;
-use crate::harness::acts::{FACT_SEPARATOR, LandReceipt, ReceiptLeg};
+use crate::harness::acts::{LandReceipt, ReceiptLeg};
 use crate::harness::hold_said::NeedTail;
 
 /// One mode's sentence in the form each surface renders it.
@@ -79,8 +79,7 @@ pub const GONE_LEAD: &str = "the folder is gone (";
 
 /// WHAT ATERM CHECKED AT A LANDING, LEG BY LEG (`docs/DESIGN-harness-autopilot-2026-10-15.md`
 /// §14.9, slice 9c; §14.17 item 4): THE ONE SOURCE every surface reads (the Messages record, the
-/// menu bar's tips, the chip's landed title and its screen-reader description, Settings ▸
-/// Harness's state line). A head is the receipt's 12 digits; "origin/main" is the ref git named,
+/// chip's landed title and its screen-reader description, Settings ▸ Harness's state line). A head is the receipt's 12 digits; "origin/main" is the ref git named,
 /// never a remote main git did not name. The folder is the receipt's, as the probe named it
 /// (absolute: the words read the same in every process, whatever its `HOME`).
 ///
@@ -204,49 +203,28 @@ pub fn landed_words(receipt: Option<&LandReceipt>) -> String {
 /// What the chip's `✓ landed` title says after its head: what aterm checked in brief
 /// ([`checked_brief`]) and [`LANDED_REST`], and not the agent's words, which run to
 /// `SAID_BYTES` and would leave the rule beside an agent's footer no room for what aterm checked
-/// (the review round of slice 9c): the state line, both tips, the record and the description
-/// quote them.
+/// (the review round of slice 9c): the state line, the record and the description quote them.
 #[must_use]
 pub fn landed_brief(receipt: Option<&LandReceipt>) -> String {
     format!("{}; {LANDED_REST}", checked_brief(receipt))
 }
 
-/// A LANDED ROW'S TIP (§14.9, slice 9c): the menu bar's Done for you row says what aterm checked,
-/// then what the agent said (`aterm checked … · it said “…”`); with no receipt, [`NO_RECORD`].
-#[must_use]
-pub fn landed_tip(receipt: Option<&LandReceipt>) -> String {
-    match receipt {
-        Some(r) => format!(
-            "{}{FACT_SEPARATOR}{}",
-            checked_words(Some(r)),
-            said_words(r)
-        ),
-        None => NO_RECORD.to_owned(),
-    }
-}
-
 /// A `NEEDS YOU:` REPORT'S WORDS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.1, §14.7):
-/// what the tab's hover ends with and what the menu bar's report row says on hover, after the
-/// program's own name (`Program::product`: `Claude Code`, `Antigravity CLI`, `Muse Code`). The
-/// agent goes on past the report, unlike a box or a question that stops it.
+/// what the tab's hover ends with, after the program's own name (`Program::product`:
+/// `Claude Code`, `Antigravity CLI`, `Muse Code`). The agent goes on past the report, unlike a
+/// box or a question that stops it.
 pub const CARRIES_ON: &str = "carries on meanwhile";
 
-/// …the menu bar's report row where that need is all that holds its Land session (the hold's one
-/// leg is its needs, §14.7), after the program's own name and `'s`.
-pub const LANDING_WAITS_ALONE: &str = "landing waits on this alone";
-
-/// A REPORT'S WORDS, ONE FUNCTION (§14.7): `<product> carries on meanwhile`; where the need alone
-/// holds its session's landing (`alone`), `<product>'s landing waits on this alone`; and where the
+/// A REPORT'S WORDS, ONE FUNCTION (§14.7): `<product> carries on meanwhile`; and where the
 /// need's entry says the work waits on the person (`tail`, [`NeedTail::WaitsOnYou`]: the loop
 /// stopped typing, or Land rests on the need or landed beside it), `<product> waits on you`, as
-/// the entry and the chip say it (the post-landing review, 2026-11-02). The window's hover and the
-/// menu bar's tip say them, and the forever lab judges the menu's tip against them.
+/// the entry and the chip say it (the post-landing review, 2026-11-02). The window's hover says
+/// them.
 #[must_use]
-pub fn report_words(product: &str, tail: NeedTail, alone: bool) -> String {
-    match (alone, tail) {
-        (true, _) => format!("{product}'s {LANDING_WAITS_ALONE}"),
-        (false, NeedTail::WaitsOnYou) => format!("{product} {}", tail.words()),
-        (false, NeedTail::CarryingOn) => format!("{product} {CARRIES_ON}"),
+pub fn report_words(product: &str, tail: NeedTail) -> String {
+    match tail {
+        NeedTail::WaitsOnYou => format!("{product} {}", tail.words()),
+        NeedTail::CarryingOn => format!("{product} {CARRIES_ON}"),
     }
 }
 

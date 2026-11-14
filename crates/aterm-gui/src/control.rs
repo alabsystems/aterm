@@ -296,7 +296,7 @@ fn fleet_survey(verb: &str, rest: &str, scope: Scope, store: &Store) -> Option<S
         } else {
             crate::survey::SurveyLevel::Facts
         };
-        return Some(crate::survey::cmd_survey(
+        let reply = crate::survey::cmd_survey(
             store,
             rest,
             most,
@@ -305,7 +305,20 @@ fn fleet_survey(verb: &str, rest: &str, scope: Scope, store: &Store) -> Option<S
                 drive,
                 ..crate::survey::Here::cached_for_listener()
             },
-        ));
+        );
+        // A survey connection this window's own listener admitted, answered for the session its
+        // line names. A drive's survey was noted at its admission, and one the node job relayed
+        // names no reader here: that job noted it.
+        #[cfg(unix)]
+        if reply.starts_with("OK ") && crate::fabric::serving_driver().is_none() {
+            SERVING_FLEET_READER.with(|reader| {
+                crate::fleet_activity::note(crate::fleet_activity::surveyed(
+                    reader.borrow().as_ref(),
+                    aterm_types::fleet_activity::survey_asker(rest),
+                ));
+            });
+        }
+        return Some(reply);
     }
     let _ = (verb, rest, scope, store);
     None
@@ -2665,7 +2678,70 @@ pub(crate) fn source_registry() -> Option<Arc<aterm_agent::harness::codex_source
         .map(|context| Arc::clone(&context.account_services.source_registry))
 }
 
+/// The source registry of the dispatch this thread serves ([`ServingAccounts`]): the one its
+/// context's authenticated source dispatch uses, in the app and in each fixture alike. A
+/// constructor a request reserves (a renewal Attach's) reads it here.
+pub(crate) fn serving_source_registry()
+-> Option<Arc<aterm_agent::harness::codex_source_registry::Registry>> {
+    SERVING_SOURCE_REGISTRY.with(|serving| serving.borrow().clone())
+}
+
+/// Lends a source registry to the thread serving a dispatch, and takes it back on drop. It is
+/// private to the control host, so a registry is lent only by [`AccountServices::serving`] (and,
+/// in tests, by the host fixture's own helpers).
+struct ServingSourceRegistry(Option<Arc<aterm_agent::harness::codex_source_registry::Registry>>);
+
+impl ServingSourceRegistry {
+    fn enter(registry: &Arc<aterm_agent::harness::codex_source_registry::Registry>) -> Self {
+        Self(SERVING_SOURCE_REGISTRY.with(|serving| serving.replace(Some(Arc::clone(registry)))))
+    }
+}
+
+impl Drop for ServingSourceRegistry {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SERVING_SOURCE_REGISTRY.with(|serving| *serving.borrow_mut() = previous);
+    }
+}
+
+/// A dispatch's account services, their source registry lent to the serving thread while the
+/// dispatch runs. Only [`AccountServices::serving`] makes one and [`DispatchCx`] requires one, so
+/// every server (the app's control lanes, its fleet and bridge connections, each fixture's
+/// connection) dispatches a request with its own context's registry.
+struct ServingAccounts<'a> {
+    services: &'a AccountServices,
+    _lent: ServingSourceRegistry,
+}
+
+impl std::ops::Deref for ServingAccounts<'_> {
+    type Target = AccountServices;
+
+    fn deref(&self) -> &AccountServices {
+        self.services
+    }
+}
+
 impl AccountServices {
+    /// The app's account work and the one source registry bound to its lifetime. The app and
+    /// both control fixtures (the native host's and the source proof's) build theirs here, so a
+    /// fixture serves the app's constructor path.
+    fn for_app(lifetime: aterm_agent::harness::account_work::Lifetime) -> Self {
+        let source_registry =
+            Arc::new(aterm_agent::harness::codex_source_registry::Registry::for_app(&lifetime));
+        Self {
+            lifetime,
+            source_registry,
+        }
+    }
+
+    /// These services, their registry lent to this thread for one dispatch.
+    fn serving(&self) -> ServingAccounts<'_> {
+        ServingAccounts {
+            services: self,
+            _lent: ServingSourceRegistry::enter(&self.source_registry),
+        }
+    }
+
     fn renew(&self, caller: &str, rest: &str) -> String {
         self.renew_with(
             caller,
@@ -2911,12 +2987,29 @@ impl ControlWorkerContext {
     fn serve_fleet(
         &self,
         mut stream: CtlStream,
-        (content, drive): (bool, bool),
         peer: Option<std::net::SocketAddr>,
-        driver: Option<(crate::fabric::Driver, DriveRequester)>,
-        driver_key: Option<aterm_net::fleet::NodeKey>,
-        service_context: bool,
+        caller: FleetCaller,
     ) {
+        let (content, drive, driver, driver_key, service_context, reader) = match caller {
+            FleetCaller::Reader {
+                content,
+                drive,
+                reader,
+            } => (content, drive, None, None, false, reader),
+            FleetCaller::Driver {
+                driver,
+                requester,
+                key,
+                service_context,
+            } => (
+                true,
+                true,
+                Some((driver, requester)),
+                key,
+                service_context,
+                None,
+            ),
+        };
         // A drive names its requester on its first line, before any request; one that does not
         // is refused and hung up on, with no line of it served. A relayed drive's came in its
         // relay header, the node job having read that line.
@@ -2940,6 +3033,7 @@ impl ControlWorkerContext {
         SERVING_FLEET_PEER.with(|serving| serving.set(peer));
         SERVING_FLEET_KEY.with(|serving| serving.set(driver_key));
         SERVING_SERVICE_REPAIR.with(|serving| serving.set(service_context));
+        SERVING_FLEET_READER.with(|serving| *serving.borrow_mut() = reader);
         let _ = serve_preresolved(
             &stream,
             Scope::Fleet { content, drive },
@@ -2953,8 +3047,35 @@ impl ControlWorkerContext {
         SERVING_FLEET_PEER.with(|serving| serving.set(None));
         SERVING_FLEET_KEY.with(|serving| serving.set(None));
         SERVING_SERVICE_REPAIR.with(|serving| serving.set(false));
+        SERVING_FLEET_READER.with(|serving| *serving.borrow_mut() = None);
         aterm_uds::hangup::hang_up(&stream);
     }
+}
+
+/// Who a fleet connection serves (`ControlWorkerContext::serve_fleet`).
+#[cfg(unix)]
+enum FleetCaller {
+    /// A member reading, at the scope the listener admitted.
+    Reader {
+        /// It may read content.
+        content: bool,
+        /// It may drive.
+        drive: bool,
+        /// The member it proved itself as where this window's listener admitted it, for the
+        /// fleet activity record; none for a relayed one, whose surveys the node job notes.
+        reader: Option<crate::fleet_activity::Reader>,
+    },
+    /// A member driving: it reads content and drives.
+    Driver {
+        /// The member.
+        driver: crate::fabric::Driver,
+        /// Where its requester line is read.
+        requester: DriveRequester,
+        /// The key it proved, where it proved one.
+        key: Option<aterm_net::fleet::NodeKey>,
+        /// It came as the service-repair context.
+        service_context: bool,
+    },
 }
 
 /// Where a fleet drive's requester ([`aterm_types::control_verbs::Requester`]) is read.
@@ -3032,12 +3153,16 @@ pub(crate) fn fabric_bridge_retired(generation: crate::fabric::BridgeGeneration)
     }
 }
 
-/// Serve one fleet connection the fleet listener admitted ([`crate::fleet_listen`]).
+/// Serve one fleet connection the fleet listener admitted ([`crate::fleet_listen`]), or the
+/// node job relayed. `reader` is the member it proved itself as where this window's listener
+/// admitted it, for the fleet activity record; a relayed one names none, as the node job that
+/// admitted it notes its surveys.
 #[cfg(unix)]
 pub(crate) fn attach_fleet_connection(
     stream: CtlStream,
     (content, drive): (bool, bool),
     peer: Option<std::net::SocketAddr>,
+    reader: Option<crate::fleet_activity::Reader>,
 ) -> bool {
     let Some(context) = BRIDGE_CONTEXT.get().cloned() else {
         return false;
@@ -3045,7 +3170,17 @@ pub(crate) fn attach_fleet_connection(
     crate::qos::spawn_lane_thread(
         "aterm-fleet-serve".to_string(),
         crate::qos::Role::Responsive,
-        move || context.serve_fleet(stream, (content, drive), peer, None, None, false),
+        move || {
+            context.serve_fleet(
+                stream,
+                peer,
+                FleetCaller::Reader {
+                    content,
+                    drive,
+                    reader,
+                },
+            );
+        },
     )
     .is_ok()
 }
@@ -3093,12 +3228,14 @@ pub(crate) fn attach_fleet_drive(
         move || {
             context.serve_fleet(
                 stream,
-                (true, true),
                 peer,
-                Some((driver, requester)),
-                driver_key,
-                service_context,
-            )
+                FleetCaller::Driver {
+                    driver,
+                    requester,
+                    key: driver_key,
+                    service_context,
+                },
+            );
         },
     )
     .is_ok()
@@ -3584,17 +3721,11 @@ pub(crate) fn spawn(
             };
             let _owner = socket.take_owner();
             let token = socket.token().clone();
-            let source_registry = Arc::new(
-                aterm_agent::harness::codex_source_registry::Registry::for_app(&account_work),
-            );
             let worker_context = Arc::new(ControlWorkerContext {
                 active: active.clone(),
                 store: store.clone(),
                 proxy: proxy.clone(),
-                account_services: AccountServices {
-                    lifetime: account_work,
-                    source_registry,
-                },
+                account_services: AccountServices::for_app(account_work),
                 token: token.clone(),
                 sock_dir: sock_dir.clone(),
                 recovery_count_admission,
@@ -4955,7 +5086,7 @@ struct DispatchCx<'a> {
     store: &'a Store,
     scope: Scope,
     proxy: &'a EventLoopProxy<Wake>,
-    account_services: &'a AccountServices,
+    account_services: &'a ServingAccounts<'a>,
     sock_dir: &'a std::path::Path,
 }
 
@@ -5942,6 +6073,11 @@ thread_local! {
     #[cfg(any(unix, test))]
     static SERVING_FLEET_PEER: std::cell::Cell<Option<std::net::SocketAddr>> =
         const { std::cell::Cell::new(None) };
+    /// The member a survey connection this thread serves proved itself as, where this window's
+    /// own listener admitted it: who its surveys are noted for in the fleet activity record.
+    #[cfg(unix)]
+    static SERVING_FLEET_READER: std::cell::RefCell<Option<crate::fleet_activity::Reader>> =
+        const { std::cell::RefCell::new(None) };
     #[cfg(unix)]
     static SERVING_DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CARRIED_FENCE: std::cell::RefCell<Option<crate::session_timeline::SupervisorInputDelivery>> =
@@ -5950,6 +6086,9 @@ thread_local! {
         const { std::cell::Cell::new(Principal::Instance) };
     static SERVING_CALLER: std::cell::RefCell<Option<Option<Arc<crate::typed_by::Caller>>>> =
         const { std::cell::RefCell::new(None) };
+    static SERVING_SOURCE_REGISTRY: std::cell::RefCell<
+        Option<Arc<aterm_agent::harness::codex_source_registry::Registry>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// The connection's typed-by memo, lent to this lane while it serves the connection and handed back when it lets go.
@@ -6971,12 +7110,28 @@ fn drive_admission(
         let (level, age) = fleet_access_stated();
         #[cfg(all(unix, not(test)))]
         let _ = crate::fleet_listen::observe_access(level, age, None, None);
+        // The session the drive's requester line named: who asked, in the fleet activity record.
+        let asker = crate::fabric::serving_requester();
+        let asker = asker.as_ref().and_then(|requester| requester.sid());
+        let note = |kind: DriveKind, outcome| {
+            crate::fleet_activity::note(crate::fleet_activity::driven(
+                &driver, kind, asker, outcome,
+            ));
+        };
         if let Ok(kind) = drive_kind(&request.head())
             && let Some(refusal) = drive_lock_refusal(level, kind, kind.word())
         {
             audit_fleet_refusal(
                 request.head().verb,
                 &format!("{} driving: fleet access {}", driver.host, level.word()),
+            );
+            // Every refusal has its row, however many the audit line above thins.
+            note(
+                kind,
+                aterm_types::fleet_activity::Outcome::Blocked {
+                    level,
+                    needs: kind.needs(),
+                },
             );
             return Err(refusal);
         }
@@ -6997,10 +7152,24 @@ fn drive_admission(
                 .by_sid(sid)
                 .is_some()
         };
+        // A line the gate passes was admitted by the lock and is served: its row. One the gate
+        // refuses in its own words (no such session, a close of a tab that is not the driver's)
+        // was decided by no lock and does nothing here: it has none.
         return match drive_gate(request.line(), &hosts, &spawned, &shell, &retired) {
-            Ok(DriveLine::Fleet) => Ok((request, scope, None)),
+            Ok(DriveLine::Fleet) => {
+                note(
+                    DriveKind::Read,
+                    aterm_types::fleet_activity::Outcome::Admitted,
+                );
+                Ok((request, scope, None))
+            }
             Ok(DriveLine::Answer(reply)) => Err(reply),
             Ok(DriveLine::Act { line, mut act }) => {
+                // A fleet service's line is its own client's, never a session's: the record
+                // has no row for one on either Mac.
+                if !aterm_types::fleet_activity::is_service(request.head().verb) {
+                    note(act.kind, aterm_types::fleet_activity::Outcome::Admitted);
+                }
                 if let DriveAct {
                     sid: Some(sid),
                     hold: Some(ask),
@@ -7055,14 +7224,17 @@ fn drive_refused(why: &str, word: &str) -> String {
     format!("{why}; not `{}`", drive_word(word))
 }
 
-/// What a drive's line does here, by its selector, its verb and at most one word of its
-/// arguments: the one table of the acts a drive serves, which the lock judges
-/// ([`drive_lock_refusal`]) and [`drive_gate`] is keyed by. It looks at no session, no ownership
-/// and no file: `spawn` is a spawn whatever follows it, a shell read a shell read whoever's the
-/// shell is, a `close` a close whether or not the driver may close it, and the gate's later
-/// checks refuse what they refuse. `Err` is the gate's own grammar refusal: a verb a drive does
-/// not serve, a selector on `hold`, a `close` with none, or a fleet service's parser refusing
-/// its arguments, each in the words the driver reads.
+/// What a drive's line does here, by its selector, verb and bounded argument grammar:
+/// what the lock judges ([`drive_lock_refusal`]) and [`drive_gate`] is keyed by. The
+/// kind of a session's line is `aterm_types::fleet_activity::kind_of_request`'s, the table the
+/// Mac that sent it records it by, so a request has one type on both Macs; this adds the gate's
+/// own grammar refusals ahead of it and the three fleet services' parsers, which that table
+/// leaves out. It looks at no session, no ownership and no file: `spawn` is a spawn whatever
+/// follows it, a shell read a shell read whoever's the shell is, a `close` a close whether or
+/// not the driver may close it, and the gate's later checks refuse what they refuse. `Err` is
+/// the gate's own grammar refusal: a verb a drive does not serve, a selector on `hold`, a
+/// `close` with none, or a fleet service's parser refusing its arguments, each in the words the
+/// driver reads.
 #[cfg(any(unix, test))]
 fn drive_kind(head: &Head) -> Result<DriveKind, String> {
     const HOLD_SELECTOR: &str = "a drive's hold names its session as its argument, never a \
@@ -7074,22 +7246,23 @@ fn drive_kind(head: &Head) -> Result<DriveKind, String> {
     } = *head;
     match selector {
         None => match verb {
-            "survey" | "version" | "setup" => Ok(DriveKind::Read),
-            // A board names working folders and accounts: a drive grant reads it, as Owner.
-            "board" if rest.trim().is_empty() => Ok(DriveKind::Read),
-            "board" => Err(drive_refused(
-                "a drive reads a board whole: `board` (`board accept` is its own Mac's)",
-                rest.trim(),
-            )),
+            // A board names working folders and accounts: a drive grant reads it whole, as
+            // Owner.
+            "board" if !rest.trim().is_empty() => {
+                return Err(drive_refused(
+                    "a drive reads a board whole: `board` (`board accept` is its own Mac's)",
+                    rest.trim(),
+                ));
+            }
             "service-repair" => {
                 let request = aterm_agent::service_repair_rpc::Request::parse(rest)?;
-                Ok(
+                return Ok(
                     if matches!(request.operation.as_str(), "inspect" | "prepare") {
                         DriveKind::Read
                     } else {
                         DriveKind::ServiceRepair
                     },
-                )
+                );
             }
             #[cfg(unix)]
             "vault" => {
@@ -7098,73 +7271,64 @@ fn drive_kind(head: &Head) -> Result<DriveKind, String> {
                 }
                 aterm_secrets::client::admin_service::Request::parse(rest)
                     .map_err(|error| error.to_string())?;
-                Ok(DriveKind::Vault)
+                return Ok(DriveKind::Vault);
             }
             "accounts-renew" => {
                 use aterm_agent::harness::remote_renew::Request as RenewalRequest;
-                Ok(match RenewalRequest::parse(rest)? {
+                return Ok(match RenewalRequest::parse(rest)? {
                     RenewalRequest::Start(_) => DriveKind::AccountsRenew,
                     RenewalRequest::Poll(_) => DriveKind::Read,
-                })
+                });
             }
-            "hold" => Ok(DriveKind::Hold),
-            "spawn" => Ok(DriveKind::Spawn),
             // A drive reads the requests its node made (`requests_review` filters them).
-            "requests" => Ok(DriveKind::Read),
-            "request" => match rest.split_whitespace().next() {
-                Some("claim") => Ok(DriveKind::Claim),
-                Some("show") => Ok(DriveKind::Read),
-                _ => Err(drive_refused(
+            "request" if !matches!(rest.split_whitespace().next(), Some("claim" | "show")) => {
+                return Err(drive_refused(
                     "a drive's request verbs are request claim path=<absolute|~/…> [req=<id>], \
                      request show <id> and requests; review, keep and reply are this Mac's \
                      person's",
                     format!("request {}", rest.trim()).trim_end(),
-                )),
-            },
-            "await" if await_task_list(rest).is_some() => Ok(DriveKind::Read),
-            "await" => Err(drive_refused(
-                "a drive awaits only `await task @<sid>,…`",
-                format!("await {}", rest.trim()).trim_end(),
-            )),
-            "close" => Err(drive_refused(
-                "a drive's close names its session in front: @s-… close",
-                verb,
-            )),
-            _ => Err(drive_refused(
-                "a drive serves survey, version, board, requests, vault status|approve, hold, \
-                 spawn cwd=<absolute>|agent=<word>, request claim|show and await task, and \
-                 @<sid> status|text|screen|result|inbox|post|turn|key|send|close",
-                verb,
-            )),
-        },
-        Some(selector) => match verb {
-            "hold" => {
-                let selected = match selector {
-                    Selector::SelfTok => "@.".to_owned(),
-                    Selector::Local(local) => format!("@{local}"),
-                    Selector::Sid(sid) => format!("@{}", sid.as_str()),
-                    Selector::Invalid(body) => format!("@{body}"),
-                };
-                Err(drive_refused(HOLD_SELECTOR, &selected))
+                ));
             }
-            "status" | "text" | "screen" | "result" => Ok(DriveKind::Read),
-            // Under a driver `inbox seen …` marks a reply acknowledged in this Mac's mail store,
-            // a write; every other form lists and marks nothing for a driver.
-            "inbox" if rest.split_whitespace().next() == Some("seen") => Ok(DriveKind::MailSeen),
-            "inbox" => Ok(DriveKind::Read),
-            "blocks" | "blocktext" | "await" => Ok(DriveKind::ShellRead),
-            "post" => Ok(DriveKind::Post),
-            "turn" => Ok(DriveKind::Turn),
-            "key" => Ok(DriveKind::Key),
-            "send" => Ok(DriveKind::Send),
-            "close" => Ok(DriveKind::Close),
-            _ => Err(drive_refused(
-                "a drive serves @<sid> \
-                 status|text|screen|result|inbox|post|turn|key|send|close",
-                verb,
-            )),
+            "await" if await_task_list(rest).is_none() => {
+                return Err(drive_refused(
+                    "a drive awaits only `await task @<sid>,…`",
+                    format!("await {}", rest.trim()).trim_end(),
+                ));
+            }
+            "close" => {
+                return Err(drive_refused(
+                    "a drive's close names its session in front: @s-… close",
+                    verb,
+                ));
+            }
+            _ => {}
         },
+        Some(selector) if verb == "hold" => {
+            let selected = match selector {
+                Selector::SelfTok => "@.".to_owned(),
+                Selector::Local(local) => format!("@{local}"),
+                Selector::Sid(sid) => format!("@{}", sid.as_str()),
+                Selector::Invalid(body) => format!("@{body}"),
+            };
+            return Err(drive_refused(HOLD_SELECTOR, &selected));
+        }
+        Some(_) => {}
     }
+    // Under a driver `@<sid> inbox seen …` marks a reply acknowledged in this Mac's mail store,
+    // a write; every other form lists and marks nothing for a driver.
+    aterm_types::fleet_activity::kind_of_request(selector.is_some(), verb, rest).ok_or_else(|| {
+        drive_refused(
+            if selector.is_some() {
+                "a drive serves @<sid> \
+                 status|text|screen|result|inbox|post|turn|key|send|close"
+            } else {
+                "a drive serves survey, version, board, requests, update status|holds, vault status|approve, hold, \
+                 spawn cwd=<absolute>|agent=<word>, request claim|show and await task, and \
+                 @<sid> status|text|screen|result|inbox|post|turn|key|send|close"
+            },
+            verb,
+        )
+    })
 }
 
 /// [`drive_kind`] of a drive's raw `line`, for the node job, which judges a connection's first
@@ -8386,7 +8550,7 @@ fn serve_request_line(
             store,
             scope,
             proxy,
-            account_services,
+            account_services: &account_services.serving(),
             sock_dir,
         },
     );

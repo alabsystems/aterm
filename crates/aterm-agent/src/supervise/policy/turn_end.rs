@@ -582,7 +582,7 @@ fn lines_of<'a>(rows: Option<&'a str>, lines: Option<&'a str>) -> Option<&'a str
 /// the same words ([`lines_of`]), the earlier messages told apart by `breaks` in the text read. A
 /// point reads its turn so ([`TurnEndReading::needs_said`]) and a break of the agent's background
 /// work alike, so every line the go-ahead answers is a line the fold stands, never a row of one:
-/// the menu bar matches lines exactly ([`Needs::less`]), and a line the go-ahead answers never
+/// the shown set matches lines exactly ([`Needs::less`]), and a line the go-ahead answers never
 /// goes up (DESIGN-harness-autopilot §15.6).
 #[must_use]
 pub(crate) fn needs_words<'a>(
@@ -12836,8 +12836,8 @@ impl HoldStart {
     };
 }
 
-/// THE NEEDS STANDING AND WHAT THE MENU BAR SHOWS OF THEM (DESIGN-harness-autopilot §15.6): the
-/// lines the owner's standing go-ahead answers ([`go_ahead::Park::needs`]) are held off it from
+/// THE NEEDS STANDING AND WHAT THE WINDOW SHOWS OF THEM (DESIGN-harness-autopilot §15.6): the
+/// lines the owner's standing go-ahead answers ([`go_ahead::Park::needs`]) are held unshown from
 /// the decision that types the go-ahead, or waits out its back-off (`answering`), and dropped for
 /// good once that act was submitted, or a reply that names no need was read before it
 /// (`answered`). Any other decision on a reply that names them, the go-ahead's refusal, an
@@ -12855,7 +12855,7 @@ struct Needs {
     /// The needs the last reply read named, while no go-ahead was submitted since: every line
     /// standing after a report, only the turn's own after one a wall cut ([`Self::join`]).
     named: Vec<String>,
-    /// The needs standing less the lines answered or being answered: what the menu bar shows.
+    /// The needs standing less the lines answered or being answered: what the window shows.
     shown: Vec<String>,
     /// The key of `shown` ([`needs::needs_key`]).
     shown_key: u64,
@@ -12871,7 +12871,7 @@ impl Needs {
             .collect()
     }
 
-    /// Recompute what the menu bar shows.
+    /// Recompute what the window shows.
     fn reshow(&mut self) {
         self.shown = self.less(&[self.answered.as_slice(), self.answering.as_slice()]);
         self.shown_key = needs::needs_key(&self.shown);
@@ -12879,7 +12879,7 @@ impl Needs {
 
     /// A JUDGMENT OF THE REPLY LAST READ: of the lines answered before that it names
     /// ([`Self::named`]), only those its own park answers (`parks`, [`go_ahead::Park::needs`]) stay
-    /// off the menu bar. The hidden set is matched by cleaned words, so a later reply's need that
+    /// unshown. The hidden set is matched by cleaned words, so a later reply's need that
     /// cleans to a line an earlier go-ahead answered, and that this reply's park does not answer
     /// (a person's need opening with the same words), shows (2026-10-30 review 9, second pass).
     fn keep_answered(&mut self, parks: &[String]) {
@@ -12888,8 +12888,8 @@ impl Needs {
             .retain(|line| parks.contains(line) || !named.contains(line));
     }
 
-    /// The lines answered that the reply last read does not name ([`Self::named`]): off the menu
-    /// bar whatever a decision on it is ([`Self::keep_answered`]).
+    /// The lines answered that the reply last read does not name ([`Self::named`]): unshown
+    /// whatever a decision on it is ([`Self::keep_answered`]).
     fn answered_unnamed(&self) -> Vec<String> {
         self.answered
             .iter()
@@ -12935,7 +12935,7 @@ impl Needs {
         self.reshow();
     }
 
-    /// The lines being answered, and `past`, are answered: off the menu bar for good, until a
+    /// The lines being answered, and `past`, are answered: unshown for good, until a
     /// later reply names them under another decision.
     fn answer(&mut self, past: &[String]) {
         let answering = std::mem::take(&mut self.answering);
@@ -12973,7 +12973,7 @@ pub enum GoAheadVerdict {
     /// The decision types the owner's standing go-ahead ([`RULE_GO_AHEAD`]) or Land's instruction
     /// over its park, itself, as a restart's `otherwise` or by the Enter of the loop's own line
     /// of it, or waits out the go-ahead's back-off: the lines it answers
-    /// ([`go_ahead::Park::needs`]) are off the menu bar, and they are all the act answers
+    /// ([`go_ahead::Park::needs`]) are unshown, and they are all the act answers
     /// ([`TurnEndState::acted`]).
     Answers(Vec<String>),
     /// The go-ahead is spent and the person is told now
@@ -15115,7 +15115,7 @@ impl TurnEndState {
     }
 
     /// A LOOP BEFORE THIS ONE LEFT `needs` STANDING at a handover, as the window was told them
-    /// ([`crate::supervise::IdleHost::needs_told`]): they stand, and the menu bar shows them, as
+    /// ([`crate::supervise::IdleHost::needs_told`]): they stand, and the window shows them, as
     /// its last tell named them, and the ack is owed for them again unless its books show an act
     /// typed it ([`Self::seed_needs_acked`]).
     pub fn seed_needs(&mut self, needs: &[String]) {
@@ -15149,8 +15149,8 @@ impl TurnEndState {
             .unwrap_or(0)
     }
 
-    /// A NEW SET OF NEEDS STANDS UNACKED: the needs an act other than the go-ahead leaves on the
-    /// menu bar ([`GoAheadVerdict::Other`]) are not the set last acked.
+    /// A NEW SET OF NEEDS STANDS UNACKED: the needs an act other than the go-ahead leaves
+    /// shown ([`GoAheadVerdict::Other`]) are not the set last acked.
     #[must_use]
     pub fn needs_ack_owed(&self) -> bool {
         let held = self.needs.answered_unnamed();
@@ -15163,14 +15163,14 @@ impl TurnEndState {
         key != 0 && self.needs.acked != Some(key)
     }
 
-    /// THE NEEDS ON THE MENU BAR (DESIGN-harness-autopilot §15.6): those standing
+    /// THE NEEDS THE WINDOW SHOWS (DESIGN-harness-autopilot §15.6): those standing
     /// ([`Self::standing_needs`]) less the lines the owner's standing go-ahead answers.
     #[must_use]
     pub fn shown_needs(&self) -> &[String] {
         &self.needs.shown
     }
 
-    /// The key of the needs on the menu bar ([`Self::shown_needs`]; `0` for none).
+    /// The key of the needs the window shows ([`Self::shown_needs`]; `0` for none).
     #[must_use]
     pub const fn shown_key(&self) -> u64 {
         self.needs.shown_key
@@ -15185,8 +15185,8 @@ impl TurnEndState {
             .saturating_sub(self.needs.shown.len())
     }
 
-    /// [`Self::needs_ack_owed`] for the go-ahead that answers `past`: the needs it leaves on the
-    /// menu bar are not the set last acked.
+    /// [`Self::needs_ack_owed`] for the go-ahead that answers `past`: the needs it leaves
+    /// shown are not the set last acked.
     #[must_use]
     pub fn needs_ack_owed_past(&self, past: &[String]) -> bool {
         self.ack_owed_of(&self.needs.less(&[self.needs.answered.as_slice(), past]))
@@ -15242,7 +15242,7 @@ impl TurnEndState {
         }
     }
 
-    /// THE DECISION'S [`GoAheadVerdict`], judged on the needs the menu bar shows: where the reply
+    /// THE DECISION'S [`GoAheadVerdict`], judged on the needs the window shows: where the reply
     /// names needs, the lines answered before stay off only where this decision answers them too
     /// (`Needs::keep_answered`).
     pub fn go_ahead_judged(&mut self, verdict: GoAheadVerdict) {
@@ -15277,8 +15277,8 @@ impl TurnEndState {
         self.needs.reshow();
     }
 
-    /// THE GO-AHEAD DECIDED WAS NOT SUBMITTED: the lines it would have answered are back on the
-    /// menu bar. Whether any were held for it.
+    /// THE GO-AHEAD DECIDED WAS NOT SUBMITTED: the lines it would have answered are shown
+    /// again. Whether any were held for it.
     pub fn go_ahead_unwritten(&mut self) -> bool {
         if self.needs.answering.is_empty() {
             return false;
@@ -15289,7 +15289,7 @@ impl TurnEndState {
     }
 
     /// THE GO-AHEAD DECIDED WAS SUBMITTED on a park that answers `past`: the lines it answers are
-    /// off the menu bar for good, until a later reply names them under another decision.
+    /// unshown for good, until a later reply names them under another decision.
     fn go_ahead_answered(&mut self, past: &[String]) {
         self.needs.answer(past);
     }
@@ -15328,7 +15328,7 @@ impl TurnEndState {
             nudges: self.land.nudges.saturating_sub(self.land.hold.base),
             ..LandHeld::default()
         };
-        // A need the go-ahead answers holds nothing the menu bar shows (§15.6).
+        // A need the go-ahead answers holds nothing the window shows (§15.6).
         let answered = !self.needs.standing.is_empty() && self.needs.shown.is_empty();
         Some(self.land.legs.map_or(base, |legs| LandHeld {
             read: true,
@@ -15612,7 +15612,7 @@ impl TurnEndState {
         self.land_listed = match answer {
             // `LANDED` lands the work and retracts no need: a need stands until the agent's own
             // `NEEDS YOU: nothing` takes it down (its last word, [`needs::standing_before`]), so
-            // one its defense raised stays quietly on the menu bar beside the landing, as it
+            // one its defense raised stays quietly shown beside the landing, as it
             // stands over a repository read dirty, where nothing lands.
             land_check::CheckAnswer::Landed => None,
             land_check::CheckAnswer::Needs { rest_landed: true } => {
@@ -15767,7 +15767,7 @@ impl TurnEndState {
     /// spent over them survive the park, and so does Land's rest on a need
     /// ([`Self::land_resting`]), with its land episode and the needs standing
     /// ([`OffStood::Resting`]): the same reply read again past Off types nothing, under Land or
-    /// Cruise, the need stays on the menu bar, and the person's own switch to Land over the hold
+    /// Cruise, the need stays shown, and the person's own switch to Land over the hold
     /// is a move from Off ([`Self::note_word`]), which asks once over held replies and lifts the
     /// rest as their own switch does. Returns what the park kept, for its ledger row.
     pub(crate) fn park_off_held(&mut self) -> OffStood {
@@ -16383,7 +16383,7 @@ impl TurnEndState {
     /// THE PARK LAND'S INSTRUCTION ANSWERS FIRST: under Land before its instruction was typed,
     /// with answers on (`cfg`), the park the go-ahead answers once it is
     /// ([`Self::go_ahead_parked`]). The instruction typed over it is the act that answers the
-    /// park, so its lines are off the menu bar from that decision and its ack owes none of them
+    /// park, so its lines are unshown from that decision and its ack owes none of them
     /// (2026-10-30 review 9); a park after it gets the go-ahead.
     #[must_use]
     pub fn go_ahead_first(
@@ -16510,7 +16510,7 @@ impl TurnEndState {
 
     /// THE GO-AHEAD WENT ON `park` at `now` at a break ([`RULE_GO_AHEAD`]; a turn end's is booked
     /// by [`Self::acted`]): one more act on the standing park, or its first, and the lines it
-    /// answers are off the menu bar for good ([`GoAheadVerdict::Answers`]).
+    /// answers are unshown for good ([`GoAheadVerdict::Answers`]).
     pub fn go_ahead_typed(&mut self, park: &go_ahead::Park, now: Instant) {
         self.go_ahead_counted(&park.needs, now);
     }
@@ -19917,7 +19917,7 @@ impl TurnEndState {
             // whole-turn read, so its park is no judge of the turn: a park only an earlier message
             // read whole above the screen held parks nothing on `reading`, and the act counts all
             // the same, or its bound would never trip; a line that earlier message makes a
-            // person's parks on `reading`, and stays on the menu bar all the same (§15.6).
+            // person's parks on `reading`, and stays shown all the same (§15.6).
             self.go_ahead_counted(&[], now);
         } else if !past.is_empty() && !matches!(action, TurnEndAction::Submit { .. }) {
             // Another act its decision typed over the park (Land's instruction first,
@@ -20379,7 +20379,7 @@ impl TurnEndState {
         self.screen_prompt = reading.answered.map(|a| a.prompt);
         if made {
             // The act the restart was decided over is not typed: the lines its go-ahead would
-            // answer are back on the menu bar ([`Self::go_ahead_verdict`]).
+            // answer are shown again ([`Self::go_ahead_verdict`]).
             self.go_ahead_unwritten();
             self.replies = Replies::default();
             self.settling = None;
@@ -22950,7 +22950,7 @@ fn continue_policy(
         });
     }
     // Land's instruction over the park the go-ahead answers once it is typed answers that park:
-    // its ack owes none of the park's lines, which are off the menu bar (§15.6).
+    // its ack owes none of the park's lines, which are unshown (§15.6).
     if let Some(first) = state.go_ahead_first(reading, cfg, now) {
         let (text, rule_id) = land_words(state, reading, state.needs_ack_owed_past(&first.needs));
         return budgeted(TurnEndAction::Type { text, rule_id });

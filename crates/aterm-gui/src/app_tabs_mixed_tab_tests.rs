@@ -44,7 +44,8 @@ fn per_agent_off_questions_need_you_only_for_disabled_agents() {
         host.set_config(cfg);
         app.publish_needs_all();
         observed.push({
-            let mut sessions = app.status_glance().local_need_sessions();
+            let mut sessions: Vec<u64> =
+                app.local_needs().iter().map(|need| need.session).collect();
             sessions.sort_unstable();
             sessions
         });
@@ -70,7 +71,8 @@ fn per_agent_off_questions_need_you_only_for_disabled_agents() {
         }
         app.publish_needs_all();
         claimed.push({
-            let mut sessions = app.status_glance().local_need_sessions();
+            let mut sessions: Vec<u64> =
+                app.local_needs().iter().map(|need| need.session).collect();
             sessions.sort_unstable();
             sessions
         });

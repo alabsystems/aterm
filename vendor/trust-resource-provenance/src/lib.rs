@@ -25,6 +25,8 @@ mod reader;
 #[cfg(unix)]
 pub mod schema;
 #[cfg(unix)]
+pub mod signing;
+#[cfg(unix)]
 pub use reader::{
     Host, HostControlTransfer, Instance, ORIGINAL_CONTROL_DESCRIPTORS, PinnedHelper, PinnedProgram,
     Store,

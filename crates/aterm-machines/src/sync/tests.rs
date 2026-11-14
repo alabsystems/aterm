@@ -4270,7 +4270,7 @@ pub(crate) mod owed_clone {
                     read(Some(proof), &stopped),
                     Ok(OwedClone::Verified { .. })
                 ));
-                let token = home.join(crate::init_github::TOKEN_FILE);
+                let token = crate::init_github::token_file(home);
                 let token_stat = sys.stat(&token).unwrap();
                 System::remove(&sys, &token).unwrap();
                 assert!(

@@ -210,6 +210,7 @@ fn current_membership_and_local_custody_gate_shared_evidence_but_table_failure_d
         .local(
             super::super::machine_identity(bootstrap.request().unwrap().binding()),
             bootstrap.trust(),
+            Vec::new,
         )
         .unwrap();
     let connected = round(peer.request().unwrap().binding());

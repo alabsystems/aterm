@@ -76,7 +76,9 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
         Origins::github(),
         "https://github.com".to_string(),
     );
-    let cmd = host.git_command(&["fetch".into()]).expect("the command");
+    let cmd = host
+        .git_command(&["fetch".into()], None)
+        .expect("the command");
     assert_eq!(shows(&cmd, secret), [format!("env: {GIT_TOKEN_ENV}")]);
     for name in ["GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"] {
         assert!(
@@ -95,6 +97,11 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
         args[2..4],
         ["-c".to_string(), helper],
         "then the one, scoped"
+    );
+    assert_eq!(
+        args[4..8],
+        crate::git::GIT_TLS_PINS,
+        "then agh's TLS pins: verification on, no redirect"
     );
     assert!(git_helper().contains(&format!("\"${GIT_TOKEN_ENV}\"")));
     for gone in ["GITHUB_TOKEN", "GH_TOKEN"] {
@@ -117,7 +124,9 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
         Origins::github(),
         "file:///r".into(),
     );
-    let cmd = local.git_command(&["fetch".into()]).expect("the command");
+    let cmd = local
+        .git_command(&["fetch".into()], None)
+        .expect("the command");
     assert_eq!(shows(&cmd, secret), Vec::<String>::new());
     assert!(!cmd.get_args().any(|a| text(a).contains("helper=!")));
     assert!(credential_origin("https://github.com.helper=!evil").is_none());
@@ -156,6 +165,176 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
         !crate::host::ReleaseHost::reads_anonymously(&corrupt_host),
         "corrupt token file must not silently fall back to anonymous reads"
     );
+}
+
+/// A network git's TLS posture, read by the real git this host runs as git's HTTP transport
+/// reads it (by URL match against the remote it is given, `config --get-urlmatch`), beside a
+/// user config that turns verification off and follows every redirect, unscoped and scoped to
+/// `https://github.com` and to the repository's exact URL: agh's pins win, so the token this
+/// host's helper answers never goes to an unverified or redirected peer. NEGATIVE CONTROL: a
+/// git given no remote URL carries the unscoped pins alone, and the scoped keys win there.
+#[test]
+fn a_network_git_pins_tls_over_a_url_scoped_user_config() {
+    const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+    const URL: &str = "https://github.com/fixture-dev/packs.git";
+    let dir = aterm_tempfile::TempDir::new().expect("scratch");
+    let user = dir.path().join("gitconfig");
+    let off = "\tsslVerify = false\n\tfollowRedirects = true\n";
+    std::fs::write(
+        &user,
+        format!("[http]\n{off}[http \"https://github.com\"]\n{off}[http \"{URL}\"]\n{off}"),
+    )
+    .expect("the user's config");
+    let host = RestHost::at(None, Origins::github(), "https://github.com".into()).with_git_env(&[
+        ("GIT_CONFIG_NOSYSTEM", std::ffi::OsStr::new("1")),
+        ("GIT_CONFIG_GLOBAL", user.as_os_str()),
+        ("XDG_CONFIG_HOME", std::ffi::OsStr::new("/dev/null")),
+    ]);
+    let read = |url: Option<&str>, key: &str| {
+        let args = ["config", "--get-urlmatch", key, URL].map(std::ffi::OsString::from);
+        let mut git = host.git_command(&args, url).expect("the command");
+        git.current_dir(dir.path());
+        // A hang detector, not a budget: git reads its config at once.
+        let out =
+            aterm_uds::deadline::output_until(&mut git, std::time::Instant::now() + HANG_DETECTOR)
+                .expect("git config");
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout)
+            .expect("UTF-8 value")
+            .trim_end()
+            .to_string()
+    };
+    assert_eq!(read(Some(URL), "http.sslVerify"), "true");
+    assert_eq!(read(Some(URL), "http.followRedirects"), "false");
+    assert_eq!(read(None, "http.sslVerify"), "false");
+    assert_eq!(read(None, "http.followRedirects"), "true");
+}
+
+/// The `-c` values on the command line of the one top-level git whose Trace2 events `trace`
+/// holds (the session id with no parent's), as its `start` event records it.
+fn command_line_config(trace: &Path) -> Vec<String> {
+    let events = std::fs::read_to_string(trace).expect("git's Trace2 events");
+    let started: Vec<Vec<String>> = events
+        .lines()
+        .filter_map(|line| {
+            let event: Value = aterm_json::from_str(line).expect("a Trace2 event");
+            let top = event["sid"].as_str().is_some_and(|sid| !sid.contains('/'));
+            (top && event["event"].as_str() == Some("start")).then(|| {
+                event["argv"]
+                    .as_array()
+                    .expect("its command line")
+                    .iter()
+                    .map(|word| word.as_str().expect("a UTF-8 word").to_string())
+                    .collect()
+            })
+        })
+        .collect();
+    let [argv] = started.as_slice() else {
+        panic!("one top-level git: {started:?}")
+    };
+    argv[1..]
+        .chunks(2)
+        .take_while(|pair| pair.len() == 2 && pair[0] == "-c")
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
+/// Each call site that hands a network git its remote passes that URL on to `git_command`
+/// (`git_attempt` under the anonymous policy, `git_network`'s and `clone_repo`'s credentialed
+/// branches): the git that runs, as its own Trace2 `start` event records its command line,
+/// carries agh's pins at `git_url(slug)` among its `-c` pairs, on the anonymous and the
+/// credentialed path, for a clone and for a fetch. The user's config rewrites
+/// `https://github.com/` to a local mirror and `GIT_ALLOW_PROTOCOL=file` admits no other
+/// transport, so nothing reaches the network. What the pins win over is
+/// [`a_network_git_pins_tls_over_a_url_scoped_user_config`]'s. NEGATIVE CONTROLS: any of the
+/// three call sites handing `git_command` no URL fails its cases.
+#[test]
+fn every_network_git_carries_the_pins_at_the_url_it_is_given() {
+    const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+    let dir = aterm_tempfile::TempDir::new().expect("scratch");
+    let fixture = |cwd: &Path, args: &[&str]| {
+        let mut git = crate::testkit::git();
+        git.current_dir(cwd)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args);
+        // A hang detector, not a budget: each is one local repository write.
+        let out =
+            aterm_uds::deadline::output_until(&mut git, std::time::Instant::now() + HANG_DETECTOR)
+                .expect("fixture git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    let work = dir.path().join("work");
+    std::fs::create_dir(&work).expect("the work tree");
+    fixture(&work, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(work.join("README"), "fixture\n").expect("a file");
+    fixture(&work, &["add", "README"]);
+    fixture(&work, &["commit", "--quiet", "-m", "fixture"]);
+    let remotes = dir.path().join("remotes");
+    let bare = remotes.join("fixture-dev/packs.git");
+    let utf8 = |path: &Path| path.to_str().expect("a UTF-8 scratch").to_string();
+    fixture(
+        dir.path(),
+        &["clone", "--quiet", "--bare", &utf8(&work), &utf8(&bare)],
+    );
+    let user = dir.path().join("gitconfig");
+    std::fs::write(
+        &user,
+        format!(
+            "[url \"file://{}/\"]\n\tinsteadOf = https://github.com/\n",
+            remotes.display()
+        ),
+    )
+    .expect("the user's config");
+    let token = dir.path().join("token");
+    std::fs::write(&token, "github_pat_fixture\n").expect("the token file");
+    let slug = Slug::new("fixture-dev", "packs");
+    for token_file in [None, Some(token)] {
+        let path = if token_file.is_some() {
+            "credentialed"
+        } else {
+            "anonymous"
+        };
+        let dest = dir.path().join(format!("{path}-clone"));
+        for op in ["clone", "fetch"] {
+            let trace = dir.path().join(format!("{path}-{op}.trace2"));
+            let host = RestHost::at(
+                token_file.clone(),
+                Origins::github(),
+                "https://github.com".into(),
+            )
+            .with_git_env(&[
+                ("GIT_CONFIG_NOSYSTEM", std::ffi::OsStr::new("1")),
+                ("GIT_CONFIG_GLOBAL", user.as_os_str()),
+                ("XDG_CONFIG_HOME", std::ffi::OsStr::new("/dev/null")),
+                ("GIT_ALLOW_PROTOCOL", std::ffi::OsStr::new("file")),
+                ("GIT_TRACE2_EVENT", trace.as_os_str()),
+            ]);
+            let url = host.git_url(&slug);
+            assert_eq!(
+                host.canonical_anonymous_git(&url).expect("the policy"),
+                token_file.is_none(),
+                "{path}"
+            );
+            let done = if op == "clone" {
+                host.clone_repo(&slug, &dest)
+            } else {
+                host.fetch_repo(&slug, &dest)
+            };
+            done.unwrap_or_else(|e| panic!("{path} {op}: {e}"));
+            let config = command_line_config(&trace);
+            for pin in [
+                format!("http.{url}.sslVerify=true"),
+                format!("http.{url}.followRedirects=false"),
+            ] {
+                assert!(config.contains(&pin), "{path} {op}: {config:?}");
+            }
+        }
+    }
 }
 
 fn git_status(status: u16) -> aterm_update_core::git_https::Failure {

@@ -258,7 +258,14 @@ pub trait ReleaseHost {
         )))
     }
 
-    /// Updates the scratch clone `dir` of `slug` as this identity.
+    /// Updates the scratch clone `dir` of `slug` as this identity. No fetch starts in a
+    /// submodule of `dir`, whatever its config says (`--recurse-submodules=no`): such a fetch
+    /// would carry this identity's credential with only the unscoped TLS pins, since the pins
+    /// scoped to `slug`'s URL do not match a submodule's. That is all this promises about which
+    /// repository is fetched: the fetch reaches the URL git resolves `slug`'s to, and
+    /// [`rest::RestHost`], which leaves the user's, the system's and the checkout's config in
+    /// force, follows a `url.*.insteadOf` rewrite there, while its credential answers for any
+    /// repository at its origin.
     ///
     /// # Errors
     ///
@@ -305,7 +312,9 @@ pub trait ReleaseHost {
 
     /// Fetches `slug`'s `refs/heads/main` from this host into the repository `dir` as the ref
     /// `into`, as this identity, writing no other ref: the main of record a pack's source is
-    /// held to (D25), read from the host and never from `dir`'s own `origin`.
+    /// held to (D25), read from the host and never from `dir`'s own `origin`. Like
+    /// [`Self::fetch_repo`], it starts no fetch in a submodule of `dir` and reaches the URL git
+    /// resolves `slug`'s to.
     ///
     /// # Errors
     ///

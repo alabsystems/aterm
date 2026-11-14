@@ -1270,8 +1270,8 @@ pub static GLOBAL_FLAGS: &[FlagSpec] = &[
 pub static REFUSED: &[Refused] = &[
     Refused {
         path: &["auth", "login"],
-        why: "agh has no device flow",
-        next: "agh auth add NAME --file PATH --tier TIER",
+        why: "agh has no device flow: it adopts the vault's tokens",
+        next: "aterm secrets sync, else aterm secrets need gh:dev asks the lab's Macs for it",
     },
     Refused {
         path: &["auth", "token"],

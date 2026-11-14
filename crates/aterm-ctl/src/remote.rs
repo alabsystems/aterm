@@ -34,6 +34,53 @@ pub struct DriveLink {
     /// The node id the peer's handshake proved, where the dial knows it: what a board records a
     /// worker's Mac by ([`crate::board`]).
     pub node: Option<String>,
+    /// The session the drive's requester line named, where it named one: the session that asks.
+    /// A drive aterm makes of its own (the board's keeper, a service) names none, and its reads
+    /// are polls the fleet activity record does not count ([`crate::fleet_activity`]).
+    pub asked_by: Option<String>,
+    /// The same dial naming no session, where this one named one: what the later legs of one
+    /// wait go by ([`crate::await_task`]), so the driven Mac counts the wait once.
+    pub unnamed: Option<FleetDriveFn>,
+}
+
+/// Whom a drive's link reached and for which session, kept past its stream: what the fleet
+/// activity record names an outgoing request by.
+pub(crate) struct Asked {
+    node: Option<String>,
+    label: String,
+    by: Option<String>,
+}
+
+impl Asked {
+    pub(crate) fn of(link: &DriveLink) -> Self {
+        Self {
+            node: link.node.clone(),
+            label: link.label.clone(),
+            by: link.asked_by.clone(),
+        }
+    }
+
+    /// Record the request of `kind` this link carried, as the first line of its answer
+    /// (`reply`) says the other Mac's lock decided it: nothing where the kind is no agent
+    /// request, the link proved no node, or the answer is neither the lock's refusal nor `OK`.
+    pub(crate) fn note(&self, kind: Option<aterm_types::fleet_access::DriveKind>, reply: &str) {
+        use aterm_types::fleet_activity::{Outcome, Row, Way};
+        let (Some(kind), Some(node), Some(outcome)) =
+            (kind, self.node.as_deref(), Outcome::of_reply(reply))
+        else {
+            return;
+        };
+        if let Some(row) = Row::of(
+            crate::fleet_activity::now_ms(),
+            Way::Out,
+            (node, Some(&self.label)),
+            kind,
+            self.by.as_deref(),
+            outcome,
+        ) {
+            crate::fleet_activity::note_here(vec![row]);
+        }
+    }
 }
 
 /// THE FLEET CLIENT'S DRIVE DIAL the `aterm` binary links: its [`DriveLink`] has already sent
@@ -528,6 +575,7 @@ fn any_host_node(
         host: None,
         within,
         holder: None,
+        by: None,
     })
     .map_err(fleet_survey_error)?;
     let members = any_host::members_of(&read.peers);
@@ -777,6 +825,7 @@ fn spawn_worker(worker: Worker<'_>, within: Within, drive: FleetDriveFn) -> io::
     } = worker;
     let began = Instant::now();
     let dialled = drive(&host, within.get()).map_err(io::Error::other);
+    let asked = dialled.as_ref().ok().map(Asked::of);
     if let Ok(link) = &dialled {
         placed.node = placed.node.or_else(|| link.node.clone());
         placed.host = placed.host.or_else(|| Some(link.label.clone()));
@@ -784,6 +833,9 @@ fn spawn_worker(worker: Worker<'_>, within: Within, drive: FleetDriveFn) -> io::
     placed.node = placed.node.or(Some(host));
     let exchanged = dialled
         .map(|link| spawn_exchange(link, &format!("{head} len={}", task.len()), task, within));
+    if let (Some(asked), Ok(Ok((answer, _)))) = (&asked, &exchanged) {
+        asked.note(Some(aterm_types::fleet_access::DriveKind::Spawn), answer);
+    }
     let log = crate::fleet_telemetry::here_log();
     crate::fleet_telemetry::spawned(log, args, began, &exchanged, placed.node.as_deref());
     let (answer, sid) = exchanged??;
@@ -939,6 +991,7 @@ pub(crate) fn resolve_any_sid_hosts(
             host: None,
             within: survey_within_for_any(total),
             holder: None,
+            by: None,
         })
         .map_err(fleet_survey_error)?;
         for peer in &read.peers {
@@ -1030,6 +1083,7 @@ pub(crate) fn read_board(
 /// The peer answered `ERR …`, cut the reply, or sent no `OK <n>` header.
 fn board_exchange(link: DriveLink, within: Within) -> io::Result<Option<Vec<String>>> {
     const REQUEST: &str = "board\n";
+    let asked = Asked::of(&link);
     let DriveLink {
         mut stream, label, ..
     } = link;
@@ -1059,6 +1113,7 @@ fn board_exchange(link: DriveLink, within: Within) -> io::Result<Option<Vec<Stri
         read_bounded_line(&mut reader, line)
     })
     .map_err(cut)?;
+    asked.note(Some(aterm_types::fleet_access::DriveKind::Read), status);
     for row in &mut rows {
         row.truncate(row.trim_end_matches(['\r', '\n']).len());
     }
@@ -1162,6 +1217,7 @@ enum Exchange {
 }
 
 fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::Result<Exchange> {
+    let asked = Asked::of(&link);
     let DriveLink {
         mut stream, label, ..
     } = link;
@@ -1183,10 +1239,27 @@ fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::R
     {
         return Ok(Exchange::Busy);
     }
+    // The answer's first line says what the lock there decided, whatever follows it and
+    // however printing it goes; the row goes to the writer thread, never onto this answer's way.
+    let printed = print_answer(&mut reader, status, (request, verb), &label, within);
+    asked.note(aterm_types::fleet_activity::kind_of_line(request), status);
+    printed.map(Exchange::Completed)
+}
+
+/// Print a drive's answer whose first line is `status`, the rest read from `reader`, as
+/// [`exchange`] frames it; the exit status it gives.
+fn print_answer(
+    reader: &mut BufReader<Box<dyn DriveStream>>,
+    status: &str,
+    (request, verb): (&str, &str),
+    label: &str,
+    within: Within,
+) -> io::Result<ExitCode> {
+    let cut = |e| closed(label, request, within, e);
     let (head, tail) = status.split_once(' ').unwrap_or((status, ""));
     if head != "OK" {
         stderr_line(status)?;
-        return Ok(Exchange::Completed(ExitCode::FAILURE));
+        return Ok(ExitCode::FAILURE);
     }
     if streams_payload(verb, request) {
         let count = stream_count(tail).ok_or_else(|| malformed_header_error(status))?;
@@ -1198,7 +1271,7 @@ fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::R
         } else if count == 0 {
             stderr_line(&format!("{status} ({verb}: no results)"))?;
         }
-        print_payload(&mut reader, count).map_err(cut)?;
+        print_payload(reader, count).map_err(cut)?;
     } else if bytes_payload(verb, request) {
         return Err(io::Error::other(format!(
             "{label} answered `{verb}` with a body no drive carries"
@@ -1206,11 +1279,11 @@ fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::R
     } else {
         print_stdout_line(status)?;
     }
-    Ok(Exchange::Completed(if reply_is_timeout(status) {
+    Ok(if reply_is_timeout(status) {
         ExitCode::from(EXIT_TIMEOUT)
     } else {
         ExitCode::SUCCESS
-    }))
+    })
 }
 
 #[cfg(test)]

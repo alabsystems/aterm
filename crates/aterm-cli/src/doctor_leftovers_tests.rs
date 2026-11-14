@@ -14,13 +14,147 @@ fn body(entry: bool, links: usize, more: u64) -> String {
     reading_body(entry, links, more, true, false)
 }
 
+#[test]
+fn missing_or_non_string_process_classifications_are_not_a_clean_reading() {
+    for rows in [
+        "null",
+        "7",
+        "[]",
+        "{}",
+        r#"{"state":"left"}"#,
+        r#"{"state":7,"reason":"owner-gone"}"#,
+        r#"{"state":"orphaned","reason":null}"#,
+        r#"{"pid":1001,"state":"left","reason":"owner-gone","entry":true},null"#,
+    ] {
+        let body = format!(
+            r#"{{"schema":1,"kind":"sys.left","left":{{"complete":true,"bounded":false}},"procs":[{rows}],"more":0,"runs":[],"links":[]}}"#
+        );
+        let fact = fact_of(Asked::View(body), || {
+            panic!("no fallback for malformed instance data")
+        });
+        assert!(fact.is_err(), "{rows}: {fact:?}");
+        assert_eq!(row(&fact).0, Mark::Note);
+    }
+}
+
+#[test]
+fn the_actual_sys_left_json_is_a_doctor_measurement() {
+    use aterm_vitals::sys::{Ctx, Freshness, Machine, SysQuery, Target, render_json};
+    let snapshot = aterm_vitals::Snapshot {
+        left: Some(std::sync::Arc::new(aterm_vitals::left::LeftView {
+            complete: true,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let machine = Machine::default();
+    let target = Target::default();
+    let ctx = Ctx {
+        snap: Some(&snapshot),
+        epoch: 1,
+        as_of_unix_ms: 1,
+        age_ms: 0,
+        state: Freshness::Fresh,
+        machine: &machine,
+        target: &target,
+        tabs: &[],
+        caller_panes: None,
+        owner_class: true,
+        volume: None,
+        roots: &[],
+        disk: None,
+        home: None,
+        events: &[],
+        gap: None,
+        head_seq: 0,
+    };
+    let query = SysQuery::parse("left scope=aterm --json").unwrap();
+    let measured = from_json(&render_json(&query, &ctx).to_text()).expect("producer's view");
+    assert_eq!(row(&Ok(measured)).0, Mark::Ok);
+    let other = SysQuery::parse("procs --json").unwrap();
+    assert!(from_json(&render_json(&other, &ctx).to_text()).is_none());
+}
+
+#[test]
+fn a_different_or_unversioned_json_body_is_not_a_leftover_measurement() {
+    use aterm_json::Value;
+    let valid: Value = aterm_json::from_str(&body(false, 0, 0)).unwrap();
+    for (field, replacement) in [
+        ("kind", None),
+        ("kind", Some(Value::String("sys.procs".into()))),
+        ("kind", Some(Value::String("left".into()))),
+        ("schema", None),
+        ("schema", Some(Value::from(2))),
+        ("schema", Some(Value::String("1".into()))),
+    ] {
+        let mut wrong = valid.clone();
+        let fields = wrong.as_object_mut().unwrap();
+        if let Some(value) = replacement {
+            fields.insert(field.into(), value);
+        } else {
+            fields.remove(field);
+        }
+        let asked = Asked::View(aterm_json::to_string(&wrong).unwrap());
+        let fact = fact_of(asked, || panic!("no fallback for an answering instance"));
+        assert!(fact.is_err(), "{field}: {fact:?}");
+    }
+    assert!(from_json(&aterm_json::to_string(&valid).unwrap()).is_some());
+}
+
+/// A complete-looking old reading proves neither current absence nor current leftovers.
+#[test]
+fn stale_or_warming_instance_replies_cannot_supply_a_doctor_measurement() {
+    let empty = r#"{"schema":1,"kind":"sys.left","left":{"complete":true,"bounded":false},"procs":[],"more":0,"runs":[],"links":[]}"#;
+    for state in ["stale", "warming"] {
+        for body in [empty.to_owned(), body(true, 1, 0)] {
+            let wire = format!("OK 1 sys v=1 view=left state={state}\n{body}\n");
+            let asked = read_view(std::io::Cursor::new(wire));
+            let fact = fact_of(asked, || {
+                panic!("an answering instance does not permit a table fallback")
+            });
+            assert!(fact.is_err(), "{state}: {fact:?}");
+            let (mark, words) = row(&fact);
+            assert_eq!(mark, Mark::Note, "{words}");
+            assert!(words.starts_with("not measured ("), "{words}");
+        }
+    }
+    for state in ["", " state=fresh"] {
+        for (body, mark) in [(empty.to_owned(), Mark::Ok), (body(true, 1, 0), Mark::Warn)] {
+            let wire = format!("OK 1 sys v=1 view=left{state}\n{body}\n");
+            let fresh = fact_of(read_view(std::io::Cursor::new(wire)), || {
+                panic!("no fallback")
+            });
+            assert_eq!(row(&fresh).0, mark);
+        }
+    }
+}
+
+#[test]
+fn malformed_instance_framing_cannot_supply_a_doctor_measurement() {
+    let body = body(false, 0, 0);
+    let prefix = "OK 1 sys v=1 view=left ";
+    let overlong = format!("{prefix}{}\n{body}\n", "x".repeat(4096 - prefix.len()));
+    for wire in [
+        format!("OK 1 sys v=1 view=leftovers\n{body}\n"),
+        format!("OK 1 sys v=1 view=left state=unknown\n{body}\n"),
+        format!("OK 1 sys v=1 view=left\n{body}"),
+        overlong,
+    ] {
+        let fact = fact_of(read_view(std::io::Cursor::new(wire)), || {
+            panic!("no fallback")
+        });
+        assert!(fact.is_err(), "{fact:?}");
+        assert_eq!(row(&fact).0, Mark::Note);
+    }
+}
+
 /// [`body`] of a reading `complete` (the sweep listed every process) or not, and `bounded` (it
 /// stopped at its bound of new candidates) or not.
 fn reading_body(entry: bool, links: usize, more: u64, complete: bool, bounded: bool) -> String {
     let link = r#"{"state":"dangling","root":1,"kind":"target","target":"gone","seen":"disk"}"#;
     let links: Vec<&str> = std::iter::repeat_n(link, links).collect();
     format!(
-        r#"{{"view":"left","left":{{"complete":{complete},"bounded":{bounded},"program_check":0}},"procs":[{{"pid":2606,"state":"left","started_ms":12000000,"tier":"offer","reason":"owner-gone","entry":{entry},"end":"2606@1:2"}},{{"pid":4300,"state":"left","started_ms":600000,"tier":"auto","reason":"launcher-dead","entry":false,"end":"4300@1:3"}},{{"pid":2700,"state":"orphaned","started_ms":99000000,"tier":"offer","reason":"orphaned","entry":false,"end":"2700@1:4"}}],"more":{more},"runs":[],"links":[{}]}}"#,
+        r#"{{"schema":1,"kind":"sys.left","left":{{"complete":{complete},"bounded":{bounded},"program_check":0}},"procs":[{{"pid":2606,"state":"left","started_ms":12000000,"tier":"offer","reason":"owner-gone","entry":{entry},"end":"2606@1:2"}},{{"pid":4300,"state":"left","started_ms":600000,"tier":"auto","reason":"launcher-dead","entry":false,"end":"4300@1:3"}},{{"pid":2700,"state":"orphaned","started_ms":99000000,"tier":"offer","reason":"orphaned","entry":false,"end":"2700@1:4"}}],"more":{more},"runs":[],"links":[{}]}}"#,
         links.join(",")
     )
 }
@@ -62,7 +196,7 @@ fn leftovers_row_counts_rows_and_links_with_its_pointer() {
         row(&Ok(young)).1.contains(", the oldest 2 m; "),
         "under an hour, in minutes"
     );
-    let none = r#"{"view":"left","left":{"complete":true,"bounded":false},"procs":[],"more":0,"runs":[],"links":[]}"#;
+    let none = r#"{"schema":1,"kind":"sys.left","left":{"complete":true,"bounded":false},"procs":[],"more":0,"runs":[],"links":[]}"#;
     assert_eq!(
         row(&Ok(from_json(none).expect("an empty view"))),
         (
@@ -223,7 +357,7 @@ fn leftovers_row_counts_only_rows_that_outlived_their_owner() {
 fn leftovers_row_is_a_floor_when_the_reading_is_partial() {
     let none = |complete: bool, bounded: bool| {
         format!(
-            r#"{{"view":"left","left":{{"complete":{complete},"bounded":{bounded}}},"procs":[],"more":0,"runs":[],"links":[]}}"#
+            r#"{{"schema":1,"kind":"sys.left","left":{{"complete":{complete},"bounded":{bounded}}},"procs":[],"more":0,"runs":[],"links":[]}}"#
         )
     };
     for (complete, bounded) in [(true, true), (false, false)] {
@@ -264,7 +398,7 @@ fn leftovers_row_is_not_measured_when_the_instance_does_not_answer() {
     assert_eq!(fact_of(Asked::NoInstance, table), Ok(Leftovers::default()));
     assert!(
         fact_of(
-            Asked::View(r#"{"view":"left","left":{"why":"not_sampled"}}"#.into()),
+            Asked::View(r#"{"schema":1,"kind":"sys.left","left":{"why":"not_sampled"}}"#.into()),
             || panic!("the table is not read while an instance runs")
         )
         .is_err(),
@@ -512,4 +646,69 @@ fn leftovers_row_without_an_instance_is_not_measured_when_a_record_does_not_read
         why.starts_with("this boot's verify run records did not read"),
         "{why}"
     );
+}
+
+/// Explicit comparison harness: identical inputs and process CPU counters, no timing verdict.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "explicit decoder baseline comparison"]
+fn decoder_matrix_measurement() {
+    fn cpu_us() -> u64 {
+        // SAFETY: getpgrp takes no arguments and cannot fail.
+        let group = unsafe { libc::getpgrp() };
+        aterm_sysprobe::group_usage(u32::try_from(group).unwrap())
+            .expect("native process CPU counters")
+            .into_iter()
+            .find(|row| row.pid == std::process::id())
+            .expect("this process is in its group")
+            .cpu_ns
+            / 1000
+    }
+    let envelope = |rows: &str| {
+        format!(
+            r#"{{"schema":1,"kind":"sys.left","left":{{"complete":true,"bounded":false}},"procs":[{rows}],"more":0,"runs":[],"links":[]}}"#
+        )
+    };
+    for (n, iterations) in [(0usize, 16_384u64), (64, 1024), (512, 128), (4096, 16)] {
+        let rows = (0..n)
+            .map(|i| {
+                let (state, reason) = if i % 3 == 0 {
+                    ("left", "owner-gone")
+                } else {
+                    ("orphaned", "live")
+                };
+                format!(r#"{{"pid":{},"state":"{state}","reason":"{reason}","started_ms":{i},"entry":false}}"#, i + 1000)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = envelope(&rows);
+        let facts = from_json(&body).expect("valid producer-shaped input");
+        assert_eq!(facts.rows, n.div_ceil(3));
+        assert!(!facts.more);
+        println!("FACT input_rows={n} bytes={} value={facts:?}", body.len());
+        for _ in 0..8 {
+            let _ = std::hint::black_box(from_json(std::hint::black_box(&body)));
+        }
+        let before = cpu_us();
+        let wall = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = std::hint::black_box(from_json(std::hint::black_box(&body)));
+        }
+        println!(
+            "CPU input_rows={n} iterations={iterations} cpu_us={} wall_us={}",
+            cpu_us() - before,
+            wall.elapsed().as_micros()
+        );
+    }
+    for (name, body) in [
+        ("wrong-kind", envelope("").replace("sys.left", "sys.procs")),
+        (
+            "future-schema",
+            envelope("").replace("\"schema\":1", "\"schema\":2"),
+        ),
+        ("null-row", envelope("null")),
+        ("missing-state", envelope(r#"{"reason":"live"}"#)),
+    ] {
+        println!("FACT case={name} value={:?}", from_json(&body));
+    }
 }

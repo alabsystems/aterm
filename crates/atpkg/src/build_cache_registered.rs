@@ -2438,19 +2438,19 @@ fn targo_cwd(args: &[String], machine: &super::Machine<'_>) -> Result<Option<Pat
     }
 }
 
-/// Resolve explicit output from the directory the compiler actually works in. Placement
+/// Resolve selected outputs from the directory the compiler actually works in. Placement
 /// still reads the original words: this observation never rewrites the compiler's argv or
 /// invents a build-directory plan. Unknown directories and configs grant no ownership.
-fn explicit_call_cache(
+fn selected_call_outputs(
     args: &[String],
     tool: super::Tool,
     machine: &super::Machine<'_>,
     alias: &dyn Fn(&str) -> super::UserAlias,
-) -> Option<super::ExplicitCache> {
+) -> Option<super::SelectedOutputs> {
     let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
     let typed = &args[at..];
     if super::directory_arg(typed).is_none() {
-        return super::explicit_cache(args, tool, machine, alias);
+        return super::selected_outputs(args, tool, machine, alias);
     }
     let cwd = targo_cwd(typed, machine).ok()??;
     let cwd = machine
@@ -2461,7 +2461,7 @@ fn explicit_call_cache(
         cwd: Some(&cwd),
         ..*machine
     };
-    super::explicit_cache(&super::without_directory(typed), tool, &moved, alias)
+    super::selected_outputs(&super::without_directory(typed), tool, &moved, alias)
 }
 
 /// One definition of an alias in a config file ([`user_alias`]): a string's words, an array's,
@@ -2831,6 +2831,10 @@ enum Observation {
     /// Only the quiet intermediate directory is owned. Final artifacts in the explicit
     /// target remain unmanaged, so this cannot acknowledge a managed producer's output.
     IntermediatesOwned,
+    /// A managed package selected its workspace's default final output, but complete
+    /// output custody was not established. The producer must not forget that final output
+    /// merely because its separately selected intermediate lies outside managed scope.
+    DefaultOutputsUnowned,
     /// Unmanaged: an explicit target named through a link that does not name a folder atpkg
     /// owns, for this reason; a producer requiring managed output refuses it in these words.
     #[cfg(unix)]
@@ -2881,15 +2885,15 @@ fn observe_with_placement(
     let placement = selected
         .cloned()
         .or_else(|| super::decide(args, tool, machine));
-    let chosen = explicit_call_cache(args, tool, machine, &alias)
+    let chosen = selected_call_outputs(args, tool, machine, &alias)
         .map(|chosen| (chosen, false))
         .or_else(|| {
             let manifest =
                 super::local_fallback_manifests(args, tool, machine, placement.as_ref()?, &alias)?;
             let owner = workspace_choices(home, &manifest, args, tool, machine)?;
             Some((
-                super::ExplicitCache {
-                    target: owner.join("target"),
+                super::SelectedOutputs {
+                    target: super::FinalTarget::Explicit(owner.join("target")),
                     manifests: manifest,
                     intermediates: None,
                 },
@@ -2945,8 +2949,23 @@ fn observe_with_placement(
             Observation::Unmanaged
         });
     };
+    let managed_default = matches!(&chosen.target, super::FinalTarget::WorkspaceDefault)
+        && chosen
+            .manifests
+            .iter()
+            .any(|manifest| !never_managed(home, manifest));
     let Some(owner) = workspace_choices(home, &chosen.manifests, args, tool, machine) else {
-        let target = under_home(&chosen.target, home).unwrap_or_else(|| chosen.target.clone());
+        let super::FinalTarget::Explicit(target) = &chosen.target else {
+            // No canonical workspace means no default target. Keep unresolved configured
+            // roots protected, as the unsupported-output path does, without guessing one.
+            return Ok(if managed_default {
+                suppress_configured(home)?;
+                Observation::DefaultOutputsUnowned
+            } else {
+                Observation::Unmanaged
+            });
+        };
+        let target = under_home(target, home).unwrap_or_else(|| target.clone());
         return suppress_unresolved(home, &target).map(|protected| {
             if protected {
                 Observation::Protected
@@ -2955,8 +2974,17 @@ fn observe_with_placement(
             }
         });
     };
+    let target = match chosen.target {
+        super::FinalTarget::Explicit(target) => target,
+        super::FinalTarget::WorkspaceDefault => owner.join("target"),
+    };
     if let Some(intermediates) = &chosen.intermediates {
-        return observe_configured_outputs(home, &owner, &chosen.target, intermediates);
+        let observed = observe_configured_outputs(home, &owner, &target, intermediates)?;
+        return Ok(if managed_default && observed != Observation::Owned {
+            Observation::DefaultOutputsUnowned
+        } else {
+            observed
+        });
     }
     let quiet = matches!(
         placement.as_ref(),
@@ -2965,7 +2993,7 @@ fn observe_with_placement(
     // A target named through a link is the folder it names when atpkg owns that folder, and
     // never adopted or created through it.
     #[cfg(unix)]
-    match through_link(home, &chosen.target) {
+    match through_link(home, &target) {
         Some(Ok(linked)) => {
             return Ok(match admit_linked(home, &linked, &owner)? {
                 Ok(()) => {
@@ -2980,13 +3008,13 @@ fn observe_with_placement(
         Some(Err(refusal)) => return Ok(Observation::Refused(refusal)),
         None => {}
     }
-    let owned = create_checked(home, &chosen.target, &owner)?;
+    let owned = create_checked(home, &target, &owner)?;
     #[cfg(unix)]
     if owned && quiet {
-        prepare_intermediates(home, &chosen.target, &owner, &|| true)?;
+        prepare_intermediates(home, &target, &owner, &|| true)?;
     }
     if !owned && quiet {
-        let child = super::target_build_path(&chosen.target);
+        let child = super::target_build_path(&target);
         let directory = match placement.as_ref() {
             Some(super::BuildDir::Target(value)) => super::directory_from_config(value),
             Some(super::BuildDir::TrustEnv(directory)) => Some(directory.as_str()),
@@ -3006,7 +3034,7 @@ fn observe_with_placement(
                 return Ok(Observation::IntermediatesOwned);
             }
         }
-        if scope(home, &chosen.target) {
+        if scope(home, &target) {
             return Err(std::io::Error::other(
                 "the target's quiet build directory could not be owned; no build started",
             ));
@@ -3259,6 +3287,14 @@ fn command_observation(
 /// call never had, are hidden here; `env`: it exported `CARGO_BUILD_BUILD_DIR` alone (the trust
 /// lane), which the call never had, hidden here; `-`: nothing), so the call is read as typed.
 ///
+/// With `build`, the answer is what an observed call that produces build output builds
+/// ([`ShimBuild`]), for the front's start line ([`crate::build_start`]), read by a second reader
+/// ([`shim_build`]): the registration resolves no owner for a build in the shared cache, the
+/// common one. `None` without `build` (the front asks only for a call started in a tab whose
+/// record it can write, so no other call pays for the read), for a call that produces none (a
+/// reading or resolving verb, help, clean, a version) or whose workspace root this reader does
+/// not resolve, and wherever calls are not observed (off macOS, or with no home).
+///
 /// # Errors
 /// As [`observe_command`]'s, or `InvalidInput` for an unknown or mismatched placement claim.
 pub fn observe_shim_call(
@@ -3266,7 +3302,8 @@ pub fn observe_shim_call(
     tool: super::Tool,
     placed: &str,
     cwd: Option<&Path>,
-) -> std::io::Result<()> {
+    build: bool,
+) -> std::io::Result<Option<ShimBuild>> {
     observation_with(
         args,
         tool,
@@ -3274,8 +3311,119 @@ pub fn observe_shim_call(
         &|name| std::env::var_os(name),
         true,
         Some(placed),
-    )
-    .map(|_| ())
+    )?;
+    if !build || !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    Ok(with_machine(
+        cwd,
+        &|name| std::env::var_os(name),
+        |machine| shim_build(args, tool, placed, machine.home?, machine),
+    ))
+}
+
+/// What a shim's call builds, as its front read it ([`observe_shim_call`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShimBuild {
+    /// The workspace root the call compiles, canonical: Cargo's workspace root of the manifest
+    /// the call names or finds, as this reader resolves it ([`workspace`], inside home).
+    pub workspace: PathBuf,
+    /// Where the call's build output goes, where the placement names it: the directory the
+    /// shim's block placed (or, for a call it left as typed, the one `CARGO_BUILD_BUILD_DIR`
+    /// names), with the workspace root in place of `{workspace-root}`. A placement under a
+    /// target directory (`<target>/.ubd/build.noindex`) names that target directory. `None`
+    /// where none is named, and where it is relative or holds another template.
+    pub build_dir: Option<PathBuf>,
+}
+
+/// What the shim's call `args` builds, read as [`observe_shim_on`] reads it (`placed` what the
+/// block did to the words, the variable it exported hidden). It reads manifests and configs
+/// and writes nothing: no receipt, no directory. `None` for a `placed` the block never says, a
+/// call that produces no build output ([`non_producing_command`], [`targo_query`]), a `-C` this
+/// reader cannot resolve, a call that names no manifest and finds none (`targo install x` in a
+/// folder with no `Cargo.toml` builds no workspace there), and a manifest whose workspace root
+/// this reader does not resolve (outside home, or read two ways): a line names the workspace a
+/// call compiles or nothing, never the folder it was typed in, which may hold many.
+fn shim_build(
+    args: &[String],
+    tool: super::Tool,
+    placed: &str,
+    home: &Path,
+    machine: &super::Machine<'_>,
+) -> Option<ShimBuild> {
+    let (typed, hidden) = typed_call(args, placed)?;
+    let env = |name: &str| {
+        if Some(name) == hidden {
+            None
+        } else {
+            (machine.env)(name)
+        }
+    };
+    let original = &super::Machine {
+        env: &env,
+        ..*machine
+    };
+    if non_producing_command(typed, tool, original) || targo_query(typed, tool, original) {
+        return None;
+    }
+    // A `+toolchain` is no word `-C` is read from, nor one of the line Targo runs.
+    let at = usize::from(tool.is_cargo() && typed.first().is_some_and(|arg| arg.starts_with('+')));
+    let words = &typed[at..];
+    let cwd = targo_cwd(words, original).ok()??;
+    let cwd = under_home(&cwd, home).unwrap_or(cwd);
+    let alias = |verb: &str| user_alias(verb, typed, tool, original);
+    let line = super::targo_line(words, tool, &alias);
+    let named = super::without_directory(line.as_deref().unwrap_or(words));
+    let moved = &super::Machine {
+        cwd: Some(&cwd),
+        ..*original
+    };
+    let manifest = match named_manifest(&named, tool) {
+        Some(raw) if raw.is_empty() => None,
+        Some(raw) => normalize_with_cwd(PathBuf::from(raw), Some(&cwd)),
+        None => super::initial_manifest_readings(&named, tool, moved)
+            .into_iter()
+            .find_map(|reading| match reading {
+                super::InitialManifest::Readable(path) => Some(path),
+                super::InitialManifest::Absent | super::InitialManifest::Unreadable(_) => None,
+            }),
+    };
+    let workspace = workspace(home, &manifest?, typed, tool, original)?;
+    let directory = match placed {
+        "config" => args
+            .get(1)
+            .and_then(|value| super::directory_from_config(value))
+            .map(str::to_owned),
+        "env" => (machine.env)(super::BUILD_DIR_ENV).and_then(|value| value.into_string().ok()),
+        _ => super::cargo_var(super::BUILD_DIR_ENV, tool, machine)
+            .and_then(|value| value.into_string().ok()),
+    };
+    let build_dir = directory.and_then(|directory| {
+        const ROOT: &str = "{workspace-root}";
+        if directory.replace(ROOT, "").contains(['{', '}']) {
+            return None;
+        }
+        let directory = if directory.contains(ROOT) {
+            directory.replace(ROOT, workspace.to_str()?)
+        } else {
+            directory
+        };
+        let mut directory = PathBuf::from(directory);
+        if !directory.is_absolute() {
+            return None;
+        }
+        let quiet = super::target_build_relative();
+        if directory.ends_with(&quiet) {
+            for _ in quiet.components() {
+                directory.pop();
+            }
+        }
+        Some(directory)
+    });
+    Some(ShimBuild {
+        workspace,
+        build_dir,
+    })
 }
 
 /// The call as typed, from the words a shim's block `placed` handed its front
@@ -3437,13 +3585,21 @@ fn prepare_unowned_placement(
             "the selected quiet build target could not be resolved safely; no build started",
         )
     };
-    let target = if let Some(chosen) = explicit_call_cache(args, tool, machine, &|verb| {
+    let target = if let Some(chosen) = selected_call_outputs(args, tool, machine, &|verb| {
         user_alias(verb, args, tool, machine)
     }) {
-        if directory.map(Path::new) != Some(super::target_build_path(&chosen.target).as_path()) {
+        let target = match chosen.target {
+            super::FinalTarget::Explicit(target) => target,
+            super::FinalTarget::WorkspaceDefault => {
+                workspace_choices(home, &chosen.manifests, args, tool, machine)
+                    .ok_or_else(stop)?
+                    .join("target")
+            }
+        };
+        if directory.map(Path::new) != Some(super::target_build_path(&target).as_path()) {
             return Err(stop());
         }
-        chosen.target
+        target
     } else {
         let manifest = super::local_fallback_manifests(args, tool, machine, selected, &|verb| {
             user_alias(verb, args, tool, machine)
@@ -3811,13 +3967,13 @@ fn observe_for_producer_with_placement(
     let explicit = requires_managed_explicit(args, tool, home, machine);
     let refusal = || {
         std::io::Error::other(
-            "explicit build target is unmanaged or unsupported; choose a fresh target for managed cache ownership",
+            "build outputs are unmanaged or unsupported; choose fresh output directories for managed cache ownership",
         )
     };
     if require_explicit
         && explicit
         && !query
-        && explicit_call_cache(args, tool, machine, &|verb| {
+        && selected_call_outputs(args, tool, machine, &|verb| {
             user_alias(verb, args, tool, machine)
         })
         .and_then(|chosen| workspace_choices(home, &chosen.manifests, args, tool, machine))
@@ -3830,7 +3986,11 @@ fn observe_for_producer_with_placement(
         None => observe(args, tool, home, machine),
     }?;
     let owned = observed == Observation::Owned;
-    if require_explicit && explicit && !query && !owned {
+    if require_explicit
+        && (explicit || observed == Observation::DefaultOutputsUnowned)
+        && !query
+        && !owned
+    {
         #[cfg(unix)]
         if let Observation::Refused(refusal) = observed {
             return Err(std::io::Error::other(refusal.why()));

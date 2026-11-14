@@ -3,18 +3,35 @@
 
 //! The signed chain: the paper master's roster, a live machine's appcast, the release's
 //! identity and Linux triples under the durable floors ([`verify_manifest`]), the
-//! channel head's policy over an older candidate, and the command line ([`main`]).
+//! channel head's policy over an older candidate, and install.sh's command line (`main`).
+//! The chain builds on every platform (get-aterm.ps1's Windows verifier asks it too,
+//! `crate::windows`); the command line, which reads a Linux store, is Unix only.
 
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::io::Read as _;
 
 use aterm_toml::{Table, Value};
 use ring::signature::{ED25519, UnparsedPublicKey};
 
-use crate::py::{PyPath, bare_os_error, equals_str, int_tuple, os_error, truthy, uint, uint_or};
-use crate::store::{Policy, preflight_store, read_install_policy};
+#[cfg(unix)]
+use crate::py::int_tuple;
+use crate::py::{PyPath, bare_os_error, equals_str, os_error, truthy, uint, uint_or};
+#[cfg(unix)]
+use crate::store::{preflight_store, read_install_policy};
 use crate::{MAX_BINARY, Refusal, Verdict, require};
+
+/// The durable policy `.aterm-update/state.toml` records. Off Linux no store records one, and
+/// a verification asks under the clean slate, `Policy::default()`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Policy {
+    pub floors: [u64; 3],
+    pub revoked_machines: Vec<String>,
+    pub rejected_build: u64,
+    /// `[min_build_sources]` as recorded, read by [`crate::withdrawn_floor`].
+    pub min_build_sources: Option<Value>,
+}
 
 const U32_MAX: u64 = 0xffff_ffff;
 
@@ -196,18 +213,33 @@ pub(crate) fn open_file(path: &std::path::Path) -> Verdict<(std::fs::File, std::
     let file = std::fs::File::open(path).map_err(|e| os_error(&e, path))?;
     let meta = file.metadata().map_err(|e| os_error(&e, path))?;
     if meta.is_dir() {
-        return Err(os_error(
-            &std::io::Error::from_raw_os_error(libc::EISDIR),
-            path,
-        ));
+        return Err(os_error(&not_a_file(true), path));
     }
     if !meta.is_file() {
-        return Err(os_error(
-            &std::io::Error::from_raw_os_error(libc::EINVAL),
-            path,
-        ));
+        return Err(os_error(&not_a_file(false), path));
     }
     Ok((file, meta))
+}
+
+/// What `open` raises for a directory (`EISDIR`) or for anything else that is no regular file
+/// (`EINVAL`).
+#[cfg(unix)]
+fn not_a_file(directory: bool) -> std::io::Error {
+    std::io::Error::from_raw_os_error(if directory {
+        libc::EISDIR
+    } else {
+        libc::EINVAL
+    })
+}
+
+/// [`not_a_file`] off Unix, where no errno names the two: the kinds, in the same words.
+#[cfg(not(unix))]
+fn not_a_file(directory: bool) -> std::io::Error {
+    if directory {
+        std::io::Error::new(std::io::ErrorKind::IsADirectory, "Is a directory")
+    } else {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid argument")
+    }
 }
 
 /// `tomllib.loads(bytes.decode("utf-8"))`.
@@ -589,6 +621,7 @@ pub(crate) fn strings(value: Option<&Value>, why: &str) -> Verdict<Vec<String>> 
 
 /// Python's `os.path.exists`-by-`Path.exists()`: a missing entry, a missing directory on
 /// the way, a bad descriptor or a symbolic-link loop is "no"; any other error is raised.
+#[cfg(unix)]
 fn exists(path: &PyPath) -> Verdict<bool> {
     let real = path.to_path();
     match std::fs::metadata(&real) {
@@ -606,6 +639,7 @@ fn exists(path: &PyPath) -> Verdict<bool> {
 }
 
 /// The command line ([`crate::run`]) under the trust anchor `pins`.
+#[cfg(unix)]
 pub(crate) fn main(args: &[OsString], now: i64, pins: &[String]) -> Verdict<Option<String>> {
     if args.first().is_some_and(|a| a == "--store-path") {
         require(args.len() == 2, "invalid Linux verifier invocation")?;

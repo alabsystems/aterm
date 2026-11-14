@@ -318,3 +318,41 @@ fn a_withdrawal_takes_this_cuts_assets_and_never_the_source_shapes() {
     assert!(!binds_to_version(&[dmg, "aterm-0.94.0.dmg".to_string()], v));
     assert!(!binds_to_version(&["SHA256SUMS".to_string()], v));
 }
+
+/// A cut may publish its version's Windows portable zip and Windows bootstrap verifier and
+/// nothing Windows-shaped else: each binds a release to its version, a lost journal's
+/// withdrawal takes the zip, and another version's zip or verifier, the local portable
+/// spelling or an unsigned sidecar is foreign.
+#[test]
+fn the_windows_zip_is_this_versions_to_publish_and_nothing_beside_it() {
+    let v = "0.200.0";
+    let zip = "aterm-0.200.0-windows-x86_64.zip".to_string();
+    let verifier = "aterm-bootstrap-verify-0.200.0-windows-x86_64.exe".to_string();
+    assert_eq!(windows_asset_names(v), [zip.clone(), verifier.clone()]);
+    let publishable = publishable_asset_names(v);
+    assert!(publishable.contains(&zip));
+    assert!(publishable.contains(&verifier));
+    assert!(publishable.is_sorted());
+    assert!(binds_to_version(&[dmg_asset_name(v), zip.clone()], v));
+    assert!(binds_to_version(
+        &[dmg_asset_name(v), zip.clone(), verifier.clone()],
+        v
+    ));
+    for foreign in [
+        "aterm-0.199.0-windows-x86_64.zip",
+        "aterm-0.200.0-x86_64-portable.zip",
+        "aterm-0.200.0-windows-x86_64.zip.sha256",
+        "aterm-0.200.0-windows-aarch64.zip",
+        "aterm-bootstrap-verify-0.199.0-windows-x86_64.exe",
+        "aterm-bootstrap-verify-0.200.0-windows-x86_64",
+        "aterm-bootstrap-verify-0.200.0-windows-x86_64.exe.sha256",
+    ] {
+        assert!(!publishable.iter().any(|name| name == foreign), "{foreign}");
+        assert!(!binds_to_version(&[zip.clone(), foreign.to_string()], v));
+    }
+    let adopted = vec!["SHA256SUMS".to_string(), dmg_asset_name(v), zip.clone()];
+    assert_eq!(
+        withdrawable_assets(&adopted, v, None).unwrap(),
+        vec![dmg_asset_name(v), zip]
+    );
+}

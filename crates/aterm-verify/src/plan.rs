@@ -319,8 +319,34 @@ fn folds(ctx: &Ctx, wanted: &[StageId]) -> bool {
     ctx.checkers_in_tests && ctx.scope.is_workspace() && wanted.contains(&StageId::TestCompile)
 }
 
-/// Planned stages for `ctx.checks` ([`wanted`]), with source and type preflight first,
-/// each with the memory it claims
+/// The source and type preflight: the stages every later stage waits for, so their errors show
+/// before test code generation, including when a shared pool could otherwise give the compile
+/// every CPU token.
+const PREFLIGHT: [StageId; 5] = [
+    StageId::ReleasedShim,
+    StageId::Formatting,
+    StageId::Census,
+    StageId::ExportScan,
+    StageId::Tippy,
+];
+
+/// The preflight stages `id` waits for ([`PREFLIGHT`]). The released shim waits for none and
+/// every other stage waits for it. The three source guards and the lint wait for it alone and
+/// for none of each other: each reads the tree and writes none of it (`--fix` is taken only
+/// with `fmt` or `census` alone), the lint builds in its own lane, and a red in any of them
+/// ends an ordinary run where it is ([`crate::sched::Halt::after_preflight`]), so running them
+/// together loses no red and a run no longer waits for the three guards one after another.
+/// Every stage after them waits for all five.
+fn preflight_of(id: StageId) -> &'static [StageId] {
+    match PREFLIGHT.iter().position(|stage| *stage == id) {
+        Some(0) => &[],
+        Some(_) => &PREFLIGHT[..1],
+        None => &PREFLIGHT,
+    }
+}
+
+/// Planned stages for `ctx.checks` ([`wanted`]), with source and type preflight first
+/// ([`preflight_of`]), each with the memory it claims
 /// by the run's book ([`StageSpec::mem`]): none for a named skip ([`named_skip`]), which starts
 /// nothing.
 #[must_use]
@@ -340,20 +366,9 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         .map(|b| (b.records(), b.plain_records()));
     let mut planned = Vec::with_capacity(v.len());
     for mut s in v {
-        // Source guards and lint expose errors before test code generation, including
-        // when a shared pool could otherwise give the compile every CPU token.
-        for prerequisite in [
-            StageId::ReleasedShim,
-            StageId::Formatting,
-            StageId::Census,
-            StageId::ExportScan,
-            StageId::Tippy,
-        ] {
-            if s.id == prerequisite {
-                break;
-            }
-            if !s.after_stages.contains(&prerequisite) {
-                s.after_stages.push(prerequisite);
+        for prerequisite in preflight_of(s.id) {
+            if !s.after_stages.contains(prerequisite) {
+                s.after_stages.push(*prerequisite);
             }
         }
         s.after_stages.retain(|id| present.contains(id));

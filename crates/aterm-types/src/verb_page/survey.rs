@@ -99,7 +99,21 @@ pub(crate) const PAGE: Page = Page {
                      node=<32 hex|-> instances=<n> label=<pct|-> window=<0|1> window_last=<unix \
                      s|-> ssh_host_key=<pct|-> accounts=<n> accounts_unread=<cli>[,…]|-> \
                      moves_7d=<n|-> move_tries_7d=<n|-> last_move=<unix s|-> roster_unread=<0|1> \
-                     access=<read|write|full>[ drive=1]` header (`access=`: this machine's \
+                     [update=<word> update_at=<unix s|-> update_to=<version|build n|-> \
+                     update_until=<unix s|-> update_why=<word|-> update_tries=<n|-> \
+                     update_checks=<on|off|->] access=<read|write|full>[ drive=1]` header \
+                     (`update=`: where this machine's updater stands, as `aterm update status` \
+                     there decides it (on Windows, against the build staged there): off, \
+                     installed, downloaded, cannot, held, refused, not-installing, unreadable, \
+                     too-old, failing, check-failed, retrying, behind, current, unchecked or \
+                     unread; `update_at=` its last completed check, `update_to=` the build \
+                     that standing names, `update_until=` when a hold lapses, `update_why=` a \
+                     hold's cause (`start-failed`: a window there saw the staged build fail to \
+                     start, so no start without a window installs it) or a failure's class, \
+                     `update_tries=` its tries, `update_checks=` whether automatic checks are \
+                     on, both times on the clock the header's `at_ms=` was read on; none of \
+                     the updater's own text, and none at all from an aterm older than these \
+                     words; `access=`: this machine's \
                      fleet access, what a driver may do here, `aterm fleet access`; `drive=1`: a \
                      fleet reader this machine lets drive it, as far as `access=` admits; at \
                      `content`, `home= home_free_mb= repos= repos_at= repos_cut=` before \

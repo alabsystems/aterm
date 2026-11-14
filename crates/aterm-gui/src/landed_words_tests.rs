@@ -7,248 +7,7 @@ use std::sync::Arc;
 
 use aterm_agent::harness::acts::TaskFace;
 
-use crate::status_item::{EndRow, Glance, SessionRow, TaskRow, compose_status_menu, menu_lines};
-use crate::task_record::TaskState;
 use crate::{App, WindowId};
-
-const NOW: i64 = 1_800_000_000;
-
-fn ms(secs: i64) -> u64 {
-    u64::try_from(secs).expect("a positive time") * 1000
-}
-
-fn worker(
-    id: u64,
-    label: &str,
-    from: &str,
-    state: TaskState,
-    why: Option<&'static str>,
-    result: u64,
-) -> SessionRow {
-    SessionRow {
-        id,
-        sid: format!("s-{id:020}"),
-        title: label.to_string(),
-        agent: "idle",
-        task: Some(TaskRow {
-            state,
-            why,
-            from: from.to_string(),
-            entered: 7,
-            since_unix_ms: ms(NOW - 4 * 60),
-            result_bytes: result,
-            result_path: (result > 0).then(|| std::path::PathBuf::from("/tmp/r.md")),
-            seen: false,
-            finished: false,
-            own_report: false,
-        }),
-        ..SessionRow::default()
-    }
-}
-
-fn menu(rows: &[SessionRow]) -> Vec<String> {
-    let glance = Glance::build(rows, &[], None, ms(NOW), None);
-    menu_lines(&compose_status_menu(&glance, NOW), &[])
-}
-
-fn line_with(lines: &[String], words: &str) -> String {
-    let found: Vec<&String> = lines.iter().filter(|l| l.contains(words)).collect();
-    assert_eq!(found.len(), 1, "one line with {words:?}: {lines:#?}");
-    found[0]
-        .rsplit_once(" at=")
-        .map_or_else(|| found[0].clone(), |(line, _)| line.to_string())
-}
-
-#[test]
-fn a_landed_worker_reads_landed_and_an_older_done_reads_done() {
-    let manager = SessionRow {
-        id: 1,
-        sid: "s-manager".to_string(),
-        title: "lab-sweep".to_string(),
-        agent: "busy",
-        ..SessionRow::default()
-    };
-    let rows = [
-        manager,
-        worker(2, "bench", "s-manager", TaskState::Working, None, 0),
-        worker(
-            3,
-            "lint",
-            "s-manager",
-            TaskState::Done,
-            Some(crate::task_record::WHY_LANDED),
-            2150,
-        ),
-        worker(4, "fmt", "s-manager", TaskState::Done, Some("marker"), 0),
-    ];
-    let lines = menu(&rows);
-    assert!(
-        line_with(&lines, "\u{2713} lint")
-            .contains("\u{2713} lint \u{2014} landed 4m \u{b7} 2.1 KB"),
-        "{lines:#?}"
-    );
-    assert!(
-        line_with(&lines, "\u{2713} fmt").contains("\u{2713} fmt \u{2014} done 4m"),
-        "{lines:#?}"
-    );
-    assert!(
-        line_with(&lines, "bench \u{2014}").contains("\u{25cf} bench \u{2014} working 4m"),
-        "{lines:#?}"
-    );
-    assert!(
-        line_with(&lines, "lab-sweep \u{2014}")
-            .contains("lab-sweep \u{2014} 3 workers: 1 working, 1 landed, 1 done"),
-        "{lines:#?}"
-    );
-}
-
-#[test]
-fn this_mac_counts_landed_and_exited_apart() {
-    let plain = SessionRow {
-        id: 1,
-        sid: "s-plain".to_string(),
-        title: "docs pass".to_string(),
-        agent: "idle",
-        landed: true,
-        ..SessionRow::default()
-    };
-    let rows = [
-        plain,
-        worker(
-            2,
-            "lint",
-            crate::task_record::FROM_CTL,
-            TaskState::Done,
-            Some(crate::task_record::WHY_LANDED),
-            0,
-        ),
-        worker(
-            3,
-            "bench",
-            crate::task_record::FROM_CTL,
-            TaskState::Exited,
-            Some("exit"),
-            0,
-        ),
-    ];
-    let lines = menu(&rows);
-    assert_eq!(
-        line_with(&lines, "This Mac \u{2014}"),
-        "statusmenu \"This Mac \u{2014} 2 landed \u{b7} 1 exited\" enabled=no"
-    );
-    let mut older = rows.to_vec();
-    older.push(worker(
-        4,
-        "fmt",
-        crate::task_record::FROM_CTL,
-        TaskState::Done,
-        Some("done-check"),
-        0,
-    ));
-    assert_eq!(
-        line_with(&menu(&older), "This Mac \u{2014}"),
-        "statusmenu \"This Mac \u{2014} 2 landed \u{b7} 1 done \u{b7} 1 exited\" enabled=no"
-    );
-}
-
-#[test]
-fn a_seen_landing_stays_landed_in_done_for_you() {
-    let landed = |id, label| {
-        worker(
-            id,
-            label,
-            crate::task_record::FROM_CTL,
-            TaskState::Done,
-            Some(crate::task_record::WHY_LANDED),
-            0,
-        )
-    };
-    let mut seen = landed(1, "seen");
-    seen.end = Some(EndRow {
-        serial: 1,
-        since_unix_ms: ms(NOW - 4 * 60),
-        seen: true,
-    });
-    let quick = landed(2, "quick");
-    let older = worker(
-        3,
-        "older",
-        crate::task_record::FROM_CTL,
-        TaskState::Done,
-        Some("marker"),
-        0,
-    );
-    let lines = menu(&[seen, quick, older]);
-    assert!(
-        line_with(&lines, "\u{2713} seen").contains("\u{2713} seen \u{2014} landed 4m"),
-        "{lines:#?}"
-    );
-    assert!(
-        line_with(&lines, "\u{2713} quick").contains("\u{2713} quick \u{2014} landed 4m"),
-        "{lines:#?}"
-    );
-    assert!(
-        line_with(&lines, "\u{2713} older").contains("\u{2713} older \u{2014} done 4m"),
-        "{lines:#?}"
-    );
-}
-
-fn land_worker(app: &mut App, local: u64, title: &str) {
-    let ctx = app.pool.get(local).expect("pooled").ctx.clone();
-    ctx.meta
-        .lock()
-        .expect("meta")
-        .set("title", Some(title.to_string()));
-    let mut mark = crate::task_record::TaskMark::new(TaskState::Done);
-    mark.why = Some(crate::task_record::WHY_LANDED);
-    crate::task_record::mark_session_task(&ctx, local, &mark).expect("marked");
-    app.on_task_changed(local);
-}
-
-fn two_landed_workers(first: &str, second: &str) -> (App, u64) {
-    let mut app = App::headless_for_test();
-    let id = app.next_session_id;
-    app.push_stub_tab(WindowId(0), crate::stub_session(id));
-    land_worker(&mut app, 0, first);
-    land_worker(&mut app, id, second);
-    (app, id)
-}
-
-fn done_rows(app: &App) -> Vec<String> {
-    let glance = app.status_glance();
-    assert_eq!(glance.done.len(), 2, "both landings: {:?}", glance.done);
-    let mut labels: Vec<String> = glance.done.iter().map(|d| d.label.clone()).collect();
-    labels.sort();
-    labels
-}
-
-#[test]
-fn two_rows_with_one_label_say_where_they_are() {
-    let (app, _) = two_landed_workers("Claude Code", "Claude Code");
-    assert_eq!(
-        done_rows(&app),
-        ["Claude Code in tab 1", "Claude Code in tab 2"]
-    );
-}
-
-#[test]
-fn a_unique_row_names_no_place() {
-    let (app, _) = two_landed_workers("Claude Code", "lint");
-    assert_eq!(done_rows(&app), ["Claude Code", "lint"]);
-}
-
-#[test]
-fn two_panes_of_one_tab_with_one_label_say_which_pane() {
-    let mut app = App::headless_for_test();
-    let right = app.split_active_stub_tab(WindowId(0));
-    land_worker(&mut app, 0, "Claude Code");
-    land_worker(&mut app, right, "Claude Code");
-    let rows = done_rows(&app);
-    assert_ne!(rows[0], rows[1], "told apart: {rows:?}");
-    for row in &rows {
-        assert!(row.starts_with("Claude Code in tab 1, "), "{rows:?}");
-    }
-}
 
 pub(super) struct TestHost(crate::harness_host::HostHandle);
 
@@ -394,24 +153,30 @@ fn the_hover_follows_the_timer() {
 }
 
 #[test]
-fn this_mac_counts_a_landed_tab_that_is_no_worker() {
+fn a_landed_tab_that_is_no_worker_wears_landed() {
     let (mut app, sid, _host) = desk("land");
     tell(&mut app, &sid, Some(TaskFace::Open));
     let _ = app.take_status_rebuild();
     tell(&mut app, &sid, Some(TaskFace::Landed));
-    assert!(app.take_status_rebuild(), "the glance owes a rebuild");
-    assert_eq!(app.status_glance().here.landed, 1);
+    assert!(
+        app.take_status_rebuild(),
+        "the Agents surfaces owe a rebuild"
+    );
+    assert!(app.chip_face_landed(0));
     tell(&mut app, &sid, Some(TaskFace::Theirs));
-    assert!(app.take_status_rebuild(), "the glance owes a rebuild");
-    assert_eq!(app.status_glance().here.landed, 0);
+    assert!(
+        app.take_status_rebuild(),
+        "the Agents surfaces owe a rebuild"
+    );
+    assert!(!app.chip_face_landed(0));
 }
 
 #[test]
-fn a_landing_under_cruise_is_not_counted_landed() {
+fn a_landing_under_cruise_does_not_wear_landed() {
     let (mut app, sid, _host) = desk("land");
     tell(&mut app, &sid, Some(TaskFace::Open));
     tell(&mut app, &sid, Some(TaskFace::Landed));
-    assert_eq!(app.status_glance().here.landed, 1);
+    assert!(app.chip_face_landed(0));
     assert_eq!(
         driven(&app).as_deref(),
         Some("driven by aterm (land, landed)")
@@ -422,42 +187,10 @@ fn a_landing_under_cruise_is_not_counted_landed() {
         Some(TaskFace::Landed),
         "PRECONDITION: the glass keeps the landed face"
     );
-    assert_eq!(app.status_glance().here.landed, 0, "the chip wears cruise");
+    assert!(!app.chip_face_landed(0), "the chip wears cruise");
     assert_eq!(driven(&app).as_deref(), Some("driven by aterm (cruise)"));
     meta(&mut app, "set autopilot land");
-    assert_eq!(app.status_glance().here.landed, 1, "back under Land");
-}
-
-/// §14.6: This Mac counts a Land tab that holds as `landing`, the page's word for it, and the
-/// same tab under Cruise, at rest, as `resting`.
-#[test]
-fn this_mac_counts_a_held_land_tab_landing_and_a_cruise_one_resting() {
-    use aterm_agent::harness::acts::{HoldLeg, LandHeld};
-    let (mut app, sid, _host) = desk("land");
-    idle(&app);
-    tell(&mut app, &sid, Some(TaskFace::Open));
-    let here = |app: &App| {
-        let g = app.status_glance();
-        (g.here.landing, g.here.resting)
-    };
-    assert_eq!(here(&app), (0, 1), "no hold before Land's instruction");
-    let held = LandHeld {
-        since_ms: Some(1_792_159_320_000),
-        nudges: 2,
-        read: true,
-        legs: HoldLeg::Repo.bit(),
-        unpushed: 1,
-        ..LandHeld::default()
-    };
-    if crate::harness_host::store_land_held(&app.store, &sid, Some(held)) {
-        app.apply_harness_fact(&sid, crate::HarnessFact::LandHeld);
-    }
-    assert!(app.shown_hold(0).is_some(), "PRECONDITION: the hold stands");
-    assert_eq!(here(&app), (1, 0), "a held Land is landing");
-    meta(&mut app, "set autopilot cruise");
-    assert_eq!(here(&app), (0, 1), "a Cruise tab at rest is resting");
-    meta(&mut app, "set autopilot land");
-    assert_eq!(here(&app), (1, 0), "back under Land, the hold kept");
+    assert!(app.chip_face_landed(0), "back under Land");
 }
 
 /// §14.6: the Overview's row of a landed task says `landed` once, in its task words, and its
@@ -486,7 +219,7 @@ fn the_overview_says_landed_once() {
         "CONTROL: no task words, so the driver says it: {before}"
     );
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
-    let mut mark = crate::task_record::TaskMark::new(TaskState::Done);
+    let mut mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Done);
     mark.why = Some(crate::task_record::WHY_LANDED);
     mark.result_bytes = 128;
     crate::task_record::mark_session_task(&ctx, 0, &mark).expect("marked");

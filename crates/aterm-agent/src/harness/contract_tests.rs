@@ -21,8 +21,9 @@ fn the_served_contracts_are_two_and_three() {
     assert!(SERVED.contains(&SCOPED));
 }
 
-/// grok-alab, muse-alab and kimi-alab may relaunch and upgrade. Nothing else is a rostered
-/// holder, codex-alab included (its v2 rule stays its own).
+/// grok-alab, muse-alab, kimi-alab and claude-code-alab may relaunch and upgrade. Nothing else is
+/// a rostered holder, codex-alab included (its v2 rule stays its own), and neither is
+/// claude-code-alab's tool name or its vendor's.
 #[test]
 fn the_roster_names_each_harness_and_the_duties_it_may_claim() {
     let (row, pid) = holder("grok-alab@4242").expect("rostered");
@@ -49,6 +50,26 @@ fn the_roster_names_each_harness_and_the_duties_it_may_claim() {
     assert_eq!(row.allows, &[Scope::Relaunch, Scope::Upgrade]);
     assert_eq!(row_for(Program::Kimi).map(|r| r.id), Some("kimi-alab"));
     assert_eq!(row_named("Kimi-Alab").map(|r| r.id), Some("kimi-alab"));
+    let (row, pid) = holder("claude-code-alab@4245").expect("rostered");
+    assert_eq!(
+        (row.id, row.program, row.package, row.vendor, pid),
+        (
+            "claude-code-alab",
+            Program::Claude,
+            "claude-code-alab",
+            "claude",
+            4245
+        )
+    );
+    assert_eq!(row.allows, &[Scope::Relaunch, Scope::Upgrade]);
+    assert_eq!(
+        row_for(Program::Claude).map(|r| r.id),
+        Some("claude-code-alab")
+    );
+    assert_eq!(
+        row_named("Claude-Code-Alab").map(|r| r.id),
+        Some("claude-code-alab")
+    );
     // Every row's id reads as its vendor (§8.1 item 5), so presence keeps the vendor's reader.
     for row in ROSTER {
         assert_eq!(
@@ -67,7 +88,11 @@ fn the_roster_names_each_harness_and_the_duties_it_may_claim() {
         "grok-alab@42x",
         "grok-alab",
         "codex-alab@4242",
-        "claude-code-alab@4242",
+        "claude-code-alab@",
+        "claude-code-alab@1",
+        "claude-code-alab@04242",
+        "claude-alab@4242",
+        "claude@4242",
         "kimi-alab@",
         "kimi-alab@1",
         "kimi-alab@04242",
@@ -79,12 +104,7 @@ fn the_roster_names_each_harness_and_the_duties_it_may_claim() {
     ] {
         assert_eq!(holder(other), None, "{other}");
     }
-    for p in [
-        Program::Claude,
-        Program::Codex,
-        Program::Agy,
-        Program::Generic,
-    ] {
+    for p in [Program::Codex, Program::Agy, Program::Generic] {
         assert_eq!(row_for(p), None, "{p:?}");
     }
 }
@@ -154,6 +174,54 @@ fn the_scope_parser_refuses_whole_and_admits_only_the_rows_words() {
     assert!(scoped("kimi-alab@9", &["contract=3", "scope=relaunch,upgrade"]).is_ok());
     assert!(refused("kimi-alab@9", &["contract=3", "scope=turn-end"]));
     assert!(refused("kimi-alab@9", &["contract=3", "scope=bogus"]));
+}
+
+/// claude-code-alab's claim, as its launch makes it and as it widens (§11 D53): `scope=upgrade`,
+/// then `relaunch,upgrade`, each with the versions it announces. Now it is rostered it never
+/// claims under v2 (no `contract=`, with or without a lease), and a duty outside its row
+/// (`turn-end` and the rest stay the built-in engine's) refuses the claim whole. Its tool's name
+/// is no holder: `claude-alab@<pid>` stays an ordinary foreign claim.
+#[test]
+fn claude_code_alab_claims_under_contract_three_alone_and_only_relaunch_and_upgrade() {
+    let me = "claude-code-alab@500";
+    let launch = scoped(
+        me,
+        &[
+            "contract=3",
+            "scope=upgrade",
+            "version=0.2.0+ge8b32af",
+            "vendor=2.1.310",
+        ],
+    )
+    .expect("the launch claim");
+    assert_eq!((launch.row.program, launch.pid), (Program::Claude, 500));
+    assert_eq!(launch.scopes.words(), "upgrade");
+    assert!(!launch.scopes.contains(Scope::Relaunch));
+    assert_eq!(
+        launch.versions(),
+        "claude-code-alab 0.2.0+ge8b32af (claude 2.1.310)"
+    );
+    let widened = scoped(me, &["contract=3", "scope=upgrade,relaunch"]).expect("the widened claim");
+    assert_eq!(widened.scopes.words(), "relaunch,upgrade");
+    for words in [
+        &[][..],
+        &["ttl=5000"],
+        &["scope=upgrade"],
+        &["contract=2", "scope=upgrade"],
+        &["contract=3"],
+        &["contract=3", "scope=upgrade,turn-end"],
+        &["contract=3", "scope=approvals"],
+        &["contract=3", "scope=questions"],
+        &["contract=3", "scope=walls"],
+        &["contract=3", "scope=upgrade", "ttl=5000"],
+    ] {
+        assert!(refused(me, words), "{words:?}");
+    }
+    assert_eq!(
+        read("claude-alab@500", &["contract=3", "scope=upgrade"]),
+        Words::Foreign
+    );
+    assert_eq!(read("claude-alab@500", &[]), Words::V2(&[]));
 }
 
 /// The three-part parse (§5): `MAJOR.MINOR.0`, metadata kept for display, a patch refused.

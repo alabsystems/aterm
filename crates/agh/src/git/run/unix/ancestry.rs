@@ -6,7 +6,7 @@
 //! treat a shallow boundary, graft, replacement or ref as negative evidence.
 
 use aterm_json::{Value, json};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -23,6 +23,125 @@ const API_BYTES_MAX: usize = 32 * 1024 * 1024;
 const ACQUIRED_MAX: usize = 4096;
 const WALK_MAX: usize = 1_000_000;
 const WALK_BYTES_MAX: usize = 256 * 1024 * 1024;
+const LOOKAHEAD_MAX: usize = 128;
+
+#[derive(Clone, Copy)]
+enum Intake {
+    Required,
+    LocalAdvice,
+}
+
+impl Intake {
+    // Only pure inventory/body parsing results belong here. Child execution,
+    // ownership/deadline and cumulative work errors must still propagate.
+    fn observation<T>(self, parsed: Result<T>) -> Result<Option<T>> {
+        match parsed {
+            Ok(value) => Ok(Some(value)),
+            Err(_) if matches!(self, Self::LocalAdvice) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn inventory(ids: &[String], out: &ChildOut) -> Result<Vec<Option<usize>>> {
+    let text = std::str::from_utf8(&out.stdout)
+        .map_err(|_| Error::protocol("invalid commit object inventory"))?;
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() != ids.len() {
+        return Err(Error::protocol("incomplete commit object inventory"));
+    }
+    ids.iter()
+        .zip(lines)
+        .map(|(id, line)| {
+            if line == format!("{id} missing") {
+                return Ok(None);
+            }
+            let fields = line.split(' ').collect::<Vec<_>>();
+            let size = fields
+                .get(2)
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n <= BODY_MAX);
+            if fields.len() != 3
+                || fields[0] != id.as_str()
+                || fields[1] != "commit"
+                || size.is_none()
+            {
+                return Err(Error::protocol(
+                    "requested object is not a bounded exact commit",
+                ));
+            }
+            Ok(size)
+        })
+        .collect()
+}
+
+fn contents(group: &[(&String, usize)], out: &ChildOut) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut bytes = out.stdout.as_slice();
+    let mut bodies = Vec::with_capacity(group.len());
+    for (id, observed_size) in group {
+        let end = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or_else(|| Error::protocol("truncated commit header"))?;
+        let header = std::str::from_utf8(&bytes[..end])
+            .map_err(|_| Error::protocol("invalid commit header"))?;
+        let fields = header.split(' ').collect::<Vec<_>>();
+        let size = fields
+            .get(2)
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n <= BODY_MAX)
+            .ok_or_else(|| Error::protocol("commit size is unavailable or too large"))?;
+        if fields.len() != 3
+            || fields[0] != id.as_str()
+            || fields[1] != "commit"
+            || size != *observed_size
+            || bytes.len() < end + 2 + size
+            || bytes[end + 1 + size] != b'\n'
+        {
+            return Err(Error::protocol("commit contents lost exact object framing"));
+        }
+        let body = &bytes[end + 1..end + 1 + size];
+        if object::oid(body) != id.as_str() {
+            return Err(Error::protocol(
+                "held commit bytes differ from their object ID",
+            ));
+        }
+        // Endpoints and advice need original metadata too, before acceptance.
+        object::parents(body)?;
+        bodies.push((id.as_str().to_owned(), body.to_vec()));
+        bytes = &bytes[end + 2 + size..];
+    }
+    if !bytes.is_empty() {
+        return Err(Error::protocol("extra commit object bytes"));
+    }
+    Ok(bodies)
+}
+
+#[derive(Default)]
+struct WalkWork {
+    commits: usize,
+    bytes: usize,
+}
+
+impl WalkWork {
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.commits = self
+            .commits
+            .checked_add(1)
+            .filter(|n| *n <= WALK_MAX)
+            .ok_or_else(|| Error::local("commit walk count bound reached; ancestry unknown"))?;
+        self.charge_bytes(bytes)
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= WALK_BYTES_MAX)
+            .ok_or_else(|| Error::local("commit walk byte bound reached; ancestry unknown"))?;
+        Ok(())
+    }
+}
 
 fn local_children<'gh>(children: &Children<'gh>) -> Children<'gh> {
     let mut local = children.clone();
@@ -87,6 +206,19 @@ impl Reader<'_, '_> {
     }
 
     fn read(&mut self, ids: &[String]) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .read_commits(ids, Intake::Required, None)?
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect())
+    }
+
+    fn read_commits(
+        &mut self,
+        ids: &[String],
+        intake: Intake,
+        mut work: Option<&mut WalkWork>,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
         let text = ids.iter().map(|id| format!("{id}\n")).collect::<String>();
         let info = self.checked(
             "info",
@@ -94,85 +226,88 @@ impl Reader<'_, '_> {
             false,
             Some(text.as_bytes()),
         )?;
-        let info = std::str::from_utf8(&info.stdout)
-            .map_err(|_| Error::protocol("invalid commit object inventory"))?;
-        let lines = info.lines().collect::<Vec<_>>();
-        if lines.len() != ids.len() {
+        // Full captures do not establish how much physical work was done.
+        // They are fatal even for advice; ordinary malformed data can fall back.
+        if info.stdout_may_be_truncated() {
             return Err(Error::protocol("incomplete commit object inventory"));
         }
-        for (id, line) in ids.iter().zip(lines) {
-            if line == format!("{id} missing") {
+        if let Some(work) = work.as_deref_mut() {
+            work.charge_bytes(info.stdout.len())?;
+        }
+        let Some(sizes) = intake.observation(inventory(ids, &info))? else {
+            return Ok(Vec::new());
+        };
+        let mut available = Vec::new();
+        for (id, size) in ids.iter().zip(sizes) {
+            let size = if let Some(size) = size {
+                size
+            } else {
+                if matches!(intake, Intake::LocalAdvice) {
+                    continue; // Advice may never cause remote acquisition.
+                }
                 if self.local_only {
                     return Err(Error::local("the local commit witness is incomplete"));
                 }
-                self.acquire(id)?;
-            } else {
-                let fields = line.split(' ').collect::<Vec<_>>();
-                if fields.len() != 3
-                    || fields[0] != id
-                    || fields[1] != "commit"
-                    || fields[2]
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|n| *n <= BODY_MAX)
-                        .is_none()
-                {
-                    return Err(Error::protocol(
-                        "requested object is not a bounded exact commit",
-                    ));
-                }
+                self.acquire(id)?
+            };
+            if let Some(work) = work.as_deref_mut() {
+                work.charge(size)?;
             }
+            available.push((id, size));
         }
-        // Eight maximally sized objects could exceed the child capture. Read
-        // each body's size first, then pack bounded contents queries below.
-        let mut bodies = Vec::with_capacity(ids.len());
-        for group in ids.chunks(2) {
-            let text = group.iter().map(|id| format!("{id}\n")).collect::<String>();
+        // Use the observed sizes rather than the maximum for every body. Each
+        // complete framed answer must fit strictly below the retention window.
+        let mut bodies = Vec::with_capacity(available.len());
+        let mut start = 0;
+        while start < available.len() {
+            let mut end = start;
+            let mut bytes = 0_usize;
+            while let Some((id, size)) = available.get(end) {
+                let next = bytes
+                    .checked_add(format!("{id} commit {size}\n").len())
+                    .and_then(|n| n.checked_add(*size))
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(|| Error::protocol("commit frame size overflow"))?;
+                if next >= ChildOut::OUTPUT_KEEP {
+                    break;
+                }
+                bytes = next;
+                end += 1;
+            }
+            if end == start {
+                return Err(Error::protocol(
+                    "commit frame exceeds the complete capture bound",
+                ));
+            }
+            let group = &available[start..end];
+            let text = group
+                .iter()
+                .map(|(id, _)| format!("{id}\n"))
+                .collect::<String>();
             let out = self.checked(
                 "contents",
                 vec![os("cat-file"), os("--batch")],
                 false,
                 Some(text.as_bytes()),
             )?;
-            let mut bytes = out.stdout.as_slice();
-            for id in group {
-                let end = bytes
-                    .iter()
-                    .position(|b| *b == b'\n')
-                    .ok_or_else(|| Error::protocol("truncated commit header"))?;
-                let header = std::str::from_utf8(&bytes[..end])
-                    .map_err(|_| Error::protocol("invalid commit header"))?;
-                let fields = header.split(' ').collect::<Vec<_>>();
-                let size = fields
-                    .get(2)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .filter(|n| *n <= BODY_MAX)
-                    .ok_or_else(|| Error::protocol("commit size is unavailable or too large"))?;
-                if fields.len() != 3
-                    || fields[0] != id
-                    || fields[1] != "commit"
-                    || bytes.len() < end + 2 + size
-                    || bytes[end + 1 + size] != b'\n'
-                {
-                    return Err(Error::protocol("commit contents lost exact object framing"));
-                }
-                let body = &bytes[end + 1..end + 1 + size];
-                if object::oid(body) != *id {
-                    return Err(Error::protocol(
-                        "held commit bytes differ from their object ID",
-                    ));
-                }
-                bodies.push(body.to_vec());
-                bytes = &bytes[end + 2 + size..];
+            if out.stdout_may_be_truncated() {
+                return Err(Error::protocol("incomplete commit object contents"));
             }
-            if !bytes.is_empty() {
-                return Err(Error::protocol("extra commit object bytes"));
+            if let Some(work) = work.as_deref_mut() {
+                // Debit unexpected retained bytes before optional data rejection.
+                // A size race must not repeatedly exceed the inventory prepayment.
+                work.charge_bytes(out.stdout.len().saturating_sub(bytes))?;
             }
+            let Some(parsed) = intake.observation(contents(group, &out))? else {
+                return Ok(Vec::new());
+            };
+            bodies.extend(parsed);
+            start = end;
         }
         Ok(bodies)
     }
 
-    fn acquire(&mut self, id: &str) -> Result<()> {
+    fn acquire(&mut self, id: &str) -> Result<usize> {
         if self.acquired >= ACQUIRED_MAX {
             return Err(Error::local(
                 "commit acquisition count bound reached; ancestry unknown",
@@ -216,26 +351,51 @@ impl Reader<'_, '_> {
             ));
         }
         self.acquired += 1;
-        Ok(())
+        Ok(raw.len())
     }
 
-    fn ask(&mut self, query: &AncestryQuery) -> Result<Option<bool>> {
+    fn local_lookahead(
+        &mut self,
+        frontier: &str,
+        work: &mut WalkWork,
+    ) -> Result<BTreeMap<String, Vec<u8>>> {
         let out = self.git(
-            "merge-base",
+            "local-lookahead",
             vec![
-                os("merge-base"),
-                os("--is-ancestor"),
-                os(&query.ancestor),
-                os(&query.descendant),
+                os("rev-list"),
+                os("--max-count=128"),
+                os(frontier),
+                os("--"),
             ],
             false,
             None,
         )?;
-        match out.code {
-            Some(0) => Ok(Some(true)),
-            Some(1) => Ok(Some(false)),
-            _ => Ok(None),
+        // This list is advice, never a parent edge or a completeness claim.
+        // Partial, malformed or truncated advice falls back to required reads.
+        if out.code != Some(0)
+            || out.stdout_may_be_truncated()
+            || out.stdout.len() > LOOKAHEAD_MAX * 41
+            || !out.stdout.ends_with(b"\n")
+        {
+            return Ok(BTreeMap::new());
         }
+        let Some(text) = std::str::from_utf8(&out.stdout).ok() else {
+            return Ok(BTreeMap::new());
+        };
+        let mut unique = BTreeSet::new();
+        let mut ids = Vec::new();
+        for id in text.lines() {
+            if !crate::path::is_sha(id) || id.bytes().all(|b| b == b'0') || !unique.insert(id) {
+                return Ok(BTreeMap::new());
+            }
+            if id != frontier {
+                ids.push(id.to_owned());
+            }
+        }
+        Ok(self
+            .read_commits(&ids, Intake::LocalAdvice, Some(work))?
+            .into_iter()
+            .collect())
     }
 
     fn contained(&mut self, query: &AncestryQuery) -> Result<bool> {
@@ -243,45 +403,48 @@ impl Reader<'_, '_> {
         if query.ancestor == query.descendant {
             return Ok(true);
         }
-        // A native positive is an actual original parent path. A negative is
-        // withheld until every reachable raw parent has been read and hashed.
-        if self.ask(query)? == Some(true) {
-            return Ok(true);
-        }
+        // Both answers come only from hashed original bodies. Native Git may
+        // follow corrupt object bytes without checking their filename's hash;
+        // its local walk is useful only as bounded batching advice.
         let mut pending = VecDeque::from([query.descendant.clone()]);
         let mut seen = BTreeSet::from([query.descendant.clone()]);
-        let mut bytes = 0_usize;
-        while !pending.is_empty() {
-            let batch = (0..pending.len().min(128))
-                .filter_map(|_| pending.pop_front())
-                .collect::<Vec<_>>();
-            let acquired_before = self.acquired;
-            for body in self.read(&batch)? {
-                bytes = bytes
-                    .checked_add(body.len())
-                    .filter(|n| *n <= WALK_BYTES_MAX)
-                    .ok_or_else(|| {
-                        Error::local("commit walk byte bound reached; ancestry unknown")
-                    })?;
-                for parent in object::parents(&body)? {
-                    if seen.insert(parent.clone()) {
-                        if seen.len() > WALK_MAX {
-                            return Err(Error::local(
-                                "commit walk count bound reached; ancestry unknown",
-                            ));
-                        }
-                        // This edge is from an exact hashed original body;
-                        // the requested ancestor's body was also validated.
-                        // Its own older history cannot invalidate this path.
-                        if parent == query.ancestor {
-                            return Ok(true);
-                        }
-                        pending.push_back(parent);
+        let mut work = WalkWork::default();
+        let mut cache = BTreeMap::new();
+        while let Some(id) = pending.pop_front() {
+            let (body, refill) = if let Some(body) = cache.remove(&id) {
+                (body, false)
+            } else {
+                // Drop the old window before allocating another bounded one.
+                cache.clear();
+                let body = self
+                    .read_commits(std::slice::from_ref(&id), Intake::Required, Some(&mut work))?
+                    .pop()
+                    .ok_or_else(|| Error::protocol("required commit is unavailable"))?
+                    .1;
+                (body, true)
+            };
+            let mut added = false;
+            for parent in object::parents(&body)? {
+                if seen.insert(parent.clone()) {
+                    if seen.len() > WALK_MAX {
+                        return Err(Error::local(
+                            "commit walk count bound reached; ancestry unknown",
+                        ));
                     }
+                    // This edge is from an exact hashed original body;
+                    // the requested ancestor's body was also validated.
+                    // Its own older history cannot invalidate this path.
+                    if parent == query.ancestor {
+                        return Ok(true);
+                    }
+                    added = true;
+                    pending.push_back(parent);
                 }
             }
-            if self.acquired != acquired_before && self.ask(query)? == Some(true) {
-                return Ok(true);
+            if refill && added {
+                // The demanded root and its parents have already been checked.
+                // Advice neither changes that frontier nor causes acquisition.
+                cache = self.local_lookahead(&id, &mut work)?;
             }
         }
         // Every reachable original descendant parent was read and hashed,

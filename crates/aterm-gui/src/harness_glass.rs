@@ -116,6 +116,7 @@ impl Stamp {
     /// THE WALL TIME (unix ms) ITS MINUTE STARTS AT, [`Self::at`]'s inverse to the minute: the local minute and day placed by the zone's offset at that instant, read twice, so a minute within the zone's offset of a change of offset is placed by the offset it fell under (one read, at the local reading taken as an instant, places it an hour off there); `None` where the platform cannot say.
     #[must_use]
     /// Wall time in unix milliseconds when this stamp's minute starts ([`Self::at`]'s inverse to the minute).
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn unix_ms(self) -> Option<i64> {
         let local = self
             .day
@@ -433,7 +434,7 @@ pub(crate) struct SessionGlass {
     end: Option<EndGlass>,
     /// How many ends this session told: the next end's [`EndGlass::serial`].
     ends: u32,
-    /// WHY LAND STILL HOLDS (§12.3.3 item 3), as the session's loop last told it ([`on_land_held`]), with its `since` stamped once: what the SESSIONS state line, the tab's hover and the Overview, the menu bar's worker row and the chip's title (the W4 title slice) and description say of a landing that has not landed — each only while the session's Autopilot is Land and its chip wears Land's `⤓`, and all but the chip's title and description only while aterm holds its claim ([`App::shown_hold`], which shows a codex-alab's own hold in its place under that agent's proven claim, §14.3.3).
+    /// WHY LAND STILL HOLDS (§12.3.3 item 3), as the session's loop last told it ([`on_land_held`]), with its `since` stamped once: what the SESSIONS state line, the tab's hover, the Overview and the chip's title (the W4 title slice) and description say of a landing that has not landed — each only while the session's Autopilot is Land and its chip wears Land's `⤓`, and all but the chip's title and description only while aterm holds its claim ([`App::shown_hold`], which shows a codex-alab's own hold in its place under that agent's proven claim, §14.3.3).
     hold: Option<HeldGlass>,
     /// ATERM STOPPED TYPING INTO IT (§14.3), by which arm of ruling F's hold, as the session's loop last told its standing exception (`HostNote::ResumeException`'s `held`, [`on_stopped`]): set while the hold stands, whatever its urgency, and cleared as the loop lifts it or ends. What the chip's title and description, the state line, the hover and the Overview, a worker's tip and `status held=` say ([`stop_words`]), each only while the chip carries a mode ([`App::shown_stop`]).
     stopped: Option<HeldBy>,
@@ -1060,7 +1061,7 @@ pub(crate) enum HoldForm {
     Line,
     /// Tab hover form without a clock.
     Hover,
-    /// Menu bar landing worker tip and Overview held-chip line form.
+    /// Overview held-chip line form.
     Tip,
     /// Chip accessibility description lead form.
     Spoken,

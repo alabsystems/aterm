@@ -35,6 +35,27 @@ pub(crate) const CALLER: &str = "atpkg-publish";
 /// release-tier grant still lives at most `GRANT_MAX`.
 pub const LANE_GIT_BUDGET: Duration = Duration::from_secs(4 * 60 * 60);
 
+/// Why [`AghHost::configured_client`] built no client, by cause: only an agh.toml fault is
+/// agh.toml's (`agh.config.invalid`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClientRefusal {
+    /// agh.toml: unreadable, unsafe, malformed, or breaking L1–L11.
+    Config(String),
+    /// agh's vault adoption: its record (`vault.toml`), or a vault token this Mac holds that
+    /// now speaks as another login than agh adopted it as. agh's step repairs it; no credential
+    /// is missing, so nothing is asked for.
+    Adoption(String),
+}
+
+impl ClientRefusal {
+    /// The refusal, redacted.
+    pub(crate) fn why(&self) -> &str {
+        match self {
+            ClientRefusal::Config(why) | ClientRefusal::Adoption(why) => why,
+        }
+    }
+}
+
 /// A release host over one agh client.
 pub struct AghHost {
     github: agh::Github,
@@ -64,27 +85,41 @@ impl AghHost {
     /// Refusal of explicit configuration or adopted identity. Missing configuration adopts
     /// the vault's identities but grants no release-tier publication permission.
     pub fn production(dirs: &agh::config::Dirs, home: agh::Slug) -> Result<AghHost, String> {
-        Self::configured_client(dirs, true).map(|client| AghHost::new(client, home))
+        Self::configured_client(dirs, true)
+            .map(|client| AghHost::new(client, home))
+            .map_err(|refusal| refusal.why().to_string())
     }
 
     /// One client snapshot shared by a run's staging and public hosts. `learn = false`
     /// reads only recorded identities, with no request or state change.
+    ///
+    /// # Errors
+    ///
+    /// Why no client routes, by its cause ([`ClientRefusal`]).
     pub(crate) fn configured_client(
         dirs: &agh::config::Dirs,
         learn: bool,
-    ) -> Result<agh::Github, String> {
+    ) -> Result<agh::Github, ClientRefusal> {
         let base = Self::base_client(dirs);
         let resolved = if learn {
             agh::routing::adopt_for_host(&base, dirs)
         } else {
             agh::routing::view_for_host(dirs, base.env())
         };
-        resolved
-            .and_then(|resolved| resolved.bind(&base))
-            .map_err(|error| {
-                base.redactor()
-                    .apply(&format!("agh identity routing refused: {}", error.why))
-            })
+        let refused = |error: &agh::Error, next: bool| {
+            let why = if next {
+                format!("{}; next: {}", error.why, error.next)
+            } else {
+                error.why.clone()
+            };
+            base.redactor()
+                .apply(&format!("agh identity routing refused: {why}"))
+        };
+        // agh.toml is read and judged before any vault token is: its refusal is agh.toml's.
+        let configured = resolved.map_err(|error| ClientRefusal::Config(refused(&error, false)))?;
+        configured
+            .bind(&base)
+            .map_err(|error| ClientRefusal::Adoption(refused(&error, true)))
     }
 
     /// The production client before any routing (`Router::empty()`): github.com over the

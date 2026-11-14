@@ -82,6 +82,7 @@ fn snapshot(ctx: &CutCtx) -> Journal {
         artifact: ctx.artifact.clone(),
         macho_sha256: ctx.macho_sha256.clone(),
         linux: ctx.linux.clone(),
+        windows: ctx.windows.clone(),
         manifest_signed: ctx.manifest_signed,
         signature_required: ctx.signature_required,
         signature_pubkey: ctx.signature_pubkey.clone(),
@@ -125,6 +126,47 @@ fn agrees(ctx: &CutCtx, draft: &Journal) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The Windows declaration this cut makes (`declared`) is the one `draft` froze when it signed:
+/// neither declares a Windows zip, or both name one handoff directory, and a digest the cut
+/// names (`--windows-sha256`) is the one the draft's zip was bound to. The draft's signed bytes
+/// are the release's, and a cut adopting it takes its Windows handoff, so a declaration made
+/// after the draft would vanish without a word; it is refused, naming how the draft leaves.
+fn windows_agrees(
+    ctx: &CutCtx,
+    declared: Option<&buildplan::windows::Handoff>,
+    draft: &Journal,
+) -> Result<()> {
+    let frozen = draft.windows.as_ref();
+    let same_directory =
+        declared.map(|handoff| &handoff.directory) == frozen.map(|handoff| &handoff.directory);
+    let same_digest = declared
+        .and_then(|handoff| handoff.sha256.as_ref())
+        .is_none_or(|named| frozen.and_then(|handoff| handoff.sha256.as_ref()) == Some(named));
+    if same_directory && same_digest {
+        return Ok(());
+    }
+    let words = |handoff: Option<&buildplan::windows::Handoff>| {
+        handoff.map_or_else(
+            || "no Windows zip".to_string(),
+            |handoff| {
+                let digest = handoff
+                    .sha256
+                    .as_ref()
+                    .map_or_else(String::new, |sha| format!(" (SHA-256 {sha})"));
+                format!("the Windows zip of {}{digest}", handoff.directory.display())
+            },
+        )
+    };
+    Err(Error::new(format!(
+        "the private draft dist/{JOURNAL} journals ({}) signed {}, and this cut declares {}: a \
+         declaration made after the draft is never added to it — {}",
+        journaled_words(draft),
+        words(frozen),
+        words(declared),
+        withdraw_remedy(&ctx.repo, &ctx.slug, draft)
+    )))
 }
 
 /// The journaled draft as a person finds it: version, build, reservation commit, release id.
@@ -228,11 +270,13 @@ pub(super) fn adopt(ctx: &mut CutCtx) -> Result<()> {
         return Ok(());
     };
     agrees(ctx, &draft)?;
+    windows_agrees(ctx, ctx.windows.as_ref(), &draft)?;
     ctx.manifest_signed = draft.manifest_signed;
     ctx.release_id = draft.release_id;
     ctx.release_intent = draft.release_intent;
     ctx.upload_intents.clone_from(&draft.upload_intents);
     ctx.linux.clone_from(&draft.linux);
+    ctx.windows.clone_from(&draft.windows);
     check_bytes(ctx)?;
     if let Some(journal) = &mut ctx.journal {
         journal.manifest_signed = draft.manifest_signed;
@@ -240,6 +284,7 @@ pub(super) fn adopt(ctx: &mut CutCtx) -> Result<()> {
         journal.release_intent = draft.release_intent;
         journal.upload_intents = draft.upload_intents;
         journal.linux = draft.linux;
+        journal.windows = draft.windows;
         journal.save(&ctx.journal_path)?;
     }
     Ok(())
@@ -272,10 +317,17 @@ pub(super) fn prepare(ctx: &mut CutCtx, opts: &CutOptions) -> Result<()> {
         ctx.build,
     )?;
     let path = ctx.dist.join(JOURNAL);
+    let windows = opts
+        .windows_artifacts
+        .as_deref()
+        .map(|dir| buildplan::windows::Handoff::new(dir, opts.windows_sha256.as_deref()))
+        .transpose()?;
     if let Some(draft) = Journal::load(&path)? {
         agrees(ctx, &draft)?;
+        windows_agrees(ctx, windows.as_ref(), &draft)?;
         ctx.manifest_signed = draft.manifest_signed;
         ctx.linux.clone_from(&draft.linux);
+        ctx.windows.clone_from(&draft.windows);
         ctx.release_id = draft.release_id;
         ctx.release_intent = draft.release_intent;
         ctx.upload_intents.clone_from(&draft.upload_intents);
@@ -290,6 +342,7 @@ pub(super) fn prepare(ctx: &mut CutCtx, opts: &CutOptions) -> Result<()> {
                 buildplan::linux::Handoff::new(dir, &opts.linux_targets, &opts.linux_workers)
             })
             .transpose()?;
+        ctx.windows = windows;
         step_sign(ctx)?;
         prove_publication_on_disk(ctx)?;
         record_bytes(ctx)?;

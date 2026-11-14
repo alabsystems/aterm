@@ -1316,6 +1316,11 @@ fn next_pipe_write_end() -> (RawFd, Vec<std::fs::File>) {
 
 fn staged_pass_at() {
     let child_reads = |pass_before_the_strip: bool, same_number: bool| -> String {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`pass_at` hands a std command an unmarked descriptor alone (a marked one is \
+                      refused, as the kept-out lane below shows): this is the ordinary pipe it passes"
+        )]
         let (rd, mut wr) = std::io::pipe().expect("a pipe");
         wr.write_all(b"x").expect("write the byte");
         let at = if same_number {

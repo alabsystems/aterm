@@ -241,21 +241,19 @@ fn the_loops_receipt_reaches_the_timeline_and_goes_with_its_run() {
     assert_eq!(stored_on(&desk.app), None, "the shutdown took it down");
 }
 
-/// A LANDING'S RECEIPT REACHES `status` AND THE BAR'S ROW (§14.9, slice 9c): stored beside the
+/// A LANDING'S RECEIPT REACHES `status` BESIDE THE LANDED FACE (§14.9, slice 9c): stored beside the
 /// landed face, `status` names its head, its ref, its leg and its repository
-/// (`landed_head=3f9a1c2e4b7d landed_on=origin/main landed_leg=on-main landed_repo=…`) and the
-/// menu bar's row for the tab carries it; before the face lands, and once it moves off, `status`
-/// says `-` for each and the row carries none. A folder, a branch or a ref holding hidden
+/// (`landed_head=3f9a1c2e4b7d landed_on=origin/main landed_leg=on-main landed_repo=…`);
+/// before the face lands, and once it moves off, `status` says `-` for each. A folder, a branch or a ref holding hidden
 /// characters (a bidi override, a zero-width space) reaches no surface with them: the store
 /// passes each through the presentation sanitizer, as it does the agent's words. NEGATIVE
 /// CONTROLS (run by hand): `status` reading the receipt without the face's filter names it
 /// before the landing; the store sanitizing `said` alone keeps the hidden characters.
 #[test]
-fn a_landings_receipt_reaches_status_and_the_bar() {
+fn a_landings_receipt_reaches_status_beside_the_landed_face() {
     let app = App::headless_for_test();
     let session = app.pool.get(0).expect("session 0");
     let ctx = session.ctx.clone();
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
     let sid = ctx.self_id.as_str().to_string();
     let r = a_receipt();
     let fields = |app: &App| {
@@ -271,7 +269,6 @@ fn a_landings_receipt_reaches_status_and_the_bar() {
     assert_eq!(fields(&app), none, "no landing");
     assert!(store_land_receipt(&app.store, &sid, Some(&r)));
     assert_eq!(fields(&app), none, "no landed face yet");
-    assert_eq!(app.status_session_row(&handle).receipt, None);
     assert!(
         ctx.timeline
             .lock()
@@ -288,11 +285,6 @@ fn a_landings_receipt_reaches_status_and_the_bar() {
         ]
         .map(str::to_owned)
     );
-    assert_eq!(
-        app.status_session_row(&handle).receipt.as_deref(),
-        Some(&r),
-        "the bar's row"
-    );
     assert!(
         ctx.timeline
             .lock()
@@ -300,7 +292,6 @@ fn a_landings_receipt_reaches_status_and_the_bar() {
             .set_task_face(Some(TaskFace::Open), 2)
     );
     assert_eq!(fields(&app), none, "the face moved off");
-    assert_eq!(app.status_session_row(&handle).receipt, None);
 
     let hidden = LandReceipt {
         repo: "/Users//a/src/par\u{202e}ser\u{200b}".into(),
@@ -315,10 +306,13 @@ fn a_landings_receipt_reaches_status_and_the_bar() {
             .unwrap()
             .set_task_face(Some(TaskFace::Landed), 3)
     );
-    let shown = app
-        .status_session_row(&handle)
-        .receipt
-        .expect("the bar's row carries the receipt");
+    let shown = ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .land_receipt()
+        .cloned()
+        .expect("the stored receipt");
     assert_eq!(
         (
             shown.repo.as_str(),
@@ -329,7 +323,6 @@ fn a_landings_receipt_reaches_status_and_the_bar() {
     );
     use aterm_agent::supervise::mode_words;
     for text in [
-        mode_words::landed_tip(Some(&shown)),
         mode_words::landed_words(Some(&shown)),
         app.session_status_record(0).expect("live session"),
     ] {
@@ -345,17 +338,16 @@ fn a_landings_receipt_reaches_status_and_the_bar() {
 /// THE LANDED SENTENCE IS THE RECEIPT'S (§14.17 item 5, slice 13a, worded by 9c's receipt): the
 /// stored receipt keeps its one fact, whether the land check was answered
 /// (`LandReceipt::check`), and every surface that words what the agent said reads it there
-/// (`mode_words::said_words`): beside the landed face, the bar's row's tip and the `Autopilot
-/// landed` record say the agent answered the land check where the receipt says so, and only what
+/// (`mode_words::said_words`): beside the landed face, the `Autopilot
+/// landed` record says the agent answered the land check where the receipt says so, and only what
 /// it said where none was answered (a landing a build before the check noted); with no receipt,
 /// no check is claimed. NEGATIVE CONTROL (run by hand): the store writing `check: false` over the
 /// receipt's says the unchecked sentence over the checked receipt.
 #[test]
 fn the_landed_sentence_is_the_receipts() {
-    use aterm_agent::supervise::mode_words::{ANSWERED_CHECK, landed_tip};
+    use aterm_agent::supervise::mode_words::ANSWERED_CHECK;
     let app = App::headless_for_test();
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
-    let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
     let sid = ctx.self_id.as_str().to_string();
     assert!(
         ctx.timeline
@@ -363,8 +355,8 @@ fn the_landed_sentence_is_the_receipts() {
             .unwrap()
             .set_task_face(Some(TaskFace::Landed), 1)
     );
-    let said = |app: &App| {
-        let receipt = app.status_session_row(&handle).receipt;
+    let said = || {
+        let receipt = ctx.timeline.lock().unwrap().land_receipt().cloned();
         let record = crate::harness_task::task_record(
             "s-1",
             "in tab 3",
@@ -373,15 +365,12 @@ fn the_landed_sentence_is_the_receipts() {
             receipt.as_deref(),
         )
         .expect("a landing's record");
-        (
-            landed_tip(receipt.as_deref()),
-            record.detail.join("\n").to_lowercase(),
-        )
+        record.detail.join("\n").to_lowercase()
     };
-    let (tip, record) = said(&app);
+    let record = said();
     assert!(
-        !tip.contains(ANSWERED_CHECK) && !record.contains(ANSWERED_CHECK),
-        "no receipt claims no check: {tip} / {record}"
+        !record.contains(ANSWERED_CHECK),
+        "no receipt claims no check: {record}"
     );
     for check in [true, false] {
         let r = LandReceipt {
@@ -389,8 +378,7 @@ fn the_landed_sentence_is_the_receipts() {
             ..a_receipt()
         };
         assert!(store_land_receipt(&app.store, &sid, Some(&r)), "{check}");
-        let (tip, record) = said(&app);
-        assert_eq!(tip.contains(ANSWERED_CHECK), check, "{check}: {tip}");
+        let record = said();
         assert_eq!(record.contains(ANSWERED_CHECK), check, "{check}: {record}");
     }
 }

@@ -954,13 +954,11 @@ fn every_reader_says_the_published_verdict() {
             !row.contains(&format!("secret{case}x")),
             "case {case}: {row}"
         );
-        let glance = app.status_glance();
         assert_eq!(
-            glance.need_count(),
+            app.local_needs().len(),
             usize::from(verdict.need.is_some()),
             "case {case}"
         );
-        assert_eq!(glance.button_title(), "\u{276f}", "case {case}");
         let sensed = Desk::sense(&app, 0).expect("session 0 is pooled");
         Desk::table_mut(&mut app).absorb(0, sensed, std::time::Instant::now());
         drive::refresh_window(&mut app, crate::WindowId(0));
@@ -1040,7 +1038,7 @@ fn an_api_outage_is_one_digest_entry_and_no_need() {
     );
     assert_ne!(counting(2), counting(1), "PRECONDITION: the words count");
     assert_eq!(app.api_outage.len(), 2);
-    assert!(app.status_glance().needs.is_empty(), "no row per tab");
+    assert!(app.local_needs().is_empty(), "no row per tab");
     for id in 0..2 {
         let verdict = app
             .pool
@@ -1059,7 +1057,7 @@ fn an_api_outage_is_one_digest_entry_and_no_need() {
     app.refresh_presence_session(1);
     assert_eq!(app.api_outage.len(), 1);
     assert_eq!(outage_titles(&app), vec![counting(1)], "tab 0 alone");
-    assert_eq!(app.status_glance().need_count(), 1);
+    assert_eq!(app.local_needs().len(), 1);
     at_wall(&app, 0, None);
     app.refresh_presence_session(0);
     assert!(app.api_outage.is_empty(), "the last tab left the wait");
@@ -1146,7 +1144,7 @@ fn a_turn_of_many_changes_owes_one_glance_rebuild() {
             .set("attention", Some(format!("look at {session}")));
         app.on_meta_changed(*session);
     }
-    assert_eq!(app.status_glance().need_count(), 32);
+    assert_eq!(app.local_needs().len(), 32);
     assert!(app.take_status_rebuild(), "the turn owes a rebuild");
     assert!(!app.take_status_rebuild(), "and only one");
 }
@@ -2178,7 +2176,7 @@ fn a_program_claim_never_stands_over_a_word_its_reader_names() {
 /// Grok's sign-in walls fold into the machine's one sign-in: while it runs, every walled Grok
 /// session waits on it (its need stands on the session that leads it, attention
 /// `signin:grok`); signed out with none running, every walled Grok session carries the same
-/// machine need, which a surface lists once ([`machine_wide`]); signed in, each session is told
+/// need in the same words; signed in, each session is told
 /// to restart its grok. Claude's sign-in wall keeps its own per-session need.
 #[test]
 fn two_grok_auth_walls_give_one_need() {
@@ -2192,7 +2190,7 @@ fn two_grok_auth_walls_give_one_need() {
         grok_signin: signin,
         ..facts()
     };
-    // Signed out, nothing running: two sessions, one machine need.
+    // Signed out, nothing running: two sessions, the one need in the same words.
     let a = of(&walled(7, Some(GrokSignin::Idle))).need.expect("a need");
     let b = of(&walled(9, Some(GrokSignin::Idle))).need.expect("a need");
     assert_eq!(
@@ -2200,7 +2198,6 @@ fn two_grok_auth_walls_give_one_need() {
         (NeedWord::Login, GROK_SIGNIN_WHAT)
     );
     assert_eq!(b.what, a.what);
-    assert!(machine_wide(&a) && machine_wide(&b));
     assert!(GROK_SIGNIN_WHAT.len() <= ROW_WHAT_MAX);
     // The walled grok's own sign-in runs (its code on its screen, its page open): the need
     // points at it, never at a second device flow with another code.
@@ -2281,11 +2278,9 @@ fn two_grok_auth_walls_give_one_need() {
         .need
         .expect("a need");
     assert_eq!(signed.what, GROK_SIGNED_IN_WHAT);
-    assert!(!machine_wide(&signed));
     // CONTROL: Claude's sign-in wall (no Grok fact) keeps its own per-session need.
     let claude = of(&walled(7, None)).need.expect("a need");
     assert_eq!(claude.what, "logged out: log in there");
-    assert!(!machine_wide(&claude));
     let carried = of(&NeedFacts {
         wall_answer: WallAnswer::Harness,
         supervised: true,

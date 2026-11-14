@@ -39,6 +39,13 @@ pub struct CutOptions {
     pub linux_targets: Vec<String>,
     pub linux_workers: Vec<String>,
     pub mac_only: bool,
+    /// `--windows-artifacts DIRECTORY`: the Windows handoff directory
+    /// ([`buildplan::windows::Handoff`]); optional, and independent of the Linux declaration.
+    pub windows_artifacts: Option<PathBuf>,
+    /// `--windows-sha256 HEX`: the Windows zip's SHA-256 as `release-build` printed it on the
+    /// Windows host, lowercase; no carried pair is admitted without it
+    /// ([`buildplan::windows::Handoff::sha256`]).
+    pub windows_sha256: Option<String>,
     /// `--sign`: sign, notarize and package a byte copy of the release's verified bundle under
     /// its reserved number, privately, and keep the record the claim adopts ([`run_cut_sign`]).
     pub sign: bool,
@@ -2063,6 +2070,10 @@ pub struct Journal {
     pub macho_sha256: Option<String>,
     #[serde(default)]
     pub linux: Option<buildplan::linux::Handoff>,
+    /// The Windows handoff (`--windows-artifacts`), its zip frozen at the sign step. Absent
+    /// from a journal that declared none, so such a journal's bytes are as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<buildplan::windows::Handoff>,
     #[serde(default)]
     pub manifest_signed: bool,
     #[serde(default)]
@@ -2245,6 +2256,14 @@ impl Journal {
         }
         if let Some(linux) = &self.linux {
             linux.validate_identity(
+                &self.version,
+                self.build_number,
+                &self.commit,
+                self.is_done("sign"),
+            )?;
+        }
+        if let Some(windows) = &self.windows {
+            windows.validate_identity(
                 &self.version,
                 self.build_number,
                 &self.commit,
@@ -4233,11 +4252,16 @@ pub fn stage_manifest(
     inputs: &manifest_out::ManifestInputs<'_>,
     who: Option<&roster::Attribution>,
     linux: Option<&buildplan::linux::Handoff>,
+    windows: Option<&buildplan::windows::Handoff>,
 ) -> Result<PathBuf> {
     let mut manifest = manifest_out::build(inputs);
     if let Some(linux) = linux {
         linux.verify_staged(dist, inputs.version, inputs.build_number, inputs.commit)?;
         linux.stamp(&mut manifest)?;
+    }
+    if let Some(windows) = windows {
+        windows.verify_staged(dist, inputs.version, inputs.build_number, inputs.commit)?;
+        windows.stamp(&mut manifest)?;
     }
     if let Some(who) = who {
         machines::attribute(&mut manifest, who);
@@ -4439,6 +4463,7 @@ pub struct CutCtx {
     pub artifact: Option<String>,
     pub macho_sha256: Option<String>,
     pub linux: Option<buildplan::linux::Handoff>,
+    pub windows: Option<buildplan::windows::Handoff>,
     pub manifest_signed: bool,
     pub signature_required: bool,
     pub signature_pubkey: Option<String>,
@@ -4475,13 +4500,22 @@ impl CutCtx {
         })
     }
 
+    /// The native assets this cut's handoffs froze: Linux's, then the Windows zip.
+    fn handoff_asset_names(&self) -> Vec<String> {
+        let mut names = self.linux_asset_names();
+        if let Some(windows) = &self.windows {
+            names.extend(windows.asset_names());
+        }
+        names
+    }
+
     fn channel_asset_names(&self) -> Vec<String> {
         let mut names = channel::required_asset_names(
             &self.version,
             self.signature_required,
             self.attaches_roster(),
         );
-        names.extend(self.linux_asset_names());
+        names.extend(self.handoff_asset_names());
         names.push(crate::service_qualification::REPORT_ASSET.to_string());
         names.sort();
         names
@@ -4493,7 +4527,7 @@ impl CutCtx {
             &self.version,
             self.signature_required,
             self.attaches_roster(),
-            &self.linux_asset_names(),
+            &self.handoff_asset_names(),
         )
     }
 
@@ -5590,6 +5624,11 @@ fn recover_published_cut(
             "published Linux recovery requires the original cut journal and frozen native handoff; do not reconstruct worker provenance from remote filenames",
         ));
     }
+    if !buildplan::windows::manifest_asset_names(&manifest)?.is_empty() {
+        return Err(Error::new(
+            "published Windows recovery requires the original cut journal and frozen Windows handoff; do not reconstruct its build's provenance from remote filenames",
+        ));
+    }
     let names: Vec<String> = release_asset_inventory_for_release_id(slug, release_object.id)?
         .into_iter()
         .map(|asset| asset.name)
@@ -5708,6 +5747,7 @@ fn recover_published_cut(
         artifact: None,
         macho_sha256: None,
         linux: None,
+        windows: None,
         manifest_signed: signature_policy.required,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey.clone(),
@@ -5752,6 +5792,7 @@ fn recover_published_cut(
         macho_sha256: None,
         manifest_signed: signature_policy.required,
         linux: None,
+        windows: None,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey.clone(),
         verify_pubkey: recovered_pubkey.clone(),
@@ -6179,6 +6220,11 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             buildplan::linux::Handoff::new(directory, &opts.linux_targets, &opts.linux_workers)
         })
         .transpose()?;
+    let windows = opts
+        .windows_artifacts
+        .as_deref()
+        .map(|dir| buildplan::windows::Handoff::new(dir, opts.windows_sha256.as_deref()))
+        .transpose()?;
     let apple = resolve_apple_tier(aterm_update_core::pins::APPLE_TEAM_ID, credentials)?;
 
     let changelog_text =
@@ -6406,6 +6452,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         )));
     }
     if kind == CutKind::Real {
+        windows_bound_before_claim(windows.as_ref(), &dist)?;
+    }
+    if kind == CutKind::Real {
         lock?;
         channel?;
         step("lock", "release lock is free");
@@ -6593,6 +6642,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         artifact: Some(verified.complete.key.clone()),
         macho_sha256: Some(verified.complete.macho_sha256.clone()),
         linux,
+        windows,
         manifest_signed: false,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey,
@@ -6619,6 +6669,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             artifact: ctx.artifact.clone(),
             macho_sha256: ctx.macho_sha256.clone(),
             linux: ctx.linux.clone(),
+            windows: ctx.windows.clone(),
             manifest_signed: ctx.manifest_signed,
             signature_required: ctx.signature_required,
             signature_pubkey: ctx.signature_pubkey.clone(),
@@ -6637,6 +6688,30 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
 
     drop(journal_timing);
     run_pipeline(&mut ctx, t0)
+}
+
+/// A real cut that will admit a Windows zip itself (no private draft signed one first) is bound
+/// to the digest the person named before it claims: the admission comes after the claim, and
+/// `cut --resume` takes no flag, so a cut that claimed without one could never name it.
+fn windows_bound_before_claim(
+    windows: Option<&buildplan::windows::Handoff>,
+    dist: &Path,
+) -> Result<()> {
+    let Some(handoff) = windows else {
+        return Ok(());
+    };
+    if handoff.sha256.is_some() || dist.join(draft::JOURNAL).exists() {
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "--windows-artifacts {} names no --windows-sha256: a carried Windows pair is admitted \
+         only by the zip's SHA-256 as release-build printed it on the Windows host, and this cut \
+         would admit it after its claim, where `--resume` takes no flag; nothing was claimed. \
+         Build the pair with `aterm-winship release-build` at the reserved commit on a Windows \
+         host (docs/RELEASING.md § Windows release handoff) and give its digest, or release \
+         with `{CUT_COMMAND}`, whose `cut --sign` admits it before any claim",
+        handoff.directory.display()
+    )))
 }
 
 /// Whether origin's ledger `ledger_text` was claimed at or past `build` (by another release):
@@ -6794,6 +6869,7 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
         artifact: Some(verified.complete.key.clone()),
         macho_sha256: Some(verified.complete.macho_sha256.clone()),
         linux: None,
+        windows: None,
         manifest_signed: false,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey,
@@ -6842,6 +6918,12 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
             declaration.linux_artifacts = release.linux.artifacts;
             declaration.linux_targets = release.linux.targets;
             declaration.linux_workers = release.linux.workers;
+        }
+        if declaration.windows_artifacts.is_none() {
+            declaration.windows_artifacts = release.windows;
+        }
+        if declaration.windows_sha256.is_none() {
+            declaration.windows_sha256 = release.windows_sha256;
         }
         draft::prepare(&mut ctx, &declaration)?;
     }
@@ -6987,6 +7069,7 @@ fn resume_cut(
         artifact: journal.artifact.clone(),
         macho_sha256: journal.macho_sha256.clone(),
         linux: journal.linux.clone(),
+        windows: journal.windows.clone(),
         manifest_signed: journal.manifest_signed,
         signature_required: journal.signature_required,
         signature_pubkey: journal.signature_pubkey.clone(),
@@ -7037,6 +7120,19 @@ fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
                 .map_err(|e| Error::new(format!("read resumed appcast: {e}")))?,
         )?;
         buildplan::linux::verify_manifest_handoff(&manifest, ctx.linux.as_ref())?;
+    }
+    if let Some(handoff) = &ctx.windows
+        && ctx
+            .journal
+            .as_ref()
+            .is_some_and(|journal| journal.is_done("sign"))
+    {
+        handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
+        let manifest = Manifest::parse(
+            &gates::read_bounded_string(&ctx.manifest_path(), 16 << 20)
+                .map_err(|e| Error::new(format!("read resumed appcast: {e}")))?,
+        )?;
+        buildplan::windows::verify_manifest_handoff(&manifest, Some(handoff))?;
     }
     if ctx.kind == CutKind::Real
         && !matches!(
@@ -7289,6 +7385,7 @@ fn stage_ctx_signing_inputs(
         inputs,
         ctx.attribution.as_ref(),
         ctx.linux.as_ref(),
+        ctx.windows.as_ref(),
     )?;
     stage_roster_assets(&ctx.dist, ctx.roster.as_ref())?;
     Ok(manifest)
@@ -7487,6 +7584,21 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
                     record.pin().lines()
                 );
             }
+        }
+    }
+    if let Some(handoff) = &mut ctx.windows {
+        // The commit's tree and pins, read from this repository: what the receipt must name.
+        let sources = buildplan::windows::Sources::at(&GitCli::new(&ctx.repo), &ctx.commit)?;
+        handoff.import(&ctx.dist, &ctx.version, ctx.build, &ctx.commit, &sources)?;
+        if let Some(journal) = &mut ctx.journal {
+            journal.windows = Some(handoff.clone());
+            journal.save(&ctx.journal_path)?;
+        }
+        if let Some(artifact) = &handoff.artifact {
+            println!(
+                "==> Windows zip {} admitted: {} bytes, sha256 {}, built in the {} lane",
+                artifact.asset, artifact.size, artifact.sha256, artifact.lane
+            );
         }
     }
     let source = signing_source(ctx)?;
@@ -8439,6 +8551,9 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     if let Some(handoff) = &ctx.linux {
         handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
     }
+    if let Some(handoff) = &ctx.windows {
+        handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
+    }
     validate_lean_dmg_on_disk(
         &ctx.dmg_path(),
         "self-check",
@@ -8473,6 +8588,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     let manifest = Manifest::parse(&mtext)
         .map_err(|e| Error::new(format!("self-check: manifest re-parse failed: {e}")))?;
     buildplan::linux::verify_manifest_handoff(&manifest, ctx.linux.as_ref())?;
+    buildplan::windows::verify_manifest_handoff(&manifest, ctx.windows.as_ref())?;
     if manifest.build_number != ctx.build
         || manifest.version != ctx.version
         || manifest.commit.as_deref() != Some(ctx.commit.as_str())

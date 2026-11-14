@@ -268,6 +268,47 @@ pub struct VolumeFacts {
     pub reserved: u64,
     /// The disk watch's level word (`ok`, `low`, `short`, `emergency`), when measured.
     pub level: Option<String>,
+    /// The rebuildable budget the disk watch last sized on it. No level word reads it.
+    pub budget: BudgetRead,
+}
+
+/// The rebuildable budget of a volume as the disk watch last sized it: the figures of a disk
+/// view's `budget` record, in bytes. Where the sizing was cut short (`partial`), the
+/// rebuildable bytes, the target and how far over it are floors and the kept bytes a ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetFacts {
+    /// The most used bytes the volume is held to.
+    pub cap: u64,
+    /// Whether the cap is the figure aterm.toml's `disk.cap_used_gib` wrote (`false`: the
+    /// volume's share).
+    pub cap_written: bool,
+    /// The used bytes that are not rebuildable.
+    pub kept: u64,
+    /// The rebuildable bytes the cap leaves room for: the cap less the kept bytes, never below 0.
+    pub target: u64,
+    /// The rebuildable bytes sized.
+    pub rebuildable: u64,
+    /// Whether the sizing was cut short.
+    pub partial: bool,
+    /// Seconds from the sizing to the reply.
+    pub sized_s: u64,
+}
+
+/// What a disk view says of the rebuildable budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BudgetRead {
+    /// The watch sizes this volume and has no sizing yet: it sizes on an `ok` look, at most
+    /// once an hour.
+    Warming,
+    /// The watch does not size this volume: another volume, a process that is not the
+    /// account's own watch, or no watch.
+    #[default]
+    NotSampled,
+    /// The budget is off: `disk.cap_used_gib` is `0`, is not a whole number, or aterm.toml
+    /// cannot be read.
+    Off,
+    /// Sized.
+    Sized(BudgetFacts),
 }
 
 /// Why a `since=` reply is a full one.

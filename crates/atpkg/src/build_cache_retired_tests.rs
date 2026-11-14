@@ -30,6 +30,9 @@ mod history_edges;
 #[path = "build_cache_retired_reflog_tests.rs"]
 mod reflog;
 
+#[path = "build_cache_retired_config_tests.rs"]
+mod config;
+
 /// A scratch home holding the gate's leftovers, removed when the test ends.
 struct Gate {
     dir: aterm_tempfile::TempDir,
@@ -942,11 +945,14 @@ fn gits_bookkeeping_is_no_write_and_a_held_lock_stays() {
     std::fs::write(modules.join("index.lock"), "").expect("w");
     g.written(&modules, Duration::ZERO);
     let since = g.now - super::UNWRITTEN;
-    assert_eq!(written_since(&g.snapshot(), since), None);
+    assert_eq!(written_since(&g.snapshot(), since, None), Ok(None));
     let beside = g.snapshot().join(".aterm-verify/receipt");
     std::fs::write(&beside, "x").expect("w");
     g.written(&beside, Duration::ZERO);
-    assert_eq!(written_since(&g.snapshot(), since), Some(beside.clone()));
+    assert_eq!(
+        written_since(&g.snapshot(), since, None),
+        Ok(Some(beside.clone()))
+    );
     std::fs::remove_file(&beside).expect("removed");
     g.written(
         &g.snapshot().join(".aterm-verify"),
@@ -1749,4 +1755,928 @@ fn an_interrupted_snapshot_removal_from_an_earlier_boot_resumes_by_volume_uuid_a
             }
         }
     }
+}
+
+/// A linked worktree of the gate's checkout where an agent makes one,
+/// `<home>/Developer/.ubd/aterm-<name>.noindex`, on a new branch `agent/<name>` at the
+/// checkout's HEAD (which origin/main holds), its submodule populated.
+fn linked(g: &Gate, name: &str) -> PathBuf {
+    linked_at(
+        g,
+        name,
+        &agents_folder(g).join(format!("aterm-{name}.noindex")),
+    )
+}
+
+/// Where agents put their worktrees in the scratch home: `<home>/Developer/.ubd`.
+fn agents_folder(g: &Gate) -> PathBuf {
+    let at = g.home().join("Developer").join(".ubd");
+    std::fs::create_dir_all(&at).expect("the agents' folder");
+    at
+}
+
+/// [`linked`] at `wt`, wherever that is.
+fn linked_at(g: &Gate, name: &str, wt: &Path) -> PathBuf {
+    let wt = wt.to_path_buf();
+    git(
+        &g.checkout(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &format!("agent/{name}"),
+            &for_git(&wt),
+            "HEAD",
+        ],
+    );
+    git(&wt, &["submodule", "update", "-q", "--init"]);
+    wt
+}
+
+/// Make `folder` a build folder as Cargo makes one: a `CACHEDIR.TAG` in it.
+fn cache_tag(folder: &Path) {
+    std::fs::create_dir_all(folder).expect("a build folder");
+    std::fs::write(
+        folder.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# a cache directory tag\n",
+    )
+    .expect("tagged");
+}
+
+/// AN IGNORED ENTRY THAT IS NO TAGGED CACHE KEEPS ITS WORKTREE: git holds no copy of an
+/// ignored file, so a linked worktree with one (`.aterm-verify`, which the checkout ignores)
+/// stays, and so does one whose ignored `target/` carries no cache tag; the same worktree with
+/// only a tagged `target/` goes. NEGATIVE CONTROL: the tagged `target/` alone is admitted.
+#[test]
+fn a_linked_worktree_holding_an_ignored_file_stays() {
+    let g = gate();
+    let wt = linked(&g, "notes");
+    std::fs::create_dir_all(wt.join("target/debug")).expect("a build");
+    std::fs::write(wt.join("target/debug/libx.rlib"), "x").expect("written");
+    let untagged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        untagged
+            .as_ref()
+            .is_err_and(|why| why.contains("target/") && why.contains("no tagged cache")),
+        "{untagged:?}"
+    );
+    cache_tag(&wt.join("target"));
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now)
+        .expect("control: a tagged target/ alone is admitted");
+    std::fs::write(wt.join(".aterm-verify"), "notes nobody else holds").expect("written");
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains(".aterm-verify") && why.contains("no tagged cache")),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert!(wt.join(".aterm-verify").is_file(), "the file stays");
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+    assert!(linked_receipts(&g).is_empty(), "no receipt is left");
+}
+
+/// The receipts in the checkout's git directory (`.git/aterm-retiring/`).
+fn linked_receipts(g: &Gate) -> Vec<PathBuf> {
+    std::fs::read_dir(g.checkout().join(".git/aterm-retiring"))
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A LINKED WORKTREE ON A MERGED BRANCH GOES, ITS POPULATED SUBMODULE WITH IT: the judge admits
+/// it on its branch, the remover takes its tree and git's entry for it, the checkout's own
+/// submodule store stays, no receipt is left, and the gate's snapshot is judged as before.
+/// NEGATIVE CONTROL: the snapshot's rule (detached only) refuses it, `not detached`.
+#[test]
+fn a_linked_worktree_on_a_merged_branch_goes_with_its_submodule() {
+    let g = gate();
+    let wt = linked(&g, "done");
+    let snapshot_rule = super::judge_snapshot(&GitCli, &g.checkout(), &wt, g.now);
+    assert!(
+        snapshot_rule
+            .as_ref()
+            .is_err_and(|why| why.contains("not detached")),
+        "control: {snapshot_rule:?}"
+    );
+    let admitted = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now)
+        .expect("a merged, clean linked worktree is admitted");
+    assert_eq!(admitted.branch.as_deref(), Some("refs/heads/agent/done"));
+    assert!(admitted.why.contains("linked worktree"), "{}", admitted.why);
+    super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now).expect("removed");
+    assert!(wt.symlink_metadata().is_err(), "its tree went");
+    assert!(!g.has_worktree(&wt), "{}", g.worktrees());
+    assert!(
+        g.checkout().join(".git/modules/vendor/astream").is_dir(),
+        "the checkout's submodule store stays"
+    );
+    assert_eq!(linked_receipts(&g), Vec::<PathBuf>::new());
+    assert_eq!(super::retiring(&g.checkout()), Vec::<PathBuf>::new());
+    let planned = plan(&g.roots, g.now, &GitCli);
+    assert!(planned[0].goes(), "{planned:#?}");
+}
+
+/// A LINKED WORKTREE'S RECEIPT LIES IN ITS CHECKOUT'S GIT DIRECTORY: the snapshot's slot beside
+/// the checkout stays free, so the snapshot is still judged, and [`super::retiring`] names the
+/// worktree. NEGATIVE CONTROL: one slot per checkout would put it beside the checkout, and the
+/// snapshot would read as `no longer names this snapshot`.
+#[test]
+fn a_linked_receipt_lies_in_the_checkouts_git_dir() {
+    let g = gate();
+    let wt = linked(&g, "done");
+    let text = std::fs::read(wt.join(".git")).expect("its .git");
+    let entry = super::own_entry(&g.checkout(), &wt, &text).expect("its entry");
+    let head = super::listed(&GitCli, &g.checkout(), &wt)
+        .expect("git worktree list")
+        .expect("listed")
+        .head;
+    super::pending::begin(&g.checkout(), &wt, &entry, &head, &text).expect("a receipt");
+    assert_eq!(
+        linked_receipts(&g).len(),
+        1,
+        "one receipt in .git/aterm-retiring"
+    );
+    assert!(
+        super::beside(&g.checkout(), super::pending::SUFFIX)
+            .expect("the snapshot's slot")
+            .symlink_metadata()
+            .is_err(),
+        "the snapshot's slot stays free"
+    );
+    let planned = plan(&g.roots, g.now, &GitCli);
+    assert!(planned[0].goes(), "{planned:#?}");
+    assert_eq!(super::retiring(&g.checkout()), std::slice::from_ref(&wt));
+}
+
+/// A COMMIT ONLY A LINKED WORKTREE'S REFLOG HOLDS KEEPS IT: a commit made in it and then reset
+/// away is in no branch, and removing git's entry and the branch would drop the reflogs that are
+/// its only root. NEGATIVE CONTROL: the same worktree without the reset is judged on its HEAD,
+/// `is not in origin/main` ([`a_linked_worktree_on_a_merged_branch_goes_with_its_submodule`]
+/// admits one with neither).
+#[test]
+fn a_linked_worktree_whose_reflog_holds_a_commit_main_lacks_stays() {
+    let g = gate();
+    let wt = linked(&g, "lost");
+    std::fs::write(wt.join("new.rs"), "\n").expect("written");
+    git(&wt, &["add", "new.rs"]);
+    git(&wt, &["commit", "-qm", "local"]);
+    git(&wt, &["reset", "-q", "--hard", "refs/remotes/origin/main"]);
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        judged.as_ref().is_err_and(|why| why.contains("reflog")),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert!(wt.join("Cargo.toml").is_file(), "its tree stands");
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+}
+
+/// A LINKED WORKTREE HOLDING ANOTHER WORKTREE STAYS: a worktree under an ignored folder of it
+/// (`.claude/worktrees/y`) is invisible to `git status` in it and to the private-store walk,
+/// which passes a `.git` file over, so the judge names it. NEGATIVE CONTROL: without the check
+/// the removal would take `y`'s tree with its parent's.
+#[test]
+fn a_linked_worktree_holding_another_worktree_stays() {
+    let g = gate();
+    std::fs::create_dir_all(g.checkout().join(".git/info")).expect("git's info folder");
+    std::fs::write(g.checkout().join(".git/info/exclude"), "/.claude/\n").expect("written");
+    let wt = linked(&g, "done");
+    let y = wt.join(".claude/worktrees/y");
+    git(
+        &g.checkout(),
+        &["worktree", "add", "-q", "--detach", &for_git(&y), "HEAD"],
+    );
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    let inside = y.to_string_lossy().into_owned();
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains("lies inside it") && why.contains(&inside)),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert!(
+        y.join("Cargo.toml").is_file() && g.has_worktree(&y),
+        "y stands"
+    );
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+}
+
+/// A LINKED WORKTREE PART OF WHICH STAYS KEEPS GIT'S ENTRY: an ignored file its owner flagged
+/// `uchg` (which the remover never clears) stays, every other entry goes, git still lists the
+/// worktree, its `.git` is back as it was and its receipt names it, so the next look finds it;
+/// once the flag is gone the next removal finishes it from the receipt. NEGATIVE CONTROL: the
+/// snapshot's arm removes git's entry by the remover, and git then lists it no more.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_linked_worktree_half_removed_keeps_its_entry() {
+    let g = gate();
+    let wt = linked(&g, "done");
+    cache_tag(&wt.join("target"));
+    let stuck = wt.join("target/held/stuck");
+    let _release = Release {
+        flagged: vec![stuck.clone()],
+        denied: Vec::new(),
+    };
+    std::fs::create_dir_all(stuck.parent().expect("its folder")).expect("a folder");
+    std::fs::write(&stuck, "held").expect("written");
+    crate::platform::set_file_flags(&stuck, libc::UF_IMMUTABLE).expect("uchg");
+    let gitfile = std::fs::read(wt.join(".git")).expect("its .git");
+
+    let first = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(first.is_err(), "{first:?}");
+    assert!(stuck.is_file(), "the flagged file stays");
+    assert!(
+        wt.join("Cargo.toml").symlink_metadata().is_err(),
+        "the rest went"
+    );
+    assert!(g.has_worktree(&wt), "git still lists it: {}", g.worktrees());
+    assert_eq!(
+        std::fs::read(wt.join(".git")).expect("its .git"),
+        gitfile,
+        "its .git is back as it was"
+    );
+    assert_eq!(super::retiring(&g.checkout()), std::slice::from_ref(&wt));
+
+    crate::platform::set_file_flags(&stuck, 0).expect("the flag off");
+    super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now).expect("finished");
+    assert!(wt.symlink_metadata().is_err(), "its tree went");
+    assert!(!g.has_worktree(&wt), "{}", g.worktrees());
+    assert_eq!(super::retiring(&g.checkout()), Vec::<PathBuf>::new());
+}
+
+/// A LINKED REMOVAL STOPPED AFTER ITS TREE RESUMES FROM ITS RECEIPT: a process holding git's
+/// entry for it once its tree went keeps the entry; discovery, which finds a worktree by its
+/// folder, can no longer find it, and [`super::retiring`] names it; the next removal finishes it
+/// and its receipt. NEGATIVE CONTROL: without the receipt listing nothing names the worktree.
+#[test]
+fn a_linked_removal_stopped_after_its_tree_resumes_from_its_receipt() {
+    use aterm_uds::holders::{PathScan, PathUse};
+
+    let g = gate();
+    let wt = linked(&g, "done");
+    let entry = super::own_entry(
+        &g.checkout(),
+        &wt,
+        &std::fs::read(wt.join(".git")).expect("its .git"),
+    )
+    .expect("its entry");
+    let held = std::cell::Cell::new(true);
+    let processes = |dirs: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> {
+        let users = if held.get() && dirs.contains(&entry) && !wt.exists() {
+            vec![PathUse {
+                pid: 24,
+                how: "fd",
+                path: entry.join("held"),
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(PathScan {
+            users,
+            ..PathScan::default()
+        })
+    };
+    let first = super::remove_worktree_with_processes(
+        &GitCli,
+        g.home(),
+        &g.checkout(),
+        &wt,
+        g.now,
+        &processes,
+    );
+    assert!(first.is_err(), "{first:?}");
+    assert!(!wt.exists(), "its tree went");
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+    assert_eq!(super::retiring(&g.checkout()), std::slice::from_ref(&wt));
+    held.set(false);
+    super::remove_worktree_with_processes(&GitCli, g.home(), &g.checkout(), &wt, g.now, &processes)
+        .expect("resumed");
+    assert!(!g.has_worktree(&wt) && !entry.exists(), "{}", g.worktrees());
+    assert_eq!(super::retiring(&g.checkout()), Vec::<PathBuf>::new());
+}
+
+/// A RECEIPT WHOSE REMOVAL STOPS BEFORE ITS FIRST ENTRY GOES IS WITHDRAWN: a process that takes
+/// the worktree up between the receipt's commit and the first deletion keeps it whole, and no
+/// receipt is left to admit it at a later look, after a person may have put in it a file whose
+/// time a move kept. NEGATIVE CONTROL: without the withdrawal the receipt stays, and
+/// [`super::retiring`] names the worktree.
+#[test]
+fn a_linked_removal_stopped_before_its_first_deletion_leaves_no_receipt() {
+    use aterm_uds::holders::{PathScan, PathUse};
+
+    let g = gate();
+    let wt = linked(&g, "done");
+    let probes = std::cell::Cell::new(0u32);
+    let processes = |_: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> {
+        probes.set(probes.get() + 1);
+        let users = if probes.get() > 1 {
+            vec![PathUse {
+                pid: 24,
+                how: "cwd",
+                path: wt.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(PathScan {
+            users,
+            ..PathScan::default()
+        })
+    };
+    let removed = super::remove_worktree_with_processes(
+        &GitCli,
+        g.home(),
+        &g.checkout(),
+        &wt,
+        g.now,
+        &processes,
+    );
+    assert_eq!(removed, Err(super::USED.to_owned()));
+    assert_eq!(
+        probes.get(),
+        2,
+        "the second probe follows the receipt's commit"
+    );
+    assert!(wt.join("Cargo.toml").is_file(), "its tree stands");
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+    assert_eq!(linked_receipts(&g), Vec::<PathBuf>::new());
+    assert_eq!(super::retiring(&g.checkout()), Vec::<PathBuf>::new());
+}
+
+/// A FILE PUT IN A LINKED WORKTREE WHOSE REMOVAL STOPPED KEEPS IT, WHATEVER ITS TIME: a receipt
+/// stands and its removal took a tracked file; a person then moves in a month-old note, the move
+/// keeping its time, which is older than the receipt's start. The receipt admits only what git
+/// sees the removal do. NEGATIVE CONTROLS: the same tree before the note is admitted from its
+/// receipt; without the check the note, older than the receipt, goes with the tree.
+#[test]
+fn a_file_put_in_a_stopped_linked_removal_keeps_it() {
+    let g = gate();
+    let wt = linked(&g, "done");
+    let text = std::fs::read(wt.join(".git")).expect("its .git");
+    let entry = super::own_entry(&g.checkout(), &wt, &text).expect("its entry");
+    let head = super::listed(&GitCli, &g.checkout(), &wt)
+        .expect("git worktree list")
+        .expect("listed")
+        .head;
+    super::pending::begin(&g.checkout(), &wt, &entry, &head, &text).expect("a receipt");
+    std::fs::remove_file(wt.join("Cargo.toml")).expect("a tracked file gone");
+    let control = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(control.is_ok(), "control: {control:?}");
+
+    let note = wt.join("notes.md");
+    std::fs::write(&note, "mine\n").expect("written");
+    let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&note)
+        .and_then(|f| f.set_modified(month))
+        .expect("its old time");
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains("?? notes.md")),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert_eq!(std::fs::read_to_string(&note).expect("the note"), "mine\n");
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+}
+
+/// A LINKED WORKTREE WITH A FILE GIT IS TOLD NOT TO LOOK AT STAYS: an edit to a tracked file
+/// marked skip-worktree or assume-unchanged does not show in `git status`, and would go with the
+/// tree once nothing in it was written for a week. NEGATIVE CONTROL: without the check each is
+/// admitted, its edit unseen.
+#[test]
+fn a_linked_worktree_with_a_file_git_is_told_not_to_look_at_stays() {
+    let g = gate();
+    for (name, flag) in [
+        ("skip", "--skip-worktree"),
+        ("assume", "--assume-unchanged"),
+    ] {
+        let wt = linked(&g, name);
+        std::fs::write(wt.join("Cargo.toml"), "[workspace]\n# mine\n").expect("written");
+        git(&wt, &["update-index", flag, "Cargo.toml"]);
+        let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+        assert!(
+            judged
+                .as_ref()
+                .is_err_and(|why| why.contains("told not to look at its file Cargo.toml")),
+            "{name}: {judged:?}"
+        );
+        let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+        assert!(removed.is_err(), "{name}: {removed:?}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("Cargo.toml")).expect("its edit"),
+            "[workspace]\n# mine\n",
+            "{name}"
+        );
+    }
+}
+
+/// ONLY A WORKTREE AN AGENT MAKES IS A CANDIDATE: a merged, clean worktree beside the checkout
+/// (`~/aterm-develop`, a person's own) stays, judged and removed alike, with its files and git's
+/// entry; one in the checkout's `.claude/worktrees/` (Claude Code's isolation worktree) and one
+/// named `*.noindex` in a `.ubd` folder are admitted; and a worktree of a bare repository (the
+/// `git clone --bare … proj/.git` layout) stays, though it has the agent's shape. NEGATIVE
+/// CONTROLS: without the shape rule the person's worktree is admitted and goes; without the bare
+/// rule the bare repository's is admitted.
+#[test]
+fn only_a_worktree_an_agent_makes_is_a_candidate() {
+    let g = gate();
+    let person = linked_at(&g, "develop", &g.home().join("aterm-develop"));
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &person, g.now);
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains("no worktree an agent makes")),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &person, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert!(person.join("Cargo.toml").is_file(), "its tree stands");
+    assert!(g.has_worktree(&person), "{}", g.worktrees());
+
+    let isolation = linked_at(&g, "iso", &g.checkout().join(".claude/worktrees/iso"));
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &isolation, g.now)
+        .expect("control: Claude Code's isolation worktree is admitted");
+    let shaped = linked(&g, "done");
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &shaped, g.now)
+        .expect("control: an agent's .ubd/*.noindex worktree is admitted");
+
+    let bare = g.home().join("proj");
+    git(
+        g.home(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &for_git(&g.checkout()),
+            &for_git(&bare.join(".git")),
+        ],
+    );
+    git(&bare, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let in_bare = agents_folder(&g).join("proj-main.noindex");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/bare",
+            &for_git(&in_bare),
+            "HEAD",
+        ],
+    );
+    let judged = super::judge_worktree(&GitCli, g.home(), &bare, &in_bare, g.now);
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains("bare repository")),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &bare, &in_bare, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert!(in_bare.join("Cargo.toml").is_file(), "its tree stands");
+}
+
+/// AN AGENT'S WORKTREE IS READ OFF ITS PATH: a `*.noindex` name needs a `.ubd` folder above it,
+/// at any depth, and a `.ubd` folder needs the name; an isolation worktree is a folder of its
+/// own checkout's `.claude/worktrees/`, not of another's and not deeper. NEGATIVE CONTROL: a
+/// rule reading the name alone admits `/nowhere/x/a.noindex`.
+#[test]
+fn an_agents_worktree_is_read_off_its_path() {
+    let c = Path::new("/nowhere/c");
+    for (wt, made) in [
+        ("/nowhere/x/.ubd/a.noindex", true),
+        ("/nowhere/.ubd/deep/a.noindex", true),
+        ("/nowhere/x/a.noindex", false),
+        ("/nowhere/.ubd/a", false),
+        ("/nowhere/.ubd/.noindex", false),
+        ("/nowhere/c/.claude/worktrees/x", true),
+        ("/nowhere/d/.claude/worktrees/x", false),
+        ("/nowhere/c/.claude/worktrees/x/y", false),
+    ] {
+        assert_eq!(super::agent_made(c, Path::new(wt)), made, "{wt}");
+    }
+}
+
+/// Make git in `dir` (a worktree or a submodule checked out in one) ignore `pattern`, through its
+/// own git directory's `info/exclude`, so no file in the tree says so.
+fn exclude_in(dir: &Path, pattern: &str) {
+    let at = GitCli.run(
+        dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ],
+    );
+    assert_eq!(at.code, Some(0), "{}", at.err);
+    let exclude = PathBuf::from(at.out.trim());
+    std::fs::create_dir_all(exclude.parent().expect("its folder")).expect("git's info folder");
+    let mut rules = std::fs::read_to_string(&exclude).unwrap_or_default();
+    rules.push_str(pattern);
+    rules.push('\n');
+    std::fs::write(&exclude, rules).expect("written");
+}
+
+/// A FILE A SUBMODULE IGNORES KEEPS ITS WORKTREE: the superproject's `git status` reports no
+/// file git ignores inside a submodule, under any `--ignore-submodules`, so a submodule's own
+/// `.claude/` notes (a session that worked in it) would go with the tree. Each submodule checked
+/// out in a worktree is read on its own: an untagged ignored `target/` in it keeps the worktree,
+/// a tagged one is admitted and recorded by its path in the worktree, and an ignored notes file
+/// beside it keeps it, judged and removed alike. NEGATIVE CONTROL: reading the worktree's own
+/// level alone admits the notes, and the removal takes them.
+#[test]
+fn a_file_a_submodule_ignores_keeps_its_worktree() {
+    let g = gate();
+    let wt = linked(&g, "subign");
+    let sub = wt.join("vendor/astream");
+    exclude_in(&sub, "/target/");
+    exclude_in(&sub, "/.claude/");
+    std::fs::create_dir_all(sub.join("target/debug")).expect("a build");
+    std::fs::write(sub.join("target/debug/libx.rlib"), "x").expect("written");
+    let untagged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        untagged.as_ref().is_err_and(
+            |why| why.contains("vendor/astream/target/") && why.contains("no tagged cache")
+        ),
+        "{untagged:?}"
+    );
+    cache_tag(&sub.join("target"));
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now)
+        .expect("control: a tagged target/ in the submodule is admitted");
+    assert_eq!(
+        super::ignored_entries(&GitCli, &wt),
+        Ok(vec!["vendor/astream/target/".to_owned()]),
+        "recorded by its path in the worktree"
+    );
+
+    let notes = sub.join(".claude/notes.md");
+    std::fs::create_dir_all(notes.parent().expect("its folder")).expect("a folder");
+    std::fs::write(&notes, "a plan nobody else holds\n").expect("written");
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        judged.as_ref().is_err_and(
+            |why| why.contains("vendor/astream/.claude/") && why.contains("no tagged cache")
+        ),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert!(notes.is_file(), "the notes stay");
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+    assert!(linked_receipts(&g).is_empty(), "no receipt is left");
+}
+
+/// AN EDIT A SUBMODULE'S OWN INDEX HIDES KEEPS ITS WORKTREE: a tracked file of the submodule
+/// marked assume-unchanged and then edited shows in no status of the superproject or the
+/// submodule, so the judge reads the submodule's own `ls-files -v`. NEGATIVE CONTROL: the same
+/// worktree before the mark is admitted.
+#[test]
+fn an_edit_a_submodules_index_hides_keeps_its_worktree() {
+    let g = gate();
+    let wt = linked(&g, "subhide");
+    let sub = wt.join("vendor/astream");
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now)
+        .expect("control: admitted before the mark");
+    let listed = GitCli.run(&sub, &["ls-files", "-z"]);
+    let rel = listed
+        .out
+        .split('\0')
+        .next()
+        .expect("a tracked file")
+        .to_owned();
+    assert!(!rel.is_empty(), "the submodule tracks a file: {listed:?}");
+    git(&sub, &["update-index", "--assume-unchanged", &rel]);
+    std::fs::write(sub.join(&rel), "an edit nobody else holds\n").expect("written");
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains("in vendor/astream/") && why.contains(&rel)),
+        "{judged:?}"
+    );
+}
+
+/// A linked worktree of the gate's checkout where an agent makes one, on a new branch
+/// `agent/<name>`, its submodule never checked out: git leaves its folder empty.
+fn linked_bare_submodule(g: &Gate, name: &str) -> PathBuf {
+    let wt = agents_folder(g).join(format!("aterm-{name}.noindex"));
+    git(
+        &g.checkout(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &format!("agent/{name}"),
+            &for_git(&wt),
+            "HEAD",
+        ],
+    );
+    wt
+}
+
+/// A SUBMODULE FOLDER HOLDING FILES BUT NO `.git` KEEPS ITS WORKTREE: git status, under any
+/// `--ignore-submodules`, sees nothing in a gitlink folder that is not checked out, so files
+/// copied into it would go with the tree; so it stays, on a fresh judgment and on a stopped
+/// removal's resume, whatever the files' times. NEGATIVE CONTROLS: the empty folder git leaves
+/// is admitted, fresh and from the receipt; without the check the files are admitted both ways.
+#[test]
+fn a_submodule_folder_holding_files_but_no_git_keeps_its_worktree() {
+    let g = gate();
+    let wt = linked_bare_submodule(&g, "copied");
+    let folder = wt.join("vendor/astream");
+    assert!(folder.is_dir(), "git leaves the gitlink's folder");
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now)
+        .expect("control: the empty folder git leaves is admitted");
+    std::fs::write(folder.join("lib.rs"), "// copied in, then edited\n").expect("written");
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains("vendor/astream/ holds files but no .git")),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert!(folder.join("lib.rs").is_file(), "the copy stays");
+
+    let resumed = linked_bare_submodule(&g, "resumed");
+    let text = std::fs::read(resumed.join(".git")).expect("its .git");
+    let entry = super::own_entry(&g.checkout(), &resumed, &text).expect("its entry");
+    let head = super::listed(&GitCli, &g.checkout(), &resumed)
+        .expect("git worktree list")
+        .expect("listed")
+        .head;
+    super::pending::begin(&g.checkout(), &resumed, &entry, &head, &text).expect("a receipt");
+    std::fs::remove_file(resumed.join("Cargo.toml")).expect("a tracked file gone");
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &resumed, g.now)
+        .expect("control: the stopped removal's tree is admitted from its receipt");
+    let copy = resumed.join("vendor/astream/lib.rs");
+    std::fs::write(&copy, "// copied in with its old time\n").expect("written");
+    let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&copy)
+        .and_then(|f| f.set_modified(month))
+        .expect("its old time");
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &resumed, g.now);
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains("vendor/astream/ holds files but no .git")),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &resumed, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert!(copy.is_file(), "the copy stays");
+}
+
+/// Give `path` a modification time a month before the clock: what a move, a `cp -p` or a restore
+/// from a backup keeps, older than any receipt's start.
+fn a_month_old(path: &Path) {
+    let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    std::fs::File::options()
+        .read(true)
+        .open(path)
+        .and_then(|f| f.set_modified(month))
+        .expect("its old time");
+}
+
+/// A TREE THAT STANDS ONCE GIT'S ENTRY FOR IT WENT STAYS: a removal that took a linked
+/// worktree's `.git` stopped; `git worktree prune` then drops git's entry for it, whose `.git` is
+/// gone; a person restores a month-old note into what is left. Its receipt still names it, and
+/// with no entry nothing can say what was put in it since, so it stays with the note. NEGATIVE
+/// CONTROLS: the same tree before the prune is admitted from its receipt; without the rule the
+/// note, older than the receipt, goes with the tree.
+#[test]
+fn a_tree_standing_once_its_git_entry_went_stays() {
+    let g = gate();
+    let wt = linked(&g, "pruned");
+    let text = std::fs::read(wt.join(".git")).expect("its .git");
+    let entry = super::own_entry(&g.checkout(), &wt, &text).expect("its entry");
+    let head = super::listed(&GitCli, &g.checkout(), &wt)
+        .expect("git worktree list")
+        .expect("listed")
+        .head;
+    super::pending::begin(&g.checkout(), &wt, &entry, &head, &text).expect("a receipt");
+    std::fs::remove_file(wt.join(".git")).expect("its .git gone, as the removal takes it first");
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now)
+        .expect("control: with git's entry, the stopped removal is admitted from its receipt");
+
+    git(&g.checkout(), &["worktree", "prune"]);
+    assert!(entry.symlink_metadata().is_err(), "git dropped its entry");
+    let note = wt.join("notes.md");
+    std::fs::write(&note, "restored from a backup\n").expect("written");
+    a_month_old(&note);
+    let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        judged
+            .as_ref()
+            .is_err_and(|why| why.contains("went while its tree stands")),
+        "{judged:?}"
+    );
+    let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+    assert!(removed.is_err(), "{removed:?}");
+    assert_eq!(
+        std::fs::read_to_string(&note).expect("the note"),
+        "restored from a backup\n"
+    );
+    assert!(wt.join("Cargo.toml").is_file(), "what is left stays");
+}
+
+/// WHAT A STOPPED REMOVAL DID NOT DO KEEPS ITS TREE, IGNORED OR IN A SUBMODULE: a receipt stands
+/// for a linked worktree that recorded its submodule's tagged `target/`, and the removal took a
+/// tracked file of the worktree and one of its submodule. Then, each with a month-old time, an
+/// ignored file put in the worktree, an ignored note put in the submodule, and an edit to the
+/// submodule's tracked file each keep it, judged and removed alike. NEGATIVE CONTROLS: what the
+/// removal did, the recorded `target/` included, is admitted from the receipt; a status read
+/// without `--ignored`, or of the worktree alone with its submodules ignored, admits the first
+/// two and the third.
+#[test]
+fn what_a_stopped_removal_did_not_do_keeps_its_tree() {
+    let g = gate();
+    let wt = linked(&g, "stopped");
+    let sub = wt.join("vendor/astream");
+    exclude_in(&sub, "/target/");
+    exclude_in(&sub, "/.claude/");
+    cache_tag(&sub.join("target"));
+    let ignored = super::ignored_entries(&GitCli, &wt).expect("its ignored entries");
+    assert_eq!(ignored, ["vendor/astream/target/"]);
+    let text = std::fs::read(wt.join(".git")).expect("its .git");
+    let entry = super::own_entry(&g.checkout(), &wt, &text).expect("its entry");
+    let head = super::listed(&GitCli, &g.checkout(), &wt)
+        .expect("git worktree list")
+        .expect("listed")
+        .head;
+    let receipt = super::pending::prepare(
+        &wt,
+        &entry,
+        &head,
+        &text,
+        super::pending::file_clock_now(),
+        ignored,
+    )
+    .expect("a receipt");
+    super::pending::commit(&g.checkout(), &receipt).expect("committed");
+    std::fs::remove_file(wt.join("Cargo.toml")).expect("a tracked file gone");
+    std::fs::remove_file(sub.join("lib.rs")).expect("a submodule's tracked file gone");
+    super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now)
+        .expect("control: what the removal did is admitted from its receipt");
+
+    let put = wt.join(".aterm-verify");
+    let note = sub.join(".claude/notes.md");
+    let edit = sub.join("lib.rs");
+    for (path, said) in [
+        (&put, "!! .aterm-verify"),
+        (&note, "!! .claude/ in vendor/astream/"),
+        (&edit, " M lib.rs in vendor/astream/"),
+    ] {
+        std::fs::create_dir_all(path.parent().expect("its folder")).expect("a folder");
+        std::fs::write(path, "mine\n").expect("written");
+        a_month_old(path);
+        let judged = super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+        assert!(
+            judged.as_ref().is_err_and(|why| why.contains(said)),
+            "{said}: {judged:?}"
+        );
+        let removed = super::remove_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now);
+        assert!(removed.is_err(), "{said}: {removed:?}");
+        assert_eq!(std::fs::read_to_string(path).expect("it stays"), "mine\n");
+        std::fs::remove_file(path).expect("taken away for the next case");
+    }
+}
+
+/// Git as [`GitCli`] answers it, with `after` called once each run has answered (its folder and
+/// arguments) and `history` before each bounded history read: a writer racing a removal.
+struct Racing<'a> {
+    after: &'a dyn Fn(&Path, &[&str]),
+    history: &'a dyn Fn(),
+}
+
+impl super::Git for Racing<'_> {
+    fn run(&self, dir: &Path, args: &[&str]) -> super::Answer {
+        self.run_with_alt(dir, args, None)
+    }
+
+    fn run_with_alt(&self, dir: &Path, args: &[&str], alt: Option<&Path>) -> super::Answer {
+        let answer = GitCli.run_with_alt(dir, args, alt);
+        (self.after)(dir, args);
+        answer
+    }
+
+    fn read_history(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        input: &[u8],
+        objects: Option<&Path>,
+        deadline: std::time::Instant,
+    ) -> super::Answer {
+        (self.history)();
+        GitCli.read_history(dir, args, input, objects, deadline)
+    }
+}
+
+/// An edit a person saves into the worktree `wt` while its removal runs.
+const LATE: &str = "[workspace]\n# saved while the removal ran\n";
+
+/// A WRITE GIT'S LAST READ MISSED KEEPS THE WORKTREE: an edit saved just after the removal's own
+/// ignored-entry read (the last `git status` before its receipt) is one no git read sees, and
+/// the receipt's start, taken before the removal's first git read, dates it as new, so custody
+/// keeps the tree and withdraws the receipt. NEGATIVE CONTROL: with the start taken after that
+/// read, the edit is older than it and goes with the tree.
+#[test]
+fn a_write_the_last_git_read_missed_keeps_the_worktree() {
+    let g = gate();
+    let wt = linked(&g, "raced");
+    let reads = std::cell::Cell::new(0usize);
+    let count = |dir: &Path, args: &[&str]| {
+        if dir == wt && args.contains(&"--ignored") {
+            reads.set(reads.get() + 1);
+        }
+    };
+    let quiet = || {};
+    let counting = Racing {
+        after: &count,
+        history: &quiet,
+    };
+    super::judge_worktree(&counting, g.home(), &g.checkout(), &wt, g.now)
+        .expect("control: it is admitted");
+    let judged = reads.replace(0);
+    let save = |dir: &Path, args: &[&str]| {
+        count(dir, args);
+        if dir == wt && args.contains(&"--ignored") && reads.get() == judged + 1 {
+            std::fs::write(wt.join("Cargo.toml"), LATE).expect("saved");
+        }
+    };
+    let racing = Racing {
+        after: &save,
+        history: &quiet,
+    };
+    let removed = super::remove_worktree(&racing, g.home(), &g.checkout(), &wt, g.now);
+    assert!(
+        removed
+            .as_ref()
+            .is_err_and(|why| why.contains("written after")),
+        "{removed:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("Cargo.toml")).expect("the edit"),
+        LATE
+    );
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+    assert!(linked_receipts(&g).is_empty(), "the receipt is withdrawn");
+}
+
+/// A WRITE WHILE THE HISTORY CHECK READS KEEPS THE WORKTREE: the private-history check of its
+/// submodule's store (up to thirty seconds) runs before custody's last time check, so an edit
+/// saved while it reads is seen before the first deletion. NEGATIVE CONTROL: with the history
+/// check after the time check, the edit goes with the tree.
+#[test]
+fn a_write_while_the_history_check_reads_keeps_the_worktree() {
+    let g = gate();
+    let wt = linked(&g, "slow");
+    let saved = std::cell::Cell::new(false);
+    let none = |_: &Path, _: &[&str]| {};
+    let save = || {
+        if !saved.get() && !linked_receipts(&g).is_empty() && wt.join("Cargo.toml").is_file() {
+            std::fs::write(wt.join("Cargo.toml"), LATE).expect("saved");
+            saved.set(true);
+        }
+    };
+    let racing = Racing {
+        after: &none,
+        history: &save,
+    };
+    let removed = super::remove_worktree(&racing, g.home(), &g.checkout(), &wt, g.now);
+    assert!(saved.get(), "the history check read once its receipt stood");
+    assert!(
+        removed
+            .as_ref()
+            .is_err_and(|why| why.contains("written after")),
+        "{removed:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("Cargo.toml")).expect("the edit"),
+        LATE
+    );
+    assert!(g.has_worktree(&wt), "{}", g.worktrees());
+    assert!(linked_receipts(&g).is_empty(), "the receipt is withdrawn");
 }

@@ -44,12 +44,147 @@ pub struct Revocation {
 
 /// Successful `--stolen` revocation (`DESIGN-alab-swarm` §7.6, C25): vault removal, Commons
 /// retirement, swarm deny-list + pool slot release, `aterm-fleet-code` rotation (which a plain
-/// revocation makes too), and the single-line `NEEDS YOU:` provider rotation list.
+/// revocation makes too), and each credential the Mac could read filed for rotation in this
+/// Mac's need ledger ([`Exposure::file`]).
 pub struct StolenRevocation {
     /// Vault publication, prior Commons retirement and the fleet code's rotation.
     pub revocation: Revocation,
-    /// Single-line `NEEDS YOU:` provider-credential rotation notice.
-    pub needs_you_line: String,
+    /// The one line naming what was filed for rotation.
+    pub rotation_line: String,
+}
+
+/// What a stolen Mac took: the credentials among the entries it could read, which
+/// [`Exposure::file`] records in this Mac's need ledger for a new value
+/// ([`crate::need::Purpose::StolenRotation`]), and what was signed in there, which no vault
+/// value answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exposure {
+    /// The stolen Mac's name or label.
+    pub label: String,
+    /// The vault entries it could read that are credentials, each with the sections that still
+    /// hold the value it read (`[everyone]`, `[m3 m22]`; none where only its own section held
+    /// it), each filed as `entry:<name>`.
+    pub credentials: Vec<(String, Vec<String>)>,
+    /// The AI accounts warm there and the Claude Code tokens it held.
+    pub signed_in: Vec<String>,
+    /// The host lists that wrapped it which this Mac cannot open, so cannot name entries of.
+    pub unopened: Vec<String>,
+}
+
+/// Whether the entry `name` holds a credential a provider or a member makes anew: a credential
+/// leaf, release material other than the public roster, a native pool's API key or a mailbox
+/// route. Fleet configuration and control records are not; the cascade rotates the fleet code,
+/// and a Claude Code token is a sign-in ([`Exposure::signed_in`]).
+fn credential(name: &str) -> bool {
+    use crate::entry_class::{self as class, EntryClass, Held};
+    match class::of(name) {
+        EntryClass::Shared => true,
+        EntryClass::Held(Held::Release) => {
+            !class::PUBLIC_ROSTER.contains(&name) && !class::LEGACY_ROSTER.contains(&name)
+        }
+        EntryClass::Held(Held::FleetConfiguration) => {
+            class::native_api_key(name) || name == class::MAILBOX || name == class::AI_MAILBOX
+        }
+        EntryClass::Held(Held::GitConfig) | EntryClass::Consumed(_) | EntryClass::SetApart(_) => {
+            false
+        }
+    }
+}
+
+impl Exposure {
+    /// The exposure of the Mac `label` that could read `read`, each `(name, section)` where
+    /// `section` is the header that still holds it once the Mac is out (`None`: a section of
+    /// its own, which the removal drops), with `warm_accounts` warm there and the host lists
+    /// `unopened` this Mac cannot open.
+    #[must_use]
+    pub fn of(
+        label: &str,
+        read: &[(String, Option<String>)],
+        warm_accounts: &[String],
+        unopened: Vec<String>,
+    ) -> Self {
+        let mut credentials: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (name, section) in read.iter().filter(|(name, _)| credential(name)) {
+            let sections = credentials.entry(name.clone()).or_default();
+            if let Some(section) = section
+                && !sections.contains(section)
+            {
+                sections.push(section.clone());
+            }
+        }
+        let mut signed_in = warm_accounts.to_vec();
+        for (name, _) in read {
+            if crate::entry_class::claude_token(name)
+                && !name.ends_with(crate::entry_class::CLAUDE_TOKEN_META)
+                && !signed_in.contains(name)
+            {
+                signed_in.push(name.clone());
+            }
+        }
+        Self {
+            label: label.to_owned(),
+            credentials: credentials
+                .into_iter()
+                .map(|(name, mut sections)| {
+                    sections.sort();
+                    (name, sections)
+                })
+                .collect(),
+            signed_in,
+            unopened,
+        }
+    }
+
+    /// File each credential in this Mac's need ledger ([`crate::need::raise_rotations`]) and
+    /// return the one line that says what was filed. A ledger that cannot be written leaves the
+    /// removal standing: the line names the failure and the entries it did not file.
+    #[must_use]
+    pub fn file(&self, paths: &Paths) -> String {
+        let label = &self.label;
+        let mut line = if self.credentials.is_empty() {
+            format!("{label} could read no credential to file for rotation")
+        } else {
+            let wants: Vec<String> = self
+                .credentials
+                .iter()
+                .map(|(name, sections)| {
+                    std::iter::once(format!("entry:{name}"))
+                        .chain(sections.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            match crate::need::raise_rotations(paths, &self.credentials) {
+                Ok(_) => format!(
+                    "{label}'s credentials filed for rotation in this Mac's need ledger (aterm secrets need ls): {}",
+                    wants.join(", ")
+                ),
+                Err(error) => format!(
+                    "{label}'s credentials not filed for rotation ({error}): {}",
+                    wants.join(", ")
+                ),
+            }
+        };
+        if !self.signed_in.is_empty() {
+            line.push_str(&format!(
+                "; signed in on {label}: {}",
+                self.signed_in.join(", ")
+            ));
+        }
+        if !self.unopened.is_empty() {
+            line.push_str(&format!(
+                "; {} wrapped {label} and this Mac cannot open {}, so none of its entries is filed",
+                self.unopened.join(", "),
+                if self.unopened.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                }
+            ));
+        }
+        line
+    }
 }
 
 /// The refusal of a removal by an admin that is no enrolled Commons member of the vault, `me`
@@ -1664,99 +1799,37 @@ pub(super) fn cascade_member_removal(
     })
 }
 
-fn format_stolen_needs_you(
+/// What the vault member `host` could read before its removal from `before`: every entry
+/// for an admin, else each one its sections address, each under the header its section has
+/// once `host` is out of it ([`Document::remove_machine`]).
+fn exposure_of(
     before: &Document,
     host: &str,
     display_label: &str,
     warm_accounts: &[String],
-) -> String {
+) -> Exposure {
     let is_admin = before.admins().iter().any(|name| name == host);
-    let names: Vec<String> = before
+    let read: Vec<(String, Option<String>)> = before
         .entries()
         .into_iter()
         .filter(|entry| is_admin || entry.audience.includes(host))
-        .map(|entry| entry.name)
+        .map(|entry| {
+            let section = match entry.audience {
+                Audience::Everyone => Some(Audience::Everyone.header()),
+                Audience::Hosts(hosts) => {
+                    let rest: Vec<String> = hosts.into_iter().filter(|h| h != host).collect();
+                    (!rest.is_empty()).then(|| Audience::Hosts(rest).header())
+                }
+            };
+            (entry.name, section)
+        })
         .collect();
-    stolen_needs_you_line(&names, display_label, warm_accounts)
-}
-
-/// The one `NEEDS YOU:` line of a stolen Mac's removal: what the provider must rotate of the
-/// entries named `names` (the ones the Mac could read) and the AI accounts warm there.
-pub(super) fn stolen_needs_you_line(
-    names: &[String],
-    display_label: &str,
-    warm_accounts: &[String],
-) -> String {
-    let mut gh_tokens = Vec::new();
-    let mut has_release_ring = false;
-    let mut has_developer_id = false;
-    let mut has_notary = false;
-    let mut has_mailbox = false;
-
-    for name in names {
-        let lower = name.to_ascii_lowercase();
-        if lower.starts_with("gh_access_token")
-            || lower.contains("gh-token")
-            || lower.contains("github_token")
-        {
-            gh_tokens.push(name.clone());
-        } else if lower == "release-notary" || lower == "notary" || lower.contains("notary") {
-            has_notary = true;
-        } else if lower.contains("developer-id")
-            || lower.contains("developer_id")
-            || lower.ends_with(".p12")
-            || lower.contains("apple-signing")
-        {
-            has_developer_id = true;
-        } else if lower.contains("release-ring")
-            || lower.contains("release-credentials.toml")
-            || lower.contains("aterm-machines.toml")
-            || lower.ends_with("release.key")
-        {
-            has_release_ring = true;
-        } else if lower == "ai-mailbox.toml"
-            || lower == "mailbox.toml"
-            || lower.starts_with("ai-mailbox")
-        {
-            has_mailbox = true;
-        }
-    }
-
-    let mut items = Vec::new();
-    if !gh_tokens.is_empty() {
-        items.push(format!("gh tokens ({})", gh_tokens.join(", ")));
-    }
-    if has_release_ring {
-        items.push("release ring".to_owned());
-    }
-    if has_developer_id {
-        items.push("Developer ID".to_owned());
-    }
-    if has_notary {
-        items.push("notary".to_owned());
-    }
-    if has_mailbox {
-        items.push("mailbox".to_owned());
-    }
-    if !warm_accounts.is_empty() {
-        items.push(format!("warm AI accounts ({})", warm_accounts.join(", ")));
-    }
-    if items.is_empty() {
-        format!(
-            "NEEDS YOU: rotate at the provider any credentials that left with {display_label} \
-             (gh tokens, release ring, Developer ID, notary, mailbox, and any AI accounts signed in there)"
-        )
-    } else {
-        format!(
-            "NEEDS YOU: rotate at the provider what left with {display_label}: {}",
-            items.join("; ")
-        )
-    }
+    Exposure::of(display_label, &read, warm_accounts, Vec::new())
 }
 
 /// Remove a stolen vault member (`aterm secrets revoke --stolen <label>`), running the full §7.6
-/// cascade in a single vault publish, rotating `aterm-fleet-code`, and returning the single-line
-/// `NEEDS YOU:` provider rotation list (`DESIGN-alab-swarm` §7.6, C25).
+/// cascade in a single vault publish, rotating `aterm-fleet-code`, then filing each credential
+/// it could read for rotation in this Mac's need ledger (`DESIGN-alab-swarm` §7.6, C25).
 ///
 /// # Errors
 /// Self-removal, unsupported authority demotion, unreadable custody, malformed swarm entries, or
@@ -1780,7 +1853,7 @@ pub fn admin_revoke_stolen(
     doc.remove_machine(&host, drop_sections)
         .map_err(|error| Error::new(error.to_string()))?;
     let cascade = apply_swarm_revoke_cascade(paths, admin, &mut doc, &host, &recipient)?;
-    let needs_you_line = format_stolen_needs_you(
+    let exposure = exposure_of(
         &admin.published_doc,
         &host,
         &cascade.display_label,
@@ -1803,7 +1876,7 @@ pub fn admin_revoke_stolen(
             retirement,
             fleet_code_rotated: cascade.fleet_code_rotated,
         },
-        needs_you_line,
+        rotation_line: exposure.file(paths),
     })
 }
 

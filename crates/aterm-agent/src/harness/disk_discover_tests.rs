@@ -3578,3 +3578,17 @@ fn reading_a_process_ticks() {
     let _ = read_process(std::process::id(), None, None);
     assert_eq!(aterm_uds::progress::ticks_here() - before, 1);
 }
+
+/// STALE REGISTRATIONS DO NOT HIDE A LIVE WORKTREE: a repository with more registrations whose
+/// worktree is gone than the worktree bound (as trust-cg-integ had 107, 102 of them prunable)
+/// still names the one that stands, read after them. NEGATIVE CONTROL: the bound taken before
+/// the filter keeps only gone ones, and nothing stands.
+#[test]
+fn stale_registrations_do_not_hide_a_live_worktree() {
+    let tmp = Tmp::new("stale-worktrees");
+    let home = std::fs::canonicalize(tmp.path()).expect("resolved");
+    let live = mkdirs(&home.join("aterm-live"));
+    let stale = (0..100).map(|i| home.join(format!("aterm-gone-{i}")).join(".git"));
+    let found = placed_worktrees(stale.chain(std::iter::once(live.join(".git"))), &[&home]);
+    assert_eq!(found, [live]);
+}

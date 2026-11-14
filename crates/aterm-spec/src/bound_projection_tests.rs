@@ -205,7 +205,7 @@ fn duplicate_or_colliding_declarations_refuse_before_projection() {
         let error = crate::check::attempt(|| holds(&model, &model.invariants[0]))
             .expect_err("an ambiguous declaration cannot disappear in a projection");
         assert!(
-            error.contains("duplicate or reserved declaration"),
+            error.contains("duplicate or reserved TLA+ declaration"),
             "{error}"
         );
     }

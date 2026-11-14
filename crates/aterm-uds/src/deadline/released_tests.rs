@@ -100,6 +100,11 @@ fn a_never_released_native_lock_fails_at_the_detector() {
 fn a_pipe_waits_for_the_inherited_writer_without_discarding_bytes() {
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd as _;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the parked fork below must inherit the writer: a kept-out one reaches no fork, \
+                  and the read would end at once"
+    )]
     let (mut reader, mut writer) = io::pipe().unwrap();
     let fd = reader.as_raw_fd();
     // SAFETY: the test owns this reader; its description has not been shared.

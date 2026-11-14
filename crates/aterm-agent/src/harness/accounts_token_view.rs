@@ -190,6 +190,7 @@ impl AccountToken {
                 }
             }
             Some(LoginHalf::Ended { .. }) => format!("login ended; {token}"),
+            Some(LoginHalf::SignedOut { .. }) => format!("login signed out; {token}"),
             Some(LoginHalf::InUse | LoginHalf::Ok) | None => token,
         })
     }
@@ -413,6 +414,10 @@ pub struct Places<'a> {
     /// Whether this host's verb makes a token ([`OFFERED_HERE`] for a surface with no host), so
     /// its surfaces offer the step; where it does not, they still say each token's state.
     pub offers: bool,
+    /// The rows of a roster whose login is made on this Mac, as the surface beside this one
+    /// reads them (the accounts report's own rule; [`accounts::enrolled`] for a surface with
+    /// none), so both say one thing of a row's login ([`LoginHalf::of_row`]).
+    pub enrolled: &'a dyn Fn(&accounts::Roster) -> std::collections::BTreeSet<String>,
 }
 
 /// The accounts the surfaces cover (§5.9, §5.10): each roster row that names an email and that the
@@ -431,7 +436,7 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
             .any(|login| accounts::email_matches(&login.email, email))
     };
     if let Some(records) = &records {
-        let enrolled = places.store.enrolled_here(&records.roster);
+        let enrolled = (places.enrolled)(&records.roster);
         for row in &records.roster.rows {
             let (Some(email), Some(entry)) =
                 (row.expected_identity_email(), TokenEntry::of_row(row))
@@ -452,15 +457,26 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
             // it (the default login's among them) or the row's own directory holds one. A row
             // on the default login has no directory, and every such row counts as enrolled, so
             // only a login record says whether the default login is its account's.
-            let holds = logged_in || (row.dir.is_some() && enrolled.contains(&row.label));
+            let here = enrolled.contains(&row.label);
+            let holds = logged_in || (row.dir.is_some() && here);
+            // A login made here, or one a session here is logged into, is read by its records:
+            // one whose sign-out is recorded is said as signed out; a row whose login was never
+            // made here holds none.
+            let half = LoginHalf::of_row(
+                row,
+                &records.logins,
+                &records.state,
+                here || logged_in,
+                places.now,
+            );
             out.push(Covered {
                 key,
                 email: email.to_owned(),
                 label: Some(row.label.clone()),
                 logged_in,
                 login: LoginHere::of_row(
-                    LoginHalf::of_row(row, &records.logins, &records.state, places.now),
-                    holds,
+                    half,
+                    holds || (here && matches!(half, LoginHalf::SignedOut { .. })),
                 ),
             });
         }
@@ -1017,6 +1033,7 @@ pub fn view_here(
             logins: &logins,
             now,
             offers: OFFERED_HERE,
+            enrolled: &accounts::enrolled,
         },
         &vault,
     );

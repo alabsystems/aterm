@@ -460,6 +460,247 @@ fn set_elements_are_add_wins() {
     assert_eq!(row.fields["services"].members(), BTreeSet::from(["codex"]));
 }
 
+/// The present members of `row`'s set column `col` of `collection` ([`cell::members`]).
+fn members<'a>(collection: &Collection, row: &'a cell::Row, col: &str) -> BTreeSet<&'a str> {
+    cell::members(collection.column(col).unwrap(), row.fields.get(col))
+}
+
+crate::att_collection!(
+    /// A machine row's free-text sets: host names and nickname aliases.
+    TEXT_SETS = Collection {
+        name: "machine",
+        version: 4,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "mc",
+        derive: Derive::BirthSha256,
+        columns: &[
+            Column::new("hosts", Ty::Set(&Ty::Text(253))),
+            Column::new("nickname_aliases", Ty::Set(&Ty::Text(64))),
+            Column::new("row", Ty::Enum(LIFE)),
+        ],
+        unique: &[],
+        max_row: 0,
+    }
+);
+
+crate::att_collection!(
+    /// A mailbox row's free-text set: the domains it receives.
+    DOMAINS = Collection {
+        name: "mailbox",
+        version: 4,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "mb",
+        derive: Derive::BirthSha256,
+        columns: &[
+            Column::new("receives_domains", Ty::Set(&Ty::Text(253))),
+            Column::new("row", Ty::Enum(LIFE)),
+        ],
+        unique: &[],
+        max_row: 0,
+    }
+);
+
+crate::att_collection!(
+    /// `machine.hosts` as a whole-list register, as the registry declares it.
+    HOSTS_LIST = Collection {
+        name: "machine",
+        version: 3,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "mc",
+        derive: Derive::BirthSha256,
+        columns: &[
+            Column::new("hosts", Ty::List(&Ty::Text(64), 4)).null(),
+            Column::new("row", Ty::Enum(LIFE)),
+        ],
+        unique: &[],
+        max_row: 0,
+    }
+);
+
+/// Two Macs that each add a host, a nickname alias or a mail domain to one row concurrently
+/// keep both: a text set keys each member by a digest of its normal form, so the two adds are
+/// two registers and neither conflicts. Two adds of one text, spaced differently, are one
+/// register whose equal candidates collapse; a remove concurrent with an add keeps the member
+/// (add-wins), and a remove that observed it removes it. A member's key is 16 base32
+/// characters though its text has dots and passes 26 bytes; a stored text its key does not
+/// digest, an empty one, or one holding the grid's conflict separator `‖`, is refused, and a
+/// comma is a member's own text. The whole-list column this replaces leaves the
+/// same two adds a conflict (the in-test control).
+/// NEGATIVE CONTROLS: with `cell::members` reading a text set as `Field::members` does (only
+/// `true` candidates add), no member reads present and this fails; with `cell::element` keying a
+/// member by its own text, `studio.lan` breaks the key grammar and the first write panics; with
+/// `check_member_text` taking `‖`, the `a ‖ b` assertion fails.
+#[test]
+fn concurrent_edits_to_a_text_set_keep_both_elements() {
+    const MC: &str = "mc-0123456789abcdef";
+    const MB: &str = "mb-0123456789abcdef";
+    const LONG: &str = "studio-upstairs.tailnet-1234.ts.net";
+    let member = |collection: &Collection, pk: &str, col: &str, text: &str, present: bool| {
+        cell::member_change(collection, pk, col, text, present, |x| {
+            CellValue::owner(collection.version, x)
+        })
+        .unwrap()
+    };
+    let machine = |book: &Book| {
+        cell::project(&TEXT_SETS, &book.cells())
+            .rows
+            .remove(MC)
+            .unwrap()
+    };
+    let settled = |row: &cell::Row, col: &str| match row.fields.get(col) {
+        Some(Field::Set(elements)) => elements.values().all(|field| !field.conflicted()),
+        other => panic!("{col} is a set, not {other:?}"),
+    };
+
+    let mut book = Book::new();
+    let birth = book.write(1, &[], vec![put(&TEXT_SETS, MC, "row", json!("live"))]);
+    let a = book.write(
+        1,
+        &[birth],
+        vec![
+            member(&TEXT_SETS, MC, "hosts", "studio.lan", true),
+            member(&TEXT_SETS, MC, "nickname_aliases", "The Studio", true),
+        ],
+    );
+    book.write(
+        2,
+        &[birth],
+        vec![
+            member(&TEXT_SETS, MC, "hosts", LONG, true),
+            member(&TEXT_SETS, MC, "nickname_aliases", "  The   Studio ", true),
+            member(&TEXT_SETS, MC, "nickname_aliases", "Upstairs Mac", true),
+        ],
+    );
+    let row = machine(&book);
+    assert_eq!(
+        members(&TEXT_SETS, &row, "hosts"),
+        BTreeSet::from(["studio.lan", LONG])
+    );
+    assert_eq!(
+        members(&TEXT_SETS, &row, "nickname_aliases"),
+        BTreeSet::from(["The Studio", "Upstairs Mac"])
+    );
+    assert!(settled(&row, "hosts") && settled(&row, "nickname_aliases"));
+    assert!(row.raw.is_empty(), "{:?}", row.raw);
+
+    let key = member(&TEXT_SETS, MC, "hosts", LONG, true).key;
+    let elem = CellKey::parse(&key).unwrap().elem.unwrap();
+    assert!(LONG.len() > MAX_PK && LONG.contains('.'));
+    assert_eq!(elem, keys::text_elem(LONG));
+    assert_eq!(elem.len(), 16);
+    assert!(pk_grammar(elem) && keys::is_text_elem(elem));
+    assert_eq!(
+        keys::text_elem(" The  Studio"),
+        keys::text_elem("The Studio")
+    );
+    assert_ne!(keys::text_elem("the studio"), keys::text_elem("The Studio"));
+
+    // Writer 1 removes `studio.lan` having seen its own add; writer 2 adds it again without
+    // seeing the remove: add-wins keeps it. A remove that saw both takes it out.
+    let removed = book.write(
+        1,
+        &[a],
+        vec![member(&TEXT_SETS, MC, "hosts", "studio.lan", false)],
+    );
+    let again = book.write(
+        2,
+        &[],
+        vec![member(&TEXT_SETS, MC, "hosts", "studio.lan", true)],
+    );
+    assert!(members(&TEXT_SETS, &machine(&book), "hosts").contains("studio.lan"));
+    book.write(
+        3,
+        &[removed, again],
+        vec![member(&TEXT_SETS, MC, "hosts", "studio.lan", false)],
+    );
+    let row = machine(&book);
+    assert_eq!(members(&TEXT_SETS, &row, "hosts"), BTreeSet::from([LONG]));
+    assert!(settled(&row, "hosts"));
+
+    // Two Macs each add a domain a mailbox receives.
+    let mut book = Book::new();
+    let birth = book.write(1, &[], vec![put(&DOMAINS, MB, "row", json!("live"))]);
+    book.write(
+        1,
+        &[birth],
+        vec![member(
+            &DOMAINS,
+            MB,
+            "receives_domains",
+            "example.invalid",
+            true,
+        )],
+    );
+    book.write(
+        2,
+        &[birth],
+        vec![member(&DOMAINS, MB, "receives_domains", "*", true)],
+    );
+    let row = cell::project(&DOMAINS, &book.cells())
+        .rows
+        .remove(MB)
+        .unwrap();
+    assert_eq!(
+        members(&DOMAINS, &row, "receives_domains"),
+        BTreeSet::from(["*", "example.invalid"])
+    );
+    assert!(settled(&row, "receives_domains"));
+
+    // A text its key does not digest is read raw; an empty text is no member, and a comma
+    // is part of one.
+    let hosts = TEXT_SETS.column("hosts").unwrap();
+    assert!(cell::element(hosts, "   ").is_err());
+    assert!(cell::element(hosts, "a ‖ b").is_err());
+    assert_eq!(
+        cell::element(hosts, "Studio,  upstairs").unwrap().1,
+        json!("Studio, upstairs")
+    );
+    let forged = Change {
+        collection: TEXT_SETS.name.to_owned(),
+        key: format!("{MC}.hosts.{}", keys::text_elem("a.lan")),
+        value: Some(CellValue::owner(TEXT_SETS.version, json!("b.lan")).encode()),
+    };
+    assert!(
+        cell::change(
+            &TEXT_SETS,
+            CellKey::parse(&forged.key).unwrap(),
+            &CellValue::owner(TEXT_SETS.version, json!("b.lan"))
+        )
+        .is_err()
+    );
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![put(&TEXT_SETS, MC, "row", json!("live")), forged],
+    );
+    let row = machine(&book);
+    assert!(row.raw.contains("hosts"));
+    assert!(members(&TEXT_SETS, &row, "hosts").is_empty());
+
+    // Control: the whole-list register these columns were leaves the same adds a conflict.
+    let mut book = Book::new();
+    let birth = book.write(1, &[], vec![put(&HOSTS_LIST, MC, "row", json!("live"))]);
+    book.write(
+        1,
+        &[birth],
+        vec![put(&HOSTS_LIST, MC, "hosts", json!(["studio.lan"]))],
+    );
+    book.write(
+        2,
+        &[birth],
+        vec![put(&HOSTS_LIST, MC, "hosts", json!([LONG]))],
+    );
+    let row = cell::project(&HOSTS_LIST, &book.cells())
+        .rows
+        .remove(MC)
+        .unwrap();
+    assert!(row.fields["hosts"].conflicted());
+}
+
 /// A version-2 column written by a new build survives an old build's edit to another column
 /// of the row; the old build shows the newer column and an unknown word raw (read-only), and
 /// a retired column can no longer be written.

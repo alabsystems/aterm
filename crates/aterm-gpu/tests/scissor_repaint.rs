@@ -394,6 +394,27 @@ fn gpu_scissor_one_cell_change_preserves_other_rows() {
         got3 == fresh_render(&in3, true, None),
         "idle scissor diverges from a fresh render"
     );
+
+    // Stationary visible cursor on row 0 must stay scissored and byte-exact when row ROWS - 1
+    // changes, and a stationary block cursor over `A\u{0302}` on row 3 must stay byte-exact when
+    // row 2 changes above it.
+    term.process(b"\x1b[2 q\x1b[1;1H");
+    let in_cur0 = term.cell_frame(ROWS, COLS);
+    let _ = gpu.present_input_readback(&mut win, &in_cur0);
+    term.process(format!("\x1b[{ROWS};1HQ\x1b[1;1H").as_bytes());
+    let in_bot = term.cell_frame(ROWS, COLS);
+    let sc_before = gpu.scissor_taken();
+    let got_bot = gpu.present_input_readback(&mut win, &in_bot).pixels;
+    assert!(gpu.scissor_taken() > sc_before);
+    assert_eq!(got_bot, fresh_render(&in_bot, true, None));
+
+    term.process("\x1b[4;2HA\u{0302}\x1b[4;2H".as_bytes());
+    let in_over0 = term.cell_frame(ROWS, COLS);
+    let _ = gpu.present_input_readback(&mut win, &in_over0);
+    term.process(b"\x1b[3;2HW\x1b[4;2H");
+    let in_over1 = term.cell_frame(ROWS, COLS);
+    let got_over1 = gpu.present_input_readback(&mut win, &in_over1).pixels;
+    assert_eq!(got_over1, fresh_render(&in_over1, true, None));
 }
 
 #[test]

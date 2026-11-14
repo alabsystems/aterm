@@ -279,9 +279,12 @@ impl Read<'_> {
         )?;
         let mut format = 40;
         for row in listed.split('\0').filter(|row| !row.is_empty()) {
+            // Git emits only the key for an implicit Boolean; an explicit empty
+            // value still has a newline. Keep the key for every safety screen,
+            // and require explicit values for the repository-format fields.
             let (key, value) = row
                 .split_once('\n')
-                .ok_or("private Git configuration is malformed")?;
+                .map_or((row, None), |(key, value)| (key, Some(value)));
             if key.starts_with("include.") || key.starts_with("includeif.") {
                 return Err("private Git configuration includes another file".to_owned());
             }
@@ -290,12 +293,12 @@ impl Read<'_> {
             }
             match key {
                 "extensions.objectformat" => match value {
-                    "sha1" => format = 40,
-                    "sha256" => format = 64,
+                    Some("sha1") => format = 40,
+                    Some("sha256") => format = 64,
                     _ => return Err("private Git object format is unknown".to_owned()),
                 },
-                "extensions.refstorage" if value == "files" => {}
-                "core.repositoryformatversion" if matches!(value, "0" | "1") => {}
+                "extensions.refstorage" if value == Some("files") => {}
+                "core.repositoryformatversion" if matches!(value, Some("0" | "1")) => {}
                 "core.repositoryformatversion" => {
                     return Err("private Git repository format is unknown".to_owned());
                 }
@@ -748,3 +751,7 @@ pub(super) fn clear(
 ) -> Result<(), String> {
     check(git, checkout, wt, admin).map_err(|error| format!("private Git history stays: {error}"))
 }
+
+#[cfg(test)]
+#[path = "build_cache_retired_history_format_tests.rs"]
+mod format_tests;

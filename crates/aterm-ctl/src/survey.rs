@@ -7,6 +7,8 @@ use std::io::{self, Write as _};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use aterm_types::update_standing::UpdateFact;
+
 #[path = "survey_release.rs"]
 mod release;
 
@@ -81,6 +83,10 @@ pub struct FleetAsk<'a> {
     /// A release-line holder identity each peer's own kernel judges in its answer
     /// (`--holder`, [`crate::release_holder`]), or `None` for the plain survey.
     pub holder: Option<&'a crate::release_holder::Identity>,
+    /// The session that asked for the survey, which its line names to each peer
+    /// ([`aterm_types::fleet_activity::SURVEY_BY`]); `None` for a read aterm makes of its own
+    /// (the fleet glance's, a placement's, a check's), which no Mac counts as an agent's.
+    pub by: Option<&'a str>,
 }
 
 /// One fleet peer's answer to a [`FleetAsk`].
@@ -774,6 +780,24 @@ fn accounts_line(survey: &Survey, remote: bool) -> Option<String> {
     ))
 }
 
+/// The line a block's header is followed by where its instance says where its updater stands
+/// (its `update*=` words, [`UpdateFact`]): the standing's word, then the fact in words on that
+/// Mac's clock (the header's `at_ms`, [`UpdateFact::said_at`]): `  update held: 0.199.0 is held
+/// for 3 h more (crash-loop, try 2) · checked 10 min ago`, cut to [`LINE_CHARS`]. `None` where it
+/// says nothing of its updater (an aterm older than the words), and, unless `whole` (`--host`),
+/// where the updater is routine (up to date, automatic checks not said off), so a healthy fleet's
+/// digest grows by nothing.
+fn update_line(survey: &Survey, whole: bool) -> Option<String> {
+    let update = UpdateFact::of_fields(&survey.header.0)?;
+    if !whole && update.routine() {
+        return None;
+    }
+    Some(fit(
+        &format!("  update {}: {}", update.standing.word(), update.line()),
+        LINE_CHARS,
+    ))
+}
+
 /// Free space as a line shows it: whole GiB from 1 GiB, else MiB.
 pub(crate) fn size_shown(mb: u64) -> String {
     if mb >= 1024 {
@@ -1345,6 +1369,9 @@ struct Block {
     header: String,
     /// Native release-holder observations, individually folded under a text budget.
     releases: Vec<String>,
+    /// Its GitHub quota rows (`  github_rate …`, [`rate_line`]): under the budget they fold, a
+    /// line at a time, after its home and checkout lines, counted on a closing line of their own.
+    rates: Vec<String>,
     /// Its home and checkout lines ([`home_lines`]): under the budget they fold after the shells
     /// and before any agent loses a word, each a line of its own, the checkout lines before any
     /// instance's home line, counted on the closing line.
@@ -1372,6 +1399,8 @@ struct Blocks {
 struct Shown {
     /// Number of release observations shown per block.
     releases: Vec<usize>,
+    /// Number of quota rows shown per block.
+    rates: Vec<usize>,
     /// Number of session lines shown per block (remaining entries fold into `+N`).
     lines: Vec<usize>,
     /// Per block, how many of its home lines show, from the first.
@@ -1399,6 +1428,11 @@ impl Shown {
                 .iter()
                 .map(|b| b.as_ref().map_or(0, |b| b.releases.len()))
                 .collect(),
+            rates: blocks
+                .items
+                .iter()
+                .map(|b| b.as_ref().map_or(0, |b| b.rates.len()))
+                .collect(),
             lines: blocks.items.iter().map(|b| entries(b).len()).collect(),
             homes: blocks
                 .items
@@ -1422,6 +1456,7 @@ impl Shown {
     fn filled(blocks: &Blocks, order: &[Unit], n: usize) -> Shown {
         let mut shown = Shown::all(blocks, Class::Agent, EXCERPT_CHARS);
         shown.releases.iter_mut().for_each(|n| *n = 0);
+        shown.rates.iter_mut().for_each(|n| *n = 0);
         shown.lines.iter_mut().for_each(|n| *n = 0);
         shown.homes.iter_mut().for_each(|n| *n = 0);
         shown
@@ -1434,6 +1469,7 @@ impl Shown {
                 Unit::Excerpt(b, e, j) => shown.excerpts[b][e] |= 1 << j,
                 Unit::Home(b, k) => shown.homes[b] = shown.homes[b].max(k + 1),
                 Unit::Release(b, k) => shown.releases[b] = shown.releases[b].max(k + 1),
+                Unit::Rate(b, k) => shown.rates[b] = shown.rates[b].max(k + 1),
             }
         }
         shown
@@ -1441,13 +1477,14 @@ impl Shown {
 }
 
 /// One step of budget allocation: a session line, a single excerpt line, or a block's `k`th
-/// release or home line (with every one of that kind before it).
+/// release, quota or home line (with every one of that kind before it).
 #[derive(Clone, Copy)]
 enum Unit {
     Line(usize, usize),
     Excerpt(usize, usize, usize),
     Home(usize, usize),
     Release(usize, usize),
+    Rate(usize, usize),
 }
 
 #[cfg(test)]
@@ -1460,6 +1497,12 @@ thread_local! {
     /// were first made: a home with many checkouts that does not fit leaves its room unused by
     /// every unit after it.
     static HOME_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// NEGATIVE CONTROL: while set on a thread, [`fill_order`] ranks each machine's most pressing
+    /// agent's leading excerpt, and every asking or stalled agent's, with the rest of its words,
+    /// as before they led them: the asking
+    /// sessions' second lines and the round robin's earlier machines take the room of a later
+    /// machine's only line.
+    static FIRST_WORDS_UNLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether a block's home lines are one fill unit ([`HOME_WHOLE`]); never outside this crate's
@@ -1480,7 +1523,16 @@ fn home_tier() -> u8 {
     if HOME_WITH_HEADER.with(std::cell::Cell::get) {
         return 0;
     }
-    3
+    4
+}
+
+/// Whether each machine's most pressing agent's leading excerpt leads the fill
+/// ([`FIRST_WORDS_UNLED`] turns it off); always outside this crate's tests.
+fn first_words_lead() -> bool {
+    #[cfg(test)]
+    return !FIRST_WORDS_UNLED.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    true
 }
 
 fn excerpt_rank(word: &str) -> usize {
@@ -1491,6 +1543,14 @@ fn excerpt_rank(word: &str) -> usize {
     }
 }
 
+/// The order the budget is spent in, a unit at a time: every machine's header (never a unit) and
+/// agent lines; then the leading excerpt line of every asking agent, then of every stalled one
+/// (a round over the machines in each), then of each other machine's most pressing agent; then
+/// the asking and stalled agents' other words; then a round robin over the machines, the last
+/// words before what was asked; then the home, checkout, release and quota lines; then the
+/// running shells, and the idle shells last. No machine spends on a second line of words, a home
+/// or a quota row before every machine's most pressing agent, and every agent waiting on a person
+/// or stalled, has said something.
 fn fill_order(blocks: &Blocks) -> Vec<Unit> {
     type Place = (u8, usize, usize, usize, usize);
     let mut keyed: Vec<(Place, Unit)> = Vec::new();
@@ -1500,7 +1560,11 @@ fn fill_order(blocks: &Blocks) -> Vec<Unit> {
         };
         for k in 0..block.releases.len() {
             // Retained old cuts are metadata, after every pressing agent and its excerpts.
-            keyed.push(((3, 0, k, 0, b), Unit::Release(b, k)));
+            keyed.push(((4, 0, k, 0, b), Unit::Release(b, k)));
+        }
+        for k in 0..block.rates.len() {
+            // Quota rows are metadata too, after the home and checkout lines.
+            keyed.push(((4, 2, k, 0, b), Unit::Rate(b, k)));
         }
         // Each home line is a unit of one line, so a long checkout list strands no room: every
         // instance's home line first, then the checkout lines a round at a time.
@@ -1520,20 +1584,31 @@ fn fill_order(blocks: &Blocks) -> Vec<Unit> {
             let k = nth[class];
             nth[class] += 1;
             let line = match entry.class {
-                Class::Running => (4, 0, k, 0, b),
-                Class::Shell => (5, 0, k, 0, b),
+                Class::Running => (5, 0, k, 0, b),
+                Class::Shell => (6, 0, k, 0, b),
                 _ => (0, class, k, 0, b),
             };
             keyed.push((line, Unit::Line(b, e)));
             if entry.class > Class::Agent || entry.excerpts.is_empty() {
                 continue;
             }
+            // The entries are ranked, so the block's first is its most pressing agent. It leads,
+            // as does every agent waiting on a person or stalled, with its leading line: the
+            // first of its least rank, the `attention:` line where it has one.
+            let leads = e == 0 || entry.class <= Class::Stalled;
+            let leading = (leads && first_words_lead())
+                .then(|| {
+                    (0..entry.excerpts.len()).min_by_key(|&j| excerpt_rank(entry.excerpts[j].word))
+                })
+                .flatten();
             for (j, excerpt) in entry.excerpts.iter().enumerate() {
                 let rank = excerpt_rank(excerpt.word);
-                let key = if entry.class <= Class::Stalled {
-                    (1, class, k, rank, b)
+                let key = if leading == Some(j) {
+                    (1, class, k, 0, b)
+                } else if entry.class <= Class::Stalled {
+                    (2, class, k, rank, b)
                 } else {
-                    (2, round, rank, class, b)
+                    (3, round, rank, class, b)
                 };
                 keyed.push((key, Unit::Excerpt(b, e, j)));
             }
@@ -1565,15 +1640,27 @@ fn render_within(blocks: &Blocks, room: usize, budget: usize) -> Fitted {
         return Fitted { text, quoted: true };
     }
     let order = fill_order(blocks);
-    if let Some(mut text) = fits(&Shown::filled(blocks, &order, 0)) {
-        let (mut fitting, mut over) = (0, order.len());
-        while over - fitting > 1 {
-            let n = fitting + (over - fitting) / 2;
-            match fits(&Shown::filled(blocks, &order, n)) {
-                Some(more) => (fitting, text) = (n, more),
-                None => over = n,
+    if fits(&Shown::filled(blocks, &order, 0)).is_some() {
+        // The lines shown grow with every unit, so a bisection finds the most units whose lines
+        // fit; the whole read need not grow (showing a kind's last line drops what counted it),
+        // so the fill is the most units, at or below that, whose whole read fits.
+        let shown_chars = |n| {
+            let (text, telling) = render_telling(blocks, &Shown::filled(blocks, &order, n));
+            text.chars().count() - telling
+        };
+        let (mut most, mut over) = (0, order.len() + 1);
+        while over - most > 1 {
+            let n = most + (over - most) / 2;
+            if shown_chars(n) <= room {
+                most = n;
+            } else {
+                over = n;
             }
         }
+        let text = (0..=most)
+            .rev()
+            .find_map(|n| fits(&Shown::filled(blocks, &order, n)))
+            .unwrap_or_default();
         return Fitted { text, quoted: true };
     }
     let text = render(blocks, &Shown::filled(blocks, &order, 0));
@@ -1646,7 +1733,7 @@ pub(crate) fn render_read(
     notes: &[String],
     own: Option<&str>,
 ) -> String {
-    let blocks = blocks_of(replies, own);
+    let blocks = blocks_of(replies, own, false);
     let reserved: usize = notes.iter().map(|note| note.chars().count() + 1).sum();
     let head = DATA_LINE.chars().count() + 1;
     if let Some(rest) = budget.checked_sub(reserved + head) {
@@ -1680,7 +1767,9 @@ pub(crate) fn with_data_line(text: &str) -> String {
     format!("{DATA_LINE}\n{text}")
 }
 
-fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
+/// Each reply's block; `whole` (`--host`) says every instance's updater line, the digest only the
+/// ones a reader cannot pass by ([`update_line`]).
+fn blocks_of(replies: &[HostReply], own: Option<&str>, whole: bool) -> Blocks {
     let items = replies
         .iter()
         .map(|reply| match &reply.answer {
@@ -1699,27 +1788,17 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
                     .collect();
                 entries.sort_by_key(|entry| entry.class);
                 let mut header = header_line(reply, survey);
+                if let Some(line) = update_line(survey, whole) {
+                    header.push('\n');
+                    header.push_str(&line);
+                }
                 if let Some(line) = accounts_line(survey, reply.remote) {
                     header.push('\n');
                     header.push_str(&line);
                 }
-                for row in &survey.github_rate {
-                    header.push('\n');
-                    header.push_str("  github_rate ");
-                    if let Some(data) = row.get("data") {
-                        header.push_str(data);
-                    } else {
-                        header.push_str(
-                            &row.0
-                                .iter()
-                                .map(|(k, v)| format!("{k}={v}"))
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        );
-                    }
-                }
                 Ok(Block {
                     header,
+                    rates: survey.github_rate.iter().map(rate_line).collect(),
                     releases: survey
                         .release_lines
                         .iter()
@@ -1739,6 +1818,21 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
         items,
         fleet: replies.iter().any(|reply| reply.remote),
     }
+}
+
+/// One quota row as a block's text shows it: its `data`, else each of its fields.
+fn rate_line(row: &Fields) -> String {
+    let said = row.get("data").map_or_else(
+        || {
+            row.0
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
+        str::to_owned,
+    );
+    format!("  github_rate {said}")
 }
 
 /// A fleet peer's `"proven_node"` (the node its handshake proved, `null` for none) and
@@ -1776,7 +1870,7 @@ fn release_observer_node<'a>(reply: &'a HostReply, survey: &'a Survey) -> Option
 
 /// Render all sessions and full-width excerpts without a character budget (`--host`).
 pub(crate) fn render_full(replies: &[HostReply], own: Option<&str>) -> String {
-    let blocks = blocks_of(replies, own);
+    let blocks = blocks_of(replies, own, true);
     render(
         &blocks,
         &Shown::all(&blocks, Class::Shell, EXCERPT_WIDE_CHARS),
@@ -1784,9 +1878,18 @@ pub(crate) fn render_full(replies: &[HostReply], own: Option<&str>) -> String {
 }
 
 fn render(blocks: &Blocks, shown: &Shown) -> String {
+    render_telling(blocks, shown).0
+}
+
+/// [`render`]'s text and how many of its characters tell what it folded: the `+N` lines, the
+/// closing lines and each session line's [`EXCERPTS_CUT`] mark. The rest, the lines shown, grows
+/// with every unit [`Shown::filled`] adds, while the whole need not: the unit that shows a kind's
+/// last line drops the clause, or the line, that counted it.
+fn render_telling(blocks: &Blocks, shown: &Shown) -> (String, usize) {
     let mut out = String::new();
+    let mut telling = 0usize;
     let (mut cut_sessions, mut cut_excerpts, mut cut_homes) = (0usize, 0usize, 0usize);
-    let mut cut_releases = 0;
+    let (mut cut_releases, mut cut_rates) = (0, 0);
     for (b, block) in blocks.items.iter().enumerate() {
         let block = match block {
             Ok(block) => block,
@@ -1798,6 +1901,12 @@ fn render(blocks: &Blocks, shown: &Shown) -> String {
         };
         out.push_str(&block.header);
         out.push('\n');
+        let rates = shown.rates[b].min(block.rates.len());
+        for line in &block.rates[..rates] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        cut_rates += block.rates.len() - rates;
         let releases = shown.releases[b].min(block.releases.len());
         for line in &block.releases[..releases] {
             out.push_str(line);
@@ -1815,7 +1924,16 @@ fn render(blocks: &Blocks, shown: &Shown) -> String {
             let words = shown.excerpts[b][e];
             let every = (1u8 << entry.excerpts.len()) - 1;
             let cut = words & every != every && entry.class <= Class::Agent;
-            out.push_str(if cut { &entry.cut_line } else { &entry.line });
+            if cut {
+                out.push_str(&entry.cut_line);
+                telling += entry
+                    .cut_line
+                    .chars()
+                    .count()
+                    .saturating_sub(entry.line.chars().count());
+            } else {
+                out.push_str(&entry.line);
+            }
             out.push('\n');
             for (j, excerpt) in entry.excerpts.iter().enumerate() {
                 if words & (1 << j) != 0 {
@@ -1827,26 +1945,38 @@ fn render(blocks: &Blocks, shown: &Shown) -> String {
         }
         let rest = &block.entries[lines..];
         if !rest.is_empty() {
-            out.push_str(&more_line(rest));
+            let more = more_line(rest);
+            telling += more.chars().count() + 1;
+            out.push_str(&more);
             out.push('\n');
         }
         cut_sessions += rest.len();
     }
     if cut_sessions > 0 || cut_excerpts > 0 || cut_homes > 0 {
-        out.push_str(&left_out_line(
-            cut_sessions,
-            cut_excerpts,
-            cut_homes,
-            blocks.fleet,
-        ));
+        let closing = left_out_line(cut_sessions, cut_excerpts, cut_homes, blocks.fleet);
+        telling += closing.chars().count();
+        out.push_str(&closing);
     }
-    if cut_releases > 0 {
-        out.push_str(&format!(
-            "{LEFT_OUT_LEAD}{cut_releases} release observations; {} for more\n",
+    // What the budget folded of the machines' metadata goes on a line of its own, so the closing
+    // line above keeps within its cap.
+    let metadata: Vec<String> = [
+        (cut_releases, "release observation", "release observations"),
+        (cut_rates, "quota row", "quota rows"),
+    ]
+    .into_iter()
+    .filter(|&(n, ..)| n > 0)
+    .map(|(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
+    .collect();
+    if !metadata.is_empty() {
+        let closing = format!(
+            "{LEFT_OUT_LEAD}{}; {} for more\n",
+            metadata.join(" and "),
             remedies(blocks.fleet)
-        ));
+        );
+        telling += closing.chars().count();
+        out.push_str(&closing);
     }
-    out
+    (out, telling)
 }
 
 /// Prefix for the footer line reporting budget-omitted sessions or excerpts.
@@ -2196,6 +2326,41 @@ impl Printed {
     }
 }
 
+/// Record a session's read of each peer that answered it and proved its node, in this Mac's
+/// fleet activity record ([`crate::fleet_activity`]), as one write: nothing for a survey no
+/// session asked for.
+fn note_fleet_reads(peers: &[PeerSurvey], by: Option<&str>) {
+    use aterm_types::fleet_activity::{Outcome, Row, Way};
+    let now = crate::fleet_activity::now_ms();
+    let rows = peers
+        .iter()
+        .filter_map(|peer| {
+            // The node its connection proved, else the one the book named for a peer that
+            // proved its key some other way; a peer that proved none is no Mac the record can
+            // name.
+            let node = peer
+                .authenticated
+                .as_ref()
+                .map(|proved| proved.node.as_str())
+                .or(peer.node.as_deref());
+            let (Ok(_), false, Some(node)) = (&peer.answer, peer.unproven, node) else {
+                return None;
+            };
+            Row::of(
+                now,
+                Way::Out,
+                (node, Some(&peer.label)),
+                aterm_types::fleet_access::DriveKind::Read,
+                by,
+                Outcome::Admitted,
+            )
+        })
+        .collect();
+    // One write for the whole fleet's answers, made off this thread: the survey's text does
+    // not wait for it.
+    crate::fleet_activity::note_here(rows);
+}
+
 /// Query local instances and optional fleet peers concurrently, then format the output.
 pub(crate) fn read_survey(
     args: &Args,
@@ -2216,10 +2381,12 @@ pub(crate) fn read_survey(
             );
         }
     };
+    let by = own.filter(|sid| aterm_types::control_verbs::is_minted_sid(sid));
     let ask = FleetAsk {
         host: args.host.as_deref(),
         within: args.within,
         holder: args.holder.as_ref(),
+        by,
     };
     let (here, peers) = std::thread::scope(|scope| {
         let peers = fleet_client.map(|client| scope.spawn(move || client(&ask)));
@@ -2255,6 +2422,7 @@ pub(crate) fn read_survey(
             Ok(read) => {
                 notes.extend(read.note);
                 alone = read.alone;
+                note_fleet_reads(&read.peers, by);
                 read.peers
             }
             Err(refused) if args.host.is_some() => {

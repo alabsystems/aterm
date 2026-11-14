@@ -17,6 +17,7 @@ use super::pk_grammar;
 use crate::{Error, Result};
 use aterm_codec::hex;
 use aterm_digest::{Sha256, hmac_sha256_parts};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A key as diagnostics print it, concealing credential-shaped values.
 pub(crate) fn safe_key(key: &str) -> &str {
@@ -360,9 +361,240 @@ pub fn default_account_label(realm: &str, account: &str) -> Result<String> {
     Ok(format!("{cli}-{}", &hex[..6]))
 }
 
+/// The provider word of an account's realm (docs/DESIGN-shared-files-2026-11-11.md §10): what
+/// every surface says before the account's address, and what its slug starts with. A product
+/// word, so Kimi's two realms stay apart, and `kimicn` holds no `-`, so no Kimi account's handle
+/// spells another realm's slug.
+pub fn provider_word(realm: &str) -> Option<&'static str> {
+    Some(match canonical_realm(realm)? {
+        "claude" => "claude",
+        "codex" => "oai",
+        "google" => "google",
+        "meta" => "meta",
+        "grok" => "xai",
+        "kimi:global" => "kimi",
+        "kimi:mainland-cn" => "kimicn",
+        _ => return None,
+    })
+}
+
+/// An account as it is shown: its provider word and its claims address
+/// (`claude ada.fb@alpha.example`). One address signed in to three providers is three names.
+pub fn account_name(realm: &str, claims_email: &str) -> Option<String> {
+    Some(format!("{} {claims_email}", provider_word(realm)?))
+}
+
+/// The most bytes a slug's handle holds.
+pub const MAX_HANDLE: usize = 56;
+
+/// `text` lower-cased, every run of bytes outside `[a-z0-9]` written as one `-`, with none
+/// leading or trailing.
+fn handle_of(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        let byte = byte.to_ascii_lowercase();
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            out.push(char::from(byte));
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// The handles an address derives (design §10): the short one, `<tail>-<site>`, where `tail` is
+/// the text after the first `+` of the local part, else after its first `.`, else the whole
+/// local part, and `site` is the domain up to its first `.`; and the long one, built the same
+/// way from the whole local part, which two accounts of one realm take when their short
+/// handles are the same. `None` for text that is no address.
+pub fn address_handles(claims_email: &str) -> Option<(String, String)> {
+    let (local, domain) = claims_email.trim_ascii().split_once('@')?;
+    let site = domain.split('.').next().unwrap_or(domain);
+    let tail = local
+        .split_once('+')
+        .or_else(|| local.split_once('.'))
+        .map_or(local, |(_, tail)| tail);
+    Some((
+        handle_of(&format!("{tail}-{site}")),
+        handle_of(&format!("{local}-{site}")),
+    ))
+}
+
+/// One account, as [`account_slugs`] reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct Slugged<'a> {
+    /// Its key, `ac-<16 hex>`.
+    pub pk: &'a str,
+    pub realm: &'a str,
+    /// The owner's `label` cell, when one is written.
+    pub label: Option<&'a str>,
+    /// Its claims address, when its address rows resolve.
+    pub claims_email: Option<&'a str>,
+    pub live: bool,
+}
+
+/// Every account's slug, by key (design §10): `<provider word>-<handle>`, one short word that
+/// names the account in every command, file name and wire.
+///
+/// - The handle is the owner's `label` when one is set (a label that is only the row's default
+///   `<cli>-<6 hex>` is not the owner's word and is not one).
+/// - Otherwise it derives from the claims address ([`address_handles`]), and two live accounts
+///   of one realm that derive one handle both take the long one.
+/// - A handle that is empty or longer than [`MAX_HANDLE`] bytes, an account with no readable
+///   address, a slug the value guards would refuse to show (`guard::withheld`), and any slug
+///   another account still holds after that take the first 6 hex of the key instead (then all
+///   16), so slugs are distinct and showable whatever the rows say. Live accounts are named
+///   first: a retired row never takes a live one's slug.
+///
+/// The key never changes; a slug changes when the owner writes the label, when the address
+/// changes, or when a second account arrives with the same handle.
+pub fn account_slugs(accounts: &[Slugged<'_>]) -> BTreeMap<String, String> {
+    let word = |account: &Slugged<'_>| -> String {
+        provider_word(account.realm).map_or_else(
+            || {
+                let word = handle_of(account.realm).replace('-', "");
+                if word.is_empty() {
+                    "account".to_owned()
+                } else {
+                    word
+                }
+            },
+            str::to_owned,
+        )
+    };
+    fn hex<'a>(account: &Slugged<'a>) -> &'a str {
+        account.pk.strip_prefix("ac-").unwrap_or(account.pk)
+    }
+    let fits = |handle: &str| !handle.is_empty() && handle.len() <= MAX_HANDLE;
+    let labelled = |account: &Slugged<'_>| -> Option<String> {
+        let label = account.label?;
+        if default_account_label(account.realm, account.pk).is_ok_and(|default| default == label) {
+            return None;
+        }
+        Some(handle_of(label)).filter(|handle| fits(handle))
+    };
+    // Each account's handle: (the handle, and the long one it takes on a clash).
+    let mut handles: Vec<(String, Option<String>)> = accounts
+        .iter()
+        .map(|account| {
+            if let Some(label) = labelled(account) {
+                return (label, None);
+            }
+            match account.claims_email.and_then(address_handles) {
+                Some((short, long)) if fits(&short) => (short, Some(long).filter(|l| fits(l))),
+                _ => (String::new(), None),
+            }
+        })
+        .collect();
+    // Two live accounts of one realm with one derived handle both take the long handle.
+    let mut derived: BTreeMap<(String, &str), usize> = BTreeMap::new();
+    for (account, (handle, long)) in accounts.iter().zip(&handles) {
+        if account.live && long.is_some() {
+            *derived.entry((word(account), handle.as_str())).or_default() += 1;
+        }
+    }
+    let clashing: Vec<bool> = accounts
+        .iter()
+        .zip(&handles)
+        .map(|(account, (handle, long))| {
+            account.live
+                && long.is_some()
+                && derived
+                    .get(&(word(account), handle.as_str()))
+                    .is_some_and(|count| *count > 1)
+        })
+        .collect();
+    for ((handle, long), clash) in handles.iter_mut().zip(clashing) {
+        if clash && let Some(long) = long.take() {
+            *handle = long;
+        }
+    }
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    for live in [true, false] {
+        // A slug two accounts of this pass both claim goes to neither.
+        let mut claims: BTreeMap<String, usize> = BTreeMap::new();
+        for (account, (handle, _)) in accounts.iter().zip(&handles) {
+            if account.live == live && !handle.is_empty() {
+                *claims
+                    .entry(format!("{}-{handle}", word(account)))
+                    .or_default() += 1;
+            }
+        }
+        let mut by_key = Vec::new();
+        for (account, (handle, _)) in accounts.iter().zip(&handles) {
+            if account.live != live {
+                continue;
+            }
+            let slug = format!("{}-{handle}", word(account));
+            if !handle.is_empty()
+                && !super::guard::withheld(&slug)
+                && claims.get(&slug) == Some(&1)
+                && taken.insert(slug.clone())
+            {
+                out.insert(account.pk.to_owned(), slug);
+            } else {
+                by_key.push(account);
+            }
+        }
+        for account in by_key {
+            let hex = hex(account);
+            let short = format!("{}-{}", word(account), hex.get(..6).unwrap_or(hex));
+            let slug = if taken.insert(short.clone()) {
+                short
+            } else {
+                let whole = format!("{}-{hex}", word(account));
+                taken.insert(whole.clone());
+                whole
+            };
+            out.insert(account.pk.to_owned(), slug);
+        }
+    }
+    out
+}
+
 /// An import source's key: a digest of its bytes, so a re-run of the same file collapses.
 pub fn source_pk(bytes: &[u8]) -> String {
     prefix_hex("sr", &Sha256::digest(bytes)[..8])
+}
+
+/// Lower-case Crockford base32: no `i`, `l`, `o` or `u`.
+const CROCKFORD: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// The characters of a text set's element key.
+pub const TEXT_ELEM: usize = 16;
+
+/// A text set element's normal form: its surrounding whitespace trimmed and each inner run of
+/// whitespace one space. Case is kept: an element shows as it was written.
+pub fn normal_text(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The element key of a text set's member (`Ty::Set(&Ty::Text(_))`): 16 lower-case Crockford
+/// base32 characters of a SHA-256 of its normal form ([`normal_text`]), so a host name, a domain
+/// or an alias, whose dots and length break the key grammar, is one register however many Macs
+/// add it.
+pub fn text_elem(text: &str) -> String {
+    let mut sha = Sha256::new();
+    sha.update(b"aterm/att/text-elem/1\0");
+    sha.update(normal_text(text).as_bytes());
+    let digest = sha.finalize();
+    let mut bits = 0u128;
+    for &byte in &digest[..TEXT_ELEM * 5 / 8] {
+        bits = (bits << 8) | u128::from(byte);
+    }
+    (0..TEXT_ELEM)
+        .rev()
+        .map(|n| char::from(CROCKFORD[((bits >> (n * 5)) & 31) as usize]))
+        .collect()
+}
+
+/// Whether `elem` is a text set's element key in form ([`text_elem`]).
+pub fn is_text_elem(elem: &str) -> bool {
+    elem.len() == TEXT_ELEM && elem.bytes().all(|b| CROCKFORD.contains(&b))
 }
 
 /// An archived owned record's key in a later table generation (design §3.8): a digest of the
@@ -437,3 +669,7 @@ pub fn parse_uuid32(text: &str) -> Option<[u8; 16]> {
     }
     crate::database::decode_hex::<16>(text).ok()
 }
+
+#[cfg(test)]
+#[path = "keys_slug_tests.rs"]
+mod slug_tests;

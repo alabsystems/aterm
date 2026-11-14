@@ -206,9 +206,12 @@ pub struct ChildOut {
 
 #[cfg(unix)]
 impl ChildOut {
+    /// Stream retention bound shared with consumers planning complete frames.
+    pub(crate) const OUTPUT_KEEP: usize = deadline::OUTPUT_KEEP;
+
     /// A full retention window cannot prove that stdout is a complete inventory.
     pub(crate) fn stdout_may_be_truncated(&self) -> bool {
-        self.stdout.len() >= deadline::OUTPUT_KEEP
+        self.stdout.len() >= Self::OUTPUT_KEEP
     }
 }
 

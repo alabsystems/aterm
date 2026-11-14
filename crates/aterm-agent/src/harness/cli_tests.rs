@@ -61,6 +61,9 @@ mod history_report;
 #[path = "cli_observed_tests.rs"]
 mod observed_report;
 
+#[path = "cli_signed_out_reason_tests.rs"]
+mod signed_out_reason;
+
 #[path = "cli_account_backfill_tests.rs"]
 mod account_backfill;
 
@@ -14204,6 +14207,7 @@ fn the_source_tables_default_codex_row_is_here_only_with_its_login_file() {
         now: 1_790_000_000,
         error: None,
         home: Some(home.clone()),
+        default_login: None,
     };
     let listed = CliFleet {
         cli: Cli::Codex,
@@ -14274,6 +14278,7 @@ fn source_table_rows_treats_held_by_rows_as_elsewhere_and_matches_identity_email
         now: 1_790_000_000,
         error: None,
         home: Some(home),
+        default_login: None,
     };
     let fleet = CliFleet {
         cli: Cli::Codex,

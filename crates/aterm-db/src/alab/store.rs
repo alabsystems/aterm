@@ -353,18 +353,24 @@ fn planned(
     heard: bool,
     now_ms: u64,
 ) -> Result<register::Plan> {
-    // An enrollment with a facts row is bound, and its lineage decides nothing more: a refresh
-    // of that row reads none, so it cannot fail on one.
-    let bound = |uuid: &str| {
-        view.owned
-            .get(MACHINE_FACTS.name)
-            .is_some_and(|facts| facts.rows.contains_key(uuid))
-    };
+    // An enrollment with a facts row is bound, and its lineage decides nothing more, except
+    // whether a row it birthed and has not folded is a successor's birth rule 0 would have
+    // prevented (`register::fold`). Only a pass that could fold it reads the lineage
+    // (`register::may_fold`), so a bound Mac with nothing to fold pays nothing for it, and a
+    // refresh cannot fail on it: where it cannot be verified now, that row is refreshed as it
+    // stands and a later pass folds it.
+    let hint = keys::hw_hint(&trust.network, &probe.platform_uuid);
     let me = me(session, trust, probe, |uuid| {
-        if bound(uuid) {
-            Ok(Vec::new())
-        } else {
+        let bound = view
+            .owned
+            .get(MACHINE_FACTS.name)
+            .is_some_and(|facts| facts.rows.contains_key(uuid));
+        if !bound {
             former()
+        } else if register::may_fold(view, uuid, &hint, heard) {
+            Ok(former().unwrap_or_default())
+        } else {
+            Ok(Vec::new())
         }
     })?;
     let live = live_uuids(session)?;

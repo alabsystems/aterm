@@ -5,6 +5,30 @@
 use super::*;
 use std::cell::Cell;
 
+#[cfg(unix)]
+#[test]
+fn linked_git_trace_is_not_transport_evidence() {
+    let dir = crate::test_scratch_dir("git-trace-file-kind");
+    let target = dir.path().join("target");
+    let trace = dir.path().join("trace");
+    std::fs::write(&target, b"x <= Recv header: HTTP/2 429\n").unwrap();
+    std::os::unix::fs::symlink(&target, &trace).unwrap();
+    assert_eq!(observe_trace(&trace), GitObservation::default());
+    assert!(target.is_file());
+    assert!(!trace.exists());
+    let path = std::ffi::CString::new(trace.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: path is NUL-terminated and remains live for the call.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    assert_eq!(observe_trace(&trace), GitObservation::default());
+    assert!(!trace.exists());
+    std::fs::copy(&target, &trace).unwrap();
+    assert_eq!(
+        observe_trace(&trace),
+        GitObservation::from_trace("x <= Recv header: HTTP/2 429\n")
+    );
+    assert!(!trace.exists());
+}
+
 fn diagnostic(status: u16) -> Failure {
     Failure::diagnostic(format!(
         "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: {status}"

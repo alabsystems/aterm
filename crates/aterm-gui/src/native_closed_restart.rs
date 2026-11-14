@@ -476,6 +476,20 @@ impl ClosedRestart {
             && self.quiescent(kernel)
     }
 
+    /// The last budget of a root that ended because its successor never attached: retired, with
+    /// no continuation or account successor, as [`Self::cancelled_without_successor`] requires,
+    /// except that a launcher it granted Execute may have run, so long as it exited with its group
+    /// ([`Self::quiescent`]). Such a launcher never registered, or its root would have completed.
+    pub(super) fn ended_without_successor(&self, prepare: &Prepare, kernel: &dyn Kernel) -> bool {
+        let ended = {
+            let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+            succession.retired
+                && succession.pending_account.is_none()
+                && succession.successor.is_none()
+        };
+        self.predecessor == *prepare && ended && self.quiescent(kernel)
+    }
+
     /// Recheck retained kernel objects and the exact drained input boundary.
     /// Source/child absence without those objects never passes this predicate.
     pub(super) fn quiescent(&self, kernel: &dyn Kernel) -> bool {

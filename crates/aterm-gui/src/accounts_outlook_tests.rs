@@ -337,6 +337,81 @@ fn a_first_reading_is_drawn_at_the_stores_next_move() {
     set_dir(None);
 }
 
+/// A SIGN-IN THAT STARTS OR ENDS IS SAID AT THE NEXT LOOK, NOT AT THE MINUTE: `alt1`'s login is
+/// on record as signed out, so the replay says `signed out` in its figure's place. A sign-in of it
+/// starts at second 3 (the record `accounts renew` and the ladder write) and ends at second 23.
+/// The look at second 10 replays and says `signing in`; the look at second 30 replays and says
+/// `signed out` again; nothing else within the minute replays, and `me`, which is read, keeps
+/// its figure throughout. NEGATIVE CONTROLS: with no sign-in the same minute replays once; a memo
+/// that replays only at the minute says `signed out` for the whole of it (run once, restored).
+#[test]
+fn a_sign_in_that_starts_or_ends_is_said_at_the_next_look() {
+    fn alt1(memo: &OutlookMemo, now: i64) -> (Figure, Figure) {
+        let outlook = memo.outlook.as_deref().expect("a replay");
+        let figure = |label: &str| {
+            outlook
+                .rows
+                .iter()
+                .find(|row| row.label == label)
+                .unwrap_or_else(|| panic!("{label} is a row"))
+                .figure(now)
+        };
+        (figure("alt1"), figure("me"))
+    }
+    let run = |sign_in: bool| -> (Vec<(i64, Figure)>, usize) {
+        let dir = seeded();
+        let store = accounts::Store::at(dir.path());
+        let (mut state, _) = store.load(NOW).expect("load");
+        let _ = accounts::note_auth(&mut state, "alt1", accounts::Auth::SignedOut, NOW - 600);
+        store.save(&state).expect("save");
+        let roster = roster();
+        let mut memo = OutlookMemo {
+            reads: Some(scratch_reads()),
+            ..OutlookMemo::default()
+        };
+        let start = Instant::now();
+        let own = Some(Figure::Exact(580));
+        let mut said: Vec<(i64, Figure)> = Vec::new();
+        let mut running = None;
+        for s in 0..60i64 {
+            if sign_in && s == 3 {
+                running = store.signing_in_fixture("alt1", NOW + s);
+                assert!(running.is_some(), "the sign-in's record was written");
+            }
+            if s == 23 {
+                running = None;
+            }
+            let instant = start + Duration::from_secs(u64::try_from(s).expect("seconds"));
+            let _ = memo.quota((instant, NOW + s), Some(&roster), "me", own, true);
+            let (other, mine) = alt1(&memo, NOW + s);
+            assert_eq!(mine, Figure::Exact(580), "second {s}: me keeps its figure");
+            if said.last().map(|(_, f)| *f) != Some(other) {
+                said.push((s, other));
+            }
+        }
+        drop(running);
+        set_dir(None);
+        (said, memo.replays)
+    };
+    assert_eq!(
+        run(true),
+        (
+            vec![
+                (0, Figure::SignedOut),
+                (10, Figure::SigningIn),
+                (30, Figure::SignedOut),
+            ],
+            3
+        ),
+        "each move is said at its look, and replays once"
+    );
+    assert_eq!(
+        run(false),
+        (vec![(0, Figure::SignedOut)], 1),
+        "CONTROL: no sign-in, one replay in the minute"
+    );
+}
+
 #[test]
 fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
     let dir = seeded();

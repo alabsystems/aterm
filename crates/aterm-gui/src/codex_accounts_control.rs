@@ -6,9 +6,13 @@
 //! 2 also says what `restart account=` may ask of it for the asking session: the row aterm
 //! judges that session to run on, the pool's own choice, which rows a move would not be refused
 //! on record, and whether the restart would be carried now. It is a judgement, not a proof: the
-//! relaunch still proves the row it starts on.
+//! relaunch still proves the row it starts on. Schema 3 is schema 2 with each row's
+//! `signed_out_reason`, the settled refusal on record of a signed-out Codex login
+//! ([`aterm_agent::harness::codex_app_login::row_signed_out_reason`]): an observation, which
+//! grants nothing either. A client asks the schema it reads, so neither earlier schema changes.
 
 use super::*;
+use aterm_agent::harness::codex_app_login::{self, RefusalReason};
 use aterm_agent::harness::restart_stamp::Wanted;
 use aterm_agent::harness::{accounts, accounts_pool, cli::Env, self_claimed};
 use aterm_json::{Value, json};
@@ -18,7 +22,7 @@ use std::time::Instant;
 const MAX_ROWS: usize = 128;
 const MAX_FRAME: usize = 64 * 1024;
 
-/// `snapshot schema=<1|2> request=<32 lowercase hex>`: the schema asked for and the request's
+/// `snapshot schema=<1|2|3> request=<32 lowercase hex>`: the schema asked for and the request's
 /// id. A client asks the schema it can read; no other is answered.
 fn request(line: &str) -> Option<(u8, &str)> {
     let mut words = line.split_ascii_whitespace();
@@ -28,6 +32,7 @@ fn request(line: &str) -> Option<(u8, &str)> {
     let schema = match words.next()? {
         "schema=1" => 1,
         "schema=2" => 2,
+        "schema=3" => 3,
         _ => return None,
     };
     let id = words.next()?.strip_prefix("request=")?;
@@ -59,11 +64,18 @@ pub(super) fn claim(ctx: &crate::SessionCtx, master: i32) -> Option<crate::self_
     crate::control::prove_self_claim_for(ctx, &format!("codex-alab@{pid}"), master)
 }
 
+/// Why a row of a given condition is signed out, as schema 3 says it ([`rows`]): a refusal's
+/// closed word ([`RefusalReason::code`]), or `None`.
+type SignedOutReason<'a> = &'a dyn Fn(&accounts::Row, accounts::Condition) -> Option<RefusalReason>;
+
+/// The snapshot's rows; each carries `signed_out_reason` only where `reason` is given (schema
+/// 3), so the rows of schemas 1 and 2 are what they were.
 fn rows(
     records: &accounts::AccountRecords,
     home: &std::path::Path,
     now: i64,
     eligible: &dyn Fn(&str) -> bool,
+    reason: Option<SignedOutReason<'_>>,
 ) -> Option<Vec<Value>> {
     if records.roster.rows.len() > MAX_ROWS {
         return None;
@@ -86,14 +98,14 @@ fn rows(
                 .and_then(|a| a.sample.as_ref());
             let five = sample.and_then(|s| s.session(now));
             let week = sample.and_then(|s| s.week(now));
-            Some(json!({
+            let mut value = json!({
                 "id": account_id(&row.label), "label": row.label,
                 "masked_email": masked_email(row.email.as_deref()),
                 "condition": condition.as_str(), "enrolled": present,
                 "held": row.held_by.is_some(),
                 // Cached quota and file presence cannot establish fresh provider
                 // authentication or permission to launch under this account: schema 1 says
-                // no row is eligible, and schema 2 only that a move to it would not be
+                // no row is eligible, and schemas 2 and 3 only that a move to it would not be
                 // refused on record. The relaunch still proves the row.
                 "eligible": eligible(&row.label),
                 "quota": {"observed_at": sample.map(|s| s.at),
@@ -102,7 +114,14 @@ fn rows(
                     "five_hour_reset_at": five.map(|v| v.1),
                     "weekly_used_percent": week.map(|v| v.0),
                     "weekly_reset_at": week.map(|v| v.1)}
-            }))
+            });
+            if let Some(reason) = reason {
+                value.as_object_mut()?.insert(
+                    "signed_out_reason".into(),
+                    Value::from(reason(row, condition).map(RefusalReason::code)),
+                );
+            }
+            Some(value)
         })
         .collect()
 }
@@ -120,12 +139,23 @@ struct Snapshot {
 
 fn snapshot(sid: &str, proof: &crate::self_claim::Proven, schema: u8) -> Option<Snapshot> {
     let env = Env::from_process().ok()?;
-    // Schema 1 judges no launch: it says what it said before schema 2 existed.
-    let launch = (schema == 2)
+    let launch = judged_launch(sid, proof, schema);
+    snapshot_in(sid, proof, &env, schema, launch.as_ref())
+}
+
+/// The launch a snapshot of `schema` judges for the proven process `proof` of tab `sid`: for
+/// schemas 2 and 3, its validated line ([`launch_of`]) with the credential variables that
+/// process was started with ([`crate::harness_host::RunningLaunch::of_live`]). Schema 1 judges
+/// no launch: it says what it said before schema 2 existed.
+fn judged_launch(
+    sid: &str,
+    proof: &crate::self_claim::Proven,
+    schema: u8,
+) -> Option<crate::harness_host::RunningLaunch> {
+    (schema >= 2)
         .then(|| launch_of(sid, proof))
         .flatten()
-        .and_then(|resume| crate::harness_host::RunningLaunch::of_live(resume, proof.pid));
-    snapshot_in(sid, proof, &env, schema, launch.as_ref())
+        .and_then(|resume| crate::harness_host::RunningLaunch::of_live(resume, proof.pid))
 }
 
 /// The launch of the proven process `proof` of tab `sid` as aterm validated it: the tab's
@@ -169,7 +199,7 @@ fn snapshot_in(
             "session": {"sid": sid, "process_pid": proof.pid,
                 "process_birth": proof.start, "epoch": host_epoch()?},
             "assignment": {"account_id": Value::Null, "mode": "unknown"},
-            "accounts": rows(&records, home, env.now, &|_| false)?,
+            "accounts": rows(&records, home, env.now, &|_| false, None)?,
             "capabilities": {"add": false, "select": false, "auto": false}});
         return Some(Snapshot {
             value,
@@ -177,10 +207,11 @@ fn snapshot_in(
             auto: false,
         });
     }
-    // Schema 2. The row is the one the session's launch environment names in the roster, as
-    // its cold relaunch would be judged: a judgement, not a proved identity. A row is named
-    // only where this snapshot lists it. Each row's condition and its `eligible` are read off
-    // one reading, the one a move is judged on.
+    // Schema 2, and schema 3 with each row's reason. The row is the one the session's launch
+    // environment names in the roster, as its cold relaunch would be judged: a judgement, not
+    // a proved identity. A row is named only where this snapshot lists it. Each row's
+    // condition, its `eligible` and its reason are read off one reading, the one a move is
+    // judged on.
     let records = accounts_pool::move_records(&seat, accounts::Cli::Codex).ok()?;
     let moves = launch.and_then(|launch| {
         accounts_pool::moves_in(
@@ -198,7 +229,14 @@ fn snapshot_in(
             .as_ref()
             .is_some_and(|moves| moves.refusal(&Wanted::Row(label.to_owned())).is_none())
     };
-    let value = json!({"schema": 2, "observed_at": env.now,
+    // A row with no directory of its own is on the default login, whose refusal is read where
+    // the accounts store reads that login's lapse, as the reports read it.
+    let default_login = seat.store(accounts::Cli::Codex).default_login_home();
+    let signed_out_reason = |row: &accounts::Row, condition| {
+        codex_app_login::row_signed_out_reason(row, condition, default_login.as_deref(), env.now)
+    };
+    let reason = (schema == 3).then_some(&signed_out_reason as SignedOutReason<'_>);
+    let value = json!({"schema": schema, "observed_at": env.now,
         "revision": accounts::pool_authority_revision(&records.raw_roster, &records.logins).ok()?,
         "session": {"sid": sid, "process_pid": proof.pid,
             "process_birth": proof.start, "epoch": host_epoch()?},
@@ -207,7 +245,7 @@ fn snapshot_in(
             "choice_id": moves.as_ref().and_then(|moves| moves.choice.as_deref()).and_then(id_of),
             "pinned": records.state.pinned,
             "rotation": seat.mode_for(accounts::Cli::Codex).as_str()},
-        "accounts": rows(&records, home, env.now, &eligible)?,
+        "accounts": rows(&records, home, env.now, &eligible, reason)?,
         // The pool's side only; `serve` joins whether the restart would be carried.
         "capabilities": {"add": false, "select": false, "auto": false}});
     Some(Snapshot {
@@ -264,6 +302,8 @@ fn carried(
         pid: proof.pid,
         start: proof.start.clone(),
         copied: true,
+        // The offer reads no rest: the act judges that when it is asked.
+        home: None,
         refusal: None,
     };
     standing.is_none()
@@ -280,7 +320,7 @@ fn carried(
         .is_none()
 }
 
-/// A schema 2 snapshot's capabilities, true only where both the pool ([`Snapshot`]) and the
+/// A schema 2 or 3 snapshot's capabilities, true only where both the pool ([`Snapshot`]) and the
 /// session ([`move_offered`]) allow the move. `add` stays false: nothing here signs anyone in.
 fn grant(snapshot: &mut Snapshot, offered: bool) {
     let (select, auto) = (snapshot.select && offered, snapshot.auto && offered);
@@ -387,11 +427,11 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     reply(id, schema, snapshot, || move_offered(ctx, &before))
 }
 
-/// The reply that carries `snapshot` for request `id`. Only a schema 2 snapshot asks whether
-/// the move would be carried (`offered`) and is granted a capability; schema 1 asks nothing of
-/// the session and says none.
+/// The reply that carries `snapshot` for request `id`. Only a schema 2 or 3 snapshot asks
+/// whether the move would be carried (`offered`) and is granted a capability; schema 1 asks
+/// nothing of the session and says none.
 fn reply(id: &str, schema: u8, mut snapshot: Snapshot, offered: impl FnOnce() -> bool) -> String {
-    if schema == 2 {
+    if schema >= 2 {
         grant(&mut snapshot, offered());
     }
     let Some(object) = snapshot.value.as_object_mut() else {

@@ -8,14 +8,15 @@
 //! attempt ended, so the next automatic ask follows from that end alone, whatever build, launch,
 //! update or reboot reads it:
 //!
-//! - `asking`: an asker claimed the episode and its process ([`Asker`]) still runs, or the
-//!   attempt its line replaced still asks: no other automatic asker asks beside it. Once that
-//!   process is gone (aterm quit, crashed or was killed, the Mac logged out or rebooted) with no
-//!   end written, the attempt was cut off: it reads as [`Asked::Unfinished`], due again at once
-//!   for a first try (else after the pause of the tries it carries, from its claim or the last
-//!   unfinished end it carries), and the cut-off adds no try of its own. A window close that
-//!   quits aterm with the Mac Setup tab's program asking writes no end for what the quit's
-//!   hangup ends the program with ([`tab_end`]), so it is such a cut-off, never a decline.
+//! - `asking`: an asker claimed the episode and its process ([`Asker`]) still runs, or another
+//!   attempt the record keeps still asks: no other automatic asker asks beside it. Once every
+//!   process it names is gone (aterm quit, crashed or was killed, the Mac logged out or
+//!   rebooted) with no end written, the attempts were cut off: they read as
+//!   [`Asked::Unfinished`], due again at once for a first try (else after the pause of the tries
+//!   the record carries, from the latest claim or the last unfinished end), and a cut-off adds no
+//!   try of its own. A window close that quits aterm with the Mac Setup tab's program asking
+//!   writes no end for what the quit's hangup ends the program with ([`tab_end`]), so it is such
+//!   a cut-off, never a decline.
 //! - `unfinished`: the attempt ended without finishing (a password refused or never typed, a
 //!   download, catalog or installer failure, Apple's installer window closed without the tools,
 //!   which says nothing of which button closed it, an end the tab decided before `sudo`): the next
@@ -33,24 +34,26 @@
 //! ([`Record::finished`]), whatever came after: a step that finished once and reads undone later
 //! was undone by someone, which the automatic askers leave as it is.
 //!
-//! An `asking` line keeps the line it replaced, one deep, so the record holds two attempts at
-//! once: a person's retry and the attempt it took the episode over from, which may still ask.
-//! Each writes its own end in its own place: the replaced attempt's end takes the kept line's
-//! place under the retry ([`hand`] names that attempt's program there too), and the retry's
-//! end, where the attempt it replaced still asks, leaves that one asking over it. So a late end
-//! of an older attempt never overwrites a newer retry, nothing asks under a line nobody ends,
-//! and an attempt that asked nothing gives the record back as it was ([`End::Released`]):
-//! exactly, or, where a retry over it gave its line back without that one, as the unfinished
-//! tries' schedule and the finish its claim carried. An automatic claim succeeds only where the
-//! record lets an automatic ask go now, under the lock, so no automatic asker asks beside an
-//! attempt the record names. A third attempt at once (a retry over a retry over a running ask)
-//! drops the oldest from the record: that one's end then writes only a finish, and once the
-//! other two end, an automatic claim can go beside it while it still asks. Historical `opened`
-//! records (whose end nobody wrote) read as one unfinished try, except where an update carried
-//! the live tab of the build that wrote one into it ([`carry`]), and a `declined` line with no
-//! count of declines (written before the count) as one decline. Unreadable or malformed records
-//! hold automatic asks and are never rewritten. Every due is read at the reader's clock
-//! ([`Backoff::due_by`]): a line dated after it (the clock set back since) is due at once.
+//! The record keeps every attempt that may still ask, newest first, over how the last attempt
+//! before them ended: a person's retry (Install…, a typed `aterm init`) claims over whatever
+//! asks, and each attempt writes its own end in its own place. An end takes the attempt out and
+//! becomes the end the others ask over, so a late end of an older attempt never overwrites a
+//! newer one that asks on, nothing asks under a line nobody ends, and once every attempt ended
+//! the record says how the last one did. An attempt that asked nothing gives the record back as
+//! it would be without it ([`End::Released`]): the others it keeps and the end under them,
+//! exactly, a decline's count included. Any other end supersedes the attempts that were cut
+//! off. An automatic claim succeeds only where the record lets an automatic ask go now, under
+//! the lock, so no automatic asker asks beside an attempt the record keeps. A claim keeps, of
+//! the attempts already cut off, only the latest (the others add nothing to how it reads), and
+//! at most [`ATTEMPTS`] in all, dropping the oldest past that: such an attempt's end then writes
+//! only a finish. Historical `opened` records (whose end nobody wrote) read as one unfinished
+//! try, except where an update carried the live tab of the build that wrote one into it
+//! ([`carry`]), and a `declined` line with no count of declines (written before the count) as
+//! one decline. A line that kept one attempt over another with no end under it (written before
+//! the record kept every attempt) reads the end under them from the tries and finish the older
+//! one carried. Unreadable or malformed records hold automatic asks and are never rewritten.
+//! Every due is read at the reader's clock ([`Backoff::due_by`]): a line dated after it (the
+//! clock set back since) is due at once.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -65,12 +68,20 @@ pub const FILE: &str = "command-line-tools-tab";
 /// writes is one line.
 pub const LINES: usize = 8;
 
+/// The most attempts a record keeps asking at once: far more than ever ask together (the
+/// window's, a terminal `aterm init`'s and a person's retries), so a record stays readable
+/// ([`BYTES`]) whatever claims over it.
+pub const ATTEMPTS: usize = 8;
+
 /// The longest build id a line names; aterm's are far shorter (a version, `+g` and a commit).
 pub const BUILD_BYTES: usize = 96;
 
-/// The longest record read or written: [`LINES`] lines of two builds and their numbers each (an
-/// `asking` line and the one it replaced).
-pub const BYTES: usize = LINES * 2 * ("unfinished ".len() + BUILD_BYTES + 9 * 21);
+/// The longest part of a line: one build and its numbers.
+const PART: usize = "unfinished ".len() + BUILD_BYTES + 9 * 21;
+
+/// The longest record read or written: [`LINES`] historical lines, or a line of [`ATTEMPTS`]
+/// asking parts and the end under them.
+pub const BYTES: usize = (LINES + ATTEMPTS) * PART;
 
 /// When an automatic ask comes again after an attempt that did not finish (by its tries in a
 /// row), or after one that finished and a later reading finds a step owed (one try's pause):
@@ -323,50 +334,38 @@ pub enum End {
     /// or their own yes ([`lift`]).
     Declined,
     /// It provably asked nothing (no `sudo` ever started, or it stood aside before asking): the
-    /// record goes back to exactly the line it held before the claim, or to none; where a
-    /// person's retry over the claim already gave it back without that line, to the unfinished
-    /// tries' schedule or the finish the claim carried of it.
+    /// record goes back to what it would hold without the claim, exactly: the other attempts it
+    /// keeps and the end under them, or none.
     Released,
 }
 
 /// Where the record held the attempt whose end it took ([`end`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Took {
-    /// As its line: the attempt was the record's own, and its end is the line's (carried by the
-    /// attempt it replaced where that one still asks).
+    /// As its newest attempt: no other claimed over it, and its end is what the record says
+    /// (under the older attempts that still ask, where any do).
     Line,
-    /// As the line its line keeps: a person's retry replaced the attempt, and its end went into
-    /// that place, under the retry.
+    /// Under a newer attempt: a person's retry claimed over it, and its end went under that
+    /// one, which asks on over it.
     Replaced,
-    /// In neither place (three attempts asked at once, the oldest given up): only a finish is
-    /// written, as the account's.
+    /// Nowhere (it was cut off and a later end superseded it, or [`ATTEMPTS`] newer ones went
+    /// over it): only a finish is written, as the account's.
     Nowhere,
 }
 
 impl Took {
-    /// Whether the record held the attempt, in either place, and now says how it ended.
+    /// Whether the record held the attempt and now says how it ended.
     #[must_use]
     pub const fn held(self) -> bool {
         !matches!(self, Self::Nowhere)
     }
 }
 
-/// One line of a record.
+/// How an attempt ended, as a record keeps it: alone, or under the attempts that still ask.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Line {
-    /// `asking <build> <pid> <birth> <at> <n> <tries> <since> <finished>`, then ` after ` and the
-    /// line it replaced where there was one: claimed at `at` as attempt `n`, after `tries`
-    /// unfinished tries in a row whose last ended at `since`, the elevation having last finished
-    /// at `finished` (0: never). `prior` is kept one deep: a replaced `asking` line keeps no
-    /// prior of its own.
-    Asking {
-        claim: Claim,
-        tries: u32,
-        since: u64,
-        finished: u64,
-        prior: Option<Box<Line>>,
-    },
-    /// `unfinished <build> <at> <tries> <finished>`.
+    /// `unfinished <build> <at> <tries> <finished>`: the `tries`-th unfinished try in a row, at
+    /// `at`, the elevation having last finished at `finished` (0: never).
     Unfinished {
         build: String,
         at: u64,
@@ -388,30 +387,9 @@ enum Line {
 }
 
 impl Line {
-    /// The line's text, newline included.
-    fn text(&self) -> String {
-        format!("{}\n", self.words())
-    }
-
     /// The line's words, with no newline.
     fn words(&self) -> String {
         match self {
-            Self::Asking {
-                claim,
-                tries,
-                since,
-                finished,
-                prior,
-            } => {
-                let head = format!(
-                    "asking {} {} {} {} {} {tries} {since} {finished}",
-                    claim.asker.build, claim.asker.pid, claim.asker.birth, claim.at, claim.n
-                );
-                match prior {
-                    Some(prior) => format!("{head} after {}", prior.words()),
-                    None => head,
-                }
-            }
             Self::Unfinished {
                 build,
                 at,
@@ -429,69 +407,11 @@ impl Line {
         }
     }
 
-    /// This line as an `asking` line keeps it ([`Line::Asking::prior`]): one deep, so a replaced
-    /// `asking` line keeps no prior of its own.
-    fn as_prior(&self) -> Self {
-        match self {
-            Self::Asking {
-                claim,
-                tries,
-                since,
-                finished,
-                ..
-            } => Self::Asking {
-                claim: claim.clone(),
-                tries: *tries,
-                since: *since,
-                finished: *finished,
-                prior: None,
-            },
-            other => other.clone(),
-        }
-    }
-
-    /// This `asking` line with `claim` in place of its own (the same attempt, handed to the
-    /// process that asks); any other line as it is.
-    fn handed(&self, claim: Claim) -> Self {
-        match self {
-            Self::Asking {
-                tries,
-                since,
-                finished,
-                prior,
-                ..
-            } => Self::Asking {
-                claim,
-                tries: *tries,
-                since: *since,
-                finished: *finished,
-                prior: prior.clone(),
-            },
-            other => other.clone(),
-        }
-    }
-
-    /// This line, also saying setup's elevation finished at `at` (an attempt the line no longer
-    /// holds finished, [`end`]): an asking line and the line it keeps carry the finish, a done
-    /// line becomes that finish, and a historical line reads on as the unfinished try it was,
-    /// asked as `build`.
+    /// This line, also saying setup's elevation finished at `at` (an attempt the record no longer
+    /// holds finished, [`end`]): a done line becomes that finish, and a historical line reads on
+    /// as the unfinished try it was, asked as `build`.
     fn finished_at(&self, build: &str, at: u64) -> Self {
         match self {
-            Self::Asking {
-                claim,
-                tries,
-                since,
-                prior,
-                ..
-            } => Self::Asking {
-                claim: claim.clone(),
-                tries: *tries,
-                since: *since,
-                finished: at,
-                prior: prior
-                    .as_deref()
-                    .map(|prior| Box::new(prior.finished_at(build, at))),
-            },
             Self::Unfinished {
                 build: asked,
                 at: when,
@@ -527,9 +447,10 @@ impl Line {
         }
     }
 
-    /// The line an asking line's claim carried of the line it replaced ([`carried`]), written as
-    /// `build`: its unfinished tries in a row, the last ended at `since`, or the elevation's
-    /// finish at `finished`; `None` where it carried neither (it replaced no record).
+    /// The end an `asking` part's numbers carry, written as `build`: its unfinished tries in a
+    /// row, the last ended at `since`, or the elevation's finish at `finished`; `None` where it
+    /// carries neither. Only a line written before the record kept every attempt has an asking
+    /// part with no end under it.
     fn from_carried(build: String, tries: u32, since: u64, finished: u64) -> Option<Self> {
         if tries > 0 {
             Some(Self::Unfinished {
@@ -551,9 +472,7 @@ impl Line {
     /// When setup's elevation last finished, as this line says (0: never).
     const fn finished(&self) -> u64 {
         match self {
-            Self::Asking { finished, .. }
-            | Self::Unfinished { finished, .. }
-            | Self::Declined { finished, .. } => *finished,
+            Self::Unfinished { finished, .. } | Self::Declined { finished, .. } => *finished,
             Self::Done { at, .. } => *at,
             Self::Opened => 0,
         }
@@ -570,38 +489,6 @@ impl Line {
                     return None;
                 }
                 Self::Opened
-            }
-            "asking" => {
-                let build = build(&mut words)?;
-                let pid = number(&mut words)?;
-                let birth = number(&mut words)?;
-                let at = number(&mut words)?;
-                let n = number(&mut words)?;
-                let tries = number(&mut words)?;
-                let since = number(&mut words)?;
-                let finished = number(&mut words)?;
-                let prior = match words.next() {
-                    None => None,
-                    Some("after") => {
-                        let rest: Vec<&str> = words.by_ref().collect();
-                        match Self::parse(&rest.join(" "))? {
-                            Self::Asking { prior: Some(_), .. } => return None,
-                            prior => Some(Box::new(prior)),
-                        }
-                    }
-                    Some(_) => return None,
-                };
-                Self::Asking {
-                    claim: Claim {
-                        asker: Asker { build, pid, birth },
-                        at,
-                        n,
-                    },
-                    tries,
-                    since,
-                    finished,
-                    prior,
-                }
             }
             "unfinished" => Self::Unfinished {
                 build: build(&mut words)?,
@@ -629,6 +516,116 @@ impl Line {
     }
 }
 
+/// What a record keeps: the attempts that may still ask, oldest first, over how the last
+/// attempt before them ended (`None`: none ended, or a decline was lifted to no finish).
+///
+/// Its line is `asking <build> <pid> <birth> <at> <n> <tries> <since> <finished>` for each
+/// attempt, newest first, joined by ` after `, then ` after ` and the end under them where
+/// there is one, or that end alone where no attempt asks. Each attempt's numbers say what the
+/// end under them carries ([`carried`]: its unfinished tries in a row, the last ended at
+/// `since`, and the elevation's last finish), so a build that kept one attempt over the end it
+/// replaced reads a record of one attempt as its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Kept {
+    asking: Vec<Claim>,
+    ended: Option<Line>,
+}
+
+impl Kept {
+    /// The record's text, newline included; `None` for no record.
+    fn text(&self) -> Option<String> {
+        let (tries, since, finished) = carried(self.ended.as_ref());
+        let mut parts: Vec<String> = self
+            .asking
+            .iter()
+            .rev()
+            .map(|claim| {
+                format!(
+                    "asking {} {} {} {} {} {tries} {since} {finished}",
+                    claim.asker.build, claim.asker.pid, claim.asker.birth, claim.at, claim.n
+                )
+            })
+            .collect();
+        parts.extend(self.ended.as_ref().map(Line::words));
+        (!parts.is_empty()).then(|| format!("{}\n", parts.join(" after ")))
+    }
+
+    /// The record one line `text` is, or `None`.
+    fn parse(text: &str) -> Option<Self> {
+        let mut words = text.split(' ').peekable();
+        // Newest first, as written; the numbers the oldest carries.
+        let mut asking = Vec::new();
+        let mut oldest = None;
+        // Whether the attempts end the line, with no end under them.
+        let mut alone = false;
+        while words.next_if_eq(&"asking").is_some() {
+            let build = build(&mut words)?;
+            let claim = Claim {
+                asker: Asker {
+                    build: build.clone(),
+                    pid: number(&mut words)?,
+                    birth: number(&mut words)?,
+                },
+                at: number(&mut words)?,
+                n: number(&mut words)?,
+            };
+            oldest = Some((
+                build,
+                number(&mut words)?,
+                number(&mut words)?,
+                number(&mut words)?,
+            ));
+            asking.push(claim);
+            if asking.len() > ATTEMPTS {
+                return None;
+            }
+            match words.next() {
+                None => {
+                    alone = true;
+                    break;
+                }
+                Some("after") => {}
+                Some(_) => return None,
+            }
+        }
+        let rest: Vec<&str> = words.collect();
+        let ended = match oldest {
+            // No attempt asks: the line is the end alone.
+            None => Some(Line::parse(&rest.join(" "))?),
+            // Attempts with no end under them: what the oldest carried of the end it went over.
+            Some((build, tries, since, finished)) if alone => {
+                Line::from_carried(build, tries, since, finished)
+            }
+            Some(_) => Some(Line::parse(&rest.join(" "))?),
+        };
+        asking.reverse();
+        Some(Self { asking, ended })
+    }
+
+    /// `claim` added as the newest attempt. Of the attempts already cut off (no process of
+    /// theirs runs, read through `files`), only the latest stays: the others add nothing to how
+    /// the record reads. Past [`ATTEMPTS`], the oldest goes.
+    fn with(mut self, files: &dyn Files, claim: Claim) -> Self {
+        let running: Vec<bool> = self.asking.iter().map(|held| runs(files, held)).collect();
+        let latest_cut_off = running.iter().rposition(|runs| !runs);
+        self.asking = std::mem::take(&mut self.asking)
+            .into_iter()
+            .zip(running)
+            .enumerate()
+            .filter(|(at, (_, runs))| *runs || Some(*at) == latest_cut_off)
+            .map(|(_, (held, _))| held)
+            .collect();
+        if planted(Defect::ThirdDropsOldest) && self.asking.len() >= 2 {
+            self.asking.remove(0);
+        }
+        self.asking.push(claim);
+        while self.asking.len() > ATTEMPTS {
+            self.asking.remove(0);
+        }
+        self
+    }
+}
+
 /// The next of `words` where it is a build a line can name ([`nameable`]).
 fn build<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<String> {
     words
@@ -642,17 +639,22 @@ fn number<'a, N: std::str::FromStr>(words: &mut impl Iterator<Item = &'a str>) -
     words.next()?.parse().ok()
 }
 
-/// The state a record's `text` holds: its one line, or a historical record's `opened` lines (read
-/// as one cut-off attempt). `None` for any other text, an empty one included, and for more lines
+/// What a record's `text` keeps: its one line, or a historical record's `opened` lines (read as
+/// one cut-off attempt). `None` for any other text, an empty one included, and for more lines
 /// than a record keeps.
-fn state(text: &str) -> Option<Line> {
-    let lines: Vec<Line> = text.lines().map(Line::parse).collect::<Option<_>>()?;
+fn state(text: &str) -> Option<Kept> {
+    let lines: Vec<&str> = text.lines().collect();
     match lines.as_slice() {
-        [one] => Some(one.clone()),
+        [one] => Kept::parse(one),
         many if (2..=LINES).contains(&many.len())
-            && many.iter().all(|line| *line == Line::Opened) =>
+            && many
+                .iter()
+                .all(|line| Line::parse(line) == Some(Line::Opened)) =>
         {
-            Some(Line::Opened)
+            Some(Kept {
+                asking: Vec::new(),
+                ended: Some(Line::Opened),
+            })
         }
         _ => None,
     }
@@ -663,7 +665,7 @@ fn state(text: &str) -> Option<Line> {
 /// model's `Buggy=1` mutants. Nothing plants one outside a test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Defect {
-    /// A cut-off attempt reads as a person's decline (`CutOffReadsDeclined`).
+    /// Cut-off attempts read as a person's decline (`CutOffReadsDeclined`).
     CutOffReadsDeclined,
     /// An automatic claim goes beside a running asker (`ClaimBesideLive`).
     ClaimBesideLive,
@@ -672,27 +674,33 @@ enum Defect {
     /// A hand that writes nothing, so the record names the window, not its tab's program
     /// (`HandLeavesWindow`).
     HandLeavesWindow,
-    /// A hand of a claim the line keeps refused, so the window holds no claim while the record
-    /// names it (`HandDropsClaim`: the stall the review found, as the code had it).
+    /// A hand of a claim a newer attempt went over refused, so the window holds no claim while
+    /// the record names it (`HandDropsClaim`: as the code once had it).
     HandDropsClaim,
-    /// An end of the attempt the line replaced that writes over the line's own
+    /// An end of an attempt a newer one went over that drops the newer ones
     /// (`StaleEndWrites`).
     StaleEndWrites,
-    /// A retry's end that drops the running ask it replaced, so the record no longer names it
-    /// (`RetryEndDropsAsk`: as the code had it).
+    /// The newest attempt's end that drops the older ones that still ask, so the record no
+    /// longer names them (`RetryEndDropsAsk`: as the code once had it).
     EndDropsRunningAsk,
     /// A release that counts a try (`ReleaseCountsATry`).
     ReleaseCountsATry,
     /// An unfinished end that forgets the elevation finished (`EndForgetsFinish`).
     EndForgetsFinish,
+    /// A claim over two attempts that drops the oldest (`ThirdDropsOldest`: the record kept two
+    /// attempts, as the code had it).
+    ThirdDropsOldest,
+    /// A release that gives back only the tries and finish of the end under it, so a decline
+    /// and its count are lost (`ReleaseForgetsDecline`: as the code had it).
+    ReleaseForgetsDecline,
     /// The window's decision reads aterm's quit hanging its tab's program up as a person's
     /// decline (`InterruptionDeclines`).
     InterruptionDeclines,
     /// The window's decision writes nothing for any end at a quit, the program's own finish
-    /// included (`QuitDropsFinish`: as the code had it).
+    /// included (`QuitDropsFinish`: as the code once had it).
     QuitDropsOwnEnd,
     /// A terminal's decision reads its hangup or a `SIGTERM` as the person's decline
-    /// (`HangupDeclinesT`: any stop it caught, as `init_clt::episode_end` had it).
+    /// (`HangupDeclinesT`: any stop it caught, as `init_clt::episode_end` once had it).
     HangupDeclines,
 }
 
@@ -715,50 +723,50 @@ fn planted(defect: Defect) -> bool {
     }
 }
 
-/// What `line` says of automatic asks at `now` (unix seconds), its asker's process read through
-/// `files`: each due read at that clock ([`Backoff::due_by`]), so a line dated after it is due
-/// at once, never at a time the clock may take far longer than the schedule's longest pause to
-/// reach.
-fn asked(files: &dyn Files, line: &Line, now: u64) -> Asked {
-    match line {
-        // Its asker runs, or the attempt it replaced still asks (a person's retry over a running
-        // ask, cut off while that one asks on).
-        Line::Asking { prior, .. }
-            if asker_runs(files, line)
-                || prior
-                    .as_deref()
-                    .is_some_and(|prior| asker_runs(files, prior)) =>
-        {
-            Asked::Asking
+/// Whether `claim`'s asker runs now ([`Files::runs`]).
+fn runs(files: &dyn Files, claim: &Claim) -> bool {
+    files.runs(claim.asker.pid, claim.asker.birth)
+}
+
+/// What `kept` says of automatic asks at `now` (unix seconds), its askers' processes read
+/// through `files`: each due read at that clock ([`Backoff::due_by`]), so a line dated after it
+/// is due at once, never at a time the clock may take far longer than the schedule's longest
+/// pause to reach.
+fn asked(files: &dyn Files, kept: &Kept, now: u64) -> Asked {
+    // An attempt it keeps still asks.
+    if kept.asking.iter().any(|claim| runs(files, claim)) {
+        return Asked::Asking;
+    }
+    // Every attempt it keeps was cut off: due again as the try they were, from the latest claim
+    // or the unfinished end under them, whichever came last, which adds no try of its own.
+    if let Some(latest) = kept.asking.iter().map(|claim| claim.at).max() {
+        if planted(Defect::CutOffReadsDeclined) {
+            return Asked::Declined {
+                due: DECLINE_AGAIN.due_by(latest, 1, now),
+                declines: 1,
+            };
         }
-        Line::Asking { claim, .. } if planted(Defect::CutOffReadsDeclined) => Asked::Declined {
-            due: DECLINE_AGAIN.due_by(claim.at, 1, now),
-            declines: 1,
-        },
-        // Cut off: due again as the try it was, from its claim or the unfinished end it carries,
-        // whichever came last, which adds no try of its own.
-        Line::Asking {
-            claim,
+        let (tries, since, _) = carried(kept.ended.as_ref());
+        return Asked::Unfinished {
+            due: ASK_AGAIN.due_by(latest.max(since), tries, now),
             tries,
-            since,
-            ..
-        } => Asked::Unfinished {
-            due: ASK_AGAIN.due_by(claim.at.max(*since), *tries, now),
-            tries: *tries,
-        },
-        Line::Unfinished { at, tries, .. } => Asked::Unfinished {
+        };
+    }
+    match &kept.ended {
+        None => Asked::Available,
+        Some(Line::Unfinished { at, tries, .. }) => Asked::Unfinished {
             due: ASK_AGAIN.due_by(*at, *tries, now),
             tries: *tries,
         },
-        Line::Done { at, .. } => Asked::Done {
+        Some(Line::Done { at, .. }) => Asked::Done {
             due: ASK_AGAIN.due_by(*at, 1, now),
         },
-        Line::Declined {
+        Some(Line::Declined {
             build,
             at,
             finished,
             declines,
-        } => match DECLINE_AGAIN.due_by(*at, *declines, now) {
+        }) => match DECLINE_AGAIN.due_by(*at, *declines, now) {
             due if due > now => Asked::Declined {
                 due,
                 declines: *declines,
@@ -766,16 +774,19 @@ fn asked(files: &dyn Files, line: &Line, now: u64) -> Asked {
             // Its hold passed: what the record would say had nobody declined, as a lift writes.
             _ if *finished > 0 => asked(
                 files,
-                &Line::Done {
-                    build: build.clone(),
-                    at: *finished,
+                &Kept {
+                    asking: Vec::new(),
+                    ended: Some(Line::Done {
+                        build: build.clone(),
+                        at: *finished,
+                    }),
                 },
                 now,
             ),
             _ => Asked::Available,
         },
         // Its end was never written: one cut-off try, long since due.
-        Line::Opened => Asked::Unfinished {
+        Some(Line::Opened) => Asked::Unfinished {
             due: ASK_AGAIN.due(0, 1),
             tries: 1,
         },
@@ -806,9 +817,12 @@ pub fn record(files: &dyn Files, path: &Path, now: u64) -> Record {
             finished: false,
         },
         Ok(Some(text)) => match state(&text) {
-            Some(line) => Record {
-                asked: asked(files, &line, now),
-                finished: line.finished() > 0,
+            Some(kept) => Record {
+                asked: asked(files, &kept, now),
+                finished: kept
+                    .ended
+                    .as_ref()
+                    .is_some_and(|ended| ended.finished() > 0),
             },
             None => Record {
                 asked: Asked::Unread(malformed()),
@@ -822,60 +836,14 @@ pub fn record(files: &dyn Files, path: &Path, now: u64) -> Record {
     }
 }
 
-/// The tries in a row, the last unfinished end and the elevation's last finish a claim over
-/// `line` carries on.
-fn carried(line: Option<&Line>) -> (u32, u64, u64) {
-    let finished = line.map_or(0, Line::finished);
-    match line {
+/// The tries in a row, the last unfinished end and the elevation's last finish the end `ended`
+/// carries on to the attempts over it.
+fn carried(ended: Option<&Line>) -> (u32, u64, u64) {
+    let finished = ended.map_or(0, Line::finished);
+    match ended {
         None | Some(Line::Done { .. } | Line::Declined { .. }) => (0, 0, finished),
         Some(Line::Unfinished { at, tries, .. }) => (*tries, *at, finished),
-        // A cut-off attempt carries its tries on and adds none, its pause counted from its claim
-        // or the unfinished end it carries, as it reads ([`asked`]); a live one is replaced only by
-        // a person's retry, which carries them on too.
-        Some(Line::Asking {
-            claim,
-            tries,
-            since,
-            ..
-        }) => (*tries, claim.at.max(*since), finished),
         Some(Line::Opened) => (1, 0, finished),
-    }
-}
-
-/// Whether `line` is an `asking` line whose asker runs now ([`Files::runs`]).
-fn asker_runs(files: &dyn Files, line: &Line) -> bool {
-    matches!(line, Line::Asking { claim, .. } if files.runs(claim.asker.pid, claim.asker.birth))
-}
-
-/// What a person's retry claims over, of the record's `line`: that line, or, where its asker is
-/// gone while the `asking` line it replaced still asks (an earlier retry over a running ask, cut
-/// off), that line, so the retry keeps the attempt that still asks and its end. The gone one
-/// adds nothing to it, as a cut-off adds no try, and says the same finish: a claim carries its
-/// replaced line's finish, and a later finish is written into both ([`Line::finished_at`]).
-fn standing<'a>(files: &dyn Files, line: Option<&'a Line>) -> Option<&'a Line> {
-    if let Some(
-        held @ Line::Asking {
-            prior: Some(prior), ..
-        },
-    ) = line
-        && !asker_runs(files, held)
-        && asker_runs(files, prior)
-    {
-        return Some(prior);
-    }
-    line
-}
-
-/// The `asking` line of `claim` over the record's `line` (none where there was no record): it
-/// carries that line's tries and last finish on, and keeps the line itself for a release.
-fn asking_over(claim: Claim, line: Option<&Line>) -> Line {
-    let (tries, since, finished) = carried(line);
-    Line::Asking {
-        claim,
-        tries,
-        since,
-        finished,
-        prior: line.map(|line| Box::new(line.as_prior())),
     }
 }
 
@@ -902,8 +870,8 @@ fn asking_over(claim: Claim, line: Option<&Line>) -> Line {
     )
 )]
 pub fn claim(files: &dyn Files, path: &Path, asker: &Asker, now: u64) -> io::Result<Option<Claim>> {
-    change(files, path, Some(&asker.build), |files, line| {
-        let may = line.map_or(Asked::Available, |line| asked(files, line, now));
+    change(files, path, Some(&asker.build), |files, kept| {
+        let may = kept.map_or(Asked::Available, |kept| asked(files, kept, now));
         let defect = match may {
             Asked::Asking => planted(Defect::ClaimBesideLive),
             Asked::Declined { .. } => planted(Defect::ClaimThroughDecline),
@@ -917,21 +885,26 @@ pub fn claim(files: &dyn Files, path: &Path, asker: &Asker, now: u64) -> io::Res
             at: now,
             n: fresh(),
         };
-        Ok((
-            Some(Write::Line(asking_over(claim.clone(), line))),
-            Some(claim),
-        ))
+        let kept = kept.cloned().unwrap_or_default();
+        Ok((Some(kept.with(files, claim.clone())), Some(claim)))
     })
 }
 
 /// Claim the episode for a person's own retry by `asker` at `now`, whatever the record says
-/// (a decline, a try not yet due, another attempt asking): their press or typed `aterm init` is
-/// their yes. The line keeps the attempt it replaced, one deep, whose late end then writes only
-/// into its own place under the retry ([`end`]); over a cut-off retry whose replaced attempt
-/// still asks, it keeps that attempt instead.
+/// (a decline, a try not yet due, other attempts asking): their press or typed `aterm init` is
+/// their yes. The record keeps the attempts it went over, whose late ends then write only into
+/// their own places under it ([`end`]).
 ///
 /// # Errors
 /// As [`claim`]. Explicit callers keep their person-granted authority on recording failure.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "CltEpisode",
+        action = "ExplicitW",
+        project = "aterm_types::clt_mark::model_tests::project"
+    )
+)]
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -941,26 +914,21 @@ pub fn claim(files: &dyn Files, path: &Path, asker: &Asker, now: u64) -> io::Res
     )
 )]
 pub fn explicit(files: &dyn Files, path: &Path, asker: &Asker, now: u64) -> io::Result<Claim> {
-    change(files, path, Some(&asker.build), |files, line| {
+    change(files, path, Some(&asker.build), |files, kept| {
         let claim = Claim {
             asker: asker.clone(),
             at: now,
             n: fresh(),
         };
-        Ok((
-            Some(Write::Line(asking_over(
-                claim.clone(),
-                standing(files, line),
-            ))),
-            claim,
-        ))
+        let kept = kept.cloned().unwrap_or_default();
+        Ok((Some(kept.with(files, claim.clone())), claim))
     })
 }
 
 /// A person's yes to setup (System State's Set up now) lifts their earlier decline: a
 /// `declined` record goes back to what it would say had nobody declined (the elevation's last
 /// finish, or no record), so an automatic ask may go again. `true` where it lifted one; any
-/// other record is left as it is.
+/// other record, one where an attempt asks over a decline included, is left as it is.
 ///
 /// # Errors
 /// An unsafe or malformed record, or a lock/write/removal error.
@@ -973,17 +941,19 @@ pub fn explicit(files: &dyn Files, path: &Path, asker: &Asker, now: u64) -> io::
     )
 )]
 pub fn lift(files: &dyn Files, path: &Path) -> io::Result<bool> {
-    change(files, path, None, |_, line| match line {
-        Some(Line::Declined {
-            build, finished, ..
-        }) => Ok((
-            Some(if *finished > 0 {
-                Write::Line(Line::Done {
+    change(files, path, None, |_, kept| match kept {
+        Some(Kept {
+            asking,
+            ended: Some(Line::Declined {
+                build, finished, ..
+            }),
+        }) if asking.is_empty() => Ok((
+            Some(Kept {
+                asking: Vec::new(),
+                ended: (*finished > 0).then(|| Line::Done {
                     build: build.clone(),
                     at: *finished,
-                })
-            } else {
-                Write::Remove
+                }),
             }),
             true,
         )),
@@ -997,47 +967,44 @@ pub fn lift(files: &dyn Files, path: &Path) -> io::Result<bool> {
 /// the record holds that, or no record at all, it becomes the `asking` line a claim over it
 /// would write: no other automatic asker asks beside the tab while its program runs, the window
 /// that adopted the tab records its end against the claim this returns, and once the program
-/// is gone with no end written the attempt reads cut off. Where the record already names
-/// `asker` asking, in its line or the one that line keeps (this tab carried before, and a
-/// person's retry over it since), that claim, rewriting nothing: the attempt stays the adopting
-/// window's to end, in its own place. `None`, rewriting nothing, where it holds anything else:
-/// an attempt of this format another asker made, or how one ended.
+/// is gone with no end written the attempt reads cut off. Where the record already keeps an
+/// attempt `asker` asks (this tab carried before, and a person's retry over it since, perhaps),
+/// that claim, rewriting nothing: the attempt stays the adopting window's to end, in its own
+/// place. `None`, rewriting nothing, where it holds anything else: an attempt of this format
+/// another asker made, or how one ended.
 ///
 /// # Errors
 /// An unsafe or malformed record, an asker no line can name, or a lock/write error.
 pub fn carry(files: &dyn Files, path: &Path, asker: &Asker, now: u64) -> io::Result<Option<Claim>> {
-    change(files, path, Some(&asker.build), |_, line| match line {
-        None | Some(Line::Opened) => {
-            let claim = Claim {
-                asker: asker.clone(),
-                at: now,
-                n: fresh(),
-            };
-            Ok((
-                Some(Write::Line(asking_over(claim.clone(), line))),
-                Some(claim),
-            ))
+    change(files, path, Some(&asker.build), |files, kept| {
+        if let Some(held) = kept
+            .into_iter()
+            .flat_map(|kept| &kept.asking)
+            .find(|held| held.asker == *asker)
+        {
+            return Ok((None, Some(held.clone())));
         }
-        Some(Line::Asking { claim, .. }) if claim.asker == *asker => {
-            Ok((None, Some(claim.clone())))
+        // No record, or a historical one with nothing asking over it.
+        let historical =
+            kept.is_none_or(|kept| kept.asking.is_empty() && kept.ended == Some(Line::Opened));
+        if !historical {
+            return Ok((None, None));
         }
-        Some(Line::Asking {
-            prior: Some(prior), ..
-        }) => match prior.as_ref() {
-            Line::Asking { claim, .. } if claim.asker == *asker => Ok((None, Some(claim.clone()))),
-            _ => Ok((None, None)),
-        },
-        Some(_) => Ok((None, None)),
+        let claim = Claim {
+            asker: asker.clone(),
+            at: now,
+            n: fresh(),
+        };
+        let kept = kept.cloned().unwrap_or_default();
+        Ok((Some(kept.with(files, claim.clone())), Some(claim)))
     })
 }
 
 /// Hand `claim`'s attempt to the process `pid` born `birth` (the Mac Setup tab's own program,
 /// which asks for the password): the record's asker becomes that process, so the attempt is
-/// cut off when it ends, whatever becomes of the window that claimed it. Where a person's retry
-/// took the episode over first, the line it keeps names the program instead, so the attempt
-/// stays the window's to end: back on the record once that retry gives it back or ends, never
-/// a line naming the window that nobody ends. `None`, rewriting nothing, where the record holds
-/// `claim` in neither place (three attempts asked at once, the oldest given up).
+/// cut off when it ends, whatever becomes of the window that claimed it, and stays the window's
+/// to end in its own place, under a person's retry that claimed over it first too. `None`,
+/// rewriting nothing, where the record keeps no such attempt ([`Took::Nowhere`]).
 ///
 /// # Errors
 /// An unsafe or malformed record, or a lock/write error.
@@ -1065,49 +1032,29 @@ pub fn hand(
         at: claim.at,
         n: claim.n,
     };
-    change(
-        files,
-        path,
-        Some(&claim.asker.build),
-        |_, line| match line {
-            Some(Line::Asking { claim: held, .. })
-                if held == claim && planted(Defect::HandLeavesWindow) =>
-            {
-                Ok((None, Some(held.clone())))
-            }
-            Some(line @ Line::Asking { claim: held, .. }) if held == claim => {
-                Ok((Some(Write::Line(line.handed(handed.clone()))), Some(handed)))
-            }
-            Some(Line::Asking {
-                claim: holder,
-                tries,
-                since,
-                finished,
-                prior: Some(replaced),
-            }) if matches!(replaced.as_ref(), Line::Asking { claim: held, .. } if held == claim)
-                && !planted(Defect::HandDropsClaim) =>
-            {
-                Ok((
-                    Some(Write::Line(Line::Asking {
-                        claim: holder.clone(),
-                        tries: *tries,
-                        since: *since,
-                        finished: *finished,
-                        prior: Some(Box::new(replaced.handed(handed.clone()))),
-                    })),
-                    Some(handed),
-                ))
-            }
-            _ => Ok((None, None)),
-        },
-    )
+    change(files, path, Some(&claim.asker.build), |_, kept| {
+        let Some(kept) = kept else {
+            return Ok((None, None));
+        };
+        let Some(at) = kept.asking.iter().position(|held| held == claim) else {
+            return Ok((None, None));
+        };
+        if planted(Defect::HandLeavesWindow) {
+            return Ok((None, Some(claim.clone())));
+        }
+        if planted(Defect::HandDropsClaim) && at + 1 < kept.asking.len() {
+            return Ok((None, None));
+        }
+        let mut kept = kept.clone();
+        kept.asking[at] = handed.clone();
+        Ok((Some(kept), Some(handed)))
+    })
 }
 
 /// Record how `claim`'s attempt ended at `now`, and say where the record held that claim
-/// ([`Took`]): as its line, or as the line that line keeps, and it now says so; or in neither
-/// (three attempts asked at once, the oldest given up), where a finish is still the account's,
-/// so the record then says the elevation finished ([`Record::finished`]), and any other end
-/// rewrites nothing.
+/// ([`Took`]): as its newest attempt or under a newer one, and it now says so; or nowhere, where
+/// a finish is still the account's, so the record then says the elevation finished
+/// ([`Record::finished`]), and any other end rewrites nothing.
 ///
 /// # Errors
 /// An unsafe or malformed record, or a lock/write/removal error.
@@ -1224,115 +1171,66 @@ pub fn hand(
     )
 )]
 pub fn end(files: &dyn Files, path: &Path, claim: &Claim, how: End, now: u64) -> io::Result<Took> {
-    change(files, path, Some(&claim.asker.build), |files, line| {
+    change(files, path, Some(&claim.asker.build), |files, kept| {
         let build = claim.asker.build.clone();
-        // The attempt the line holds ends: the line says how, or, where the attempt it replaced
-        // still asks (a person's retry over a running ask), that attempt asks on over how this
-        // one ended, as a claim over that end would, so no automatic ask goes beside it and its
-        // end stays its own to write. A release gives back exactly the line it replaced.
-        if let Some(Line::Asking {
-            claim: held,
-            tries,
-            since,
-            finished,
-            prior,
-        }) = line
-            && held == claim
-        {
-            let ended = ending(
-                build,
-                (*tries, *since, *finished),
-                prior.as_deref(),
-                how,
-                now,
-            );
-            let write = match prior.as_deref() {
-                Some(running @ Line::Asking { claim: on, .. })
-                    if how != End::Released
-                        && asker_runs(files, running)
-                        && !planted(Defect::EndDropsRunningAsk) =>
-                {
-                    Write::Line(asking_over(on.clone(), ended.as_ref()))
+        let held = kept.and_then(|kept| {
+            kept.asking
+                .iter()
+                .position(|held| held == claim)
+                .map(|at| (kept, at))
+        });
+        // The attempt the record keeps ends: it goes, and how it ended becomes the end the
+        // others ask over, as a claim over that end would carry it on; a release leaves that end
+        // as it was. An end that is not a release supersedes the attempts that were cut off.
+        if let Some((kept, at)) = held {
+            let newest = at + 1 == kept.asking.len();
+            let mut next = kept.clone();
+            next.asking.remove(at);
+            next.ended = ending(build, next.ended.as_ref(), how, now);
+            if how != End::Released {
+                next.asking.retain(|other| runs(files, other));
+                let dropped = if newest {
+                    planted(Defect::EndDropsRunningAsk)
+                } else {
+                    planted(Defect::StaleEndWrites)
+                };
+                if dropped {
+                    next.asking.clear();
                 }
-                _ => ended.map_or(Write::Remove, Write::Line),
-            };
-            return Ok((Some(write), Took::Line));
+            }
+            return Ok((Some(next), if newest { Took::Line } else { Took::Replaced }));
         }
-        // The attempt the line replaced ends while the line's own goes on (the window's tab,
-        // still asking when a person's retry took the episode over): how it ended takes the
-        // replaced line's place, under the line's own attempt, which carries it on as a claim
-        // over it would. Where the line's own asker is gone too, that end is the line: a cut-off
-        // adds nothing.
-        if let Some(
-            holding @ Line::Asking {
-                claim: holder,
-                finished,
-                prior: Some(replaced),
-                ..
-            },
-        ) = line
-            && let Line::Asking {
-                claim: held,
-                tries,
-                since,
-                finished: theirs,
-                ..
-            } = replaced.as_ref()
-            && held == claim
-        {
-            let ended = ending(build, (*tries, *since, *theirs), None, how, now);
-            let write = if asker_runs(files, holding) && !planted(Defect::StaleEndWrites) {
-                let (tries, since, carried_finish) = carried(ended.as_ref());
-                Write::Line(Line::Asking {
-                    claim: holder.clone(),
-                    tries,
-                    since,
-                    finished: carried_finish.max(*finished),
-                    prior: ended.map(Box::new),
-                })
-            } else {
-                ended.map_or(Write::Remove, Write::Line)
-            };
-            return Ok((Some(write), Took::Replaced));
-        }
-        // An attempt the record holds in neither place (three asked at once, and it the oldest,
-        // given up one deep): how it ended is not the record's to say, but a finish is the
-        // account's whoever holds it: the line, and the line it keeps, say so, and no line
-        // becomes the finish.
+        // An attempt the record no longer keeps: how it ended is not the record's to say, but a
+        // finish is the account's whoever asks now: the end under them says so.
         if how == End::Done {
-            let finish = line.map_or_else(
+            let mut next = kept.cloned().unwrap_or_default();
+            next.ended = Some(next.ended.as_ref().map_or_else(
                 || Line::Done {
                     build: build.clone(),
                     at: now,
                 },
-                |line| line.finished_at(&build, now),
-            );
-            return Ok((Some(Write::Line(finish)), Took::Nowhere));
+                |ended| ended.finished_at(&build, now),
+            ));
+            return Ok((Some(next), Took::Nowhere));
         }
         Ok((None, Took::Nowhere))
     })
 }
 
-/// The line the end `how` at `now` of an attempt asked as `build` writes: its claim carried
-/// `carried`'s unfinished tries in a row, the last ended at its `since`, and the elevation's
-/// finish at its `finished` ([`carried`]), over the line `prior` it replaced (`None` where it
-/// replaced none, or where that one was dropped, kept one deep). `None` for no line.
-fn ending(
-    build: String,
-    (tries, since, finished): (u32, u64, u64),
-    prior: Option<&Line>,
-    how: End,
-    now: u64,
-) -> Option<Line> {
+/// The end the end `how` at `now` of an attempt asked as `build` writes over `under`, the end
+/// the record keeps under its attempts ([`carried`]: the unfinished tries in a row, the last
+/// ended at its `since`, and the elevation's finish). `None` for no end.
+fn ending(build: String, under: Option<&Line>, how: End, now: u64) -> Option<Line> {
+    let (tries, since, finished) = carried(under);
     match how {
         End::Done => Some(Line::Done { build, at: now }),
-        // One more decline in a row where the claim replaced one (a person's own retry, or an
-        // automatic ask once its hold passed); else the first.
+        // One more decline in a row where the attempts went over one (a person's own retry, or
+        // an automatic ask once its hold passed); else the first.
         End::Declined => Some(Line::Declined {
             build,
             at: now,
             finished,
-            declines: match prior {
+            declines: match under {
                 Some(Line::Declined { declines, .. }) => declines.saturating_add(1),
                 _ => 1,
             },
@@ -1353,14 +1251,12 @@ fn ending(
             tries: tries.saturating_add(1),
             finished,
         }),
-        // Exactly what the record held before the claim: a decline, a finish, another asker's
-        // live attempt or an unfinished try's schedule, or nothing. Where that line was dropped
-        // (a person's retry over this claim gave the record back without it, kept one deep),
-        // what the claim carried of it: its unfinished tries' schedule, or its finish.
-        End::Released => match prior {
-            Some(prior) => Some(prior.clone()),
-            None => Line::from_carried(build, tries, since, finished),
-        },
+        End::Released if planted(Defect::ReleaseForgetsDecline) => {
+            Line::from_carried(build, tries, since, finished)
+        }
+        // Exactly the end under it: a decline and its count, a finish, an unfinished try's
+        // schedule, or none.
+        End::Released => under.cloned(),
     }
 }
 
@@ -1647,7 +1543,7 @@ pub fn never_ran(code: i32) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "CltEpisode",
         action = "CutOffReadsDeclined",
-        reason = "The Buggy=1 mutant: a cut-off attempt read as a decline; planted in `asked` \
+        reason = "The Buggy=1 mutant: cut-off attempts read as a decline; planted in `asked` \
                   by the negative control."
     )
 )]
@@ -1683,8 +1579,8 @@ pub fn never_ran(code: i32) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "CltEpisode",
         action = "HandDropsClaim",
-        reason = "The Buggy=1 mutant: a hand of a claim the line keeps refused, the window left \
-                  holding none; planted in `hand` by the negative control."
+        reason = "The Buggy=1 mutant: a hand of a claim a newer attempt went over refused, the \
+                  window left holding none; planted in `hand` by the negative control."
     )
 )]
 #[cfg_attr(
@@ -1692,8 +1588,8 @@ pub fn never_ran(code: i32) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "CltEpisode",
         action = "StaleEndWrites",
-        reason = "The Buggy=1 mutant: an end of the attempt the line replaced that writes over \
-                  the line's own; planted in `end` by the negative control."
+        reason = "The Buggy=1 mutant: an end of an attempt a newer one went over that drops \
+                  the newer ones; planted in `end` by the negative control."
     )
 )]
 #[cfg_attr(
@@ -1701,8 +1597,8 @@ pub fn never_ran(code: i32) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "CltEpisode",
         action = "RetryEndDropsAsk",
-        reason = "The Buggy=1 mutant: a retry's end that drops the running ask it replaced; \
-                  planted in `end` by the negative control."
+        reason = "The Buggy=1 mutant: the newest attempt's end that drops the older ones that \
+                  still ask; planted in `end` by the negative control."
     )
 )]
 #[cfg_attr(
@@ -1721,6 +1617,25 @@ pub fn never_ran(code: i32) -> bool {
         action = "EndForgetsFinish",
         reason = "The Buggy=1 mutant: an unfinished end that forgets the elevation finished; \
                   planted in `end` by the negative control."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "CltEpisode",
+        action = "ThirdDropsOldest",
+        reason = "The Buggy=1 mutant: a claim over two attempts that drops the oldest; planted \
+                  in `Kept::with` by the negative control."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "CltEpisode",
+        action = "ReleaseForgetsDecline",
+        reason = "The Buggy=1 mutant: a release that gives back only the tries and finish of the \
+                  end under it, a decline's count lost; planted in `ending` by the negative \
+                  control."
     )
 )]
 #[cfg_attr(
@@ -1753,35 +1668,28 @@ pub fn never_ran(code: i32) -> bool {
 #[doc(hidden)]
 pub fn clt_episode_environment() {}
 
-/// What a change writes.
-enum Write {
-    /// The record becomes this one line.
-    Line(Line),
-    /// The record goes.
-    Remove,
-}
-
-/// Read the record at `path` under its lock and make the change `decide` returns for its line
-/// (`None` where there is no record), with `decide`'s answer. `build`, the build a written line
-/// names where the change names one, must be nameable ([`nameable`]).
+/// Read the record at `path` under its lock and make the change `decide` returns for what it
+/// keeps (`None` where there is no record): the record becomes what `decide` gives, or goes where
+/// that keeps nothing. With `decide`'s answer. `build`, the build a written line names where the
+/// change names one, must be nameable ([`nameable`]).
 fn change<T>(
     files: &dyn Files,
     path: &Path,
     build: Option<&str>,
-    decide: impl FnOnce(&dyn Files, Option<&Line>) -> io::Result<(Option<Write>, T)>,
+    decide: impl FnOnce(&dyn Files, Option<&Kept>) -> io::Result<(Option<Kept>, T)>,
 ) -> io::Result<T> {
     if build.is_some_and(|build| !nameable(build)) {
         return Err(unnameable());
     }
     let _held = files.lock(path)?;
-    let line = match files.read(path, BYTES)? {
+    let kept = match files.read(path, BYTES)? {
         None => None,
         Some(text) => Some(state(&text).ok_or_else(malformed)?),
     };
-    let (write, answer) = decide(files, line.as_ref())?;
-    match write {
-        Some(Write::Line(line)) => files.write(path, &line.text())?,
-        Some(Write::Remove) => files.remove(path)?,
+    let (write, answer) = decide(files, kept.as_ref())?;
+    match write.as_ref().map(Kept::text) {
+        Some(Some(text)) => files.write(path, &text)?,
+        Some(None) => files.remove(path)?,
         None => {}
     }
     Ok(answer)

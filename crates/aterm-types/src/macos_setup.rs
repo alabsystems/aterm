@@ -525,7 +525,7 @@ impl Standing {
 }
 
 /// What can end a failure (design §3.6), decided where the failure is found and carried to
-/// System State's page, its menu line, the tab's diamond and the setup run's retry loop alike,
+/// System State's page, its signal line, the tab's diamond and the setup run's retry loop alike,
 /// so none of them says a step waits that only a person can finish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FailureKind {

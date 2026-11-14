@@ -58,21 +58,6 @@ fn a_check_regardless_of_uid_still_checks_code_and_the_floor_keeps_its_uid() {
         Identity::same_uid().admits_code_at_strictly(Path::new("/bin/ls")),
         Err(CheckError::Unchecked(_))
     ));
-    assert_eq!(sec::static_validity(0), Ok(()));
-    for status in [-67062, -67061, -67050] {
-        assert!(
-            matches!(sec::static_validity(status), Err(CheckError::Refused(_))),
-            "a definite code refusal: {status}"
-        );
-    }
-    for status in [
-        -67060, -67068, -67048, -67032, -67033, -67025, -67006, -67056, -67054, -67045, -1,
-    ] {
-        assert!(
-            matches!(sec::static_validity(status), Err(CheckError::Unchecked(_))),
-            "an operational, incomplete or unknown result is not a refusal: {status}"
-        );
-    }
     assert!(matches!(
         CheckError::from(GateRefusal::Unanswered("silent".into())),
         CheckError::Unanswered(_)
@@ -83,32 +68,7 @@ fn a_check_regardless_of_uid_still_checks_code_and_the_floor_keeps_its_uid() {
     ));
 }
 
-/// A running guest's status is refused only where it is a definite refusal, as a static
-/// check's is, or the guest's validity is gone for good; an operational failure is unchecked.
-#[test]
-fn a_guest_status_is_refused_only_where_its_code_was_judged() {
-    assert_eq!(sec::guest_validity(0), Ok(()));
-    for status in [-67062, -67061, -67050, -67063, -67034] {
-        assert!(
-            matches!(sec::guest_validity(status), Err(CheckError::Refused(_))),
-            "a definite refusal of a running guest: {status}"
-        );
-    }
-    for status in [
-        -67060, -67068, -67048, -67032, -67033, -67056, -67054, -67045, -1,
-    ] {
-        assert!(
-            matches!(sec::guest_validity(status), Err(CheckError::Unchecked(_))),
-            "an operational or unknown result is not a refusal: {status}"
-        );
-    }
-    for status in [-67063, -67034] {
-        assert!(
-            matches!(sec::static_validity(status), Err(CheckError::Unchecked(_))),
-            "only a running guest's validity is gone for good: {status}"
-        );
-    }
-}
+// Native status classification controls live beside the shared implementation.
 
 #[test]
 fn a_held_token_is_checked_as_the_process_it_named() {

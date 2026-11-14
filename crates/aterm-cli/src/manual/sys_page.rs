@@ -299,7 +299,8 @@ HEADER (stderr)
   age_ms=      how old that reading was when the reply was sent
   window_ms=   the interval its rates cover
   next=        the cursor, <hex epoch>.<seq>, that since= takes next time
-  state=stale    no new reading came within the wait: the last reading's values, with its age
+  state=stale    no new reading came within the wait: the last reading's values, with its age;
+                 the first line then says when they were read and how long ago
   state=warming  the first reading of a cold instance: rates are not known yet
   delta=1      a since= reply
 
@@ -622,6 +623,10 @@ const DISK_BODY: &str = r#"  aterm ctl @self sys disk [scope=pane|tab|window|req
   while; nothing waits on a walk (`await sys` has no walk term), so read again until
   state=complete. A folder no walk measures (protected, another user's, remote, removable, too
   broad) reads unavailable(<why>), never zero.
+  A tab's roots are the repository its front program works in with that repository's build
+  output, and on macOS, for each pane, the newest 64 workspaces its targo builds compiled,
+  however each was reached (cd, --manifest-path, -C), with their build output; a cargo call
+  adds none.
 
 LINES
   space    the volume: used · free · total (decimal units)
@@ -644,10 +649,25 @@ LINES
            purgeable_bytes=; free_bytes= is what this user may write, reserved_bytes= the free
            blocks kept from it (0 on APFS); level= is `status disk=`'s word; slope_bps= and
            purgeable_bytes= (and JSON's eta_full_s) read unavailable(not_sampled) in this build
+  budget   cap_bytes= cap_from=aterm.toml|share kept_bytes= target_bytes= rebuildable_bytes=
+           over_bytes=|under_bytes= walk=complete|partial sized_s=: the home volume's
+           rebuildable budget. cap_bytes= is `[disk] cap_used_gib` in aterm.toml, or 80% of the
+           volume (share) where that is smaller or unwritten; rebuildable_bytes= is aterm's
+           build caches and the build directories a search finds; kept_bytes= is the rest of
+           the used bytes; target_bytes= is the cap less the kept bytes, and one of over_bytes=
+           and under_bytes= says how far the rebuildable bytes are from it. The window sizes it
+           on a thread of its own, at most once an hour across its processes, while level= is
+           ok (sized_s= ago; a new process prints the last sizing). walk=partial: the sizing
+           was cut short, so rebuildable_bytes=, target_bytes= and over_bytes= are floors and
+           kept_bytes= a ceiling. It moves no level: a volume over its budget still reads ok.
+           unavailable(warming) before the first sizing; unavailable(not_sampled) on another
+           volume or in a process that is not the account's own watch;
+           unavailable(not_enabled:disk.cap_used_gib) where cap_used_gib is 0, is not a whole
+           number, or aterm.toml cannot be read
   summary  folders past 100,000 entries, the roots no walk measures, and whether a walk is
            still under way (sizes are then lower bounds)
   withheld=<n> counts the writer and program rows outside this tab, which are the owner's.
-  --json names growth_bytes_per_s, walked_age_s and write_bytes_per_s in full.
+  --json names growth_bytes_per_s, walked_age_s, sized_age_s and write_bytes_per_s in full.
   To wait for space, `aterm help sys wait` (VOLUME).
 "#;
 

@@ -465,7 +465,7 @@ impl App {
         let holds = ctx.fabric.holds();
         let hold = holds.word();
         let stall = stall.map(|(fact, program, after)| {
-            let row = crate::input_stall::menu_row(
+            let row = crate::input_stall::stall_row(
                 &fact,
                 program.as_deref(),
                 &after,
@@ -1125,7 +1125,9 @@ impl App {
         }
     }
 
-    fn done_unseen(&self, session: u64) -> bool {
+    /// Whether `session` holds a done, a turn end or an end nobody has looked at: what its tab's
+    /// `•` says behind another tab, and `status done_unseen=` in a development build.
+    pub(crate) fn done_unseen(&self, session: u64) -> bool {
         self.task_done
             .get(&session)
             .is_some_and(|rev| self.done_seen.get(&session) != Some(rev))
@@ -1174,6 +1176,7 @@ impl App {
         {
             match asked {
                 PersonAsked::Look(window) => self.person_look(window.map(WindowId)),
+                PersonAsked::Open => self.person_menubar_open(),
                 PersonAsked::Press(at) => {
                     let proxy = self.proxy.clone();
                     self.person_menubar_press(&at, &mut |wake| {
@@ -1191,7 +1194,10 @@ impl App {
         #[cfg(not(any(test, debug_assertions)))]
         {
             match asked {
-                PersonAsked::Look(_) | PersonAsked::Press(_) | PersonAsked::Click => {
+                PersonAsked::Look(_)
+                | PersonAsked::Open
+                | PersonAsked::Press(_)
+                | PersonAsked::Click => {
                     Err(crate::control::control_media::PERSON_NEEDS_DEBUG.to_string())
                 }
             }
@@ -1785,7 +1791,6 @@ pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> 
     lines.push(aterm_agent::supervise::mode_words::report_words(
         ask.program.product(),
         ask.tail,
-        false,
     ));
     lines
 }

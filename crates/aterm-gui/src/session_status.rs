@@ -5624,7 +5624,11 @@ impl crate::App {
                     .task_face_at(end.face.task_face());
                 (end, crate::app_tabs::end_wall_ms(end, at))
             });
-        end_fields(end)
+        format!(
+            "{}{}",
+            end_fields(end),
+            unseen_field(self.done_unseen(session))
+        )
     }
 }
 
@@ -5735,6 +5739,15 @@ pub(crate) fn end_fields(end: Option<(crate::harness_glass::EndGlass, u64)>) -> 
             )
         }
     }
+}
+
+/// Formats the development-build `done_unseen` field for `status` output: `1` while the session
+/// holds a done, a turn end or an end nobody has looked at, `0` otherwise. It is the rule the
+/// tab's `•` reads (`App::done_unseen`), said of a tab in front too, where the strip draws no
+/// `•`, so a reader need not move a tab to ask.
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn unseen_field(unseen: bool) -> String {
+    format!(" done_unseen={}", u8::from(unseen))
 }
 
 #[cfg(all(test, windows))]

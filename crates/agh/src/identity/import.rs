@@ -22,6 +22,7 @@ use crate::identity::EnvSource;
 use crate::identity::provision::{
     AddFrom, AddOptions, AddRequest, Added, add_with_metered, refuse_loose_stdin, refuse_off_unix,
 };
+use crate::policy::Tier;
 
 /// The absolute paths gh is looked for at, in order.
 pub const GH_ABSOLUTE: [&str; 3] = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"];
@@ -51,7 +52,7 @@ pub struct ImportRequest {
 ///
 /// # Errors
 ///
-/// - CouldNotRun, next `agh auth add NAME --file PATH --tier TIER`, when no gh exists at
+/// - CouldNotRun, next the tier's vault token (`file_next`), when no gh exists at
 ///   `GH_ABSOLUTE`, and the child's could_not_run with that next when gh cannot start or
 ///   does not finish within `GH_BUDGET`;
 /// - Unauthenticated, next the same, when gh exits non-zero. Its stderr is never quoted,
@@ -153,13 +154,16 @@ pub(crate) fn import_from_gh_metered(
     add_with_metered(gh, dirs, &add, options, &mut stdin)
 }
 
-/// The `auth add --file` a person or an agent runs where gh cannot answer.
+/// The step where gh cannot answer: the credential's one path, the vault's token of the tier.
 fn file_next(add: &AddRequest) -> String {
-    format!(
-        "agh auth add {} --file PATH --tier {}",
-        add.name,
-        add.tier.slug()
-    )
+    match add.tier {
+        Tier::Dev => super::vault::Slot::Dev.sync_step(),
+        Tier::Release => super::vault::Slot::Release.sync_step(),
+        Tier::External => format!(
+            "aterm secrets need entry:{} asks the lab's Macs for it",
+            add.name
+        ),
+    }
 }
 
 /// The gh to run: under a simulated `Fx`, `GH_ABSOLUTE[0]`, so a test's scripted child

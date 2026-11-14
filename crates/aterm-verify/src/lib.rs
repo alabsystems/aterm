@@ -81,7 +81,7 @@ pub mod plan;
 pub mod provision;
 pub mod release_input;
 pub mod release_input_facts;
-mod released_shim;
+pub mod released_shim;
 pub mod report;
 mod resource_waits;
 mod run_log;
@@ -105,6 +105,7 @@ pub mod test_index;
 pub mod test_plan;
 mod test_progress;
 mod test_shards;
+mod test_share;
 mod test_workers;
 pub mod testrun;
 pub mod unitgraph;
@@ -151,6 +152,9 @@ pub mod exit {
     pub const USAGE: i32 = 2;
     /// Could not run.
     pub const COULD_NOT_RUN: i32 = 3;
+    /// `verify land` only: merging main conflicts in a path no mechanical rule resolves.
+    /// Nothing was pushed, and the merge is left for the person.
+    pub const CONFLICT: i32 = 4;
 }
 
 /// Select derived verification targets without moving the native compiler cache.
@@ -3576,6 +3580,48 @@ pub fn head_commit(root: &Path, path_env: &OsStr) -> Option<String> {
     (out.status.success() && !head.is_empty()).then_some(head)
 }
 
+/// A round of `verify land` as `parsed` names it ([`cli::JUDGED`], [`cli::SHARED`]): the judged
+/// commit and the shared paths, read from the file beside `cwd` that holds each ended by a NUL.
+/// `None` for any other run.
+///
+/// # Errors
+/// The file could not be read; the usage line to stop with.
+fn round_of(parsed: &cli::Args, cwd: &Path) -> Result<Option<(String, Vec<String>)>, String> {
+    let (Some(judged), Some(path)) = (parsed.judged.as_deref(), parsed.shared.as_deref()) else {
+        return Ok(None);
+    };
+    let text = aterm_uds::atomic_file::read_regular_text(&cwd.join(path), 16 * 1024 * 1024)
+        .map_err(|why| format!("verify: {} {}: {why}", cli::SHARED, path.display()))?;
+    Ok(Some((
+        judged.to_owned(),
+        text.split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )))
+}
+
+/// The crates a run that narrows with no `-p` judges: the change cone since `base`, or, for a
+/// round ([`round_of`]), what is left of that cone to judge beside the judgment kept for the
+/// round's judged commit ([`changed::resolve_round`]), no shared path's owner judged alone
+/// where the merge was made by hand ([`cli::BY_HAND`]). The scope keeps `base` either way, so
+/// each check that reads the change (fmt, census, export-scan, released-shim) reads all of it.
+fn cone_selection(
+    parsed: &cli::Args,
+    round: Option<(String, Vec<String>)>,
+    root: &Path,
+    tools: &Toolchain,
+    path_env: &OsStr,
+    base: &str,
+) -> changed::Selection {
+    match round {
+        Some((judged, paths)) if tools.have_targo() => {
+            changed::resolve_round(root, tools, path_env, base, &judged, paths, !parsed.by_hand)
+        }
+        Some(_) | None => changed::resolve(root, tools, path_env, base),
+    }
+}
+
 /// The checks a parsed invocation runs after selection-sensitive pulls. This is the one planner
 /// used by [`run_cli`]: tests exercise it directly so a check cannot be implemented correctly but
 /// left disconnected from the command that lands changes.
@@ -3725,6 +3771,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         Some(Ok(passed)) => Some(passed),
         None => None,
     };
+    let round = match round_of(&parsed, cwd) {
+        Ok(round) => round,
+        Err(why) => return stop(exit::USAGE, why),
+    };
     let events = match parsed
         .events
         .as_deref()
@@ -3840,7 +3890,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             .base
             .clone()
             .unwrap_or_else(|| changed::default_base(&root, &path_env));
-        let sel = changed::resolve(&root, &tools, &path_env, &base);
+        let sel = cone_selection(&parsed, round, &root, &tools, &path_env, &base);
         let (scope, said) = changed::cone(&base, &sel);
         (scope, Some(said))
     };

@@ -1645,29 +1645,11 @@ impl Drop for VendorScratch {
 
 fn read_capped(path: &Path, cap: u64, url: &str) -> Result<Vec<u8>, HttpError> {
     use std::io::Read;
-    #[cfg(unix)]
-    let open = || {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-    };
-    #[cfg(not(unix))]
-    let open = || std::fs::File::open(path);
-    let file = match open() {
-        Ok(file) => file,
+    let (file, meta) = match aterm_uds::regular_file::open(path) {
+        Ok(opened) => opened,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(HttpError::Transport(format!("read vendor body: {e}"))),
     };
-    let meta = file
-        .metadata()
-        .map_err(|e| HttpError::Transport(format!("read vendor body: {e}")))?;
-    if !meta.is_file() {
-        return Err(HttpError::Transport(
-            "read vendor body: not a regular file".to_string(),
-        ));
-    }
     if meta.len() > cap {
         return Err(HttpError::VendorRefused(format!(
             "vendor document {url} exceeds its {cap}-byte cap"

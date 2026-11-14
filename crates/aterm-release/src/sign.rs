@@ -29,9 +29,6 @@ const STAPLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// signing_key = "<base64 PKCS#8 Ed25519 private key>"
 /// # Tier APPLE only (ignored while pins::APPLE_TEAM_ID is empty):
 /// notary_profile = "notary"  # set by ship provision from the vault's release-notary entry (aterm secrets need notary)
-/// # ...or, for a machine with no usable keychain, the headless fallback:
-/// # notary_apple_id = "<Apple ID>"
-/// # notary_password = "<app-specific password>"
 /// # Machine-roster tier only (ignored while pins::PAPER_MASTER_PUBKEYS is empty):
 /// machine_roster = "<path to the master-signed aterm-machines.toml; a leading ~/ is HOME>"
 /// machine_id     = "<this machine's id, e.g. the one `join --id` was given>"
@@ -288,33 +285,10 @@ fn credentials_signing_key(text: &str) -> Result<&str, String> {
         .ok_or_else(|| "no `signing_key` in the credentials profile".to_string())
 }
 
-/// Assemble [`NotaryAuth`] from the profile's optional Apple keys.
+/// The profile's notarytool keychain profile: the one notary source, which `ship provision`
+/// sets from the vault's release-notary entry. No other key of the profile is a credential.
 pub fn credentials_notary_auth(text: &str) -> Result<Option<NotaryAuth>, String> {
-    let profile = credentials_value(text, "notary_profile")?;
-    let apple_id = credentials_value(text, "notary_apple_id")?;
-    let password = credentials_value(text, "notary_password")?;
-    match (profile, apple_id, password) {
-        (None, None, None) => Ok(None),
-        (Some(name), None, None) => Ok(Some(NotaryAuth::KeychainProfile(name.to_string()))),
-        (None, Some(apple_id), Some(password)) => Ok(Some(NotaryAuth::AppleId {
-            apple_id: apple_id.to_string(),
-            team_id: String::new(),
-            password: password.to_string(),
-        })),
-        (Some(_), _, _) => Err(
-            "names both notary_profile and notary_apple_id/notary_password — pick one, \
-             so the file answers which credential authenticated the submission"
-                .to_string(),
-        ),
-        (None, Some(_), None) => Err(
-            "names notary_apple_id without notary_password — the headless fallback needs both"
-                .to_string(),
-        ),
-        (None, None, Some(_)) => Err(
-            "names notary_password without notary_apple_id — the headless fallback needs both"
-                .to_string(),
-        ),
-    }
+    Ok(credentials_value(text, "notary_profile")?.map(NotaryAuth::keychain_profile))
 }
 
 /// The pure refusal rule (fixture-tested).
@@ -615,7 +589,7 @@ fn resolve_apple_tier_with(
     let identity = locate_identity(team_id, credentials.signing_identity_sha1(), home, run)?;
     Ok(AppleTier::Active {
         identity,
-        auth: auth.clone().with_team_id(team_id),
+        auth: auth.clone(),
     })
 }
 
@@ -746,85 +720,31 @@ fn dmg_sign_args(dmg: &Path, id: &DevIdIdentity) -> Vec<std::ffi::OsString> {
     args
 }
 
-/// Notarytool credentials.
-#[derive(Clone)]
-pub enum NotaryAuth {
-    KeychainProfile(String),
-    AppleId {
-        apple_id: String,
-        /// Always `pins::APPLE_TEAM_ID`, stamped in by [`NotaryAuth::with_team_id`].
-        team_id: String,
-        password: String,
-    },
-}
-
-impl std::fmt::Debug for NotaryAuth {
-    /// Hand-written so the `AppleId` password never reaches a transcript, journal or panic
-    /// message.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NotaryAuth::KeychainProfile(name) => {
-                f.debug_tuple("KeychainProfile").field(name).finish()
-            }
-            NotaryAuth::AppleId {
-                apple_id, team_id, ..
-            } => f
-                .debug_struct("AppleId")
-                .field("apple_id", apple_id)
-                .field("team_id", team_id)
-                .field("password", &"<redacted>")
-                .finish(),
-        }
-    }
+/// Notarytool's credential: the name of the keychain profile that holds it, never the secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotaryAuth {
+    profile: String,
 }
 
 impl NotaryAuth {
-    /// Which credential spelling is configured.
+    /// The keychain profile `name`.
     #[must_use]
-    pub fn kind(&self) -> String {
-        match self {
-            NotaryAuth::KeychainProfile(name) => format!("keychain profile {name:?}"),
-            NotaryAuth::AppleId { apple_id, .. } => {
-                format!("Apple ID {apple_id} + app-specific password")
-            }
+    pub fn keychain_profile(name: impl Into<String>) -> Self {
+        Self {
+            profile: name.into(),
         }
     }
 
-    /// Stamp the committed anchor into the variant that needs one.
+    /// Which credential is configured.
     #[must_use]
-    pub fn with_team_id(self, team_id: &str) -> Self {
-        match self {
-            NotaryAuth::KeychainProfile(name) => NotaryAuth::KeychainProfile(name),
-            NotaryAuth::AppleId {
-                apple_id, password, ..
-            } => NotaryAuth::AppleId {
-                apple_id,
-                team_id: team_id.to_string(),
-                password,
-            },
-        }
+    pub fn kind(&self) -> String {
+        format!("keychain profile {:?}", self.profile)
     }
 
     /// The notarytool argument list this credential expands to.
     #[must_use]
     pub fn args(&self) -> Vec<String> {
-        match self {
-            NotaryAuth::KeychainProfile(p) => {
-                vec!["--keychain-profile".into(), p.clone()]
-            }
-            NotaryAuth::AppleId {
-                apple_id,
-                team_id,
-                password,
-            } => vec![
-                "--apple-id".into(),
-                apple_id.clone(),
-                "--team-id".into(),
-                team_id.clone(),
-                "--password".into(),
-                password.clone(),
-            ],
-        }
+        vec!["--keychain-profile".into(), self.profile.clone()]
     }
 }
 

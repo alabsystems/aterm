@@ -15,6 +15,37 @@ fn every_free_token(pool: &Jobserver) -> Vec<Token<'_>> {
 }
 
 #[test]
+fn an_interrupted_read_does_not_report_an_empty_fifo() {
+    struct InterruptedOnce<R>(R, bool);
+    impl<R: Read> Read for InterruptedOnce<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if std::mem::replace(&mut self.1, false) {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                self.0.read(buf)
+            }
+        }
+    }
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = Jobserver::new(&dir.path().join("jobs"), 1).unwrap();
+    let byte = read_token(&mut InterruptedOnce(&pool.file, true)).unwrap();
+    assert_eq!(byte, Some(b'+'));
+    assert!(pool.try_acquire().unwrap().is_none());
+    assert_eq!(
+        read_token(&mut InterruptedOnce(&pool.file, true)).unwrap(),
+        None
+    );
+    pool.give(byte.unwrap());
+    assert_eq!(every_free_token(&pool).len(), 1);
+    assert_eq!(
+        read_token(&mut InterruptedOnce(io::empty(), true))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+}
+
+#[test]
 fn branches_and_their_workers_share_exactly_the_grant() {
     use std::os::unix::fs::OpenOptionsExt as _;
     let dir = aterm_tempfile::tempdir().unwrap();

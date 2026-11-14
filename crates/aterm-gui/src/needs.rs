@@ -8,7 +8,7 @@
 use aterm_messages::presence::WallAnswer;
 use aterm_types::needs::{AttentionKind, HoldWord, NeedWord, WaitWord};
 
-/// The published input stall, in the server attention's own words (`input_stall::menu_row`).
+/// The published input stall, in the server attention's own words (`input_stall::stall_row`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StallFact {
     /// The stall's words, its remedy at their end.
@@ -77,7 +77,7 @@ pub(crate) enum GrokSignin {
 }
 
 /// The one need every Grok session on a sign-in wall shares while this machine is signed out
-/// and no sign-in runs ([`machine_wide`]): its remedy is the sign-in that session's grok already
+/// and no sign-in runs: its remedy is the sign-in that session's grok already
 /// runs, whose code is on its screen and whose page it already opened, never a second device
 /// flow with another code (the window starts no sign-in of its own).
 pub(crate) const GROK_SIGNIN_WHAT: &str =
@@ -92,13 +92,6 @@ pub(crate) const GROK_SIGNIN_READING: &str = "reading where Grok Build's sign-in
 /// A Grok session's sign-in wall once this machine is signed in.
 pub(crate) const GROK_SIGNED_IN_WHAT: &str =
     "Grok Build is signed in on this machine: restart grok here";
-
-/// Whether `need` is this machine's rather than its session's: every session it stands in
-/// shares it, so a surface listing the machine's needs lists it once.
-#[must_use]
-pub(crate) fn machine_wide(need: &Need) -> bool {
-    need.word == NeedWord::Login && need.what == GROK_SIGNIN_WHAT
-}
 
 /// The program's own report that it is blocked (OSC 7501 `blocked`, codex's claim), kept apart
 /// from [`AgentFact`]: a claim never moves the agent verdict ([`program_need`]).
@@ -170,8 +163,7 @@ impl NeedFacts {
 }
 
 /// THE NEEDS YOU SETS EVERY READER READS FOR `ctx`'s SESSION (the facts' [`NeedFacts::told`],
-/// so the menu bar's rows one level in, the hover's lines and [`HarnessAsk::others`], and `status
-/// needs_told=`), told by whoever drives it: under a proven self-claim, the sets that claim told
+/// so the hover's lines and [`HarnessAsk::others`], and `status needs_told=`), told by whoever drives it: under a proven self-claim, the sets that claim told
 /// of its own entry while it stands (`meta set harness_needs`,
 /// [`crate::session_timeline::SessionMeta::self_needs`]), else the sets aterm's own loop told the
 /// window's host ([`crate::session_timeline::SessionTimeline::harness_needs`]). Each leaf lock is
@@ -1053,23 +1045,6 @@ pub(crate) const CODEX_APPROVAL_WORDS: &str = "approval (codex's own report)";
 pub(crate) const CODEX_QUESTION_WORDS: &str = "question (codex's own report)";
 /// [`CODEX_APPROVAL_WORDS`] for a sign-in.
 pub(crate) const CODEX_SIGN_IN_WORDS: &str = "sign-in (codex's own report)";
-
-/// The words for a need another aterm's survey row publishes as the program's own report
-/// (`needs_by=program`): the program-claim need's words for its need word and the row's
-/// `agent=`, the survey's word for the report (`wall:auth` a sign-in); `None` for a need of
-/// another word.
-pub(crate) fn claim_words_of_row(
-    word: aterm_types::needs::NeedWord,
-    agent: Option<&str>,
-) -> Option<&'static str> {
-    use aterm_types::needs::NeedWord;
-    match word {
-        NeedWord::Question => Some(CODEX_QUESTION_WORDS),
-        NeedWord::Approval if agent == Some("wall:auth") => Some(CODEX_SIGN_IN_WORDS),
-        NeedWord::Approval => Some(CODEX_APPROVAL_WORDS),
-        _ => None,
-    }
-}
 
 /// THE PROGRAM-CLAIM NEED: codex says it is blocked (OSC 7501) where its reader names no state
 /// (`agent=unknown`) and no claim speaks for the tab. It is codex's claim, so it never moves

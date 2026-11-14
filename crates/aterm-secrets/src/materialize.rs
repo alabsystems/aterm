@@ -84,7 +84,7 @@ fn written_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
         Some(rel) => rel
             .split('/')
             .fold(home.to_path_buf(), |path, component| path.join(component)),
-        None => home.join(".secrets").join(name),
+        None => aterm_types::vault_entry::plain_entry_path(home, name),
     })
 }
 

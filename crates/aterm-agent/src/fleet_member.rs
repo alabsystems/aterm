@@ -20,6 +20,7 @@ use aterm_net::fleet_member::{
     JoinCode, Keyring, Leaving, Leveling, NODE_FILE, NODE_KEY_FILE, PEERS_FILE, Peer, Recorded,
     Registration, Unreached, Unwritten, Via, automatic_host, target_of,
 };
+use aterm_types::update_standing::UpdateFact;
 use aterm_uds::atomic_file::{ConfigFile, EditLanded};
 use aterm_uds::private_file::ANOTHER_LINK;
 
@@ -114,6 +115,19 @@ USAGE:
                          chosen for one fleet: leave, and an init, a join or
                          a sync that writes another fleet's key, put it back
                          to Read Only
+  aterm fleet activity [--json] [--since <span>]
+                         the agent requests that crossed between this Mac
+                         and the others of its fleet over the last hour (or
+                         --since 90s|30m|6h|2d, a week at most): one line
+                         that counts the Macs each way and what a fleet
+                         access blocked, a line for each Mac and way, then
+                         each request, newest first: when, which way, the
+                         Mac, read|message|typed|hold|close|new-job, whether
+                         the asked Mac's fleet access admitted or blocked
+                         it, and the session that asked. It is what a
+                         session asked for; aterm's own polls are not in
+                         it. A local read of this Mac's record: it holds no
+                         message text, prompt or command line
   aterm fleet publish    an ALab vault admin on the Mac that minted the fleet's
                          code publishes it to every current and future ALab
                          member
@@ -184,7 +198,11 @@ is the version a member last registered: its fleet listener's (its node job's,
 when one runs, else its window's), which each heartbeat round records, or for
 up to a round after a `join` or `sync` there, that command's own; WINDOW
 VERSION is that of the window that answered the check (none: the node job
-answered with no window open; -: no answer). See `aterm help fleet`.
+answered with no window open; -: no answer); UPDATE is where the answering
+instance's updater stands, as `aterm update status` decides it there (-: no
+answer, or an aterm that says nothing of it), and each peer whose standing is
+not `current` with automatic checks on gets an `Updater of` line after the
+table. See `aterm help fleet`.
 ";
 
 const PEER_CHECK_WITHIN: Duration = aterm_ctl::FLEET_WITHIN;
@@ -5794,9 +5812,21 @@ fn format_peer_listing(
         .collect();
     let wide = heads.iter().map(|head| head.len()).fold(8, usize::max);
     out.push_str(&format!(
-        "  {:<wide$}  {:<11}  {:<23}  {:<21}  {:<15}  {:<15}  {:<7}  {:<8}  {:<37}  CHECK\n",
-        "NODE", "VIA", "HOST", "ADDRESS", "NODE VERSION", "WINDOW VERSION", "JOINED", "KEY", "NAME"
+        "  {:<wide$}  {:<11}  {:<23}  {:<21}  {:<15}  {:<15}  {:<14}  {:<7}  {:<8}  {:<37}  CHECK\n",
+        "NODE",
+        "VIA",
+        "HOST",
+        "ADDRESS",
+        "NODE VERSION",
+        "WINDOW VERSION",
+        "UPDATE",
+        "JOINED",
+        "KEY",
+        "NAME"
     ));
+    // Each answering peer's updater that is not routine, by its head: one line each after the
+    // table (`updater_words`).
+    let mut updaters = Vec::new();
     for (row, head) in listing.rows.iter().zip(&heads) {
         let peer = &row.peer;
         let check = match &row.check {
@@ -5811,6 +5841,9 @@ fn format_peer_listing(
             }
             Some(Ok(checked)) => {
                 reached += 1;
+                if let Some(update) = checked.update.as_ref().filter(|update| !update.routine()) {
+                    updaters.push(((*head).to_owned(), update.clone()));
+                }
                 match (&peer.node, &checked.node) {
                     (None, Some(node)) => format!(
                         "ok, serves {} (node {}{})",
@@ -5850,7 +5883,7 @@ fn format_peer_listing(
             }
         };
         out.push_str(&format!(
-            "  {head:<wide$}  {:<11}  {:<23}  {:<21}  {:<15}  {:<15}  {:<7}  {:<8}  {:<37}  {check}\n",
+            "  {head:<wide$}  {:<11}  {:<23}  {:<21}  {:<15}  {:<15}  {:<14}  {:<7}  {:<8}  {:<37}  {check}\n",
             if row.configured.is_some() {
                 "config"
             } else if peer.is_dormant_at(now_ms) {
@@ -5862,6 +5895,7 @@ fn format_peer_listing(
             peer.target(),
             peer.version.as_deref().unwrap_or("-"),
             window_version(row.check.as_ref()),
+            update_word(row.check.as_ref()),
             peer.seen_ms
                 .map_or_else(|| "-".to_owned(), |ms| age(now_ms.saturating_sub(ms))),
             match (&peer.node, peer.key) {
@@ -5888,6 +5922,7 @@ fn format_peer_listing(
         now_ms,
         aterm_uds::zone::local_offset_at,
     ));
+    out.push_str(&updater_words(&updaters));
     let why_away = (reached == 0 && unreached > 0 && no_route_here == 0)
         .then(|| place.and_then(|place| aterm_netplace::words::why_away(place, words)))
         .flatten();
@@ -5970,6 +6005,38 @@ fn window_version(check: Option<&Result<member::Checked, Unreached>>) -> &str {
         },
         Some(Err(_)) | None => "-",
     }
+}
+
+/// A `peers` row's UPDATE, from its check `check`: the standing word of the answering instance's
+/// updater ([`member::Checked::update`]), `-` with no answer or none said (an aterm older than the
+/// words, or a word outside their grammar).
+fn update_word(check: Option<&Result<member::Checked, Unreached>>) -> &str {
+    match check {
+        Some(Ok(member::Checked {
+            update: Some(update),
+            ..
+        })) => update.standing.word(),
+        Some(_) | None => "-",
+    }
+}
+
+/// One line per answering peer whose updater is not routine (`updaters`: each by its head, its
+/// standing not `current` or its automatic checks off), after the table and in its order, each on
+/// the clock of the peer that said it ([`UpdateFact::line`]), never this Mac's, which may be hours
+/// off a peer's: `Updater of 1a2b3c4d: 0.199.0 is held for 3 h more (crash-loop, try 2) · checked
+/// 10 min ago.` It starts with words no row starts with, so a reader of the table's rows passes it
+/// by.
+fn updater_words(updaters: &[(String, UpdateFact)]) -> String {
+    updaters
+        .iter()
+        .map(|(who, update)| {
+            format!(
+                "Updater of {}: {}.\n",
+                aterm_codec::tty::one_line(who, 64),
+                update.line()
+            )
+        })
+        .collect()
 }
 
 /// Whether `why` found no route to an address on the network this Mac is on (`place`'s route,
@@ -8078,15 +8145,11 @@ fn registry_target_until(
             continue;
         }
         let uuid = aterm_codec::hex::encode_lower(seat.binding.machine());
-        let mac = facts
-            .and_then(|facts| facts.rows.get(&uuid))
-            .and_then(|row| row.value.get("mac"))
-            .and_then(aterm_json::Value::as_str);
         claims.push(LabelSeat {
             actor: *actor,
             node: member::node_principal(key)[2..].to_owned(),
             name: seat.name.clone(),
-            mac: mac.map(str::to_owned),
+            mac: seat_machine(facts, &uuid),
             transport: own
                 .as_ref()
                 .filter(|identity| identity.key() == key)
@@ -8200,8 +8263,19 @@ struct LabelSeat {
     actor: aterm_secrets::membership_log::MemberId,
     node: String,
     name: String,
+    /// The machine the seat's enrollment is ([`seat_machine`]).
     mac: Option<String>,
     transport: String,
+}
+
+/// The machine the enrollment `uuid` is, as its facts row in `facts` says: the one its own
+/// `merged_into` names (an acknowledged owner merge, or the fold of a successor's birth), else
+/// its binding (`aterm_db::alab::registry::bound_machine`), as the lab's own view reads it.
+fn seat_machine(facts: Option<&aterm_db::typed::owned::OwnedRead>, uuid: &str) -> Option<String> {
+    facts
+        .and_then(|facts| facts.rows.get(uuid))
+        .and_then(|row| aterm_db::alab::registry::bound_machine(&row.value))
+        .map(str::to_owned)
 }
 
 fn resolve_registry_label(
@@ -8828,6 +8902,7 @@ fn survey_all_facts_in(
             host: None,
             within,
             holder: None,
+            by: None,
         },
         "survey facts",
     )
@@ -8847,10 +8922,27 @@ pub fn drive_fleet_from_shell(
     drive_fleet(host, HERE.get_or_init(aterm_ctl::requester_here), within)
 }
 
+/// [`drive_fleet`] naming no requester: the dial of a wait's later legs
+/// (`aterm_ctl::DriveLink::unnamed`), which are aterm's re-asks of a request the driven Mac
+/// already counted.
+/// # Errors
+/// As [`drive_fleet`].
+fn drive_fleet_unnamed(
+    host: &str,
+    within: Duration,
+) -> Result<aterm_ctl::DriveLink, aterm_ctl::DriveRefused> {
+    drive_fleet(
+        host,
+        &aterm_types::control_verbs::Requester::default(),
+        within,
+    )
+}
+
 /// A drive of the peer `host` names, for `requester`, whom the drive's first line names
 /// (ATERM-KI-1109-3). A process aterm runs of its own (a window, the node job, a harness's
-/// service) passes [`aterm_types::control_verbs::Requester::default`]: it names no requester, and
-/// never reads one from its own environment.
+/// service) passes [`aterm_types::control_verbs::Requester::default`] for its own traffic: it
+/// names no requester, and never reads one from its own environment. A window that carries a
+/// session's mail names that session, which it holds itself.
 /// # Errors
 /// This machine is in no fleet or holds no node key, the book cannot be read, `host` names no
 /// node the book records (or more than one), the drive is refused, or its first line could not
@@ -9116,6 +9208,10 @@ fn drive_fleet_proven_in(
     Ok((
         aterm_ctl::DriveLink {
             node: Some(proof.node.to_string()),
+            asked_by: requester.sid().map(str::to_owned),
+            unnamed: requester
+                .sid()
+                .map(|_| drive_fleet_unnamed as aterm_ctl::FleetDriveFn),
             stream: Box::new(Introduced::new(driven, requester)),
             label,
         },
@@ -9407,6 +9503,11 @@ fn survey_fleet_in(
         || "survey".to_owned(),
         |holder| format!("survey {}", holder.arg()),
     );
+    // A survey a session asked for names it, so the Mac that answers counts an agent's read.
+    let query = match ask.by {
+        Some(by) => aterm_types::fleet_activity::survey_marked(&query, by),
+        None => query,
+    };
     survey_fleet_read_in(places, ask, &query)
 }
 

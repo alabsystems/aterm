@@ -4239,9 +4239,7 @@ impl WordDecorations {
                             lexicon,
                             &opts,
                             &mut row_cells,
-                            |rr, buf| {
-                                term.render_row_into(rr, buf);
-                            },
+                            crate::trick_flash::TermRows(term),
                         );
                         if cutoff > 0 {
                             self.rescan_restart(&mut out, &mut ink_full);
@@ -4255,9 +4253,15 @@ impl WordDecorations {
             }
             break;
         }
-        self.locate_trick_flash(rows, cols, cursor, now, cfg, &mut row_cells, |r, buf| {
-            term.render_row_into(r, buf);
-        });
+        self.locate_trick_flash(
+            rows,
+            cols,
+            cursor,
+            now,
+            cfg,
+            &mut row_cells,
+            crate::trick_flash::TermRows(term),
+        );
         self.scan_cells = row_cells;
         self.rescan_end(out, cols, epoch, now, None, None);
     }
@@ -4385,12 +4389,7 @@ impl WordDecorations {
                             lexicon,
                             &opts,
                             &mut row_cells,
-                            |rr, buf| {
-                                buf.clear();
-                                if let Some(row) = cells.get(rr) {
-                                    buf.extend_from_slice(row);
-                                }
-                            },
+                            crate::trick_flash::CellRows(cells),
                         );
                         if cutoff > 0 {
                             self.rescan_restart(&mut out, &mut ink_full);
@@ -4404,12 +4403,15 @@ impl WordDecorations {
             }
             break;
         }
-        self.locate_trick_flash(rows, cols, cursor, now, cfg, &mut row_cells, |r, buf| {
-            buf.clear();
-            if let Some(row) = cells.get(r) {
-                buf.extend_from_slice(row);
-            }
-        });
+        self.locate_trick_flash(
+            rows,
+            cols,
+            cursor,
+            now,
+            cfg,
+            &mut row_cells,
+            crate::trick_flash::CellRows(cells),
+        );
         self.scan_cells = row_cells;
         self.rescan_end(
             out,
@@ -4430,7 +4432,7 @@ impl WordDecorations {
         reason = "threads the rescan's geometry, caret, clock, config and row source to the flash; the dense_scan_cutoff shape"
     )]
     #[inline]
-    fn locate_trick_flash(
+    fn locate_trick_flash<S: crate::trick_flash::RowSource>(
         &mut self,
         rows: usize,
         cols: usize,
@@ -4438,7 +4440,7 @@ impl WordDecorations {
         now: Instant,
         cfg: &DecoConfig,
         row_buf: &mut Vec<RenderCell>,
-        load_row: impl FnMut(usize, &mut Vec<RenderCell>),
+        load_row: S,
     ) {
         let scope = self.scan_scope();
         self.trick_flash.on_rescan(
@@ -4470,13 +4472,13 @@ impl WordDecorations {
     }
 
     #[inline]
-    fn dense_scan_cutoff(
+    fn dense_scan_cutoff<S: crate::trick_flash::RowSource>(
         &mut self,
         rows: usize,
         lexicon: &Lexicon,
         opts: &ScanOptions<'_>,
         row_cells: &mut Vec<RenderCell>,
-        mut load_row: impl FnMut(usize, &mut Vec<RenderCell>),
+        mut load_row: S,
     ) -> usize {
         if self.scan_row_occupied.len() < rows {
             self.scan_row_occupied.resize(rows, false);
@@ -4489,7 +4491,7 @@ impl WordDecorations {
         let mut r = rows;
         while r > 0 {
             r -= 1;
-            load_row(r, row_cells);
+            let row_slice = load_row.load_row(r, row_cells);
             let need_text = cutoff == 0;
             if need_text {
                 self.scan_text.clear();
@@ -4498,8 +4500,8 @@ impl WordDecorations {
             let mut ink_end = 0u16;
             let mut occupied = false;
             let mut c = 0;
-            while c < row_cells.len() {
-                let cell = &row_cells[c];
+            while c < row_slice.len() {
+                let cell = &row_slice[c];
                 let col = c as u16;
                 if cell.wide {
                     if ink_end == col {
@@ -4521,7 +4523,7 @@ impl WordDecorations {
                         if need_text {
                             let mut pc = 0;
                             while pc < c {
-                                let prev = &row_cells[pc];
+                                let prev = &row_slice[pc];
                                 if !prev.wide {
                                     self.scan_text.push(prev.ch);
                                 }

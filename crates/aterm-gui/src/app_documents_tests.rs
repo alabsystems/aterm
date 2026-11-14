@@ -6551,6 +6551,25 @@ fn shipping_buffer_queries_refuse_ambiguous_views_before_switch_or_kill() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// End `app` as a crash ends its process: its journal locks are gone before anyone reopens.
+/// Dropping an App only asks its journal custody worker to release; the worker settles each
+/// journal under that journal's lock afterwards, which a reopen's event-loop take must not meet.
+fn crash(mut app: App) {
+    let finished = app
+        .native_documents
+        .journals
+        .as_mut()
+        .and_then(|store| store.custody_finished_for_test());
+    drop(app);
+    if let Some(finished) = finished {
+        finished
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the crashed App's journal custody worker finished");
+    }
+}
+
 #[test]
 fn production_open_recovers_durable_draft_before_publishing_editor_view() {
     let dir = fresh_dir("aterm-app-crash-recovery");
@@ -6576,6 +6595,7 @@ fn production_open_recovers_durable_draft_before_publishing_editor_view() {
             "unsaved disk\n"
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "disk\n");
+        crash(crashed);
     }
 
     let mut reopened = App::headless_for_test();
@@ -6617,6 +6637,7 @@ fn undo_stops_at_a_recovered_draft_and_keeps_it_unsaved() {
         crashed.native_documents.journals = JournalSlot::for_test(journal_root.clone());
         crashed.open_document_tab(AppKind::Editor, &uri).unwrap();
         commit(&mut crashed, WindowId(0), "unsaved ");
+        crash(crashed);
     }
     let mut reopened = App::headless_for_test();
     reopened.native_documents.journals = JournalSlot::for_test(journal_root.clone());
@@ -6663,6 +6684,7 @@ fn production_open_surfaces_disk_conflict_and_preserves_draft() {
         crashed.native_documents.journals = JournalSlot::for_test(journal_root.clone());
         crashed.open_document_tab(AppKind::Editor, &uri).unwrap();
         commit(&mut crashed, WindowId(0), "draft ");
+        crash(crashed);
     }
     fs::write(&path, "external\n").unwrap();
 

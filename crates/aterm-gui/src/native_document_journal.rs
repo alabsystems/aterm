@@ -43,6 +43,12 @@ mod owner {
         pub(crate) fn id(&self) -> JournalOwnerId {
             match *self {}
         }
+        #[cfg(test)]
+        pub(crate) fn finished_for_test(
+            &self,
+        ) -> std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>> {
+            match *self {}
+        }
         pub(super) fn run<T: Send + 'static>(
             &self,
             _work: impl FnOnce(&mut Custody) -> T + Send + 'static,
@@ -1085,6 +1091,17 @@ impl DocumentJournalStore {
     #[cfg(test)]
     pub(crate) fn key_for(&self, canonical_uri: &str) -> JournalDocumentKey {
         self.host.key_for(canonical_uri)
+    }
+
+    /// The finish signal of this store's journal custody worker, which runs its releases after the store drops.
+    #[cfg(test)]
+    pub(crate) fn custody_finished_for_test(
+        &self,
+    ) -> Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>> {
+        self.host
+            .owner
+            .as_ref()
+            .map(|owner| owner.finished_for_test())
     }
 
     /// The file `canonical_uri`'s journal lives in.

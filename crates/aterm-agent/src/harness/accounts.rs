@@ -239,13 +239,14 @@ pub const WORD_MAX: usize = 64;
 /// The longest reason a ledger row is given ([`Event::because`]), in bytes.
 pub const WHY_MAX: usize = 200;
 
-/// The longest record of the routes an automatic sign-in tried ([`SignInAttempt::routes`]), in
-/// bytes: room for every route's words at their longest (the mailbox's masked login among
-/// them), so none is cut off.
-pub const ROUTES_MAX: usize = 432;
+/// The longest record of the routes a sign-in tried ([`SignInAttempt::routes`]), in bytes: room
+/// for every route's words at their longest (the mailbox's masked login among them) and for the
+/// reason its opener gave ([`super::open_url::Met::WHY_MAX`]), so none is cut off.
+pub const ROUTES_MAX: usize = 432 + super::open_url::Met::WHY_MAX;
 
 /// The longest reason a ledger row carries, in bytes: a [`Kind::SignIn`] row's `auto <outcome>:`
-/// and its [`ROUTES_MAX`] of routes ([`note_sign_in_attempt`]), every other row's [`WHY_MAX`].
+/// or `hand <outcome>:` and its [`ROUTES_MAX`] of routes ([`note_sign_in_attempt`],
+/// [`note_hand_sign_in_attempt`]), every other row's [`WHY_MAX`].
 pub const LEDGER_WHY_MAX: usize = ROUTES_MAX + 32;
 
 /// The longest ledger line that is parsed.
@@ -3138,8 +3139,8 @@ pub struct Binding {
     pub google_principal: Option<[u8; 32]>,
     /// The remaining human step of a renewal, cleared by a successful sign-in.
     pub sign_in_task: Option<SignInTask>,
-    /// How the row's last automatic sign-in ended and the routes it tried
-    /// ([`note_sign_in_attempt`]); a failed one is cleared by a new login, a renewal's
+    /// How the row's last sign-in ended and the routes it tried ([`note_sign_in_attempt`],
+    /// [`note_hand_sign_in_attempt`]); a failed one is cleared by a new login, a renewal's
     /// ([`note_renewed`]) or one signed back in where it stands ([`note_signed_back`]).
     pub sign_in_attempt: Option<SignInAttempt>,
 }
@@ -3151,9 +3152,15 @@ pub enum AttemptOutcome {
     NoRoute,
     /// A route ran and did not bind a login.
     Failed,
-    /// A route ran and its page stopped it (Cloudflare's bot check or block page,
-    /// [`super::open_url::Met::stopped`]), which aterm never tries to pass: the row needs a
-    /// person's own sign-in, in a browser that clears it.
+    /// A route ran and ended where another try by itself changes nothing
+    /// ([`super::open_url::Met::stopped`]): Cloudflare's bot check or block page, in the
+    /// headless page or in aterm's sign-in window, the consent page's human check (aterm
+    /// operates none of them), a consent page that named another account, a session with no
+    /// desktop, or a window a person closed. The upkeep waits ([`super::accounts_sync`]'s
+    /// `PERSON_BACKOFF`), opens no sign-in window for the row again, and the row's next step
+    /// is a person's own renewal at this Mac's terminal. A sign-in in the window that failed
+    /// for any other reason (a page that did not load, a mailbox that did not answer, its
+    /// deadline) is [`Self::Failed`], and is tried again on the ordinary backoff.
     Blocked,
     /// A route signed the row in and its login was bound.
     SignedIn,
@@ -3184,7 +3191,8 @@ impl AttemptOutcome {
     }
 
     /// How the attempt a [`Kind::SignIn`] event records ended, read back from its `why`: an
-    /// automatic sign-in's `auto <outcome>: <routes>` ([`note_sign_in_attempt`]), a driven
+    /// automatic sign-in's `auto <outcome>: <routes>` ([`note_sign_in_attempt`]), a renewal run
+    /// by hand's `hand <outcome>: <routes>` ([`note_hand_sign_in_attempt`]), a driven
     /// renewal's `<host> <flow> <outcome>` ([`super::login_drive::Drove::attempt_of`]; its host
     /// may be `auto`), or Grok's sign-in's `<host> device <outcome>; <rungs>`
     /// ([`super::grok_signin::attempt_of`]); `None` for any other reason, a step
@@ -3192,6 +3200,7 @@ impl AttemptOutcome {
     #[must_use]
     pub fn of_sign_in(why: &str) -> Option<Self> {
         why.strip_prefix(AUTO_SIGN_IN)
+            .or_else(|| why.strip_prefix(HAND_SIGN_IN))
             .and_then(|r| r.strip_prefix(' '))
             .and_then(|rest| Self::parse(rest.split_once(':')?.0))
             .or_else(|| super::login_drive::Drove::attempt_of(why))
@@ -3205,8 +3214,9 @@ pub const SHARED_ADOPTION_BEGUN: &str = "shared adoption begun";
 /// The `why` of the [`Kind::SignIn`] event that begins a shared preparation.
 pub const SHARED_PREPARATION_BEGUN: &str = "shared preparation begun";
 
-/// A row's last automatic sign-in: how it ended, the routes its ladder tried (one bounded line
-/// that never holds a URL, code, password or email), and since when that has been so.
+/// A row's last sign-in, the upkeep's own or a renewal run by hand: how it ended, the routes it
+/// tried with the reason its opener gave (one bounded line that never holds a URL's query, a
+/// code, a password or an email), and since when that has been so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignInAttempt {
     /// How it ended.
@@ -3228,6 +3238,11 @@ pub enum SignInAction {
     Browser,
     /// Approve the CLI's own sign-in on a terminal.
     Login,
+    /// Run the row's renewal at a terminal on this Mac: a Claude row with an email, whose
+    /// sign-in met what only a person there clears (Cloudflare's check, the consent page's
+    /// human check, a session with no desktop). Their renewal opens aterm's sign-in window,
+    /// where they complete the check.
+    Renew,
 }
 
 impl SignInAction {
@@ -3237,6 +3252,7 @@ impl SignInAction {
         match self {
             Self::Browser => "browser",
             Self::Login => "login",
+            Self::Renew => "renew",
         }
     }
 
@@ -3244,6 +3260,7 @@ impl SignInAction {
         match word {
             "browser" => Some(Self::Browser),
             "login" => Some(Self::Login),
+            "renew" => Some(Self::Renew),
             _ => None,
         }
     }
@@ -3251,11 +3268,16 @@ impl SignInAction {
     /// The next step for this action on `label` in `cli`'s pool: a browser profile signed in
     /// once is a step only where a renewal can then approve the page in it
     /// ([`Cli::renews_headlessly`]), so a task of one stored for a CLI whose renewals stop for a
-    /// person names its sign-in on a terminal ([`Cli::sign_in_verb`]).
+    /// person names its sign-in on a terminal ([`Cli::sign_in_verb`]). A renewal is run at a
+    /// terminal on this Mac, where a person can complete a check in aterm's sign-in window.
     #[must_use]
     pub fn next_step(self, cli: Cli, label: &str) -> String {
         use super::accounts_step::Step;
         match self {
+            Self::Renew => format!(
+                "Run {} in a terminal on this Mac",
+                Step::Renew(cli, label.to_owned())
+            ),
             Self::Browser if cli.renews_headlessly() => format!(
                 "Run {}, then {}",
                 Step::Browser(cli, label.to_owned()),
@@ -3693,22 +3715,23 @@ impl Logins {
                 }
             };
             let v = value;
+            // A task naming a step this build does not know is dropped, not refused, as an
+            // attempt is below: another build of aterm sharing this file may name a newer step,
+            // and refusing it would make every binding here unknown. The next stop of the row's
+            // sign-in writes its task again. A task with no step or no timestamp is damage and
+            // refuses the file.
             let sign_in_task = match v.get("sign_in_task") {
                 None | Some(Value::Null) => None,
                 Some(task) => {
-                    let action = task
-                        .get("action")
-                        .and_then(Value::as_str)
-                        .and_then(SignInAction::parse)
-                        .ok_or_else(|| {
-                            Unread::NotOurs(format!(
-                                "binding `{label}` has an unknown sign-in task"
-                            ))
-                        })?;
+                    let step = task.get("action").and_then(Value::as_str).ok_or_else(|| {
+                        Unread::NotOurs(format!(
+                            "binding `{label}` has a sign-in task with no step"
+                        ))
+                    })?;
                     let at = stamp(task.get("at"), now).ok_or_else(|| {
                         Unread::NotOurs(format!("binding `{label}` has no sign-in task timestamp"))
                     })?;
-                    Some(SignInTask { action, at })
+                    SignInAction::parse(step).map(|action| SignInTask { action, at })
                 }
             };
             // An attempt this build cannot read is dropped, not refused: it is a record of the
@@ -4600,6 +4623,10 @@ pub fn note_sign_in_task(logins: &mut Logins, label: &str, action: SignInAction,
 /// ([`note_sign_in_attempt`]).
 pub const AUTO_SIGN_IN: &str = "auto";
 
+/// The `why` prefix of the [`Kind::SignIn`] event a renewal run by hand writes
+/// ([`note_hand_sign_in_attempt`]): a person's, or an agent's, `accounts renew`.
+pub const HAND_SIGN_IN: &str = "hand";
+
 /// Records how `label`'s automatic sign-in ended at `at` and the `routes` its ladder tried,
 /// without changing its login binding: one [`Kind::SignIn`] event (`auto <outcome>: <routes>`)
 /// when the workflow, outcome or routes differ from the row's last attempt. An unchanged
@@ -4615,6 +4642,55 @@ pub const AUTO_SIGN_IN: &str = "auto";
 pub fn note_sign_in_attempt(
     logins: &mut Logins,
     label: &str,
+    outcome: AttemptOutcome,
+    routes: &str,
+    at: i64,
+) -> Vec<Event> {
+    note_sign_in_attempt_by(logins, label, AUTO_SIGN_IN, outcome, routes, at)
+}
+
+/// [`note_sign_in_attempt`] for a renewal a person or an agent ran by hand
+/// (`aterm harness accounts renew`), whose `routes` say how its one run ended: the row's last
+/// sign-in is the same record whoever ran it, so the report's `sign-in:` line, the ladder's
+/// wait at a page that stopped it and the next renewal's choice of browser all read it, and its
+/// [`Kind::SignIn`] event says `hand <outcome>: <routes>`.
+///
+/// A hand run that failed for another reason never lifts a page's hold: where the row's
+/// current attempt is [`AttemptOutcome::Blocked`], a [`AttemptOutcome::Failed`] hand run
+/// writes its event and leaves that attempt, and the time its wait counts from, as they stand.
+/// The page that stopped the row is still there, and without the record the upkeep would sign
+/// in against it again at its next pass.
+pub fn note_hand_sign_in_attempt(
+    logins: &mut Logins,
+    label: &str,
+    outcome: AttemptOutcome,
+    routes: &str,
+    at: i64,
+) -> Vec<Event> {
+    let held = if outcome == AttemptOutcome::Failed
+        && admissible_label(label)
+        && workflow_scope::attempt_current(logins, label)
+    {
+        logins
+            .entry(label)
+            .and_then(|binding| binding.sign_in_attempt.clone())
+            .filter(|last| last.outcome == AttemptOutcome::Blocked)
+    } else {
+        None
+    };
+    let events = note_sign_in_attempt_by(logins, label, HAND_SIGN_IN, outcome, routes, at);
+    if let Some(blocked) = held
+        && let Some(binding) = logins.entry(label)
+    {
+        binding.sign_in_attempt = Some(blocked);
+    }
+    events
+}
+
+fn note_sign_in_attempt_by(
+    logins: &mut Logins,
+    label: &str,
+    by: &str,
     outcome: AttemptOutcome,
     routes: &str,
     at: i64,
@@ -4646,7 +4722,7 @@ pub fn note_sign_in_attempt(
     };
     let mut event = Event::sign_in(at, label, step);
     event.why = one_line(
-        &format!("{AUTO_SIGN_IN} {}: {routes}", outcome.as_str()),
+        &format!("{by} {}: {routes}", outcome.as_str()),
         LEDGER_WHY_MAX,
     );
     binding.sign_in_attempt = Some(SignInAttempt {
@@ -8307,17 +8383,56 @@ impl Condition {
     }
 }
 
+/// A roster row's login on this machine: THE ONE READING of whether a session can be run on
+/// it here, which [`condition`] reads as [`Condition::NotEnrolled`] or [`Condition::SignedOut`],
+/// the accounts report as its `login:` word, the report's vault tokens section as its login half
+/// ([`super::accounts_token_view::LoginHalf::of_row`]) and the glass as `signed out`
+/// ([`super::outlook::Figure::SignedOut`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginHere {
+    /// No login was made for it on this machine ([`login_made`]).
+    NotMade,
+    /// One was made and is signed out here ([`signed_out_here`]).
+    SignedOut,
+    /// One is here and is not signed out.
+    In,
+}
+
+impl LoginHere {
+    /// What every report says of a row with no login to run on here, whichever way it has none.
+    pub const SIGNED_OUT: &'static str = "signed-out";
+
+    /// Whether a login is here and is not signed out.
+    #[must_use]
+    pub const fn signed_in(self) -> bool {
+        matches!(self, LoginHere::In)
+    }
+}
+
+/// [`LoginHere`] of `row` given `state` and whether its login is `enrolled` (made on this
+/// machine): a lapsed credential file reads signed out whatever its records say
+/// ([`signed_out_here`]).
+#[must_use]
+pub fn login_here(row: &Row, state: &State, enrolled: bool) -> LoginHere {
+    if !enrolled {
+        LoginHere::NotMade
+    } else if signed_out_here(row, state) {
+        LoginHere::SignedOut
+    } else {
+        LoginHere::In
+    }
+}
+
 /// Computes the [`Condition`] of `row` at `now` given `state` and whether its login is `enrolled`:
-/// an enrolled row signed out here ([`signed_out_here`], the rule [`login_state`] reads as
-/// [`LoginState::Expired`]) is [`Condition::SignedOut`], a lapsed credential file whatever its
-/// records say, so no launch picks it.
+/// a row with no login to run on here ([`login_here`]) is [`Condition::NotEnrolled`] or
+/// [`Condition::SignedOut`] (the rule [`login_state`] reads as [`LoginState::Expired`]), a lapsed
+/// credential file whatever its records say, so no launch picks it.
 #[must_use]
 pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Condition {
-    if !enrolled {
-        return Condition::NotEnrolled;
-    }
-    if signed_out_here(row, state) {
-        return Condition::SignedOut;
+    match login_here(row, state, enrolled) {
+        LoginHere::NotMade => return Condition::NotEnrolled,
+        LoginHere::SignedOut => return Condition::SignedOut,
+        LoginHere::In => {}
     }
     let Some(account) = state.accounts.get(&row.label) else {
         return Condition::Unseen;
@@ -11329,6 +11444,38 @@ pub(super) fn strike_native_unexecuted(
     )
 }
 
+/// A native move whose successor never attached failed on the account it moved to, as a moved
+/// session that exited before it answered did ([`Strike::Failed`]): the unproven `active` that
+/// the exact reservation `receipt` of `sid` holds as its canary is struck, which rolls the pool
+/// back to the account it left and holds the struck one off ([`STRUCK_WINDOW`]). A canary
+/// another reservation or session holds now, a proven `active` or a pin is left as it stands.
+pub(super) fn strike_native_unattached(
+    state: &mut State,
+    sid: &str,
+    receipt: &str,
+    why: &str,
+    now: i64,
+) -> Vec<Event> {
+    let sid = one_line(sid, WORD_MAX);
+    let owned = state.canary.as_ref().is_some_and(|canary| {
+        !sid.is_empty() && canary.sid == sid && canary.native_receipt.as_deref() == Some(receipt)
+    });
+    let Some(account) = state.active.clone().filter(|_| owned && !state.proven) else {
+        return Vec::new();
+    };
+    if state.pinned {
+        return Vec::new();
+    }
+    strike_as(
+        state,
+        &account,
+        &sid,
+        &Strike::Failed(why.into()),
+        now,
+        Some(receipt),
+    )
+}
+
 fn strike_as(
     state: &mut State,
     account: &str,
@@ -12232,6 +12379,23 @@ impl Store {
             Some(home) => enrolled_in(self.cli, roster, home),
             None => enrolled_for(self.cli, roster),
         }
+    }
+
+    /// The label of this store's CLI's row whose sign-in runs on this Mac now, in this process or
+    /// another (`accounts renew` in a terminal, the upkeep's ladder): the fact the glass and the
+    /// accounts report say as `signing in`. `None` once the sign-in's process ends, however it
+    /// ends.
+    #[must_use]
+    pub fn signing_in(&self) -> Option<String> {
+        super::sign_in_ladder::signing_in(self, self.cli)
+    }
+
+    /// A started sign-in's record for a test of what reads [`Self::signing_in`]: this store's
+    /// CLI's `label` reads as signing in, by this process, until what this returns drops.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn signing_in_fixture(&self, label: &str, at: i64) -> Option<Box<dyn std::any::Any>> {
+        super::sign_in_ladder::running_fixture(self, self.cli, label, at)
     }
 
     /// Claude Code's store directory beside it (the same directory for Claude Code's own): the

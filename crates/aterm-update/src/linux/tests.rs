@@ -741,6 +741,36 @@ fn a_first_bootstrap_orders_its_candidate_and_keeps_its_records_durable() {
     );
 }
 
+/// A REPLACED EXECUTABLE STILL NAMES ITS INSTALL: Linux names the executable of a process an
+/// update replaced (renamed a new build over) `<path> (deleted)`, and the context a process reads
+/// first after that is its install's, as a read at its start was, so a node job a window answered
+/// for until the window closed tells its updater's standing and never `off`. A file that has the
+/// marked name itself is not taken for the install beside it.
+/// NEGATIVE CONTROL: a `running` that hands the kernel's name to `Context::at` unchanged fails
+/// "a replaced executable still names its install".
+#[test]
+fn a_replaced_executable_still_names_its_install() {
+    let f = Fixture::new();
+    let replaced = f.root.join("aterm (deleted)");
+    let context =
+        Context::running(replaced.clone()).expect("a replaced executable still names its install");
+    assert_eq!(
+        (&context.target, &context.dir),
+        (&f.context.target, &f.context.dir)
+    );
+    assert_eq!(
+        Context::running(f.context.target.clone()).map(|context| context.target),
+        Ok(f.context.target.clone()),
+        "an executable in place names itself"
+    );
+    fs::write(&replaced, elf(1, native().unwrap())).unwrap();
+    fs::set_permissions(&replaced, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        Context::running(replaced).is_err(),
+        "a file with the marked name is no install"
+    );
+}
+
 #[test]
 fn bootstrap_and_self_update_share_the_same_process_lock() {
     let f = Fixture::new();

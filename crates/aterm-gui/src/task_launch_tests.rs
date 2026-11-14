@@ -791,10 +791,16 @@ fn a_quit_removes_its_workers_task_files_and_no_other() {
     let elsewhere = write(&SessionId::new("s-0c"));
     let result = touch(&dir, &format!("{}-2.result.md", worker.sid.as_str()));
     let untasked_result = touch(&dir, &format!("{}-2.result.md", shell.sid.as_str()));
-    retire_task_files_in(&dir, &store, std::slice::from_ref(&worker.sid));
+    retire_task_files_in(
+        &dir,
+        &store,
+        std::slice::from_ref(&worker.sid),
+        &QuitClosed::default(),
+        &[],
+    );
     assert!(tasked.exists(), "the predecessor's worker keeps its file");
     assert!(result.exists(), "and its result");
-    retire_task_files_in(&dir, &store, &[]);
+    retire_task_files_in(&dir, &store, &[], &QuitClosed::default(), &[]);
     assert!(
         !tasked.exists(),
         "the worker's task file goes with the quit"
@@ -3461,5 +3467,804 @@ fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
     assert!(
         dropped.get(),
         "refused replacement retained its authentication guard"
+    );
+}
+
+/// [`remove_in`] of `which` of `sids`' files alone: nothing by its own path, nothing kept.
+#[cfg(unix)]
+fn retire_files_in(dir: &Path, sids: &[SessionId], which: Retire) {
+    remove_in(dir, sids, which, &[], &|_| false);
+}
+
+/// The layout a quit writes of one tab: its leaf names session `sid` and carries task row `row`.
+fn layout_of(sid: &SessionId, row: Option<&str>) -> crate::restore::RestoreManifest {
+    let mut layout = crate::restore::RestoreManifest::one_terminal_for_test(None);
+    for window in &mut layout.windows {
+        for tab in &mut window.restored_tabs {
+            tab.root.visit_terminals_mut(&mut |leaf| {
+                leaf.sid = Some(sid.as_str().to_string());
+                leaf.task = row.map(str::to_owned);
+            });
+        }
+    }
+    layout
+}
+
+/// A done worker on `handle`, as its done edge leaves it: its task file, and a snapshot of the
+/// one reply `Fixed the parser.` under its own session ID, which its record names. Returns the
+/// task file, the snapshot and what `result` answers.
+fn done_worker(
+    handle: &crate::session_store::SessionHandle,
+    scratch: &Path,
+) -> (
+    PathBuf,
+    aterm_agent::harness::result::Snapshot,
+    &'static str,
+) {
+    use aterm_agent::harness::result;
+    let dir = crate::task_record::tasks_dir().expect("the test binary's state root");
+    let transcript = scratch.join("t.jsonl");
+    let line = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Fixed the parser."}]}}"#;
+    let task = TaskSeed::new(b"t".to_vec())
+        .write_in(&dir, &handle.sid)
+        .expect("written");
+    crate::task_record::mark_session_task(&handle.ctx, 1, &TaskMark::new(TaskState::Working))
+        .expect("unfenced");
+    let snap = result::snapshot(
+        &dir,
+        &result::result_stem(Some(handle.sid.as_str()), 2),
+        Some((&transcript, &format!("{line}\n"))),
+        result::DoneBy::Turn,
+    )
+    .expect("written");
+    let done = TaskMark {
+        why: Some(crate::task_record::WHY_LANDED),
+        result_bytes: snap.bytes,
+        result_path: Some(snap.path.clone()),
+        ..TaskMark::new(TaskState::Done)
+    };
+    crate::task_record::mark_session_task(&handle.ctx, 1, &done).expect("unfenced");
+    (
+        task,
+        snap,
+        "OK 1 source=transcript session=0b22 uuid=a-1 bytes=17\nFixed the parser.\n",
+    )
+}
+
+/// A QUIT AND A RELAUNCH of the one tab `tab`: the quit writes its layout and removes what the
+/// layout does not bring back ([`retire_task_files_at_quit`]); the relaunch takes the layout,
+/// seeds the tab's record onto a session with a new ID, and sweeps what the layout left
+/// ([`RestoredTasks::sweep`]). Returns the restored session and the store that holds it.
+fn quit_and_restore(
+    tab: &crate::session_store::SessionHandle,
+) -> (crate::session_store::SessionHandle, Store) {
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(tab.clone());
+    let row = crate::task_record::restore_row(&tab.ctx).expect("a worker's row");
+    let layout = layout_of(&tab.sid, Some(&row));
+    retire_task_files_at_quit(
+        &store,
+        &[],
+        &QuitClosed::default(),
+        &restored_results(&layout),
+    );
+
+    let left = RestoredTasks::of(&layout);
+    let relaunched = crate::session_store::new_store();
+    let restored = crate::session_store::test_handle(1);
+    assert_ne!(restored.sid, tab.sid, "a cold restore mints a session id");
+    crate::task_record::seed_restored(&restored.ctx, &row, false, false);
+    relaunched.write().unwrap().register(restored.clone());
+    left.sweep(&relaunched);
+    (restored, relaunched)
+}
+
+/// A DONE TASK'S RESULT READS BACK AFTER A QUIT AND A RESTORE (tracker ST-01): a worker's done
+/// edge stores its result, a plain quit writes the layout with the worker's task row and ends,
+/// and the relaunch restores that row onto a session with a new id, whose `result` answers what
+/// the worker's did before the quit. Restored a second time, as the 11 workers of 2026-11-12 were,
+/// it still does: the file stays where the row names it, under the ID the tab had at its done
+/// edge. The quit takes the task file, which no restored session reads. CONTROL: a quit that
+/// wrote no layout takes the result too, though the tab's ID no longer names it.
+#[test]
+fn a_done_task_result_reads_back_after_a_quit_and_a_restore() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-quit-restore")
+        .tempdir()
+        .expect("scratch dir");
+    let worker = crate::session_store::test_handle(1);
+    let (task, snap, answer) = done_worker(&worker, scratch.path());
+    let sidecar = aterm_agent::harness::result::sidecar_of(&snap.path);
+    assert_eq!(
+        crate::task_record::cmd_result(&worker.ctx, 1, ""),
+        answer,
+        "CONTROL: before the quit"
+    );
+
+    // A quit and a relaunch, twice: each restore gives the tab a session with a new id.
+    let mut tab = worker;
+    for restore in 1..=2 {
+        let (restored, _) = quit_and_restore(&tab);
+        let record = restored
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .cloned()
+            .expect("the restored record");
+        assert_eq!(
+            (
+                record.state,
+                record.result_bytes,
+                record.result_path.as_deref()
+            ),
+            (TaskState::Done, snap.bytes, Some(snap.path.as_path())),
+            "restore {restore}: the record says done with the result its row named"
+        );
+        assert_eq!(
+            crate::task_record::cmd_result(&restored.ctx, 1, ""),
+            answer,
+            "restore {restore}: the stored result reads back"
+        );
+        assert_eq!(
+            restored.ctx.timeline.lock().unwrap().carried_results(),
+            std::slice::from_ref(&snap.path),
+            "restore {restore}: the tab came back with it"
+        );
+        assert!(
+            !task.exists(),
+            "restore {restore}: the task file went with the first quit"
+        );
+        tab = restored;
+    }
+
+    // CONTROL: a quit whose layout is not written brings no record back, so the result goes.
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(tab.clone());
+    retire_task_files_at_quit(&store, &[], &QuitClosed::default(), &[]);
+    assert!(
+        !snap.path.exists() && !sidecar.exists(),
+        "a quit that brings no tab back removes the result its tab came back with"
+    );
+}
+
+/// A RESULT A TAB CAME BACK WITH GOES WITH ITS TAB, by its own path: the restored session's ID
+/// does not name the file. A close takes it with the tab. It does not go at a mark: a turn that
+/// reopens the task leaves the record naming none, and the harness's exit mark, made from a
+/// reading of the record before that turn, names the file again; removed at the reopening mark
+/// (as it was before 2026-11-12), that exit left a record naming a file that was gone. CONTROL: a
+/// close that keeps results (a retired row answers for them) keeps it, and the row's end takes
+/// it.
+#[test]
+fn a_result_a_tab_came_back_with_goes_with_its_tab() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-carried")
+        .tempdir()
+        .expect("scratch dir");
+    let came_back = || {
+        let worker = crate::session_store::test_handle(1);
+        let (_, snap, answer) = done_worker(&worker, scratch.path());
+        let (restored, store) = quit_and_restore(&worker);
+        let sidecar = aterm_agent::harness::result::sidecar_of(&snap.path);
+        assert!(snap.path.exists() && sidecar.exists(), "PRECONDITION");
+        (restored, store, snap, sidecar, answer)
+    };
+    let carried_of = |handle: &crate::session_store::SessionHandle| {
+        handle
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .carried_results()
+            .to_vec()
+    };
+    // The tab's session is out of the store when its close removes its files.
+    let closed_store = crate::session_store::new_store;
+
+    // A turn reopens the task: the record names no result, and the file stays with the tab.
+    let (reopened, _, snap, sidecar, answer) = came_back();
+    crate::task_record::mark_session_task(&reopened.ctx, 1, &TaskMark::new(TaskState::Working))
+        .expect("unfenced");
+    assert!(
+        snap.path.exists() && sidecar.exists(),
+        "reopened: the file stays while its tab lives"
+    );
+    assert_eq!(
+        carried_of(&reopened),
+        std::slice::from_ref(&snap.path),
+        "and is still the tab's to remove"
+    );
+    // The exit mark of a harness that read the record before that turn names it again.
+    let late = TaskMark {
+        why: Some(crate::task_record::WHY_EXIT),
+        result_bytes: snap.bytes,
+        result_path: Some(snap.path.clone()),
+        ..TaskMark::new(TaskState::Exited)
+    };
+    crate::task_record::mark_session_task(&reopened.ctx, 1, &late).expect("unfenced");
+    assert_eq!(
+        crate::task_record::cmd_result(&reopened.ctx, 1, ""),
+        answer,
+        "a record a late mark points back at the result reads it"
+    );
+    retire_task_file(
+        &closed_store(),
+        &reopened.sid,
+        &carried_of(&reopened),
+        false,
+    );
+    assert!(
+        !snap.path.exists() && !sidecar.exists(),
+        "reopened: removed with its tab"
+    );
+
+    // A close takes it with the tab.
+    let (closed, _, snap, sidecar, _) = came_back();
+    let carried = carried_of(&closed);
+    assert_eq!(carried, std::slice::from_ref(&snap.path));
+    retire_task_file(&closed_store(), &closed.sid, &carried, false);
+    assert!(!snap.path.exists() && !sidecar.exists(), "closed: removed");
+
+    // CONTROL: a retired row keeps it, and takes it when the row goes.
+    let (reaped, store, snap, sidecar, _) = came_back();
+    let carried = carried_of(&reaped);
+    let retired = closed_store();
+    retired
+        .write()
+        .unwrap()
+        .retired_workers_mut()
+        .keep(crate::retired_workers::Retired {
+            sid: reaped.sid.clone(),
+            local: Some(1),
+            window: None,
+            title: "reaped".to_string(),
+            last_words: None,
+            record: reaped
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .task()
+                .cloned()
+                .expect("its record"),
+            closed_unix_ms: 1,
+        });
+    retire_task_file(&retired, &reaped.sid, &carried, true);
+    assert!(
+        snap.path.exists() && sidecar.exists(),
+        "its row answers for it"
+    );
+    retire_result_files(&store, &reaped.sid, carried.first().map(PathBuf::as_path));
+    assert!(
+        snap.path.exists() && sidecar.exists(),
+        "a record the store still holds names it: it stays"
+    );
+    retire_result_files(
+        &closed_store(),
+        &reaped.sid,
+        carried.first().map(PathBuf::as_path),
+    );
+    assert!(
+        !snap.path.exists() && !sidecar.exists(),
+        "its row went: removed"
+    );
+}
+
+/// The snapshot `snap` and the sidecar beside it.
+fn snapshot_pair(snap: &aterm_agent::harness::result::Snapshot) -> [PathBuf; 2] {
+    [
+        snap.path.clone(),
+        aterm_agent::harness::result::sidecar_of(&snap.path),
+    ]
+}
+
+/// The result files `handle`'s tab named under other session IDs.
+fn carried_results_of(handle: &crate::session_store::SessionHandle) -> Vec<PathBuf> {
+    handle
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .carried_results()
+        .to_vec()
+}
+
+/// A RESULT A TAB CAME BACK WITH CROSSES EVERY PROCESS UNTIL ITS TAB ENDS, though its record has
+/// moved on to a result of its own: each row that carries the record to another process names it
+/// (` carried=`). A seamless update's successor, whose session keeps the tab's ID, takes the file
+/// at the tab's close; the restore of the layout a crash left, which gives the tab a new ID,
+/// sweeps it, the record naming the newer result. Before 2026-11-13 only the process that seeded
+/// the record knew the file, so after either the file and its sidecar stayed for good.
+#[test]
+fn a_result_a_tab_came_back_with_crosses_every_process_until_its_tab_ends() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-carried-across")
+        .tempdir()
+        .expect("scratch dir");
+    // The tab came back with its earlier ID's result, and has since ended a task of its own.
+    let came_back_and_moved_on = || {
+        let worker = crate::session_store::test_handle(1);
+        let (_, earlier, _) = done_worker(&worker, scratch.path());
+        let (restored, _) = quit_and_restore(&worker);
+        let (_, own, answer) = done_worker(&restored, scratch.path());
+        assert_eq!(
+            carried_results_of(&restored),
+            std::slice::from_ref(&earlier.path),
+            "PRECONDITION: the tab still answers for the result it came back with"
+        );
+        (restored, earlier, own, answer)
+    };
+
+    // A crash, and the restore of the layout its journal left: the tab gets a new ID.
+    let (crashed, earlier, own, answer) = came_back_and_moved_on();
+    let row = crate::task_record::restore_row(&crashed.ctx).expect("a worker's row");
+    let left = RestoredTasks::of(&layout_of(&crashed.sid, Some(&row)));
+    let store = crate::session_store::new_store();
+    let back = crate::session_store::test_handle(1);
+    crate::task_record::seed_restored(&back.ctx, &row, false, false);
+    store.write().unwrap().register(back.clone());
+    left.sweep(&store);
+    assert!(
+        snapshot_pair(&earlier).iter().all(|file| !file.exists()),
+        "crash: the result the tab came back with, which no record names now, is swept"
+    );
+    assert_eq!(
+        crate::task_record::cmd_result(&back.ctx, 1, ""),
+        answer,
+        "crash: the result the record names stays and reads back"
+    );
+    retire_task_file(
+        &crate::session_store::new_store(),
+        &back.sid,
+        &carried_results_of(&back),
+        false,
+    );
+    assert!(
+        snapshot_pair(&own).iter().all(|file| !file.exists()),
+        "crash: and goes with the restored tab"
+    );
+
+    // A seamless update: the successor's session keeps the tab's ID.
+    #[cfg(unix)]
+    {
+        let (handed, earlier, own, _) = came_back_and_moved_on();
+        let row = handed
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task_carry_row()
+            .expect("a worker's row");
+        let successor = crate::session_store::test_handle_identified(
+            2,
+            handed.sid.clone(),
+            aterm_session::LaunchNonce::generate(),
+            std::sync::Arc::new(crate::session_log::Epochs::new()),
+            aterm_slog::Stamp::new(1_789_000_000_000, 2_000),
+        );
+        crate::task_record::seed_carried(&successor.ctx, Some(&row));
+        assert_eq!(
+            carried_results_of(&successor),
+            std::slice::from_ref(&earlier.path),
+            "update: the successor's tab answers for the result the tab came back with"
+        );
+        // The predecessor ends at the Commit and removes nothing; the successor's tab closes.
+        retire_task_file(
+            &crate::session_store::new_store(),
+            &successor.sid,
+            &carried_results_of(&successor),
+            false,
+        );
+        assert!(
+            snapshot_pair(&earlier)
+                .iter()
+                .chain(&snapshot_pair(&own))
+                .all(|file| !file.exists()),
+            "update: the successor's close takes it with the tab's own"
+        );
+    }
+}
+
+/// A FILE A MARK NAMED UNDER ANOTHER SESSION ID GOES WITH THE LAST TAB THAT NAMED IT. `task mark`
+/// takes any path in the tasks directory, so a worker's record can name another session's
+/// snapshot, and move on from it. The tab answers for the file from that mark to its close, as
+/// for one it came back with: the owner's close leaves it while the other tab lives, and the other
+/// tab's close takes it. Before 2026-11-13 only a restore noted such a file, so after the owner's
+/// close it stayed for good. CONTROL: closed the other way round, the owner's ID takes it.
+#[test]
+fn a_file_a_mark_named_under_another_id_goes_with_the_last_tab_that_named_it() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-mark-alias")
+        .tempdir()
+        .expect("scratch dir");
+    for owner_first in [true, false] {
+        let (owner, alias) = (
+            crate::session_store::test_handle(1),
+            crate::session_store::test_handle(2),
+        );
+        let (_, snap, _) = done_worker(&owner, scratch.path());
+        // The other worker's record is pointed at the owner's snapshot by hand, then moves on.
+        let aliased = TaskMark {
+            why: Some(crate::task_record::WHY_LANDED),
+            result_bytes: snap.bytes,
+            result_path: Some(snap.path.clone()),
+            ..TaskMark::new(TaskState::Done)
+        };
+        crate::task_record::mark_session_task(&alias.ctx, 2, &aliased).expect("unfenced");
+        let (_, own, _) = done_worker(&alias, scratch.path());
+        assert_eq!(
+            carried_results_of(&alias),
+            std::slice::from_ref(&snap.path),
+            "owner_first = {owner_first}: the alias's tab answers for the file it named"
+        );
+        let (first, then) = if owner_first {
+            (&owner, &alias)
+        } else {
+            (&alias, &owner)
+        };
+        let store = crate::session_store::new_store();
+        store.write().unwrap().register(then.clone());
+        retire_task_file(&store, &first.sid, &carried_results_of(first), false);
+        assert!(
+            snapshot_pair(&snap).iter().all(|file| file.exists()),
+            "owner_first = {owner_first}: the tab still open answers for it, so it stays"
+        );
+        retire_task_file(
+            &crate::session_store::new_store(),
+            &then.sid,
+            &carried_results_of(then),
+            false,
+        );
+        assert!(
+            snapshot_pair(&snap)
+                .iter()
+                .chain(&snapshot_pair(&own))
+                .all(|file| !file.exists()),
+            "owner_first = {owner_first}: the last close takes it"
+        );
+    }
+}
+
+/// A NAME DIFFERING FROM A SNAPSHOT'S ONLY IN CASE IS NO SNAPSHOT. macOS's default volume is
+/// case-insensitive, so `s-AB…-3.result.md` is the file `s-ab…-3.result.md`, while every check
+/// that keeps a file compares names exactly: noted as carried, it would be removed at the tab's
+/// close by the variant name, and take the snapshot another record answers from. Before
+/// 2026-11-13 any hex digit passed, and a mark naming the variant noted it. CONTROL: the name as
+/// minted is one.
+#[test]
+fn a_case_variant_of_a_snapshot_name_is_never_carried() {
+    let tasks = crate::task_record::tasks_dir().expect("the test binary's state root");
+    let owner = SessionId::generate();
+    let name = format!("{}-3.result.md", owner.as_str());
+    let variant = format!("s-{}-3.result.md", owner.as_str()[2..].to_ascii_uppercase());
+    assert_eq!(
+        snapshot_sid(&name),
+        Some(owner.as_str()),
+        "CONTROL: the minted name"
+    );
+    assert_eq!(snapshot_sid(&variant), None, "the case variant");
+    let alias = crate::session_store::test_handle(1);
+    let mark = |file: &str| TaskMark {
+        why: Some(crate::task_record::WHY_LANDED),
+        result_bytes: 1,
+        result_path: Some(tasks.join(file)),
+        ..TaskMark::new(TaskState::Done)
+    };
+    crate::task_record::mark_session_task(&alias.ctx, 1, &mark(&variant)).expect("unfenced");
+    assert!(
+        carried_results_of(&alias).is_empty(),
+        "a mark naming the variant notes nothing to remove"
+    );
+    crate::task_record::mark_session_task(&alias.ctx, 1, &mark(&name)).expect("unfenced");
+    assert_eq!(
+        carried_results_of(&alias),
+        [tasks.join(&name)],
+        "CONTROL: a mark naming the snapshot notes it"
+    );
+}
+
+/// A FILE A MARK NAMED STAYS WHILE ITS OWNER LIVES IN ANOTHER PROCESS. The tasks directory is
+/// shared by every aterm on the state root, and a close asks only its own process's records: a
+/// worker here whose record a mark pointed at a snapshot of a session another aterm runs leaves
+/// that file at its close while the owner's task file stands, and the owner's own ID removes it.
+/// Before 2026-11-13 the close took it, and the other process's record said `result_bytes` above
+/// 0 over `no-snapshot`. CONTROL: once the owner's task file has gone, the alias's close takes it.
+#[test]
+fn a_file_a_mark_named_stays_while_its_owner_lives_in_another_process() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-mark-elsewhere")
+        .tempdir()
+        .expect("scratch dir");
+    for owner_gone in [false, true] {
+        // The owner is no session of this process's store: another aterm runs it.
+        let (owner, alias) = (
+            crate::session_store::test_handle(1),
+            crate::session_store::test_handle(2),
+        );
+        let (task, snap, _) = done_worker(&owner, scratch.path());
+        let aliased = TaskMark {
+            why: Some(crate::task_record::WHY_LANDED),
+            result_bytes: snap.bytes,
+            result_path: Some(snap.path.clone()),
+            ..TaskMark::new(TaskState::Done)
+        };
+        crate::task_record::mark_session_task(&alias.ctx, 2, &aliased).expect("unfenced");
+        assert_eq!(
+            carried_results_of(&alias),
+            std::slice::from_ref(&snap.path),
+            "PRECONDITION: the alias's tab answers for the file it named"
+        );
+        if owner_gone {
+            // The owner's tab closed in its own process with a retired row standing: its task file
+            // went, its results stay.
+            retire_task_file(&crate::session_store::new_store(), &owner.sid, &[], true);
+        }
+        assert_eq!(
+            task.exists(),
+            !owner_gone,
+            "PRECONDITION: the owner's task file"
+        );
+        retire_task_file(
+            &crate::session_store::new_store(),
+            &alias.sid,
+            &carried_results_of(&alias),
+            false,
+        );
+        assert_eq!(
+            snapshot_pair(&snap).iter().all(|file| file.exists()),
+            !owner_gone,
+            "owner_gone = {owner_gone}: the alias's close leaves the file while its owner lives"
+        );
+        retire_task_file(&crate::session_store::new_store(), &owner.sid, &[], false);
+    }
+}
+
+/// A TAB NOTES AT MOST `CARRIED_RESULTS_MAX` FILES UNDER OTHER IDS, so each row that carries the
+/// list stays inside what a stored layout row may hold (8 KiB), past which a restore drops the
+/// row and the record with it. Before 2026-11-13 every distinct path a mark named was noted, and
+/// about 235 marks put the tab's row past the bound.
+#[test]
+fn a_tab_notes_a_bounded_list_of_carried_results() {
+    let tasks = crate::task_record::tasks_dir().expect("the test binary's state root");
+    let tab = crate::session_store::test_handle(1);
+    for rev in 1..=u64::try_from(crate::session_timeline::CARRIED_RESULTS_MAX + 8).unwrap() {
+        let name = format!("{}-{rev}.result.md", SessionId::generate().as_str());
+        let mark = TaskMark {
+            why: Some(crate::task_record::WHY_LANDED),
+            result_bytes: 1,
+            result_path: Some(tasks.join(name)),
+            ..TaskMark::new(TaskState::Done)
+        };
+        crate::task_record::mark_session_task(&tab.ctx, 1, &mark).expect("unfenced");
+    }
+    assert_eq!(
+        carried_results_of(&tab).len(),
+        crate::session_timeline::CARRIED_RESULTS_MAX,
+        "the list stops at its bound"
+    );
+    let row = crate::task_record::restore_row(&tab.ctx).expect("a worker's row");
+    assert!(row.len() < 2048, "the row stays small: {} bytes", row.len());
+}
+
+/// NO REMOVAL BY PATH TAKES A FILE ANOTHER RECORD HERE NAMES. `task mark` takes any path in the
+/// tasks directory as `result_path=`, so a record can name another session's snapshot, and after
+/// a restore both tabs come back with that one file. The close of either leaves it while the
+/// other's record names it; before 2026-11-12 the first close removed it, and the other said
+/// `result_bytes` above 0 over `no-snapshot`. A row that names a file no done edge writes is
+/// nothing its tab left: the restore's sweep does not remove it by that name.
+#[test]
+fn a_file_another_record_names_outlives_a_tab_that_also_named_it() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-alias")
+        .tempdir()
+        .expect("scratch dir");
+    let dir = crate::task_record::tasks_dir().expect("the test binary's state root");
+    let (owner, alias) = (
+        crate::session_store::test_handle(1),
+        crate::session_store::test_handle(2),
+    );
+    let (_, snap, answer) = done_worker(&owner, scratch.path());
+    let sidecar = aterm_agent::harness::result::sidecar_of(&snap.path);
+    // The other worker's record is pointed at the owner's snapshot by hand.
+    let _ = done_worker(&alias, scratch.path());
+    let aliased = TaskMark {
+        why: Some(crate::task_record::WHY_LANDED),
+        result_bytes: snap.bytes,
+        result_path: Some(snap.path.clone()),
+        ..TaskMark::new(TaskState::Done)
+    };
+    crate::task_record::mark_session_task(&alias.ctx, 2, &aliased).expect("unfenced");
+    let row = |handle: &crate::session_store::SessionHandle| {
+        crate::task_record::restore_row(&handle.ctx).expect("a worker's row")
+    };
+
+    // The quit writes a layout whose rows both name the file, and takes the task files, which
+    // name sessions no restore brings back.
+    let quitting = crate::session_store::new_store();
+    quitting.write().unwrap().register(owner.clone());
+    quitting.write().unwrap().register(alias.clone());
+    retire_task_files_at_quit(
+        &quitting,
+        &[],
+        &QuitClosed::default(),
+        std::slice::from_ref(&snap.path),
+    );
+
+    // Both come back, each with the one file.
+    let store = crate::session_store::new_store();
+    let (owner_back, alias_back) = (
+        crate::session_store::test_handle(1),
+        crate::session_store::test_handle(2),
+    );
+    crate::task_record::seed_restored(&owner_back.ctx, &row(&owner), false, false);
+    crate::task_record::seed_restored(&alias_back.ctx, &row(&alias), false, false);
+    let carried_of = |handle: &crate::session_store::SessionHandle| {
+        handle
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .carried_results()
+            .to_vec()
+    };
+    assert_eq!(
+        (carried_of(&owner_back), carried_of(&alias_back)),
+        (vec![snap.path.clone()], vec![snap.path.clone()]),
+        "PRECONDITION: both tabs came back with it"
+    );
+
+    // The alias's tab closes: its session is out of the store, the owner's is in it.
+    store.write().unwrap().register(owner_back.clone());
+    retire_task_file(&store, &alias_back.sid, &carried_of(&alias_back), false);
+    assert!(
+        snap.path.exists() && sidecar.exists(),
+        "the owner's record names it: it stays"
+    );
+    assert_eq!(
+        crate::task_record::cmd_result(&owner_back.ctx, 1, ""),
+        answer,
+        "and the owner still reads it"
+    );
+    // CONTROL: the owner's tab closes too, and nothing names the file.
+    retire_task_file(
+        &crate::session_store::new_store(),
+        &owner_back.sid,
+        &carried_of(&owner_back),
+        false,
+    );
+    assert!(
+        !snap.path.exists() && !sidecar.exists(),
+        "CONTROL: the last record that named it took it"
+    );
+
+    // A row of a tab the restore dropped names a file no done edge writes: the sweep leaves it.
+    let dropped = SessionId::generate();
+    let (notes, notes_src) = (dir.join("notes.md"), dir.join("notes.src"));
+    std::fs::write(&notes, "kept by hand").expect("written");
+    std::fs::write(&notes_src, "source=none why=hand").expect("written");
+    let shaped = dir.join(format!("{}-3.result.md", SessionId::generate().as_str()));
+    std::fs::write(&shaped, "a tab's result").expect("written");
+    let named = |path: &Path| {
+        format!(
+            "rev=4 state=done from=ctl since=1789000000000 result_bytes=12 attention=0 \
+             why=landed result_path={}",
+            crate::control::pct_encode(&path.to_string_lossy())
+        )
+    };
+    let mut layout = layout_of(&dropped, Some(&named(&notes)));
+    layout
+        .windows
+        .extend(layout_of(&SessionId::generate(), Some(&named(&shaped))).windows);
+    RestoredTasks::of(&layout).sweep(&crate::session_store::new_store());
+    assert!(
+        notes.exists() && notes_src.exists(),
+        "a name no done edge writes is not removed by a row that names it"
+    );
+    assert!(
+        !shaped.exists(),
+        "CONTROL: a snapshot a dropped tab's row names goes"
+    );
+    for path in [notes, notes_src] {
+        std::fs::remove_file(path).expect("removed");
+    }
+    let emptied = crate::session_store::new_store();
+    retire_task_file(&emptied, &owner.sid, &[], false);
+    retire_task_file(&emptied, &alias.sid, &[], false);
+}
+
+/// A RESTORE SWEEPS WHAT ITS LAYOUT LEFT, AND NO OTHER FILE: after a crash no quit removed
+/// anything, so the session IDs the taken layout names still have their task files, a result a
+/// done edge wrote after the layout's last write, and the result of a tab the restore did not
+/// bring back. Those go once the restore has finished. What stays: the result a restored record
+/// names, every file of a shell the keeper handed back under its ID, and the files of a session
+/// the layout does not name (another aterm's on this state root).
+#[test]
+fn a_restore_sweeps_what_its_layout_left_and_no_other() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-sweep")
+        .tempdir()
+        .expect("scratch dir");
+    let dir = crate::task_record::tasks_dir().expect("the test binary's state root");
+    let file = |sid: &SessionId, tail: &str| dir.join(format!("{}-{tail}", sid.as_str()));
+    let written = |sid: &SessionId, tail: &str| {
+        let path = file(sid, tail);
+        std::fs::write(&path, "").expect("written");
+        path
+    };
+
+    // The crashed run: a done worker the restore brings back, one it drops, and a shell the
+    // keeper hands back; another aterm's worker beside them.
+    let (back, dropped, kept) = (
+        crate::session_store::test_handle(1),
+        crate::session_store::test_handle(2),
+        crate::session_store::test_handle(3),
+    );
+    let (back_task, back_snap, answer) = done_worker(&back, scratch.path());
+    let (dropped_task, dropped_snap, _) = done_worker(&dropped, scratch.path());
+    let (kept_task, kept_snap, _) = done_worker(&kept, scratch.path());
+    let unjournaled = [
+        written(&back.sid, "9.result.md"),
+        written(&back.sid, "9.result.src"),
+    ];
+    let elsewhere = SessionId::generate();
+    let others = [
+        written(&elsewhere, "1.txt"),
+        written(&elsewhere, "2.result.md"),
+        written(&elsewhere, "2.result.src"),
+    ];
+    let row = |handle: &crate::session_store::SessionHandle| {
+        crate::task_record::restore_row(&handle.ctx).expect("a worker's row")
+    };
+    let mut layout = layout_of(&back.sid, Some(&row(&back)));
+    for other in [&dropped, &kept] {
+        layout
+            .windows
+            .extend(layout_of(&other.sid, Some(&row(other))).windows);
+    }
+    let left = RestoredTasks::of(&layout);
+
+    // The relaunch: `back` returns under a new ID, `kept` under its own, `dropped` not at all.
+    let store = crate::session_store::new_store();
+    let restored = crate::session_store::test_handle(1);
+    crate::task_record::seed_restored(&restored.ctx, &row(&back), false, false);
+    store.write().unwrap().register(restored.clone());
+    store.write().unwrap().register(kept.clone());
+    left.sweep(&store);
+
+    assert_eq!(
+        crate::task_record::cmd_result(&restored.ctx, 1, ""),
+        answer,
+        "the restored record's result stays"
+    );
+    assert!(!back_task.exists(), "its old ID's task file goes");
+    assert!(
+        unjournaled.iter().all(|path| !path.exists()),
+        "and a result no row names"
+    );
+    assert!(
+        !dropped_task.exists()
+            && !dropped_snap.path.exists()
+            && !aterm_agent::harness::result::sidecar_of(&dropped_snap.path).exists(),
+        "a tab the restore dropped leaves nothing"
+    );
+    assert!(
+        kept_task.exists() && kept_snap.path.exists(),
+        "a shell handed back under its ID keeps its files"
+    );
+    assert!(
+        others.iter().all(|path| path.exists()),
+        "a session the layout does not name keeps its files"
+    );
+    for path in others {
+        std::fs::remove_file(path).expect("removed");
+    }
+    let emptied = crate::session_store::new_store();
+    retire_task_file(&emptied, &kept.sid, &[], false);
+    retire_task_file(
+        &emptied,
+        &restored.sid,
+        std::slice::from_ref(&back_snap.path),
+        false,
     );
 }

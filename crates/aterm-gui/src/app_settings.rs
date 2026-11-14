@@ -5,28 +5,56 @@
 
 use crate::App;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FONT_CATALOG_DELIVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FONT_REFUSAL_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static SETTINGS_TOPOLOGY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn tccutil_presence_once() -> aterm_containment::TccutilPresence {
     static PRESENCE: std::sync::OnceLock<aterm_containment::TccutilPresence> =
         std::sync::OnceLock::new();
     *PRESENCE.get_or_init(aterm_containment::consent::tccutil_presence)
 }
 
-static SETTINGS_FONT_REFUSALS: std::sync::Mutex<Vec<crate::native_font_catalog::FontRefusal>> =
-    std::sync::Mutex::new(Vec::new());
+#[derive(Default)]
+struct SettingsFonts {
+    listed_for: Option<crate::native_app::AppInstanceId>,
+    families: Option<std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>>,
+    refusals: std::sync::Arc<Vec<crate::native_font_catalog::FontRefusal>>,
+}
 
-static SETTINGS_FONT_FAMILIES: std::sync::Mutex<(
-    Option<crate::native_app::AppInstanceId>,
-    Option<std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>>,
-)> = std::sync::Mutex::new((None, None));
+#[cfg(not(test))]
+static SETTINGS_FONTS: std::sync::LazyLock<std::sync::Mutex<SettingsFonts>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(SettingsFonts::default()));
 
-/// The installed fonts the Settings font pickers were last given ([`SETTINGS_FONT_FAMILIES`]).
+#[cfg(test)]
+thread_local! {
+    // A test's UI thread owns its process facts; no reset can clear another test's cache.
+    static TEST_SETTINGS_FONTS: std::cell::RefCell<SettingsFonts> =
+        std::cell::RefCell::new(SettingsFonts::default());
+}
+
+fn with_settings_fonts<R>(read: impl FnOnce(&mut SettingsFonts) -> R) -> R {
+    #[cfg(test)]
+    {
+        TEST_SETTINGS_FONTS.with(|fonts| read(&mut fonts.borrow_mut()))
+    }
+    #[cfg(not(test))]
+    {
+        read(
+            &mut SETTINGS_FONTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+/// The installed fonts the Settings font pickers were last given.
 pub(crate) fn settings_font_families()
 -> Option<std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>> {
-    SETTINGS_FONT_FAMILIES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .1
-        .clone()
+    with_settings_fonts(|fonts| fonts.families.clone())
 }
 
 impl App {
@@ -57,6 +85,8 @@ impl App {
             crate::tab_model::ViewId,
         ),
     ) {
+        #[cfg(test)]
+        SETTINGS_TOPOLOGY_VISITS.with(|n| n.set(n.get() + 1));
         let Some(window) = self.windows.get(&wid) else {
             return;
         };
@@ -229,23 +259,21 @@ impl App {
             journal: self.session_log_journal.status(),
             keeper: crate::keeper_link::status(),
         };
-        let mut views = Vec::new();
-        for &wid in self.windows.keys() {
-            self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
+        let changed = self.native_runtime.deliver_settings_runtime(runtime);
+        self.redraw_changed_settings_views(&changed);
+    }
+
+    fn redraw_changed_settings_views(&mut self, changed: &[crate::tab_model::ViewId]) {
+        if changed.is_empty() {
+            return;
         }
-        for (wid, view) in views {
-            let changed = self
-                .native_runtime
-                .change_view_state(view, |state| match state {
-                    crate::native_app::AppViewState::Settings(state)
-                        if state.session_runtime != Some(runtime) =>
-                    {
-                        state.session_runtime = Some(runtime);
-                        true
-                    }
-                    _ => false,
-                });
-            if changed && let Some(window) = self.windows.get_mut(&wid) {
+        let windows: Vec<_> = self.windows.keys().copied().collect();
+        for wid in windows {
+            let mut holds_changed = false;
+            self.visit_settings_tabs_in_window(wid, |_, _, _, view| {
+                holds_changed |= changed.contains(&view);
+            });
+            if holds_changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
                 if let Some(window) = &window.os_window {
                     window.request_redraw();
@@ -262,15 +290,15 @@ impl App {
         else {
             return;
         };
-        let (listed_for, families) = SETTINGS_FONT_FAMILIES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let (listed_for, families, refusals) = with_settings_fonts(|fonts| {
+            (
+                fonts.listed_for,
+                fonts.families.clone(),
+                std::sync::Arc::clone(&fonts.refusals),
+            )
+        });
         if listed_for != Some(instance) {
-            SETTINGS_FONT_FAMILIES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0 = Some(instance);
+            with_settings_fonts(|fonts| fonts.listed_for = Some(instance));
             if let Some(proxy) = self.proxy.clone() {
                 let _ = crate::qos::spawn_lane_thread(
                     "aterm-font-families",
@@ -285,43 +313,15 @@ impl App {
         if let Some(families) = families {
             self.hand_settings_font_families(&families);
         }
-        let refusals = SETTINGS_FONT_REFUSALS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         self.hand_settings_font_refusals(&refusals, false);
         self.hand_settings_drawn_faces();
     }
 
     fn hand_settings_drawn_faces(&mut self) {
-        let drawn = self.backend.drawn_faces().cloned();
-        let mut views = Vec::new();
-        for &wid in self.windows.keys() {
-            self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
-        }
-        for (wid, view) in views {
-            let changed = self
-                .native_runtime
-                .change_view_state(view, |state| match state {
-                    crate::native_app::AppViewState::Settings(state) => {
-                        state.replace_drawn_faces(drawn.clone())
-                    }
-                    crate::native_app::AppViewState::Mail(_)
-                    | crate::native_app::AppViewState::About(_)
-                    | crate::native_app::AppViewState::SystemState(_)
-                    | crate::native_app::AppViewState::Editor(_)
-                    | crate::native_app::AppViewState::Recovery(_)
-                    | crate::native_app::AppViewState::Workers(_)
-                    | crate::native_app::AppViewState::Tables(_)
-                    | crate::native_app::AppViewState::Allocation(_) => false,
-                });
-            if changed && let Some(window) = self.windows.get_mut(&wid) {
-                window.last_present = None;
-                if let Some(os_window) = window.os_window.as_ref() {
-                    os_window.request_redraw();
-                }
-            }
-        }
+        let changed = self
+            .native_runtime
+            .deliver_settings_drawn(self.backend.drawn_faces());
+        self.redraw_changed_settings_views(&changed);
     }
 
     /// A font generation's refused rows ([`crate::native_font_catalog::FontRefusal`]).
@@ -329,45 +329,20 @@ impl App {
         &mut self,
         refusals: Vec<crate::native_font_catalog::FontRefusal>,
     ) {
-        SETTINGS_FONT_REFUSALS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone_from(&refusals);
+        let refusals = std::sync::Arc::new(refusals);
+        with_settings_fonts(|fonts| fonts.refusals = std::sync::Arc::clone(&refusals));
         self.hand_settings_font_refusals(&refusals, true);
     }
 
     fn hand_settings_font_refusals(
         &mut self,
-        refusals: &[crate::native_font_catalog::FontRefusal],
+        refusals: &std::sync::Arc<Vec<crate::native_font_catalog::FontRefusal>>,
         announce: bool,
     ) {
-        let mut views = Vec::new();
-        for &wid in self.windows.keys() {
-            self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
-        }
-        for (wid, view) in views {
-            let changed = self
-                .native_runtime
-                .change_view_state(view, |state| match state {
-                    crate::native_app::AppViewState::Settings(state) => {
-                        state.replace_font_refusals(refusals.to_vec(), announce)
-                    }
-                    crate::native_app::AppViewState::Mail(_)
-                    | crate::native_app::AppViewState::About(_)
-                    | crate::native_app::AppViewState::SystemState(_)
-                    | crate::native_app::AppViewState::Editor(_)
-                    | crate::native_app::AppViewState::Recovery(_)
-                    | crate::native_app::AppViewState::Workers(_)
-                    | crate::native_app::AppViewState::Tables(_)
-                    | crate::native_app::AppViewState::Allocation(_) => false,
-                });
-            if changed && let Some(window) = self.windows.get_mut(&wid) {
-                window.last_present = None;
-                if let Some(os_window) = window.os_window.as_ref() {
-                    os_window.request_redraw();
-                }
-            }
-        }
+        let changed = self
+            .native_runtime
+            .deliver_settings_refusals(std::sync::Arc::clone(refusals), announce);
+        self.redraw_changed_settings_views(&changed);
     }
 
     /// The listing thread's answer ([`crate::Wake::FontFamiliesListed`]).
@@ -375,10 +350,7 @@ impl App {
         &mut self,
         families: std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>,
     ) {
-        SETTINGS_FONT_FAMILIES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .1 = Some(std::sync::Arc::clone(&families));
+        with_settings_fonts(|fonts| fonts.families = Some(std::sync::Arc::clone(&families)));
         self.hand_settings_font_families(&families);
     }
 
@@ -386,33 +358,10 @@ impl App {
         &mut self,
         families: &std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>,
     ) {
-        let mut views = Vec::new();
-        for &wid in self.windows.keys() {
-            self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
-        }
-        for (wid, view) in views {
-            let changed = self
-                .native_runtime
-                .change_view_state(view, |state| match state {
-                    crate::native_app::AppViewState::Settings(state) => {
-                        state.replace_font_families(std::sync::Arc::clone(families))
-                    }
-                    crate::native_app::AppViewState::Mail(_)
-                    | crate::native_app::AppViewState::About(_)
-                    | crate::native_app::AppViewState::SystemState(_)
-                    | crate::native_app::AppViewState::Editor(_)
-                    | crate::native_app::AppViewState::Recovery(_)
-                    | crate::native_app::AppViewState::Workers(_)
-                    | crate::native_app::AppViewState::Tables(_)
-                    | crate::native_app::AppViewState::Allocation(_) => false,
-                });
-            if changed && let Some(window) = self.windows.get_mut(&wid) {
-                window.last_present = None;
-                if let Some(os_window) = window.os_window.as_ref() {
-                    os_window.request_redraw();
-                }
-            }
-        }
+        let changed = self
+            .native_runtime
+            .deliver_settings_families(std::sync::Arc::clone(families));
+        self.redraw_changed_settings_views(&changed);
     }
 
     /// Ask a frame of every window that holds a native leaf's raster after a chrome font

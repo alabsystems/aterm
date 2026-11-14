@@ -75,25 +75,11 @@ fn a_tab_named_by_its_programs_title_reaches_the_log_by_its_session() {
         );
         let logged = logged_while(|| {
             app.stop_worker_refused(0, crate::app_overview::StopRefused::NoAgent);
-            app.read_status_result(&crate::status_item::ResultRef {
-                session: 0,
-                entered: 0,
-                end_serial: None,
-                path: std::path::PathBuf::from("QZP7E7G2/result.md"),
-                label: "QZP7E7G2".to_string(),
-            });
         });
         assert!(
             logged.iter().any(|line| line.starts_with("message ")
                 && line.contains(" key=harness.stop-worker.0 title=")),
             "the posted message is logged by its key: {} lines",
-            logged.len()
-        );
-        assert!(
-            logged
-                .iter()
-                .any(|line| line.starts_with("status item: session 0's result did not open: ")),
-            "the result that did not open is logged: {} lines",
             logged.len()
         );
         assert!(

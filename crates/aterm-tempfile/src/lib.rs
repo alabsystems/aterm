@@ -466,8 +466,42 @@ impl TempDir {
 impl Drop for TempDir {
     #[cfg_attr(trust_verify, trust::skip)]
     fn drop(&mut self) {
-        if !self.path.as_os_str().is_empty() {
-            let _ = fs::remove_dir_all(&self.path);
+        if !self.path.as_os_str().is_empty() && fs::remove_dir_all(&self.path).is_err() {
+            // A test may leave a sealed directory inside (the host-executable image store seals
+            // each image 0o500), which no unlink can empty: open every directory of the tree to
+            // its owner, then remove the tree again.
+            #[cfg(unix)]
+            {
+                unseal_tree(&self.path);
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+}
+
+/// Give the owner write and search permission on `dir` and every directory below it, never
+/// following a symbolic link out of the tree. Errors are ignored: the caller's removal reports
+/// nothing either.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn unseal_tree(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700));
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            unseal_tree(&entry.path());
         }
     }
 }

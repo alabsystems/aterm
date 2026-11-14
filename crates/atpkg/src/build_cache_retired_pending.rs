@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Durable custody of one eligible snapshot while its tree and Git entry are removed.
+//!
+//! The retired gate's snapshot keeps its receipt beside its checkout
+//! (`<checkout>-verify-retiring.noindex`), where `aterm pkg machine apply` finds it. Any other
+//! linked worktree keeps its own in the checkout's git directory,
+//! `<checkout>/.git/aterm-retiring/<the first 32 hex digits of the SHA-256 of its location>`:
+//! one slot per worktree, keyed by its path (git reuses an entry's id), so a stopped removal of
+//! one never blocks another's or the snapshot's, and none lies in the person's folders.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -10,6 +17,12 @@ use super::super::registered::volume;
 
 pub(super) const SUFFIX: &str = "-verify-retiring.noindex";
 const MAX_BYTES: usize = 32 << 10;
+
+/// The folder of a linked worktree's receipts, in its checkout's git directory.
+const LINKED: &str = "aterm-retiring";
+
+/// The most receipts [`listed`] reads and returns.
+const MAX_LISTED: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Pending {
@@ -27,6 +40,10 @@ pub(super) struct Pending {
     pub(super) head: String,
     pub(super) tree_gone: bool,
     pub(super) started: [u64; 2],
+    /// What a linked worktree ignored when its removal began (`git status --ignored`'s rows),
+    /// the one kind of untracked entry a removal that stopped part way may leave.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) ignored: Vec<String>,
 }
 
 impl Pending {
@@ -61,12 +78,65 @@ impl Identity {
     }
 }
 
-fn location(path: &Path) -> Option<PathBuf> {
+pub(super) fn location(path: &Path) -> Option<PathBuf> {
     Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
 }
 
-fn path(checkout: &Path) -> Result<PathBuf, String> {
-    super::beside(checkout, SUFFIX).ok_or_else(|| "no snapshot receipt path".to_owned())
+/// The folder of `checkout`'s linked worktrees' receipts.
+fn linked_dir(checkout: &Path) -> PathBuf {
+    checkout.join(".git").join(LINKED)
+}
+
+/// A linked worktree's receipt name: the first 32 lowercase hex digits of the SHA-256 of its
+/// location ([`location`]).
+fn slot(location: &Path) -> String {
+    use std::fmt::Write as _;
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        location.as_os_str().as_encoded_bytes(),
+    );
+    let mut name = String::with_capacity(32);
+    for byte in digest.as_ref().iter().take(16) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// Where the receipt of `wt`, a worktree of `checkout`, lies: beside the checkout for the
+/// retired gate's snapshot, in the checkout's git directory for any other.
+fn path(checkout: &Path, wt: &Path) -> Result<PathBuf, String> {
+    const NONE: &str = "no snapshot receipt path";
+    let snapshot = super::beside(checkout, super::SNAPSHOT).ok_or(NONE)?;
+    let at = location(wt);
+    if wt == snapshot || (at.is_some() && at == location(&snapshot)) {
+        let receipt = super::beside(checkout, SUFFIX);
+        return receipt.ok_or_else(|| NONE.to_owned());
+    }
+    let at = at.ok_or("the worktree's location is unavailable, so it has no receipt path")?;
+    Ok(linked_dir(checkout).join(slot(&at)))
+}
+
+/// The worktree each readable receipt in `checkout`'s git directory names, at most
+/// [`MAX_LISTED`], each once: a receipt whose name is not its worktree's slot names none.
+pub(super) fn listed(checkout: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(linked_dir(checkout)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .take(MAX_LISTED.saturating_mul(4))
+        .filter_map(|entry| {
+            let bytes = crate::metadata_io::read_bounded_regular(&entry.path(), MAX_BYTES).ok()?;
+            let pending: Pending = aterm_json::from_slice(&bytes).ok()?;
+            let named = slot(&pending.snapshot);
+            (pending.schema == 1 && entry.file_name().to_str() == Some(named.as_str()))
+                .then_some(pending.snapshot)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_LISTED);
+    out
 }
 
 fn identity(path: &Path) -> Result<Option<Identity>, String> {
@@ -235,7 +305,7 @@ fn read_bound(
     now: SystemTime,
     proving_gone: bool,
 ) -> Result<Option<Pending>, String> {
-    let path = path(checkout)?;
+    let path = path(checkout, wt)?;
     let bytes = match crate::metadata_io::read_bounded_regular(&path, MAX_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -302,13 +372,15 @@ fn read_bound(
     Ok(Some(pending))
 }
 
-/// Capture the admitted identities and cutoff before the potentially blocking process probe.
+/// Capture the admitted identities and cutoff before the potentially blocking process probe,
+/// with what a linked worktree ignored then (`ignored`; none for the gate's snapshot).
 pub(super) fn prepare(
     wt: &Path,
     entry: &Path,
     head: &str,
     gitfile: &[u8],
     started: SystemTime,
+    ignored: Vec<String>,
 ) -> Result<Pending, String> {
     let started = started
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -328,6 +400,7 @@ pub(super) fn prepare(
         head: head.to_owned(),
         tree_gone: false,
         started: [started.as_secs(), u64::from(started.subsec_nanos())],
+        ignored,
     };
     Ok(pending)
 }
@@ -346,15 +419,20 @@ pub(super) fn begin(
     head: &str,
     gitfile: &[u8],
 ) -> Result<Pending, String> {
-    let pending = prepare(wt, entry, head, gitfile, file_clock_now())?;
+    let pending = prepare(wt, entry, head, gitfile, file_clock_now(), Vec::new())?;
     commit(checkout, &pending)?;
     Ok(pending)
 }
 
 fn write(checkout: &Path, pending: &Pending, replace: bool) -> Result<(), String> {
     use std::io::Write as _;
-    let path = path(checkout)?;
+    let path = path(checkout, &pending.snapshot)?;
     let parent = path.parent().ok_or("snapshot receipt parent unavailable")?;
+    if parent == linked_dir(checkout) {
+        std::fs::create_dir_all(parent)
+            .and_then(|()| aterm_durable::ordered_dir(&checkout.join(".git")))
+            .map_err(|error| format!("{} could not be made: {error}", parent.display()))?;
+    }
     let stage = aterm_tempfile::Builder::new()
         .prefix("retired-receipt-")
         .tempdir_in(parent)
@@ -403,6 +481,23 @@ pub(super) fn tree_gone(checkout: &Path, wt: &Path, pending: &mut Pending) -> Re
     Ok(())
 }
 
+/// Withdraw `pending`, a receipt this pass committed, when its removal stopped before anything
+/// it binds was removed: only that same receipt goes (another pass's stays), read as written,
+/// whatever was written in its tree since, for that is what stopped it.
+pub(super) fn retract(checkout: &Path, wt: &Path, pending: &Pending) -> Result<(), String> {
+    let path = path(checkout, wt)?;
+    let bytes = crate::metadata_io::read_bounded_regular(&path, MAX_BYTES)
+        .map_err(|error| format!("its removal receipt could not be read back: {error}"))?;
+    let written: Pending = aterm_json::from_slice(&bytes)
+        .map_err(|error| format!("its removal receipt could not be read back: {error}"))?;
+    if written != *pending {
+        return Err("its removal receipt changed, so it stays".to_owned());
+    }
+    std::fs::remove_file(&path).map_err(|error| format!("its removal receipt stayed: {error}"))?;
+    aterm_durable::ordered_dir(path.parent().ok_or("snapshot receipt parent unavailable")?)
+        .map_err(|error| format!("its removal receipt's withdrawal could not be synced: {error}"))
+}
+
 /// Only the same receipt goes, once both of its admitted directories are absent.
 pub(super) fn finish(checkout: &Path, wt: &Path, pending: &Pending) -> Result<(), String> {
     if read(checkout, wt)?.as_ref() != Some(pending)
@@ -411,7 +506,7 @@ pub(super) fn finish(checkout: &Path, wt: &Path, pending: &Pending) -> Result<()
     {
         return Err("snapshot removal receipt still has data or changed custody".to_owned());
     }
-    let path = path(checkout)?;
+    let path = path(checkout, wt)?;
     std::fs::remove_file(&path).map_err(|error| format!("snapshot receipt stayed: {error}"))?;
     aterm_durable::ordered_dir(path.parent().ok_or("snapshot receipt parent unavailable")?)
         .map_err(|error| format!("snapshot receipt removal could not be synced: {error}"))

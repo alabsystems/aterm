@@ -13,13 +13,13 @@
 
 use super::{Digest, Held, Kind, ProofKey, Stores, TableKey, Verdict};
 use crate::egress::{Feed, Wake, sinks};
-use aterm_db::replica::Replica;
+use aterm_db::replica::MeshAccess;
 use aterm_secrets::client::Paths;
 use aterm_secrets::membership_log::{MemberVerdict, Record};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long one batch waits for the stores' local admission.
 const ADMISSION: Duration = Duration::from_secs(10);
@@ -27,27 +27,20 @@ const ADMISSION: Duration = Duration::from_secs(10);
 /// The vault's stores.
 #[derive(Clone, Debug)]
 pub struct VaultStores {
-    paths: Paths,
-    config: PathBuf,
+    db: MeshAccess,
 }
 
 impl VaultStores {
     /// The stores of the vault `paths` keeps, under the Commons policy in `config` (`aterm.toml`).
     #[must_use]
     pub const fn new(paths: Paths, config: PathBuf) -> Self {
-        Self { paths, config }
-    }
-
-    fn replica(&self) -> aterm_db::Result<Replica> {
-        Replica::commons_until(
-            self.paths.clone(),
-            self.config.clone(),
-            Instant::now() + ADMISSION,
-        )
+        Self {
+            db: MeshAccess::new(paths, config, ADMISSION),
+        }
     }
 
     fn members(&self) -> io::Result<aterm_secrets::membership_log::Store> {
-        aterm_secrets::client::load_records(&self.paths)
+        aterm_secrets::client::load_records(self.db.paths())
             .map_err(|e| io::Error::other(e.to_string()))
     }
 }
@@ -86,9 +79,7 @@ fn unadmitted(error: &aterm_db::Error, n: usize) -> Vec<Verdict> {
 
 impl Stores for VaultStores {
     fn ingest_table(&self, table: Digest, kind: Kind, wires: &[Vec<u8>]) -> Vec<Verdict> {
-        let ingested = self
-            .replica()
-            .and_then(|replica| replica.mesh_ingest(table, kind_of(kind), wires));
+        let ingested = self.db.ingest_table(table, kind_of(kind), wires);
         match ingested {
             Ok(verdicts) => verdicts.into_iter().map(verdict_of).collect(),
             Err(e) => unadmitted(&e, wires.len()),
@@ -109,7 +100,7 @@ impl Stores for VaultStores {
             }
         }
         if !decoded.is_empty() {
-            match aterm_secrets::client::ingest_mesh_records(&self.paths, decoded) {
+            match aterm_secrets::client::ingest_mesh_records(self.db.paths(), decoded) {
                 Ok(outcomes) => {
                     for (i, (_, outcome)) in at.iter().zip(outcomes) {
                         verdicts[*i] = Some(match outcome {
@@ -133,7 +124,7 @@ impl Stores for VaultStores {
     }
 
     fn table_lengths(&self) -> io::Result<Vec<(TableKey, u64)>> {
-        Ok(aterm_db::table::store::held_lengths(&self.paths)
+        Ok(aterm_db::table::store::held_lengths(self.db.paths())
             .map_err(|e| io_of(&e))?
             .into_iter()
             .map(|(table, recovery, length)| (TableKey { table, recovery }, length))
@@ -141,19 +132,17 @@ impl Stores for VaultStores {
     }
 
     fn table_length(&self, key: TableKey) -> io::Result<Option<u64>> {
-        aterm_db::table::store::held_length(&self.paths, key.table, key.recovery)
+        aterm_db::table::store::held_length(self.db.paths(), key.table, key.recovery)
             .map_err(|e| io_of(&e))
     }
 
     fn tables_summary(&self) -> io::Result<Vec<super::TableSummary>> {
-        self.replica()
-            .and_then(|replica| replica.mesh_tables_summary())
-            .map_err(|e| io_of(&e))
+        self.db.tables_summary().map_err(|e| io_of(&e))
     }
 
     fn table_held(&self, key: TableKey, from: u64, upto: u64) -> io::Result<Vec<Held>> {
         Ok(
-            aterm_db::table::store::read_held(&self.paths, key.table, key.recovery, from, upto)
+            aterm_db::table::store::read_held(self.db.paths(), key.table, key.recovery, from, upto)
                 .map_err(|e| io_of(&e))?
                 .into_iter()
                 .map(|held| Held {
@@ -182,9 +171,7 @@ impl Stores for VaultStores {
     }
 
     fn tables(&self) -> io::Result<BTreeSet<Digest>> {
-        self.replica()
-            .and_then(|replica| replica.mesh_tables())
-            .map_err(|e| io_of(&e))
+        self.db.tables().map_err(|e| io_of(&e))
     }
 
     /// The vault takes what its Commons selection lists, which is what `mesh_ingest` admits (the
@@ -192,32 +179,24 @@ impl Stores for VaultStores {
     /// a moment ago included), and a ring window's table it does not hold yet, which it takes up
     /// as a repair round does one a peer offers (`Replica::mesh_takes`).
     fn takes(&self, table: Digest) -> io::Result<bool> {
-        self.replica()
-            .and_then(|replica| replica.mesh_takes(table))
-            .map_err(|e| io_of(&e))
+        self.db.takes(table).map_err(|e| io_of(&e))
     }
 
     fn table_inventory(&self, table: Digest) -> io::Result<Option<BTreeSet<Digest>>> {
-        self.replica()
-            .and_then(|replica| replica.mesh_inventory(table))
-            .map_err(|e| io_of(&e))
+        self.db.table_inventory(table).map_err(|e| io_of(&e))
     }
 
     fn table_wires(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
-        self.replica()
-            .and_then(|replica| replica.mesh_wires(table, ids))
-            .map_err(|e| io_of(&e))
+        self.db.table_wires(table, ids).map_err(|e| io_of(&e))
     }
 
     fn table_proofs(&self, table: Digest) -> io::Result<Option<BTreeSet<ProofKey>>> {
-        self.replica()
-            .and_then(|replica| replica.mesh_proofs(table))
-            .map_err(|e| io_of(&e))
+        self.db.table_proofs(table).map_err(|e| io_of(&e))
     }
 
     fn table_proof_wires(&self, table: Digest, keys: &[ProofKey]) -> io::Result<Vec<Vec<u8>>> {
-        self.replica()
-            .and_then(|replica| replica.mesh_proof_wires(table, keys))
+        self.db
+            .table_proof_wires(table, keys)
             .map_err(|e| io_of(&e))
     }
 

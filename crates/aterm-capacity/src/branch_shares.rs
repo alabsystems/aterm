@@ -25,6 +25,45 @@ struct State {
     initial_reserved: bool,
     serial_build: bool,
     build_phase: BuildPhase,
+    last_recovery: Option<Recovery>,
+    first_shortfall: Option<Recovery>,
+}
+
+/// Observations at an already-drained branch boundary, never permission to recover a live one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Recovery {
+    branch: usize,
+    recipient: usize,
+    assigned: u32,
+    /// Export has an in-process reservation rather than a FIFO.
+    returned: Option<u64>,
+    /// A partial read cannot establish a shortfall.
+    read_error: Option<io::ErrorKind>,
+}
+
+impl Recovery {
+    fn shortfall(self) -> Option<u64> {
+        if self.read_error.is_some() {
+            return None;
+        }
+        self.returned
+            .map(|returned| u64::from(self.assigned).saturating_sub(returned))
+    }
+}
+
+impl std::fmt::Display for Recovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "branch:{},recipient:{},assigned:{},returned:{:?},shortfall:{:?},read_error:{:?}",
+            self.branch,
+            self.recipient,
+            self.assigned,
+            self.returned,
+            self.shortfall(),
+            self.read_error
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +146,8 @@ impl BranchShares {
                 initial_reserved: false,
                 serial_build: false,
                 build_phase: BuildPhase::Compilers,
+                last_recovery: None,
+                first_shortfall: None,
             }),
         };
         shares.describe(
@@ -432,12 +473,35 @@ impl BranchShares {
         let tokens = std::mem::take(&mut state.allocated[branch]);
         // If the last branch is tree, its surviving bytes already back the bundle allocation.
         // Drain those bytes first: its clients may have returned any subset of the allocation.
-        while let Ok(Some(token)) = self
-            .pools
-            .get(branch)
-            .map_or(Ok(None), Jobserver::try_acquire)
+        let mut returned = self.pools.get(branch).map(|_| 0_u64);
+        let mut read_error = None;
+        if let Some(pool) = self.pools.get(branch) {
+            loop {
+                match pool.try_acquire() {
+                    Ok(Some(token)) => {
+                        returned = returned.map(|count| count.saturating_add(1));
+                        std::mem::forget(token);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        read_error = Some(error.kind());
+                        break;
+                    }
+                }
+            }
+        }
+        let recovery = Recovery {
+            branch,
+            recipient,
+            assigned: tokens,
+            returned,
+            read_error,
+        };
+        state.last_recovery = Some(recovery);
+        if state.first_shortfall.is_none()
+            && recovery.shortfall().is_some_and(|missing| missing > 0)
         {
-            std::mem::forget(token);
+            state.first_shortfall = Some(recovery);
         }
         state.allocated[recipient] += tokens;
         // Publish the wider dispatch share before a reminted byte can wake a child. The child
@@ -448,8 +512,14 @@ impl BranchShares {
     }
 
     fn describe(&self, state: &State) {
+        let recovery = state
+            .last_recovery
+            .map_or_else(|| "none".to_string(), |r| r.to_string());
+        let first_shortfall = state
+            .first_shortfall
+            .map_or_else(|| "none".to_string(), |r| r.to_string());
         let record = format!(
-            "coordinator_pid={} assigned_holders=[build,tree,export] shares={:?} ended={:?} initial_reserved={} serial_build={} build_phase={:?} fifos=[{},{}] unreturned_token_holders=unobservable-in-GNU-protocol",
+            "coordinator_pid={} assigned_holders=[build,tree,export] shares={:?} ended={:?} initial_reserved={} serial_build={} build_phase={:?} fifos=[{},{}] last_recovery=[{}] first_shortfall=[{}] unreturned_token_holders=unobservable-in-GNU-protocol",
             std::process::id(),
             state.allocated,
             state.ended,
@@ -457,7 +527,9 @@ impl BranchShares {
             state.serial_build,
             state.build_phase,
             self.pools[0].path().display(),
-            self.pools[1].path().display()
+            self.pools[1].path().display(),
+            recovery,
+            first_shortfall
         );
         for (i, pool) in self.pools.iter().enumerate() {
             if let Err(error) = crate::book::write_staged(

@@ -1534,6 +1534,37 @@ pub(super) trait Kernel {
         let (_, pgid, tpgid) = self.ids(shell)?;
         Some(pgid == i64::from(shell) && pgid == tpgid)
     }
+    /// The live children of `pid` as the kernel records them now (`None`: not read), each of
+    /// which a closed restart's watch requires to run no image the restart's grant may run before
+    /// it ends ([`super::native_restart::closed_watch`]). The default reads no machine, so an
+    /// injected kernel never rules a grantee out unless it says so.
+    fn children(&self, pid: u32) -> Option<Vec<u32>> {
+        let _ = pid;
+        None
+    }
+    /// The identity of the file `pid`'s running image was mapped from, read from the kernel's
+    /// mapping rather than a path that may name another file now (`None`: gone or not read):
+    /// what tells a closed restart's possible grantee from its shell's other children
+    /// ([`super::native_restart::closed_watch`]). The default reads no machine, so an injected
+    /// kernel never rules a child out by its image unless it says so.
+    fn image_file(&self, pid: u32) -> Option<agent_image::FileId> {
+        let _ = pid;
+        None
+    }
+    /// Whether a process holds `pid` now (`None`: not read); a free pid and a zombie hold none.
+    /// What proves a closed restart's shell or old agent gone by its start once its pid is free
+    /// ([`super::native_restart::closed_watch`]). The default reads no machine, so an injected
+    /// kernel proves no process gone unless it says so.
+    fn holds_pid(&self, pid: u32) -> Option<bool> {
+        let _ = pid;
+        None
+    }
+    /// The machine and boot this process runs in (`None`: not read), which a closed restart's
+    /// watch holds to the boot its prepare names: a later boot ended every process of the
+    /// restart's ([`super::native_restart::closed_watch`]). The default reads no machine.
+    fn machine_boot(&self) -> Option<super::native_act::BootStamp> {
+        None
+    }
     /// What each of `procs`, the shells under `agent` in table `t`, is: its age, its seat and,
     /// for a direct child, its command. The default reads no machine: every one a top with no
     /// command, which is never a wait ([`upgrade::own_of`]).
@@ -1579,6 +1610,22 @@ impl Kernel for Live {
 
     fn restart_background(&self, pid: u32) -> Vec<String> {
         live_background(pid)
+    }
+
+    fn children(&self, pid: u32) -> Option<Vec<u32>> {
+        live_children(pid)
+    }
+
+    fn image_file(&self, pid: u32) -> Option<agent_image::FileId> {
+        live_image_file(pid)
+    }
+
+    fn holds_pid(&self, pid: u32) -> Option<bool> {
+        live_presence(pid)
+    }
+
+    fn machine_boot(&self) -> Option<super::native_act::BootStamp> {
+        super::native_act::BootStamp::current()
     }
 
     fn restart_held(&self, pid: u32) -> Option<Vec<upgrade::Held>> {
@@ -1770,6 +1817,92 @@ pub(super) fn live_background(pid: u32) -> Vec<String> {
     #[cfg(not(target_os = "macos"))]
     {
         background_or_unreadable(pid, &table())
+    }
+}
+
+/// Whether a process holds `pid` now ([`Kernel::holds_pid`]): on Unix by the kernel's own answer, a
+/// zombie or a free pid holding none; `None` where it did not answer, and off Unix, whose reader
+/// does not tell a free pid from one it could not query.
+fn live_presence(pid: u32) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        use aterm_uds::process::ProcessPresence;
+        match aterm_uds::process::process_presence(i32::try_from(pid).ok().filter(|p| *p > 0)?) {
+            ProcessPresence::Present => Some(true),
+            ProcessPresence::Exited | ProcessPresence::Absent => Some(false),
+            ProcessPresence::Unknown => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `pid`'s live children as the kernel records them now ([`Kernel::children`]): on macOS from its
+/// own child list, never the whole table, each read again by its pid so that a zombie or a child
+/// that left is not counted; elsewhere from the table. `None` where the list, a child's row or the
+/// table did not read.
+fn live_children(pid: u32) -> Option<Vec<u32>> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut live = Vec::new();
+        for child in aterm_sysprobe::jobs::child_pids(pid)? {
+            match live_child_row(child) {
+                Ok(Some((parent, _))) if parent == pid => live.push(child),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(live)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let t = table();
+        if t.is_empty() {
+            return None;
+        }
+        Some(
+            t.iter()
+                .filter(|(_, parent, _)| *parent == pid)
+                .map(|(child, _, _)| *child)
+                .collect(),
+        )
+    }
+}
+
+/// The identity of the file `pid`'s running image was mapped from ([`Kernel::image_file`]): on
+/// macOS its first file-backed region, read by `proc_pidinfo`
+/// ([`aterm_sysprobe::kproc::image_file`], in `MetadataExt::dev`'s device convention); on Linux
+/// the file `/proc/<pid>/exe` is, the mapped file itself wherever its path went; on Windows,
+/// which lets no one write or delete a mapped image and names it by its current path, the file at
+/// that path. `None` where it is gone, not read, or elsewhere.
+fn live_image_file(pid: u32) -> Option<agent_image::FileId> {
+    #[cfg(target_os = "macos")]
+    {
+        aterm_sysprobe::kproc::image_file(pid).map(|file| agent_image::FileId {
+            dev: file.device,
+            ino: file.inode,
+        })
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        agent_image::FileId::of(Path::new(&format!("/proc/{pid}/exe")))
+    }
+    #[cfg(windows)]
+    {
+        agent_image::FileId::of(&aterm_sysprobe::process_path(pid)?)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "android",
+        windows
+    )))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -3359,10 +3492,12 @@ pub const SKIP_SELF_CLAIMED: &str = "skip:self-claimed";
 /// Whether `status` says a proven claim stands (`supervisor_proven=1`): codex-alab's v2
 /// self-claim, or a rostered harness's contract v3 scoped claim. `status` carries no scope, so a
 /// scoped claim stands this lane down whatever its scope (`docs/DESIGN-harness-repos-2026-10-24.md`
-/// §11 D29, 2026-10-25 amendment): two actors never move one tab, and the only rostered row
-/// (grok-alab) always claims `upgrade` for a program this lane has no upgrade for. A row whose
-/// scope may leave `upgrade` to aterm, for a program this lane upgrades, puts the scope on
-/// `status` first.
+/// §11 D29, 2026-10-25 amendment): two actors never move one tab. That holds for the programs
+/// this lane upgrades too (Claude Code under claude-code-alab, Muse Code under muse-alab; D52,
+/// D53): the harness leads the tab and its vendor is its child, which only the harness may end.
+/// A claim that names `relaunch` alone therefore leaves the upgrade with nobody; this lane takes
+/// it back only by reading `supervisor_scope=` and moving the child through the harness, which
+/// is not built.
 #[must_use]
 pub(super) fn self_claimed_by_status(line: &str) -> bool {
     crate::is_ok_reply(line) && line.split_whitespace().any(|t| t == "supervisor_proven=1")
@@ -4116,6 +4251,13 @@ pub(super) struct St {
     /// The latest positively unexecuted attempt, independent of its live predecessor.
     pub(super) native_noexec_prepare: Option<Box<super::native_act::Prepare>>,
     pub(super) native_observation: Option<super::native_observe::SavedObservation>,
+    /// The watch of a restart that reached its close uncommitted
+    /// ([`super::native_restart::Recovery::Closed`]): its exact prepare, whose plan names the
+    /// shell, the old agent and the images its grant may run, which
+    /// [`super::native_restart::closed_watch`] reads. While it is kept no fresh plan
+    /// is minted; a lane clears it once it adopts the relaunched agent or nothing the restart may
+    /// have started runs. It grants nothing.
+    pub(super) native_closed: Option<Box<super::native_act::Prepare>>,
     pub(super) native_rollback: bool,
     pub(super) native: Option<super::native_act::Binding>,
     /// The directory [`Self::line`] runs the agent in when it carries no `cd` of its own
@@ -4698,6 +4840,9 @@ impl St {
         let native_noexec_prepare = prior
             .as_ref()
             .and_then(|st| st.native_noexec_prepare.clone());
+        // A closed restart's watch is passive, as a positive no-exec is: the new target's record
+        // carries it, and its own plan settles it before signalling or starting anything.
+        let native_closed = prior.as_ref().and_then(|st| st.native_closed.clone());
         let left = prior
             .as_ref()
             .map(|p| p.left_typed.clone())
@@ -4880,6 +5025,9 @@ impl St {
         if st.native_noexec_prepare.is_none() {
             st.native_noexec_prepare = native_noexec_prepare;
         }
+        if st.native_closed.is_none() {
+            st.native_closed = native_closed;
+        }
         if st.left_typed.is_empty() {
             st.left_typed = left;
         }
@@ -4992,6 +5140,7 @@ impl St {
         st.native_coordination |= super::native_restart::coordinated(self);
         st.native_record = self.native_record.clone();
         self.carry_noexec(st);
+        self.carry_closed(st);
         if self.agent == st.agent
             && let Some(failed) = self
                 .carried_failed_start()
@@ -5016,6 +5165,7 @@ impl St {
         st.native_coordination |= super::native_restart::coordinated(self);
         st.native_record = self.native_record.clone();
         self.carry_noexec(st);
+        self.carry_closed(st);
         st.keep_completed_native(self.native_completed_prepare.clone());
         if let Some(word) = self.owners_hold(tab) {
             st.request = word;
@@ -5050,6 +5200,15 @@ impl St {
             st.native_completed_prepare = self.native_completed_prepare.clone();
             st.native_observation = self.native_observation.clone();
             st.native_rollback = self.native_rollback;
+        }
+    }
+
+    /// A closed restart's watch is passive: unlike an unresolved operation, which holds the whole
+    /// record, it rides on the move's own record (its cause, ask, login and target), whose plan
+    /// settles it ([`super::native_restart::settle_closed`]) before signalling or starting.
+    fn carry_closed(&self, st: &mut St) {
+        if st.native_closed.is_none() {
+            st.native_closed = self.native_closed.clone();
         }
     }
 
@@ -5392,6 +5551,13 @@ impl St {
         {
             o.insert("native_observation".into(), Value::from(encoded));
         }
+        if let Some(encoded) = self
+            .native_closed
+            .as_ref()
+            .and_then(|prepare| super::native_act::Request::Prepare(prepare.clone()).encode())
+        {
+            o.insert("native_closed_prepare".into(), Value::from(encoded));
+        }
         if let Some(login) = &self.login {
             o.insert("login".into(), Value::from(login.as_str()));
         }
@@ -5641,6 +5807,7 @@ impl St {
                 || v.get("native_completed_prepare").is_some()
                 || v.get("native_noexec_prepare").is_some()
                 || v.get("native_observation").is_some()
+                || v.get("native_closed_prepare").is_some()
                 || v.get("native_account_candidate").is_some()
                 || v.get("native_generation").is_some()
                 || v.get("native_write_id").is_some()
@@ -5683,6 +5850,20 @@ impl St {
                 Some(value) => Some(super::native_observe::SavedObservation::parse(
                     value.as_str()?,
                 )?),
+            },
+            native_closed: match v.get("native_closed_prepare") {
+                None => None,
+                Some(value) => {
+                    let wire = value.as_str()?;
+                    let request = super::native_act::Request::parse(wire)?;
+                    if !request.matches_retained(wire) {
+                        return None;
+                    }
+                    let super::native_act::Request::Prepare(prepare) = request else {
+                        return None;
+                    };
+                    Some(prepare)
+                }
             },
             native_rollback: v
                 .get("native_rollback")
@@ -6934,6 +7115,7 @@ mod record {
             "native_completed_prepare",
             "native_noexec_prepare",
             "native_observation",
+            "native_closed_prepare",
             "native_account_candidate",
             "native_generation",
             "native_write_id",
@@ -10484,6 +10666,38 @@ pub fn self_claimed_after_exit(
     self_claimed_relaunch(opts, snap, resume, cause)
 }
 
+/// One step of handing back the session of a codex-alab that aterm's account renewal signalled
+/// and no successor took (aterm-gui's renewal worker, once its root ended): the crash rule's
+/// relaunch of `snap`'s agent on its own line `resume`, the conversation, home and login it ran
+/// on, filed with its own cause ([`super::relaunch::ExitCause::Renewal`]). Like that relaunch it
+/// types the line at most once: its witness of the agent names it handled for every later step.
+#[must_use]
+pub fn renewal_hand_back(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+    resume: &super::self_claimed::Resume,
+) -> Report {
+    codex_alab_drive::self_claimed_after_exit(
+        opts,
+        snap,
+        resume,
+        super::relaunch::ExitCause::Renewal,
+        &Live,
+    )
+}
+
+/// Whether a process other than the agent `source` names holds the writer lock of the
+/// conversation `resume` resumes, once that agent is gone: another agent runs the conversation,
+/// started in this tab or any other, and a [`renewal_hand_back`] would resume it under them. It
+/// reads the lock the relaunch's own step waits on before it types.
+#[must_use]
+pub fn renewal_conversation_taken(
+    source: &super::self_claimed::Copy,
+    resume: &super::self_claimed::Resume,
+) -> bool {
+    codex_alab_drive::conversation_taken(source, resume, &Live)
+}
+
 pub(super) fn self_claimed_relaunch(
     opts: &Opts,
     snap: &super::relaunch::Snapshot,
@@ -13410,6 +13624,17 @@ fn restart(
     if st.native_retired_unissued {
         return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
     }
+    if let Err(why) = super::native_restart::settle_closed(
+        st,
+        super::native_restart::Fresh::Signal {
+            pid: sf.pid,
+            conversation: &sf.session_id,
+        },
+        || Records::of_file(&opts.home, sf).session_files(),
+        k,
+    ) {
+        return said(r, format!("wait:{why}"));
+    }
     let Restarting {
         argv,
         target,
@@ -13674,6 +13899,13 @@ fn restart(
                     st,
                     &sf.session_id,
                 ));
+            }
+            // A kept restart closed: nothing of this move was sent, and its watch stays with the
+            // record, settled before the next move signals.
+            Ok(super::native_restart::Recovery::Closed) => {
+                st.unsent(back);
+                save(opts, &sf.session_id, st);
+                break 'signal Some(said(r.clone(), super::native_restart::WAIT_CLOSED));
             }
             Ok(
                 super::native_restart::Recovery::Cancelled

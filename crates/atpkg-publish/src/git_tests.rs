@@ -14,17 +14,29 @@ fn credential_preparation_removes_current_and_future_trace_and_ambient_auth_sele
         "GITHUB_ENTERPRISE_TOKEN",
         "AGH_GIT_GRANT",
         "AGH_GIT_CONFIG_DIR",
+        // Inherited TLS overrides, which agh's own runner never passes. NEGATIVE CONTROL:
+        // without the `GIT_SSL_` prefix in the removals, these stay.
+        "GIT_SSL_NO_VERIFY",
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
+        // Inherited command-scope config, which git reads as it reads `-c`, so it could carry
+        // a URL-scoped `http.*` key or a `url.*.insteadOf` rewrite. NEGATIVE CONTROL: without
+        // the `GIT_CONFIG_KEY_`/`GIT_CONFIG_VALUE_` prefixes in the removals, these stay.
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
         "SSH_AUTH_SOCK",
         "PATH",
     ];
     let remove = git_environment_removals_from(names.map(OsString::from));
-    for name in &names[..8] {
-        assert!(remove.iter().any(|entry| entry == name));
+    for name in &names[..13] {
+        assert!(remove.iter().any(|entry| entry == name), "{name}");
     }
     for name in [
         crate::host::rest::GIT_TOKEN_ENV,
         "GH_TOKEN",
         "GITHUB_TOKEN",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
         "GIT_CURL_VERBOSE",
         "BASH_ENV",
         "ENV",
@@ -38,6 +50,30 @@ fn credential_preparation_removes_current_and_future_trace_and_ambient_auth_sele
             .iter()
             .any(|entry| entry == "SSH_AUTH_SOCK" || entry == "PATH")
     );
+}
+
+/// The scoped pins are for a URL git fetches over HTTP alone, and a URL that would end its
+/// `-c` key early refuses rather than pin some other key.
+#[test]
+fn tls_pins_scope_to_an_http_url_and_refuse_one_no_key_can_name() {
+    let url = "https://github.com/fixture/claude-code-alab.git";
+    assert_eq!(
+        git_tls_pins_at(url).expect("an https URL"),
+        [
+            "-c".to_string(),
+            format!("http.{url}.sslVerify=true"),
+            "-c".to_string(),
+            format!("http.{url}.followRedirects=false"),
+        ]
+    );
+    for other in [
+        "git@github.com:fixture/claude-code-alab.git",
+        "file:///r/x.git",
+    ] {
+        assert_eq!(git_tls_pins_at(other), Ok(Vec::new()), "{other}");
+    }
+    let why = git_tls_pins_at("https://github.com/a.b=c/r.git").expect_err("an '=' refuses");
+    assert!(why.contains("holds '='"), "{why}");
 }
 
 /// Only a checkout with no `origin` among its remotes is told it has none. An origin that is

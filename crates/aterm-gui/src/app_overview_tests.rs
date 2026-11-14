@@ -585,10 +585,9 @@ fn the_title_counts_another_aterms_sessions_apart() {
     };
     assert!(title(&app).starts_with("This aterm \u{2014} 3 sessions"));
     assert!(!title(&app).contains("another aterm"), "{}", title(&app));
-    app.siblings = vec![crate::status_item::SiblingInstance {
+    app.siblings = vec![crate::sibling_scan::SiblingInstance {
         pid: 900,
         sessions: 3,
-        ..crate::status_item::SiblingInstance::default()
     }];
     app.overview_refresh_all();
     assert!(

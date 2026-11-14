@@ -30,6 +30,11 @@ pub(crate) const META_OWNER_MAX: usize = 64;
 pub(crate) const BARE_ATTENTION_OWNER: &str = "-";
 /// Byte cap for `meta set questions` (the stored, normalized value).
 pub(crate) const META_QUESTIONS_MAX: usize = 16;
+/// The most result files a tab notes under other session IDs (`SessionTimeline::carried_results`).
+/// Each name is a snapshot's (`task_launch::snapshot_sid`, at most 53 bytes), so ` carried=` stays
+/// under 900 bytes, well inside the 8 KiB a stored layout row may hold
+/// (`restore::MAX_DOCUMENT_URI_BYTES`), past which a restore drops the row and its record whole.
+pub(crate) const CARRIED_RESULTS_MAX: usize = 16;
 
 /// The policy words `meta set questions` accepts.
 pub(crate) const QUESTIONS_POLICY_WORDS: [&str;
@@ -174,6 +179,12 @@ pub(crate) struct SessionMeta {
     pub(crate) attention_owners: AttentionOwners,
     pub(crate) supervisor: Option<SupervisorClaim>,
     pub(crate) supervisor_revision: u64,
+    /// Every placement and release of the claim ([`Self::set_supervisor`]), a renewal in place
+    /// included, which [`Self::supervisor_revision`] leaves alone. It orders the claim's off-lock
+    /// record reads ([`crate::self_claim`]): one begun before the latest placement never
+    /// publishes, so it cannot overwrite the copy that placement's own read took, as a renewal
+    /// in place no longer moving the revision would otherwise let it.
+    pub(crate) claim_placements: u64,
     /// The actual host runner carrying this session's task across a process replacement.
     /// A claim's release or a new claim does not end the runner's responsibility.
     pub(crate) task_exit_owner: crate::harness_host::task_exit::Slot,
@@ -235,6 +246,7 @@ impl PartialEq for SessionMeta {
             attention_owners: _,
             supervisor: _,
             supervisor_revision: _,
+            claim_placements: _,
             task_exit_owner: _,
             builtin_relaunch_epoch: _,
             supervisor_builtin: _,
@@ -369,6 +381,7 @@ impl SessionMeta {
             attention_owners: AttentionOwners::default(),
             supervisor: None,
             supervisor_revision: 0,
+            claim_placements: 0,
             task_exit_owner: Default::default(),
             builtin_relaunch_epoch: RelaunchEpoch::default(),
             supervisor_builtin: false,
@@ -604,7 +617,12 @@ impl SessionMeta {
     /// process claiming again included, so a stop, a hold or a set its claimant could not lift
     /// during the lapse never comes back); a proven claim bound to a connection is recorded in
     /// [`Self::claimant_conn`] until that connection closes, and an unproven claim bound to a
-    /// connection clears any earlier proof recorded for that connection.
+    /// connection clears any earlier proof recorded for that connection. The revision stays where
+    /// it was for a renewal in place: `claim` is the claim live at `now_us` again with only its
+    /// `ttl=` lease moved ([`SupervisorClaim::renews_in_place`]) and the authority the session
+    /// shows ([`Self::supervisor_authority`]) is unchanged, so a seal, a native operation or a
+    /// typed input bound to the revision outlives its own holder's reconfirmations. Every call
+    /// moves [`Self::claim_placements`].
     #[cfg_attr(
         all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
@@ -690,6 +708,11 @@ impl SessionMeta {
         claim: Option<SupervisorClaim>,
         now_us: u64,
     ) -> (u64, AttentionMove) {
+        let before = self.supervisor_authority(now_us);
+        let in_place = claim
+            .as_ref()
+            .zip(self.live_claim(now_us))
+            .is_some_and(|(next, live)| live.renews_in_place(next));
         let builtin = crate::control::serving_principal() == crate::control::Principal::Harness
             && crate::control::serving_peer_pid() == Some(std::process::id())
             && crate::control::serving_connection().is_some()
@@ -761,7 +784,10 @@ impl SessionMeta {
             self.claim_needs = None;
         }
         self.supervisor = claim;
-        self.supervisor_revision = self.supervisor_revision.wrapping_add(1);
+        if !in_place || self.supervisor_authority(now_us) != before {
+            self.supervisor_revision = self.supervisor_revision.wrapping_add(1);
+        }
+        self.claim_placements = self.claim_placements.wrapping_add(1);
         (self.supervisor_revision, lapsed)
     }
 
@@ -1909,6 +1935,23 @@ impl SupervisorClaim {
         self.identity().is_some()
     }
 
+    /// Whether `next` is this claim again with only its `ttl=` lease moved: the same holder,
+    /// connection, proof and scoped claim (its scopes and versions), so it names no new authority
+    /// ([`SessionMeta::set_supervisor`]).
+    fn renews_in_place(&self, next: &Self) -> bool {
+        let Self {
+            holder,
+            conn,
+            expires_us: _,
+            proven,
+            scoped,
+        } = self;
+        *holder == next.holder
+            && *conn == next.conn
+            && *proven == next.proven
+            && *scoped == next.scoped
+    }
+
     /// Whether the claim takes `duty` on its session (`docs/DESIGN-harness-repos-2026-10-24.md`
     /// §8.1 item 4, §8.3): a rostered harness's scoped claim (contract v3, [`Self::scoped`]) takes
     /// exactly the duties its scope names, and aterm keeps every other one; every other claim
@@ -2460,6 +2503,8 @@ pub(crate) struct Claimed {
     pub(crate) changed: bool,
     pub(crate) replaced: Option<String>,
     pub(crate) revision: u64,
+    /// [`SessionMeta::claim_placements`] after this claim: what its record read is ordered by.
+    pub(crate) placement: u64,
 }
 
 /// How a claim request meets the claim standing ([`claim_rule`]).
@@ -2629,6 +2674,7 @@ fn claim_supervisor_with(
         rule == ClaimRule::Renew && standing.as_ref().is_some_and(|(_, old)| *old != identity);
     let renewed_scoped_changed = rule == ClaimRule::Renew
         && meta.live_scoped(now_us).map(|s| &s.claim) != scoped.as_ref().map(|s| &s.claim);
+    let prior = meta.supervisor_revision;
     let drain = ctx.fenced_writes.capture_drain();
     let (revision, lapsed) = meta.set_supervisor(
         Some(SupervisorClaim {
@@ -2640,6 +2686,14 @@ fn claim_supervisor_with(
         }),
         now_us,
     );
+    let placement = meta.claim_placements;
+    // A renewal in place keeps the revision and supersedes no admitted write, so its ACK owes no
+    // drain; a drain of the revision it keeps would also wait on every write admitted after it.
+    let drain = if revision == prior {
+        FencedInputDrain::default()
+    } else {
+        drain
+    };
     let supervisor_changed = match rule {
         ClaimRule::Renew => was_proven != now_proven,
         ClaimRule::Take | ClaimRule::Replace | ClaimRule::Busy => true,
@@ -2680,6 +2734,7 @@ fn claim_supervisor_with(
             changed,
             replaced,
             revision,
+            placement,
         },
         drain,
     })
@@ -2778,7 +2833,8 @@ impl FencedWrites {
 }
 
 /// One native operation's exact position in the same ordering as fenced input. The owning
-/// operation retains this after ACK loss and EOF, until its actual outcome is proved.
+/// operation retains this after ACK loss and EOF, until its actual outcome is proved or its close
+/// seals it `closed` once no input byte of it can follow.
 #[derive(Debug)]
 pub(crate) struct NativeCustody {
     state: Arc<FencedWriteState>,
@@ -3649,6 +3705,21 @@ pub(crate) struct SessionTimeline {
     /// An exit read before the agent publication cleared. A new task mark supersedes it;
     /// otherwise it takes effect only once a publication sees no agent in the tab.
     pending_task_exit: Option<crate::task_record::TaskMark>,
+    /// THE RESULT FILES THIS TAB'S RECORD NAMED UNDER ANOTHER SESSION ID: the one its record
+    /// named when a restore or a seamless update seeded it, where an earlier session ID of the
+    /// tab names the file ([`crate::task_record::seed_restored`],
+    /// [`crate::task_record::seed_carried`]), and each one a mark named since
+    /// (`task mark … result_path=` takes any file in the tasks directory,
+    /// [`crate::task_record::mark_session_task_with_timeline`]). Nothing that goes by this
+    /// session's own ID finds them, so they are removed by these paths, but where another record
+    /// still names one: when the tab closes, and at a quit whose layout does not name them
+    /// (`crate::task_launch`). They stay while the tab lives, though a later mark leaves the
+    /// record naming none or another: a mark made from an earlier reading of the record (the
+    /// harness's exit mark) may name one again, and a mark holds no store to ask whether another
+    /// record names the file. Every row that carries the record to another process carries them
+    /// too ([`Self::push_carried_results`]), so a seamless update's successor removes them in
+    /// turn and a restore's sweep clears those its record no longer names.
+    carried_results: Vec<std::path::PathBuf>,
     worker_launch: Option<(std::time::Instant, String)>,
     /// The worker's launcher is installing its program or preparing its Google sign-in now
     /// (`task_launch::InstallingMark`).
@@ -4943,6 +5014,49 @@ impl SessionTimeline {
         self.task = Some(record);
     }
 
+    /// Note the result files the record just seeded came with under other session IDs
+    /// ([`Self::carried_results`]), in place of any noted before.
+    pub(crate) fn seed_carried_results(&mut self, mut paths: Vec<std::path::PathBuf>) {
+        paths.truncate(CARRIED_RESULTS_MAX);
+        self.carried_results = paths;
+    }
+
+    /// Note one more result file this tab's record named under another session ID
+    /// ([`Self::carried_results`]), once, while fewer than [`CARRIED_RESULTS_MAX`] are noted. One
+    /// past the bound is not noted: it stays when the tab ends, as a file nothing notes does,
+    /// rather than growing every row that carries the list.
+    pub(crate) fn note_carried_result(&mut self, path: std::path::PathBuf) {
+        if self.carried_results.len() < CARRIED_RESULTS_MAX && !self.carried_results.contains(&path)
+        {
+            self.carried_results.push(path);
+        }
+    }
+
+    /// The result files this tab's record named under other session IDs, to be removed with its
+    /// tab.
+    pub(crate) fn carried_results(&self) -> &[std::path::PathBuf] {
+        &self.carried_results
+    }
+
+    /// ` carried=<name>,…` of a row that carries the record to another process
+    /// ([`Self::task_carry_row`], [`crate::task_record::restore_row`]): the file names of
+    /// [`Self::carried_results`], each directly in the tasks directory and shaped as a done edge
+    /// writes it, so no comma or space is in one; nothing where there are none. An older build
+    /// reads past the word.
+    pub(crate) fn push_carried_results(&self, out: &mut String) {
+        let names: Vec<&str> = self
+            .carried_results
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str())
+            .filter(|name| crate::task_launch::snapshot_sid(name).is_some())
+            .take(CARRIED_RESULTS_MAX)
+            .collect();
+        if !names.is_empty() {
+            out.push_str(" carried=");
+            out.push_str(&names.join(","));
+        }
+    }
+
     /// Note the shell block a program worker's launcher typed its program into
     /// ([`crate::task_record::note_program_block`]): taken where the record is a program worker's,
     /// still `working` or `stalled`, with none noted. Moves no rev.
@@ -5000,12 +5114,13 @@ impl SessionTimeline {
             .map(|task| &mut task.told)
     }
 
-    /// The row a seamless update carries for the record, `None` with no task.
+    /// The row a seamless update carries for the record, `None` with no task: the record's carry
+    /// row and the results its tab named under other session IDs ([`Self::carried_results`]).
     #[cfg(any(unix, test))]
     pub(crate) fn task_carry_row(&self) -> Option<String> {
-        self.task
-            .as_ref()
-            .map(|task| task.carry_row(std::time::Instant::now()))
+        let mut row = self.task.as_ref()?.carry_row(std::time::Instant::now());
+        self.push_carried_results(&mut row);
+        Some(row)
     }
 
     /// The published program for foreground group `pgid`, or `None` when the publication names

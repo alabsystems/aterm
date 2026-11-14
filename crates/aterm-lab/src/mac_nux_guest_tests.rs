@@ -504,6 +504,7 @@ fn setup_reads_its_status_field_and_falls_back_to_the_record() {
     assert!(
         Reading {
             setup: None,
+            network: None,
             record: completed.clone(),
             acts: 0,
         }
@@ -512,6 +513,7 @@ fn setup_reads_its_status_field_and_falls_back_to_the_record() {
     );
     assert!(
         !Reading {
+            network: None,
             setup: Some("pending:fda".into()),
             record: completed.clone(),
             acts: 0,
@@ -521,6 +523,7 @@ fn setup_reads_its_status_field_and_falls_back_to_the_record() {
     );
     assert!(
         !Reading {
+            network: None,
             setup: Some("unread:dock;offered:fda".into()),
             record: completed.clone(),
             acts: 0,
@@ -547,6 +550,7 @@ fn setup_reads_its_status_field_and_falls_back_to_the_record() {
     ] {
         assert_eq!(
             Reading {
+                network: Some("remote".into()),
                 setup: Some(field.into()),
                 record: completed.clone(),
                 acts: 0,
@@ -568,8 +572,51 @@ fn setup_reads_its_status_field_and_falls_back_to_the_record() {
 }
 
 #[test]
+fn an_unanswered_request_finishes_only_for_the_vault_proven_off_its_lan() {
+    for status in [
+        "net=remote",
+        "net=offline",
+        "net=alab-lan",
+        "net=checking",
+        "net=-",
+        "",
+        "net=future-place",
+        "internet=down net_kind=remote",
+    ] {
+        for setup in [
+            "asking:vault",
+            "asking:dock",
+            "asking:vault,dock",
+            "asking:",
+        ] {
+            let reading = Reading {
+                setup: Some(setup.into()),
+                network: network_field(status).map(str::to_owned),
+                ..Default::default()
+            };
+            let expected =
+                setup == "asking:vault" && matches!(status, "net=remote" | "net=offline");
+            assert_eq!(reading.done(), expected, "{setup} {status}");
+            assert_eq!(
+                Stall::new(STALL_MS).see(0, &reading),
+                if expected {
+                    Waited::Done
+                } else {
+                    Waited::Moving
+                },
+                "{setup} {status}"
+            );
+        }
+    }
+    let status = "OK setup=asking:vault net=remote net_kind=hotspot";
+    assert_eq!(setup_field(status), Some("asking:vault"));
+    assert_eq!(network_field(status), Some("remote"));
+}
+
+#[test]
 fn the_wait_stops_a_minute_after_setup_last_moved_and_never_before() {
     let at = |setup: &str| Reading {
+        network: None,
         setup: Some(setup.to_owned()),
         record: None,
         acts: 0,
@@ -594,6 +641,7 @@ fn the_wait_stops_a_minute_after_setup_last_moved_and_never_before() {
     // A stage moving under an unchanged setup= is progress too.
     let mut stages = Stall::new(STALL_MS);
     let running = |bit| Reading {
+        network: None,
         setup: Some("pending".into()),
         record: Some(Record {
             state: "pending".into(),
@@ -740,6 +788,7 @@ fn the_persons_presses_and_the_apps_processes_are_progress_but_a_repeated_press_
         2
     );
     let at = |ms: u64| Reading {
+        network: None,
         setup: Some("pending:devtools,debugger,vault".into()),
         record: None,
         acts: acts(&by(ms)),

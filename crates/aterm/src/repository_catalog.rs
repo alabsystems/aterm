@@ -25,7 +25,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const NAME: &str = aterm_secrets::entry_class::GITHUB_REPOSITORIES;
-const TOKEN: &str = "gh_access_token";
+const TOKEN: &str = aterm_secrets::entry_class::DEV_GH_TOKEN;
 const PROFILE: &str = "private-catalog";
 const TOKEN_ENV: &str = "ATERM_ADMITTED_CATALOG_TOKEN";
 const MAX: usize = 1 << 20;

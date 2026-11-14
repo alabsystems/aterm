@@ -337,3 +337,44 @@ fn a_case_variant_of_the_entry_directory_is_named() {
     }
     assert!(path_findings("changes/fixed/x.md").is_empty());
 }
+
+/// A BRANCH'S CHANGELOG ENTRY BECOMES A FILE THE CHECKER ACCEPTS: `verify land`'s changelog rule
+/// writes each `[Unreleased]` entry a branch added as its own fragment, `* ` written `- `, one
+/// final newline, and the writer refuses exactly what [`fragment_findings`] refuses. The body's
+/// reader gives each entry its kind and keeps a closed comment apart, so the rule can tell what
+/// taking main's file would drop. NEGATIVE CONTROL: a tab-indented continuation, which the
+/// checker refuses, is refused by the writer too.
+#[test]
+fn a_branch_changelog_entry_becomes_a_file_the_checker_accepts() {
+    let written = super::fragment("Fixed", "land-x", "* Fixes x.\n  more\n\n").unwrap();
+    assert_eq!(written.path, "changes/fixed/land-x.md");
+    assert_eq!(written.text, "- Fixes x.\n  more\n");
+    assert!(fragment_findings(&written.path, &written.text).is_empty());
+    let refused = super::fragment("Fixed", "land-x", "- Fixes x.\n\tmore").unwrap_err();
+    assert!(
+        refused
+            .iter()
+            .any(|f| f.contains("indent continuation lines with two spaces")),
+        "{refused:?}"
+    );
+
+    let body = unreleased_by_kind(
+        "# C\n\n## [Unreleased]\n\n<!-- a note -->\n\n### Added\n\n- A one.\n\n- **Harness \
+         versions since v1.** derived.\n\n### Fixed\n\n- F one,\n  continued.\n\n## [0.1.0]\n\n\
+         - Old.\n",
+    )
+    .unwrap();
+    assert_eq!(
+        body.entries,
+        [
+            (Some("Added"), "- A one.".to_owned()),
+            (Some("Fixed"), "- F one,\n  continued.".to_owned()),
+        ]
+    );
+    assert_eq!(body.comments, ["<!-- a note -->"]);
+    assert!(unreleased_by_kind("## [Unreleased]\n\nloose text\n").is_err());
+    assert_eq!(
+        unreleased_by_kind("# C\n").unwrap(),
+        UnreleasedBody::default()
+    );
+}

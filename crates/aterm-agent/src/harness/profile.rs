@@ -1185,7 +1185,11 @@ impl WeeklyFigure {
             figure @ (super::outlook::Figure::Exact(_) | super::outlook::Figure::AtLeast(_)) => {
                 Some(format!("weekly {}", figure.words()))
             }
-            super::outlook::Figure::Out | super::outlook::Figure::Unread => None,
+            // A reading is never a login's state ([`super::outlook::Figure::of_login`]).
+            super::outlook::Figure::Out
+            | super::outlook::Figure::Unread
+            | super::outlook::Figure::SignedOut
+            | super::outlook::Figure::SigningIn => None,
         }
     }
 

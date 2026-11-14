@@ -91,9 +91,16 @@ fn the_survey_reads_every_session_of_an_instance() {
             .all(|line| wire_field(line, "status").as_deref() == Some("unrecorded")),
         "no quota history is zero use: {text}"
     );
+    // A test copy runs outside an installed app, so its updater is never routine and the digest
+    // says where it stands, once, under the header.
+    let updaters: Vec<&str> = rest
+        .lines()
+        .filter(|line| line.starts_with("  update "))
+        .collect();
+    assert_eq!(updaters.len(), 1, "the instance's updater: {text}");
     let lines: Vec<&str> = rest
         .lines()
-        .filter(|line| !line.starts_with("  github_rate "))
+        .filter(|line| !line.starts_with("  github_rate ") && !line.starts_with("  update "))
         .collect();
     assert_eq!(
         lines.len(),
@@ -225,13 +232,6 @@ fn a_kind_ask_attention_is_a_need_every_reader_names_and_a_wait_is_none() {
     let json = survey(&inst, &["--json"]);
     assert_eq!(json_needs(&json, &asker).as_deref(), Some("ask"), "{json}");
     assert_eq!(json_needs(&json, &waiter).as_deref(), Some("-"), "{json}");
-    let chrome = ctl_ok(&inst, &["chrome"]);
-    let line = chrome
-        .lines()
-        .find(|l| l.starts_with("statusitem "))
-        .unwrap_or_else(|| panic!("a statusitem line: {chrome}"));
-    assert_eq!(wire_field(line, "needs").as_deref(), Some("1"), "{line}");
-    assert_eq!(wire_field(line, "stuck").as_deref(), Some("0"), "{line}");
 }
 
 const FAKE_LEADER: &str = r#"#!/bin/sh

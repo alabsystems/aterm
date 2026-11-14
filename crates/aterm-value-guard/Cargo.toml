@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-value-guard"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "What a stored text value may not hold (a credential's shape, a secret's name, a phone number, an address outside its column): the one guard aterm-db's typed cells and aterm-file's outbox both apply"
+
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
+# No dependencies: the guard is pure text rules, so the shared-file reader (aterm-file) can hold
+# it without reaching aterm-db.
+[dependencies]
+
+[lints]
+workspace = true

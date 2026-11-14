@@ -8,21 +8,21 @@
 //! under Land through its nudges to its landing, `reland` to its landing, the `off` leg once
 //! codex-alab gave its claim back for Autopilot Off, and a `worker` its manager's tab spawned under
 //! Land. At each read, the tab's `chrome` `autopilot` line, its pad (the row over the composer's
-//! prompt, as the program drew it), its state line on the page, its hover in the strip, This Mac's
-//! row, its menu bar rows and its `status`; then, all four at rest, END's idle window twice, the
-//! page open and then shut ([`crate::forever::surfaces::idle_counts`]).
+//! prompt, as the program drew it), its state line on the page, its hover in the strip and its
+//! `status`; then, all four at rest, END's idle window twice, the page open and then shut
+//! ([`crate::forever::surfaces::idle_counts`]).
 //!
 //! What codex-alab tells is judged by its build ([`dev_build`]): from [`TELLS_LAND_HOLD`] on, its
-//! Land hold must reach the status, the state line, the hover and This Mac's `landing` count, and
-//! leave them once landed, and the worker's row must read `landing` before `landed`; from
+//! Land hold must reach the status, the state line and the hover, and leave them once landed, and
+//! the worker's status must tell its hold before it reads landed; from
 //! [`SAYS_ITS_MODE`] on, its own line must name the face. An older build's missing half is a
 //! named skip that names the build, never a pass on a read that missed it.
 //!
 //! Land and reland each run a slow turn ([`model::SLOW_TURN`]), past the work floor (§11.2.3), so
-//! each landing is an end (`status end=`) with its Done for you row; the worker's few seconds are
-//! under it, so its row under its manager is what it shows. The worker's land act is answered
-//! only once the pass read that row say `landing` ([`model::hold_worker_land`]), so its hold
-//! stands until it is seen, not for the second or two a 2 s read catches by luck.
+//! each landing is an end (`status end=`); the worker's few seconds are under it. The worker's
+//! land act is answered only once the pass read its status tell the hold
+//! ([`model::hold_worker_land`]), so its hold stands until it is seen, not for the second or two
+//! a 2 s read catches by luck.
 //!
 //! Codex owns the prompt area. The host must report `why=no-footer` even when the
 //! native program leaves a blank pad. Builds with native mode text must show their
@@ -34,10 +34,6 @@ use crate::forever::surfaces::{self, Desk, Glance, StripTab};
 /// The pass's hang detector: the land leg's four nudges and its landing, each a slow turn and a
 /// back-off, with room. A wait for what must happen, never a budget.
 const HANG: Duration = Duration::from_secs(30 * 60);
-
-/// The hang detector of a landing's Done for you row once `status end=` told the end (or, on an
-/// aterm whose `status` prints no `end=`, once the landing showed).
-const ROW_HANG: Duration = Duration::from_secs(60);
 
 /// How long every leg's journal must stand still before an idle window is taken.
 const QUIET: Duration = Duration::from_secs(20);
@@ -60,8 +56,7 @@ enum Scene {
     Reland,
     /// Autopilot Off, codex-alab's claim given back: no chip.
     Off,
-    /// A worker its manager spawned under Land: its row under the manager goes from landing to
-    /// landed.
+    /// A worker its manager spawned under Land: its status tells its hold, then reads landed.
     Worker,
 }
 
@@ -94,10 +89,6 @@ struct Seen {
     reads: Vec<(i64, Read)>,
     /// The latest read's time, whether or not it showed anything new.
     last_t: i64,
-    /// Its menu bar rows (`menu_of`), each distinct one.
-    rows: Vec<(i64, String)>,
-    /// Its row under its manager (`worker_of`), each distinct one.
-    under: Vec<(i64, String)>,
 }
 
 /// One read of a leg's window.
@@ -117,8 +108,6 @@ struct Read {
     /// Its hover in the strip (`driven by aterm (…)`): `-` where it says none, `?` where the
     /// strip's tips were not read whole.
     hover: String,
-    /// This Mac's row in the menu bar: `-` where none.
-    here: String,
 }
 
 impl Read {
@@ -184,20 +173,6 @@ fn judge_line(
     Ok(format!(
         "codex-alab owns its controls; face={face}, no host footer"
     ))
-}
-
-/// Whether `entry` ([`surfaces::worker_of`]'s) says the worker is landing, or landed.
-fn under_says(entry: &str, word: &str) -> bool {
-    entry
-        .lines()
-        .find_map(|l| l.strip_prefix("row|"))
-        .is_some_and(|row| row.contains(&format!("\u{2014} {word}")))
-}
-
-fn push_new<T: PartialEq>(list: &mut Vec<(i64, T)>, t: i64, v: T) {
-    if list.last().is_none_or(|(_, last)| *last != v) {
-        list.push((t, v));
-    }
 }
 
 /// `ctl` on the rig's instance as [`surfaces::lay_windows_by`] takes it.
@@ -322,7 +297,7 @@ pub(super) fn legs(proof: &mut Proof, pkg: &Path) -> Result<(), Fail> {
 }
 
 /// Every leg read each [`POLL`] until all are at rest ([`at_rest`]) or [`HANG`] ran out. The
-/// worker's held land act is let go once its row read `landing`.
+/// worker's held land act is let go once its status told its hold.
 fn read_until_rest(
     proof: &Proof,
     legs: &[(Scene, Leg)],
@@ -339,11 +314,6 @@ fn read_until_rest(
             .stdout;
         let g = Glance::of(crate::util::now_ms(), &chrome, &page);
         let t = g.t - t0;
-        let here = g
-            .menu
-            .iter()
-            .find(|r| r.section == "here")
-            .map_or_else(|| "-".to_string(), |r| r.label.clone());
         for ((scene, leg), s) in legs.iter().zip(seen.iter_mut()) {
             let status = proof.status(&leg.sid);
             let words = [
@@ -376,44 +346,34 @@ fn read_until_rest(
                 } else {
                     "?".into()
                 },
-                here: here.clone(),
             };
+            if *scene == Scene::Worker && read.held() {
+                model::release_worker_land();
+            }
             if s.reads.last().is_none_or(|(_, r)| *r != read) {
                 println!(
-                    "    {} {}: {} | {} | pad {:?} | state {} | hover {} | here {}",
+                    "    {} {}: {} | {} | pad {:?} | state {} | hover {}",
                     secs_at(t),
                     leg.name,
                     read.line,
                     read.words,
                     read.pad,
                     read.state,
-                    read.hover,
-                    read.here
+                    read.hover
                 );
                 s.reads.push((t, read));
             }
             s.last_t = t;
-            push_new(&mut s.rows, t, surfaces::menu_of(&g.menu, leg.name));
-            let under = surfaces::worker_of(&g.sub, leg.name);
-            if *scene == Scene::Worker && under_says(&under, "landing") {
-                model::release_worker_land();
-            }
-            push_new(&mut s.under, t, under);
         }
-        let now = crate::util::now_ms() - t0;
         let reached = legs
             .iter()
             .zip(&seen)
-            .all(|((scene, leg), s)| at_rest(proof, *scene, leg, s, now));
+            .all(|((scene, leg), s)| at_rest(proof, *scene, leg, s));
         if reached || Instant::now() >= end {
             return Ok(seen);
         }
         sleep(POLL)?;
     }
-}
-
-fn ms(d: Duration) -> i64 {
-    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// The trailing run of `s`'s reads that show the task landed, oldest first.
@@ -426,14 +386,13 @@ fn landed_run(s: &Seen) -> &[(i64, Read)] {
     &s.reads[from..]
 }
 
-/// Whether `leg` reached the end of its scene, where its window stands still, at `now` (ms from
-/// the pass's start).
-fn at_rest(proof: &Proof, scene: Scene, leg: &Leg, s: &Seen, now: i64) -> bool {
+/// Whether `leg` reached the end of its scene, where its window stands still.
+fn at_rest(proof: &Proof, scene: Scene, leg: &Leg, s: &Seen) -> bool {
     let Some((_, last)) = s.reads.last() else {
         return false;
     };
     match scene {
-        Scene::Land | Scene::Reland => landing_at_rest(s, leg.name, now),
+        Scene::Land | Scene::Reland => landing_at_rest(s),
         Scene::Off => {
             last.word("supervisor_proven").as_deref() != Some("1")
                 && proof
@@ -441,54 +400,22 @@ fn at_rest(proof: &Proof, scene: Scene, leg: &Leg, s: &Seen, now: i64) -> bool {
                     .stdout
                     .contains(model::STEP_ONE)
         }
-        Scene::Worker => {
-            s.under.last().is_some_and(|(_, u)| under_says(u, "landed"))
-                || last.landed() && s.under.iter().all(|(_, u)| u == "-")
-        }
+        Scene::Worker => last.landed(),
     }
 }
 
-/// Whether a landing leg labelled `label` is at rest at `now`: once its Done for you row is read;
-/// or once a read past the landing still says `end=-` (no end told, which is judged); or
-/// [`ROW_HANG`] after `end=` told the end (or after the landing, on an aterm whose `status`
-/// prints no `end=`) with no row. Never on elapsed time alone while the row is still owed.
-fn landing_at_rest(s: &Seen, label: &str, now: i64) -> bool {
-    let Some((_, last)) = s.reads.last() else {
-        return false;
-    };
-    let run = landed_run(s);
-    let Some((landed_at, _)) = run.first() else {
-        return false;
-    };
-    if done_row_seen(s, label).is_some() {
-        return true;
-    }
-    match last.word("end").as_deref() {
-        Some("-") => s.last_t > *landed_at,
-        Some("?") | None => now.saturating_sub(*landed_at) >= ms(ROW_HANG),
-        Some(_) => run
-            .iter()
-            .find(|(_, r)| r.word("end").is_some_and(|e| e != "-" && e != "?"))
-            .is_some_and(|(told, _)| now.saturating_sub(*told) >= ms(ROW_HANG)),
-    }
-}
-
-fn done_row_seen<'s>(s: &'s Seen, label: &str) -> Option<&'s (i64, String)> {
-    let want = format!("\u{2713} {label} \u{2014} landed");
-    s.rows
-        .iter()
-        .find(|(_, r)| r.lines().any(|l| l.contains(&want)))
+/// Whether a landing leg is at rest: once a read past the read that first showed it landed has
+/// been taken, so the `end=` its landing told (or did not tell, which is judged) was read after
+/// the landing.
+fn landing_at_rest(s: &Seen) -> bool {
+    landed_run(s)
+        .first()
+        .is_some_and(|(landed_at, _)| s.last_t > *landed_at)
 }
 
 /// A time from the pass's start, in whole seconds.
 fn secs_at(t: i64) -> String {
     format!("+{} s", t / 1000)
-}
-
-/// The `landing` count of This Mac's row `here` as read: what follows its lead (`This Mac` or the
-/// machine's title, [`surfaces::here_counts`]), 0 for a row that is not This Mac's (`-`, unread).
-fn landing_on_this_mac(here: &str) -> usize {
-    surfaces::here_counts(here).map_or(0, |counts| surfaces::count_in(counts, "landing"))
 }
 
 /// The first read of `s` where `want` holds, with its time.
@@ -530,7 +457,6 @@ fn judge(proof: &mut Proof, b: &Build, scene: Scene, leg: &Leg, s: &Seen) {
                 "landed",
             );
             end_check(proof, s, name);
-            done_check(proof, s, name);
         }
         Scene::Reland => {
             face_check(
@@ -540,7 +466,6 @@ fn judge(proof: &mut Proof, b: &Build, scene: Scene, leg: &Leg, s: &Seen) {
                 "landed",
             );
             end_check(proof, s, name);
-            done_check(proof, s, name);
         }
         Scene::Off => {
             let released = first_read(s, |r| {
@@ -563,31 +488,25 @@ fn judge(proof: &mut Proof, b: &Build, scene: Scene, leg: &Leg, s: &Seen) {
         }
         Scene::Worker => {
             let said = s
-                .under
+                .reads
                 .iter()
-                .map(|(t, u)| format!("{} {}", secs_at(*t), u.replace('\n', " ")))
+                .map(|(t, r)| format!("{} {}", secs_at(*t), r.words))
                 .collect::<Vec<_>>()
                 .join("; ");
             let land_act = proof
                 .tags(name)
                 .iter()
                 .any(|t| t.starts_with("worker:land"));
-            match worker_rows(&s.under, b.tells_hold && land_act) {
+            match worker_went(&s.reads, b.tells_hold && land_act) {
                 Ok(order) => {
-                    proof.check(
-                        &format!("window: {name} its row under its manager {order} ({said})"),
-                        true,
-                    );
+                    proof.check(&format!("window: {name} its status {order} ({said})"), true);
                 }
                 Err(Some(why)) => {
-                    proof.check(
-                        &format!("window: {name} its row under its manager: {why} ({said})"),
-                        false,
-                    );
+                    proof.check(&format!("window: {name} its status: {why} ({said})"), false);
                 }
                 Err(None) => {
                     proof.check(
-                        &format!("window: {name} its row under its manager reads landed ({said})"),
+                        &format!("window: {name} its status reads landed ({said})"),
                         true,
                     );
                     let why = if b.tells_hold {
@@ -595,12 +514,11 @@ fn judge(proof: &mut Proof, b: &Build, scene: Scene, leg: &Leg, s: &Seen) {
                     } else {
                         format!(
                             "codex-alab {} tells no Land hold (that came with build \
-                             {TELLS_LAND_HOLD}, §14.3.3), and a row says landing only while a \
-                             hold stands (§12.4.3)",
+                             {TELLS_LAND_HOLD}, §14.3.3)",
                             b.version
                         )
                     };
-                    println!("  skip window: {name} its row's `landing`: {why}");
+                    println!("  skip window: {name} its status's hold: {why}");
                 }
             }
         }
@@ -608,14 +526,13 @@ fn judge(proof: &mut Proof, b: &Build, scene: Scene, leg: &Leg, s: &Seen) {
 }
 
 /// The Land leg's hold on every surface it reaches (§14.3.3), for a build that tells it: told on
-/// `status`, said on the state line and This Mac's `landing` count while it stands, on the hover
-/// once a yield was judged, and gone from all three once landed. For an older build, one named
-/// skip.
+/// `status`, said on the state line while it stands, on the hover once a yield was judged, and
+/// gone from both once landed. For an older build, one named skip.
 fn hold_checks(proof: &mut Proof, b: &Build, name: &str, s: &Seen) {
     if !b.tells_hold {
         println!(
-            "  skip window: {name} its hold's status, state line, hover and This Mac count: \
-             codex-alab {} tells no Land hold (that came with build {TELLS_LAND_HOLD}, §14.3.3)",
+            "  skip window: {name} its hold's status, state line and hover: codex-alab {} tells \
+             no Land hold (that came with build {TELLS_LAND_HOLD}, §14.3.3)",
             b.version
         );
         return;
@@ -643,14 +560,6 @@ fn hold_checks(proof: &mut Proof, b: &Build, name: &str, s: &Seen) {
             said(line, &|r: &Read| r.state.clone())
         ),
         line.is_some(),
-    );
-    let here = first_read(s, |r| r.held() && landing_on_this_mac(&r.here) >= 1);
-    proof.check(
-        &format!(
-            "window: {name} This Mac counts it landing while it holds ({})",
-            said(here, &|r: &Read| r.here.clone())
-        ),
-        here.is_some(),
     );
     let hover = first_read(s, |r| {
         r.judged() && r.hover.contains("codex-alab: not landed yet")
@@ -682,23 +591,14 @@ fn hold_checks(proof: &mut Proof, b: &Build, name: &str, s: &Seen) {
         if r.hover == "?" || r.hover.contains("not landed yet") {
             left.push(format!("hover {:?}", r.hover));
         }
-        if landing_on_this_mac(&r.here) != 0 {
-            left.push(format!("This Mac {:?}", r.here));
-        }
         left
     });
     proof.check(
         &format!(
-            "window: {name} once landed its hold is gone from the state line, hover and This Mac \
-             ({})",
+            "window: {name} once landed its hold is gone from the state line and hover ({})",
             match (&left, gone) {
-                (Some(left), Some((t, r))) if left.is_empty() => format!(
-                    "{}: state {:?}, hover {:?}, here {:?}",
-                    secs_at(*t),
-                    r.state,
-                    r.hover,
-                    r.here
-                ),
+                (Some(left), Some((t, r))) if left.is_empty() =>
+                    format!("{}: state {:?}, hover {:?}", secs_at(*t), r.state, r.hover),
                 (Some(left), Some((t, _))) => format!("{}: still {}", secs_at(*t), left.join(", ")),
                 _ => "never read landed".into(),
             }
@@ -707,24 +607,23 @@ fn hold_checks(proof: &mut Proof, b: &Build, name: &str, s: &Seen) {
     );
 }
 
-/// A worker's rows under its manager, judged: Ok with the order read where its hold was told
-/// (`held`: its build tells it and its land act was typed) and its row went from landing to
-/// landed; `Err(None)` where none was told and the row reads landed (the skip names why);
-/// `Err(Some(why))` otherwise. A worker under the work floor (§11.2.3) wears no Done for you row,
-/// so none is wanted of it.
-fn worker_rows(under: &[(i64, String)], held: bool) -> Result<&'static str, Option<String>> {
-    let landing = under.iter().find(|(_, u)| under_says(u, "landing"));
-    let landed = under.iter().find(|(_, u)| under_says(u, "landed"));
+/// A worker's `status` reads, judged: Ok with the order read where its hold was told (`held`: its
+/// build tells it and its land act was typed) and its status told the hold before it read
+/// landed; `Err(None)` where none was told and it reads landed (the skip names why);
+/// `Err(Some(why))` otherwise.
+fn worker_went(reads: &[(i64, Read)], held: bool) -> Result<&'static str, Option<String>> {
+    let landing = reads.iter().find(|(_, r)| r.held() && !r.landed());
+    let landed = reads.iter().find(|(_, r)| r.landed());
     match (landing, landed, held) {
-        (Some((a, _)), Some((b, _)), _) if a <= b => Ok("goes from landing to landed"),
-        (Some(_), Some(_), _) => Err(Some("landed before it read landing".into())),
+        (Some((a, _)), Some((b, _)), _) if a <= b => Ok("goes from its hold told to landed"),
+        (Some(_), Some(_), _) => Err(Some("landed before it told its hold".into())),
         (None, Some(_), false) => Err(None),
         (None, Some(_), true) => Err(Some(
-            "its hold was told (its land act typed, held until its row read landing), yet its \
-             row never read landing"
+            "its hold was told (its land act typed, held until its status told the hold), yet \
+             its status never read it"
                 .into(),
         )),
-        (_, None, _) => Err(Some("its row never read landed".into())),
+        (_, None, _) => Err(Some("it never read landed".into())),
     }
 }
 
@@ -754,20 +653,6 @@ fn end_check(proof: &mut Proof, s: &Seen, name: &str) {
             );
         }
     }
-}
-
-fn done_check(proof: &mut Proof, s: &Seen, name: &str) {
-    let row = done_row_seen(s, name);
-    proof.check(
-        &format!(
-            "window: {name} a Done for you row once landed ({})",
-            row.map_or_else(
-                || "none in the menu bar".to_string(),
-                |(t, r)| format!("{}: {}", secs_at(*t), r.replace('\n', " ")),
-            )
-        ),
-        row.is_some(),
-    );
 }
 
 /// The tab index of `view`, Settings ▸ Harness, in `window` (`inspect app/v1 tabs`).

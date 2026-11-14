@@ -21,7 +21,9 @@ fn adopted(home: &Path, slot: Slot, login: &str, fingerprint: &str) -> Vaulted {
 #[test]
 fn the_release_file_is_named_for_the_public_owner() {
     assert!(
-        super::RELEASE_TOKEN_FILE.ends_with(&format!("_{}", aterm_types::channel::PUBLIC_OWNER))
+        Slot::Release
+            .entry()
+            .ends_with(&format!("_{}", aterm_types::channel::PUBLIC_OWNER))
     );
     assert_eq!(Slot::named("dev"), Some(Slot::Dev));
     assert_eq!(Slot::named("release"), Some(Slot::Release));
@@ -251,4 +253,33 @@ fn the_subsets_keep_the_most_tokens_dev_first() {
         ]
     );
     assert_eq!(super::subsets(&[]), vec![Vec::<Slot>::new()]);
+}
+
+/// An absent token's step is the vault's: a slot's sync step, another vault file's entry, and
+/// none for a token the vault does not land.
+#[test]
+fn an_absent_token_is_asked_of_the_vault_by_its_entry() {
+    use crate::identity::{Profile, Source};
+    use crate::policy::Tier;
+    let file = |path: &str| Profile::new("w", Source::File(Path::new(path).into()), Tier::Dev);
+    assert_eq!(
+        super::absent_step(&file("/h/.secrets/gh_access_token")),
+        Some(Slot::Dev.sync_step())
+    );
+    let other = super::absent_step(&file("/h/.secrets/gh_access_token_org")).expect("a step");
+    assert!(
+        other.starts_with("aterm secrets need entry:gh_access_token_org "),
+        "{other}"
+    );
+    assert_eq!(super::absent_step(&file("/h/tokens/w.token")), None);
+}
+
+/// An owner no routed token writes is asked of the vault, and the file the entry lands in is the
+/// one the row routes.
+#[test]
+fn an_uncovered_owner_names_the_entry_and_its_file() {
+    let step = super::owner_step("fixture-ext", "NAME", "dev|external");
+    assert!(step.starts_with("aterm secrets need entry:NAME "), "{step}");
+    assert!(step.contains("--file ~/.secrets/NAME "), "{step}");
+    assert!(step.contains("--owner fixture-ext --write"), "{step}");
 }

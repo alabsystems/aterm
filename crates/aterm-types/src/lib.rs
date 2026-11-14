@@ -30,7 +30,10 @@ pub mod cli_path;
 pub mod clt_mark;
 pub mod clt_shim;
 
+// `#[macro_use]`: its `listed!` writes `update_standing`'s enum and its `ALL` too.
+#[macro_use]
 pub mod fleet_access;
+pub mod fleet_activity;
 pub mod fleet_name;
 pub mod hidden_char;
 mod hyperlink;
@@ -46,6 +49,7 @@ pub mod private_edit;
 #[cfg(not(target_family = "wasm"))]
 pub mod reach;
 pub mod retry_schedule;
+pub mod vault_entry;
 
 mod cursor;
 
@@ -67,6 +71,7 @@ pub mod release_version;
 pub mod rfc3339;
 pub mod rust_lane;
 pub mod update_boundary;
+pub mod update_standing;
 
 pub mod allocation_monitor;
 pub mod app_inspection;

@@ -1183,6 +1183,27 @@ mod imp {
                     .is_some_and(|fd| matches!(is_regular_file(&fd), Ok(true)))
         }
 
+        /// Whether `name` is a regular file directly in this directory, no link followed, where
+        /// the answer is known: `Ok(false)` where nothing is at the name, or what is there is a
+        /// link or no regular file. An error says the name could not be read (no descriptor
+        /// left, no permission), which is neither answer: [`Self::is_regular_file`] calls that
+        /// `false`.
+        pub(crate) fn holds_regular_file(&self, name: &OsStr) -> io::Result<bool> {
+            if validate_component(name).is_err() {
+                return Ok(false);
+            }
+            match openat(self.leaf(), name, file_read_flags(), Mode::empty()) {
+                Ok(fd) => is_regular_file(&fd),
+                Err(errno) => {
+                    let error = io::Error::from(errno);
+                    match error.raw_os_error() {
+                        Some(libc::ENOENT | libc::ELOOP) => Ok(false),
+                        _ => Err(error),
+                    }
+                }
+            }
+        }
+
         /// Hard-bounded enumeration.
         #[cfg(test)]
         pub(crate) fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
@@ -2568,6 +2589,35 @@ mod imp {
             }
             probe_regular_file(&self.path.join(name))
                 .is_ok_and(|file| ensure_direct_child(self.leaf(), &file).is_ok())
+        }
+
+        /// Whether `name` is a regular file directly in this directory, where the answer is
+        /// known: `Ok(false)` where nothing is at the name, or what is there is not a singly
+        /// linked regular file this process may open (a directory, a reparse point, a file it is
+        /// denied: Windows says `PermissionDenied` of each), or is no direct child. Any other
+        /// error says the name could not be read, which is neither answer:
+        /// [`Self::is_regular_file`] calls that `false`.
+        pub(crate) fn holds_regular_file(&self, name: &OsStr) -> io::Result<bool> {
+            if validate_component(name).is_err() {
+                return Ok(false);
+            }
+            self.validate_path_identity()?;
+            let absent = |error: &io::Error| {
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                )
+            };
+            let file = match probe_regular_file(&self.path.join(name)) {
+                Ok(file) => file,
+                Err(error) if absent(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            match ensure_direct_child(self.leaf(), &file) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
         }
 
         pub(crate) fn names_up_to(&self, limit: usize) -> io::Result<Vec<OsString>> {

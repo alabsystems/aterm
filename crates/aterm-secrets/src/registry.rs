@@ -24,8 +24,8 @@ pub struct Entry {
 #[must_use]
 pub fn purpose(name: &str) -> String {
     match name {
-        "gh_access_token" => Want::Gh(GhProfile::Dev).title(),
-        "gh_access_token_alabsystems" => Want::Gh(GhProfile::Release).title(),
+        crate::entry_class::DEV_GH_TOKEN => Want::Gh(GhProfile::Dev).title(),
+        crate::entry_class::RELEASE_GH_TOKEN => Want::Gh(GhProfile::Release).title(),
         "github-repositories.json" => {
             "Private development account and repository inventory for automatic setup".into()
         }

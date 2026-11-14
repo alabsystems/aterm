@@ -1060,10 +1060,10 @@ fn add_unix(
             && let Some(slot) = super::vault::Slot::named(&req.name)
         {
             return Err(Error::usage(format!(
-                "profile {} is the vault's ~/{}, which agh adopts with nothing to run: agh.toml \
-                 says vault = true, so it names no profile dev or release",
+                "profile {} is the vault's {}, which agh adopts with nothing to run: agh.toml says \
+                 vault = true, so it names no profile dev or release",
                 req.name,
-                slot.file()
+                slot.pointer()
             ))
             .with_next("choose another NAME: the vault's token already joins agh.toml's rows"));
         }

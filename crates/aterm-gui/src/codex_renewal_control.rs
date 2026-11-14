@@ -25,11 +25,19 @@ pub(super) use rotation::observe_exec;
 #[cfg(all(test, unix))]
 pub(super) use service::append_child as fixture_append_child;
 #[cfg(all(test, unix))]
+pub(super) use service::cleanup_terminal_pool as fixture_cleanup_terminal_pool;
+#[cfg(all(test, unix))]
 pub(super) use service::observe_terminal_by as fixture_observe_terminal;
 #[cfg(all(test, unix))]
 pub(super) use service::retire_unstarted as fixture_retire_unstarted;
 #[cfg(all(test, unix))]
 pub(super) use service::settle_terminal_native as fixture_settle_terminal_native;
+#[cfg(all(test, unix))]
+pub(super) use service::unattached_completion as fixture_unattached_completion;
+#[cfg(all(test, unix))]
+pub(super) use service::{
+    ClosedDriver as FixtureClosedDriver, MAX_CONTINUATIONS, close_worker_by as fixture_close_worker,
+};
 pub(crate) use service::{cancel_owner, pending};
 
 #[derive(Clone, Debug)]
@@ -41,6 +49,9 @@ pub(super) struct Seal {
     env: Env,
     intent: Arc<IntentFence>,
     record: Option<RecordWitness>,
+    /// The source agent's copy, its resume line validated against the live process at commit:
+    /// what a root that ends with no successor hands its session back on.
+    source: Option<self_claimed::Copy>,
     continuation: Option<Arc<ClosedRestart>>,
     fresh_snapshot: Option<SupervisorAuthority>,
 }
@@ -180,8 +191,8 @@ impl Seal {
 
     /// The owner hook invokes this at the Meta/native cancellation boundary.
     /// Durable publication is separate and can never clear the in-memory fence.
-    pub(super) fn cancel(&self, kind: renewal::CancellationKind) {
-        self.intent.cancel(kind);
+    pub(super) fn cancel(&self, kind: renewal::CancellationKind) -> bool {
+        self.intent.cancel(kind)
     }
 
     fn active_receipt(&self, env: &Env) -> Option<Receipt> {
@@ -790,6 +801,7 @@ fn commit(
         env: env.clone(),
         intent: Arc::new(IntentFence::new(ctx)),
         record: RecordWitness::capture(copy, current, &receipt),
+        source: Some(copy.clone()),
         continuation: None,
         fresh_snapshot: None,
     };
@@ -881,14 +893,7 @@ fn commit(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            service::continue_closed(&worker_ctx, &opts, &id);
-            if let Some(ctx) = worker_ctx.upgrade() {
-                service::observe_terminal(&ctx, &id);
-                let deadline = renewal::read_receipt(&worker_env, &id)
-                    .and_then(|current| renewal::active_prepare(&worker_env, &current))
-                    .map_or(prepare.deadline_us, |active| active.deadline_us);
-                ctx.native_policy.renewal_coordinator_stopped(&id, deadline);
-            }
+            service::close_worker(&worker_ctx, &opts, &worker_env, &id, prepare.deadline_us);
         });
     if spawned.is_err() {
         reset_before_signal(env, &receipt.id);
@@ -1148,6 +1153,23 @@ fn status(
         }
         return acknowledged_receipt_reply(env, &receipt);
     }
+    // A root that retired with no successor left its session on the login it was on, and the
+    // agent relaunched there (by its root's hand-back, the crash rule or a person) inherits the
+    // owed act that binds this receipt. It is neither the source, which has ended, nor a
+    // successor, and until it hears the receipt retired it keeps the point and asks again. The
+    // answer is a terminal observation, which grants no execution: it lets that agent unbind
+    // and ask afresh, where every native check applies again.
+    let handed_back = receipt.phase == Phase::Retired
+        && receipt.successor_pid.is_none()
+        && receipt.successor_birth.is_none()
+        && receipt.accepted_turn.is_none()
+        && !source
+        && Process::observe(receipt.old_pid).is_none_or(|old| old.birth != receipt.old_birth)
+        && current_auth == receipt.old_auth
+        && receipt.intent.marker(current)["receipt"].as_str() == Some(id);
+    if same_session && handed_back {
+        return acknowledged_receipt_reply(env, &receipt);
+    }
     if !same_session || !(source || successor) {
         return "ERR codex-renewal wrong process\n".into();
     }
@@ -1263,6 +1285,25 @@ pub(super) fn fixture_after_signal(
         .clone();
     let intent = Arc::new(IntentFence::new(ctx));
     intent.did_signal();
+    // The source's own line: its conversation on the login and home it ran on.
+    let source = Some(self_claimed::Copy {
+        lifetime: None,
+        pid: receipt.old_pid,
+        start: "fixture-source-start".into(),
+        home: home.clone(),
+        seen: self_claimed::Seen::Never,
+        resume: Ok(self_claimed::Resume {
+            argv: vec![
+                "/fixture/codex-alab".into(),
+                "resume".into(),
+                receipt.intent.thread.clone(),
+            ],
+            session: receipt.intent.thread.clone(),
+            codex_home: Some(home.to_string_lossy().into_owned()),
+            codex_auth_path: Some(receipt.old_auth.to_string_lossy().into_owned()),
+            cwd: None,
+        }),
+    });
     let record = Some(RecordWitness {
         home,
         pid: receipt.old_pid,
@@ -1277,6 +1318,7 @@ pub(super) fn fixture_after_signal(
         env,
         intent,
         record,
+        source,
         continuation: None,
         fresh_snapshot: None,
     }

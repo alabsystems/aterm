@@ -5956,23 +5956,27 @@ fn copy_remedy(e: &str, read: &str) -> String {
     )
 }
 
-/// A path of the engine's records rather than its code (`bin/pub`'s `ENGINE_DATA_PLANE` and
-/// `ENGINE_DATA_PLANE_PREFIXES`): its ledger, its audit log, its handoff records.
+/// A path of the engine's records rather than its code (`bin/pub`'s `ENGINE_DATA_PLANE`): its
+/// ledger and its audit log. Nothing else is a record: a path under `handoff/`, a folder of
+/// hand-written notes the engine deleted (publication CU-13), is judged like any other path.
 fn engine_data_plane(path: &str) -> bool {
-    matches!(path, "mappings.json" | "verification-log.jsonl") || path.starts_with("handoff/")
+    matches!(path, "mappings.json" | "verification-log.jsonl")
 }
 
 /// A changed engine path that is engine code, as the engine's own stage guard judges a move of
-/// its HEAD (`bin/pub`'s `engine_code_drift`): neither its records ([`engine_data_plane`]), its
-/// Rust port (`RUST_PORT_FILES`, `crates/`), which no `bin/pub` verb a release runs reads, nor
-/// its prose (`docs/`, a top-level `*.md`), which `bin/pub` never opens. A `*.md` anywhere else
-/// (`bin/`, `registry/`) is code. Read from `git diff --no-renames --name-only`, so a rename
-/// lists the path it left as well as the one it took.
+/// its HEAD (`bin/pub`'s `engine_code_drift`, path for path): any non-blank path that is neither
+/// one of its records ([`engine_data_plane`]), its prose (`docs/`, a top-level `*.md`), which
+/// `bin/pub` never opens, nor its lab tracker (`goals/`: the tracker's tables, `GOALS.md`,
+/// designs and the `goals/tools/*.py` that write them), tooling `bin/pub` never imports, runs or
+/// opens, which `goals.py` commits to the engine every few minutes. Only the `goals/` directory
+/// passes (`bin/goals.py` and `goalsx/` are code), a `*.md` anywhere else (`bin/`, `registry/`)
+/// is code, and so is every path of the Rust port the engine deleted (`crates/`, `Cargo.*`,
+/// `rust-toolchain.toml`). Read from `git diff --no-renames --name-only`, so a rename lists the
+/// path it left as well as the one it took.
 fn engine_code(path: &str) -> bool {
-    let port = matches!(path, "Cargo.toml" | "Cargo.lock" | "rust-toolchain.toml")
-        || path.starts_with("crates/");
     let prose = path.starts_with("docs/") || (!path.contains('/') && path.ends_with(".md"));
-    !path.is_empty() && !engine_data_plane(path) && !port && !prose
+    let tracker = path.starts_with("goals/");
+    !path.trim().is_empty() && !engine_data_plane(path) && !prose && !tracker
 }
 
 /// The passes [`Real::engine_fast_forward`] makes over a main that keeps moving before it
@@ -6845,6 +6849,32 @@ pub(crate) fn verify_plan_for_default_target(
     target_root: &Path,
 ) -> aterm_verify::NativeBuildPlan {
     aterm_verify::NativeBuildPlan::for_default_target(&verify_environment(), repo, target_root)
+}
+
+/// Whether step 1 still asks the released-shim judgment of a tree with these check records
+/// ([`Backend::released_shim`]): while its `test` check has no passing record under this seal,
+/// a FAIL included, and whenever the records cannot be read. The tree's `test` runs the
+/// released-shim rig's own tests against the same installed release, so a tree that passed it
+/// has nothing left for the early ask to foretell, and a qualified release is not refused over
+/// a release that became public after it qualified.
+fn shim_owed(records: &Result<crate::check_record::Checks, String>) -> bool {
+    let test = aterm_verify::checks::Check::Test.name();
+    records.as_ref().map_or(true, |checks| {
+        checks.missing.iter().any(|name| name == test)
+            || checks.failed.iter().any(|failed| failed.check == test)
+    })
+}
+
+/// What step 1 makes of the released-shim judgment: the row's own words, as a pass, as R's red
+/// (the public release refuses its tree), or as a judgment this Mac could not make (COULD NOT
+/// RUN, never green). A host that is no Mac judges nothing and cuts no release either.
+fn shim_finding(judged: aterm_verify::released_shim::Judged) -> Result<String, InputFinding> {
+    use aterm_verify::released_shim::Verdict;
+    match judged.verdict {
+        Verdict::Accepted | Verdict::NotThisHost => Ok(judged.row),
+        Verdict::Refused => Err(InputFinding::Failed(judged.row)),
+        Verdict::Undecided => Err(InputFinding::Unanswered(judged.row)),
+    }
 }
 
 /// The release compiler policy, with caller Cargo layout overrides excluded as in `Real::child`.
@@ -9561,6 +9591,46 @@ impl Backend for Real {
         self.input_checks_using(base, tip, prover, Self::input_engine)
     }
 
+    fn released_shim(&mut self, c: &Candidate) -> Result<String, InputFinding> {
+        let unavailable = |why: String| {
+            InputFinding::Unanswered(format!("released-shim could not be asked of R: {why}"))
+        };
+        let records = crate::check_record::checks(&self.git(), &c.commit, None, self.build_inputs);
+        if !shim_owed(&records) {
+            return Ok(format!(
+                "released-shim not asked again: the `test` record of {}'s tree stands under \
+                 this seal, its tests of the released-shim rig included",
+                c.commit.get(..12).unwrap_or(&c.commit)
+            ));
+        }
+        let log = self.step_log(Step::Checks);
+        say_to(&self.transcript(), "        released-shim (starting)");
+        let _phase = crate::cut_timing::Timer::start(&log, "released-shim");
+        // The input judgment's own checkout of R, which a dry run and a real run share: a dry
+        // run's planned head is in no other folder, and the release clone is never read here.
+        let root = crate::input_record::directory(&self.release);
+        let _checkout_claim = crate::input_record::claim(&self.release).map_err(unavailable)?;
+        crate::input_record::checkout(&self.git(), &root, &c.commit).map_err(unavailable)?;
+        // What a `verify` child of the release reads: the publication PATH and the account's
+        // own store, registry and toolchains, with no caller Cargo or rustup override.
+        let environment = aterm_verify::EnvSnapshot {
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute()),
+            ..verify_environment()
+        };
+        let judged = aterm_verify::released_shim::judge(
+            &root,
+            &environment,
+            &[aterm_verify::released_shim::WHOLE_TREE.to_owned()],
+        );
+        if let Ok(mut file) = crate::durable::open_append(&log, true) {
+            let _ = file.write_all(judged.output.as_bytes());
+            let _ = writeln!(file, "{}", judged.row);
+        }
+        shim_finding(judged)
+    }
+
     fn branch_is_main(&mut self) -> bool {
         self.git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
             .as_deref()
@@ -9712,7 +9782,7 @@ impl Backend for Real {
         if moved.is_empty() {
             return Ok(EngineNow::Same(format!(
                 "the engine at its origin/main {} has the code that staged ({}; only its \
-                 records, Rust port or prose moved)",
+                 records, prose or lab tracker moved)",
                 short(to),
                 short(from)
             )));
@@ -10414,6 +10484,10 @@ impl Backend for Real {
     }
     fn audit(&mut self, machine_id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding> {
         crate::provision::audit(&self.repo, machine_id, profile, dry)
+    }
+
+    fn distribution(&mut self, dry: bool) -> Vec<Finding> {
+        crate::provision::distribution(&self.repo, dry)
     }
 
     fn ask(&mut self, words: &AskWords) -> Result<String, String> {

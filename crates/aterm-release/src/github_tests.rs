@@ -219,6 +219,7 @@ fn concurrent_upload_fixture_walls() {
             artifact: None,
             macho_sha256: None,
             linux: None,
+            windows: None,
             manifest_signed: true,
             signature_required: true,
             signature_pubkey: None,

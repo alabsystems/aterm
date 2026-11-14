@@ -905,6 +905,14 @@ pub fn setup_field(status: &str) -> Option<&str> {
         .find_map(|kv| kv.strip_prefix("setup="))
 }
 
+/// The guest's network place in the same status reading as `setup=`.
+#[must_use]
+pub fn network_field(status: &str) -> Option<&str> {
+    status
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("net="))
+}
+
 /// The sid of the first session in `aterm ctl ls`' lines (`<pid> <local> <sid> …`); `None` when
 /// no line is one.
 #[must_use]
@@ -952,6 +960,7 @@ pub fn shell_session(ls: &str) -> Option<&str> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reading {
     pub setup: Option<String>,
+    pub network: Option<String>,
     pub record: Option<Record>,
     pub acts: usize,
 }
@@ -985,10 +994,11 @@ pub fn acts(text: &str) -> usize {
 impl Reading {
     /// Done: `setup=done`, `read-back:<rows>` (everything else as for `done`, those rows set up
     /// as last read longer ago than a reading stands, which is how a finished run nobody watches
-    /// reads ten minutes on), or `asking:<rows>` (everything else as for `done`, those rows asked
-    /// and not answered, which aterm asks again by itself: the ALab vault on a Mac off its LAN,
-    /// which no wait of the lab's ends); or, from a build without the field, the record
-    /// completed. Their tails (`;offered:`, `;asking:`, `;at-login:`, `;changed:`) hold nothing
+    /// reads ten minutes on), or `asking:vault` when the same reading places the guest on a
+    /// remote network or offline: no wait of the lab's answers that vault request. Other
+    /// requests, and unknown network places, remain unfinished. From a build without the field,
+    /// the record must have completed. Their tails (`;offered:`, `;asking:`, `;at-login:`,
+    /// `;changed:`) hold nothing
     /// back. A head that names a step left or a row unread is not done.
     #[must_use]
     pub fn done(&self) -> bool {
@@ -996,9 +1006,11 @@ impl Reading {
             Some(field) => {
                 let head = field.split(';').next().unwrap_or_default();
                 head == "done"
-                    || ["read-back:", "asking:"]
-                        .iter()
-                        .any(|key| head.strip_prefix(key).is_some_and(|rows| !rows.is_empty()))
+                    || head
+                        .strip_prefix("read-back:")
+                        .is_some_and(|rows| !rows.is_empty())
+                    || (head == "asking:vault"
+                        && matches!(self.network.as_deref(), Some("remote" | "offline")))
             }
             None => self.record.as_ref().is_some_and(|r| r.state == "completed"),
         }
@@ -1019,10 +1031,15 @@ impl Reading {
                 )
             },
         );
-        format!(
+        let mut said = format!(
             "setup={} ({record})",
             self.setup.as_deref().unwrap_or("absent")
-        )
+        );
+        if let Some(network) = &self.network {
+            said.push_str(" net=");
+            said.push_str(network);
+        }
+        said
     }
 }
 

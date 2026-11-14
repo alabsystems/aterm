@@ -827,7 +827,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "fleet.watch",
         "Read the fleet every minute",
         ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["fleet", "survey", "menu bar", "status", "watch"],
+        &["fleet", "survey", "network", "status", "watch"],
         true,
     ),
     // No Reset: a one-key write would leave `drive_from` below drive (`aterm fleet allow`).

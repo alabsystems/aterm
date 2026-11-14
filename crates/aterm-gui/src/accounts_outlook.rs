@@ -215,6 +215,12 @@ pub(crate) struct OutlookMemo {
     replayed: Option<(i64, (Mode, bool))>,
     /// The store was read again since the last replay (its stamps or the roster moved).
     unreplayed: bool,
+    /// The row whose sign-in runs on this Mac now, as the last look read it
+    /// ([`accounts::Store::signing_in`]).
+    signing_in: Option<String>,
+    /// [`Self::signing_in`] moved since the last replay: the next one runs at once, so a row
+    /// says `signing in`, and stops saying it, within [`LOOK_EVERY`].
+    sign_in_moved: bool,
     outlook: Option<Arc<Outlook>>,
     /// Each label's plan as this process last noted it ([`Self::note_plan`]).
     planned: BTreeMap<String, account_series::PlanSaid>,
@@ -239,7 +245,9 @@ impl OutlookMemo {
     /// replay had not seen ([`Self::quota`]): then a store read again since that replay is
     /// replayed at once, not at the minute. The read is at a stamp look, so the replay follows
     /// the harness's fold of the reading within [`LOOK_EVERY`], and a replay that has seen it
-    /// ends the pane's `behind`.
+    /// ends the pane's `behind`. The same look reads which row's sign-in runs on this Mac
+    /// ([`accounts::Store::signing_in`]); where that moved, the next replay runs at once too, so
+    /// a row says `signing in`, and stops saying it, within [`LOOK_EVERY`].
     pub(crate) fn at(
         &mut self,
         instant: Instant,
@@ -282,6 +290,11 @@ impl OutlookMemo {
                 self.unreplayed = true;
                 moved = true;
             }
+            let signing_in = store.signing_in();
+            if self.signing_in != signing_in {
+                self.signing_in = signing_in;
+                self.sign_in_moved = true;
+            }
         }
         let policy = (reads.policy)();
         let unavailable =
@@ -291,6 +304,7 @@ impl OutlookMemo {
             moved = true;
         }
         let due = (behind && self.unreplayed)
+            || self.sign_in_moved
             || self
                 .replayed
                 .is_none_or(|(at, _)| now.saturating_sub(at) >= REPLAY_EVERY_S || now < at);
@@ -301,6 +315,7 @@ impl OutlookMemo {
         {
             self.replayed = Some((now, policy));
             self.unreplayed = false;
+            self.sign_in_moved = false;
             let series = refresh_series(&mut self.series, &dir, roster, &state.machine, now);
             #[cfg(test)]
             {
@@ -316,6 +331,7 @@ impl OutlookMemo {
                 credits: policy.1,
                 now,
                 offset: reads.offset,
+                signing_in: self.signing_in.as_deref(),
             })));
             moved = true;
         }
@@ -376,7 +392,7 @@ impl OutlookMemo {
             && self.outlook.as_ref().is_some_and(|o| {
                 o.rows
                     .iter()
-                    .any(|r| r.label == tab && r.figure(o.as_of) == Figure::Unread)
+                    .any(|r| r.label == tab && r.week_figure(o.as_of) == Figure::Unread)
             });
         self.at(instant, now, roster, false, behind)?;
         let outlook = self.outlook.clone()?;

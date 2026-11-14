@@ -215,6 +215,14 @@ fn row_of(t: &aterm_toml::Table) -> Option<Need> {
         },
         line,
         seq: n("seq"),
+        exposed: match t.get("exposed") {
+            None => Vec::new(),
+            Some(sections) => sections
+                .as_array()?
+                .iter()
+                .map(|section| section.as_str().map(str::to_owned))
+                .collect::<Option<_>>()?,
+        },
     })
 }
 
@@ -265,6 +273,10 @@ fn render(paths: &Paths, rows: &[Need]) -> crate::Result<String> {
         }
         if need.custodian_silent {
             put("custodian_silent", "true".to_owned());
+        }
+        if !need.exposed.is_empty() {
+            let sections: Vec<String> = need.exposed.iter().map(|s| toml_str(s)).collect();
+            put("exposed", format!("[{}]", sections.join(", ")));
         }
         if let Some(retired) = &need.retired {
             put("reason", toml_str(retired.reason.word()));
@@ -359,6 +371,76 @@ fn new_id() -> crate::Result<[u8; 16]> {
 /// The ledger or the vault state cannot be read or written, or no request id can be drawn.
 pub fn raise(paths: &Paths, want: Want, purpose: Purpose) -> crate::Result<Need> {
     raise_with(paths, want, purpose, None)
+}
+
+/// File each vault entry of `exposures`, `(name, sections)`, for a new value under one lock: a
+/// stolen Mac read it in those sections ([`Purpose::StolenRotation`]). Idempotent as [`raise`]:
+/// an open filing gains the sections, one a set closed is filed again.
+///
+/// # Errors
+/// As [`raise`].
+pub fn raise_rotations(
+    paths: &Paths,
+    exposures: &[(String, Vec<String>)],
+) -> crate::Result<Vec<Need>> {
+    with_ledger(paths, |rows, facts| {
+        exposures
+            .iter()
+            .map(|(name, sections)| {
+                let want = Want::Entry(name.clone());
+                let need = raise_in(rows, facts, want.clone(), Purpose::StolenRotation, None)?;
+                let Some(row) = rows
+                    .iter_mut()
+                    .find(|row| row.want == want && row.purpose == Purpose::StolenRotation)
+                else {
+                    return Ok(need);
+                };
+                if row.state.ended() {
+                    return Ok(need);
+                }
+                row.exposed.extend(sections.iter().cloned());
+                row.exposed.sort();
+                row.exposed.dedup();
+                *row = settle(row, facts);
+                Ok(row.clone())
+            })
+            .collect()
+    })
+}
+
+/// A new value of the entry `name` was published in the vault section `section` (`[everyone]`,
+/// `[m3 m22]`): the open rotation filing for it, if any, no longer counts that section, and ends
+/// `not-needed` once no section the stolen Mac read it in holds the old value. `None` when none
+/// is open; the ledger is read alone, under no lock, to find that out.
+///
+/// # Errors
+/// The ledger or the vault state cannot be read or written.
+pub fn rotated(paths: &Paths, name: &str, section: &str) -> crate::Result<Option<Need>> {
+    let want = Want::Entry(name.to_owned());
+    let open = |row: &Need| {
+        row.want == want && row.purpose == Purpose::StolenRotation && !row.state.ended()
+    };
+    if !load(paths)?.iter().any(open) {
+        return Ok(None);
+    }
+    with_ledger(paths, |rows, facts| {
+        let Some(row) = rows.iter_mut().find(|row| open(row)) else {
+            return Ok(None);
+        };
+        row.exposed.retain(|held| held != section);
+        if !row.exposed.is_empty() {
+            *row = settle(row, facts);
+            return Ok(Some(row.clone()));
+        }
+        let Some(next) = act(row, facts, &Act::Unneeded) else {
+            return Ok(None);
+        };
+        *row = Need {
+            line: format!("rotated: a new value of {name} was published"),
+            ..next
+        };
+        Ok(Some(row.clone()))
+    })
 }
 
 /// [`raise`] for a consumer that refused the value the vault gave it at `seq` (§6.2).

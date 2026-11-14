@@ -2140,13 +2140,15 @@ pub(crate) const PERSON_NEEDS_DEBUG: &str = "person needs a debug build";
 pub(crate) const PERSON_DENIED: &str = "denied: person is a development build's stand-in for \
      the person at the window (ATERM_DEBUG_PERSON_INVOKE=1 at launch)";
 
-const PERSON_USAGE: &str =
-    "usage: person look <window>|off | person menubar press <at> | person menubar click";
+const PERSON_USAGE: &str = "usage: person look <window>|off | person menubar open | person menubar press <at> | \
+     person menubar click";
 
 /// Parsed `person` control request for development-build UI simulation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PersonAsked {
     Look(Option<u64>),
+    /// The menu-bar item's menu opened.
+    Open,
     Press(crate::status_item::MenuAt),
     /// A left click on the menu-bar lock.
     Click,
@@ -2175,7 +2177,10 @@ pub(crate) fn parse_person(
             .ok_or_else(|| format!("{PERSON_USAGE} (`{window}` is no window number)")),
         ["menubar", "press", at] => crate::status_item::MenuAt::parse(at)
             .map(PersonAsked::Press)
-            .ok_or_else(|| format!("{PERSON_USAGE} (`{at}` is no row path: `chrome` prints them)")),
+            .ok_or_else(|| {
+                format!("{PERSON_USAGE} (`{at}` is no row place: `chrome` prints each as `at=`)")
+            }),
+        ["menubar", "open"] => Ok(PersonAsked::Open),
         ["menubar", "click"] => Ok(PersonAsked::Click),
         _ => Err(PERSON_USAGE.to_string()),
     }

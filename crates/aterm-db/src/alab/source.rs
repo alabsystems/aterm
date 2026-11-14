@@ -196,6 +196,16 @@ impl Registry {
         )
     }
 
+    /// Whether this installation never configured a Commons, read at once without waiting on
+    /// or creating custody (an initially busy vault refuses at once). What a reader with no
+    /// shared file to read asks before it calls that absence rather than pending.
+    ///
+    /// # Errors
+    /// A busy or unavailable vault, or a writer generation that cannot be read.
+    pub fn never_configured(&self) -> Result<bool> {
+        application::never_configured(&self.paths, crate::admission::deadline())
+    }
+
     /// The native cache's observation. `None` on an installation that never
     /// configured a Commons, read at once without waiting on or creating
     /// custody; an initially busy vault refuses immediately. Otherwise

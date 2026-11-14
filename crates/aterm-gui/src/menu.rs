@@ -476,6 +476,9 @@ pub(crate) enum MenuAction {
     TakeOver,
     /// Hand Back This Tab: lift the person's hold, and only it (`App::hand_back`).
     HandBack,
+    /// Hand Back All: lift the person's hold on every tab that has one
+    /// (`App::hand_back_all`).
+    HandBackAll,
     /// Read This Mac: `aterm ctl survey` as a child, its text in a document tab.
     ReadThisMac,
     /// Read the Fleet: `aterm ctl survey --fleet --timeout 3` into a document tab.
@@ -565,6 +568,7 @@ impl MenuAction {
             MenuAction::HarnessLog => 60,
             MenuAction::TakeOver => 61,
             MenuAction::HandBack => 62,
+            MenuAction::HandBackAll => 104,
             MenuAction::FabricStatus => 63,
             MenuAction::FabricOn => 64,
             MenuAction::FabricOff => 65,
@@ -654,6 +658,7 @@ impl MenuAction {
             60 => MenuAction::HarnessLog,
             61 => MenuAction::TakeOver,
             62 => MenuAction::HandBack,
+            104 => MenuAction::HandBackAll,
             63 => MenuAction::FabricStatus,
             64 => MenuAction::FabricOn,
             65 => MenuAction::FabricOff,
@@ -825,6 +830,23 @@ pub(crate) fn set_front_person_hold(held: bool) {
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn front_person_hold() -> bool {
     FRONT_PERSON_HOLD.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+menu_static! {
+    static ANY_PERSON_HOLD: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+}
+
+/// Publish whether Hand Back All has a hold to lift: the person holds a tab, the front one or
+/// not.
+pub(crate) fn set_any_person_hold(held: bool) {
+    ANY_PERSON_HOLD.published(|bit| bit.store(held, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// The published person holds ([`set_any_person_hold`]).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn any_person_hold() -> bool {
+    ANY_PERSON_HOLD.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 menu_static! {
@@ -1152,6 +1174,7 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
     match action {
         MenuAction::TakeOver if front_person_hold() && !front_remote_hold() => return false,
         MenuAction::HandBack if !front_person_hold() => return false,
+        MenuAction::HandBackAll if !any_person_hold() => return false,
         MenuAction::NextNeed
         | MenuAction::Overview
         | MenuAction::ReadFleet
@@ -1250,7 +1273,7 @@ impl MenuAction {
             | MenuAction::FabricStatus
             | MenuAction::FabricOn
             | MenuAction::FabricOff => OwnerOnly,
-            MenuAction::TakeOver | MenuAction::HandBack => PersonOnly,
+            MenuAction::TakeOver | MenuAction::HandBack | MenuAction::HandBackAll => PersonOnly,
             MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
                 ConfigWrite
             }
@@ -1372,6 +1395,7 @@ impl MenuAction {
             | MenuAction::HarnessLog
             | MenuAction::TakeOver
             | MenuAction::HandBack
+            | MenuAction::HandBackAll
             | MenuAction::ReadThisMac
             | MenuAction::ReadFleet
             | MenuAction::SummarizeFleet
@@ -1482,6 +1506,9 @@ impl MenuAction {
             MenuAction::TakeOver => TAKE_OVER_TIP,
             MenuAction::HandBack => {
                 "Hand this tab back: your hold lifts; any other hold on it stays."
+            }
+            MenuAction::HandBackAll => {
+                "Hand back every tab you took over: your holds lift; any other hold stays."
             }
             MenuAction::ReadThisMac => {
                 "Read every session on this Mac (aterm ctl survey) in a tab; no model runs."
@@ -1649,6 +1676,7 @@ impl MenuAction {
             "FleetMachines" => Some(MenuAction::FleetMachines),
             "TakeOver" => Some(MenuAction::TakeOver),
             "HandBack" => Some(MenuAction::HandBack),
+            "HandBackAll" => Some(MenuAction::HandBackAll),
             "FabricStatus" => Some(MenuAction::FabricStatus),
             "FabricOn" => Some(MenuAction::FabricOn),
             "FabricOff" => Some(MenuAction::FabricOff),
@@ -1888,6 +1916,12 @@ const AGENTS_MENU: &[MenuEntry] = &[
     Item {
         label: "Hand Back This Tab",
         action: MenuAction::HandBack,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Hand Back All",
+        action: MenuAction::HandBackAll,
         key: "",
         mods: MenuMods::None,
     },

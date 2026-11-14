@@ -455,9 +455,12 @@ fn hosts_check_reports_each_check() {
     let checks = check(HostChoice::Agh, false);
     let public = named(&checks, "public_writer");
     assert!(!public.ok, "{public:?}");
-    assert_eq!(
-        public.detail,
-        "release writes alabsystems, and its token is absent"
+    assert!(
+        public
+            .detail
+            .starts_with("release writes alabsystems, and its token is absent: ")
+            && public.detail.contains("aterm secrets need gh:release"),
+        "{public:?}"
     );
     assert!(named(&checks, "grants").ok, "{checks:?}");
 
@@ -522,7 +525,7 @@ fn hosts_check_reports_each_check() {
         "{staging:?}"
     );
     assert!(
-        staging.detail.contains("--file PATH") && staging.detail.contains(RUNBOOK),
+        staging.detail.contains("aterm secrets need gh:dev") && staging.detail.contains(RUNBOOK),
         "{staging:?}"
     );
 }

@@ -16,9 +16,6 @@ pub(crate) const LONG_HOLD: Duration = Duration::from_secs(30 * 60);
 
 const LONG_HOLD_RESTATE: Duration = Duration::from_secs(60);
 
-/// Allowance for the requested fleet hold change's owned command.
-const HOLD_ACTION_HANG: Duration = Duration::from_secs(60);
-
 /// Why a control client's copy or paste did nothing ([`App::refuse_clipboard_gesture`]).
 pub(crate) const CLIPBOARD_REFUSED: &str = "the clipboard is the person's own: a control client \
      cannot copy to it or paste from it (send text with the `paste` verb)";
@@ -95,9 +92,6 @@ pub(crate) struct AgentsState {
     /// the person takes or hands one back, and where a session's published hold moved
     /// (`App::publish_need`).
     pub(crate) long_holds_moved: bool,
-    /// The refusals the person's holds had counted when the menu-bar glance last read them
-    /// ([`App::note_person_refusals`]).
-    pub(crate) refusals_seen: u64,
     /// When the next standing hold reaches [`LONG_HOLD`], in unix seconds, as of the last walk;
     /// `None` when none will.
     pub(crate) long_holds_due: Option<u64>,
@@ -157,8 +151,7 @@ pub(crate) struct AgentsState {
     pub(crate) owner_sheet_for_test: Option<Option<bool>>,
 }
 
-/// One local need, ordered as the status item orders this aterm's needs
-/// (`status_item::need_order`): stuck before decide; within a severity a need that has stopped
+/// One local need, in the order Next That Needs You walks them: stuck before decide; within a severity a need that has stopped
 /// its agent before a harness's report it carries on past
 /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7); then oldest first (since this aterm
 /// first saw it published, `NeedAges::need_since`; unknown age last), then by the tab's label,
@@ -171,7 +164,7 @@ pub(crate) struct NeedStop {
     pub(crate) carries_on: bool,
     /// Since when it has stood, unix seconds; `i64::MAX` for unknown.
     pub(crate) since: i64,
-    /// The tab's label ([`App::tab_label_of_session`], as ❯ names the row).
+    /// The tab's label ([`App::tab_label_of_session`]).
     pub(crate) label: String,
     pub(crate) session: u64,
     /// The need's identity within its word ([`crate::needs::Need::key`]).
@@ -282,7 +275,7 @@ pub(crate) fn title_without_agent_glyph(title: &str) -> &str {
     }
 }
 
-/// One standing person hold, as the menu bar's You hold row and the hover read it
+/// One standing person hold, as Hand Back All and the long hold's entry read it
 /// ([`App::person_holds`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PersonHeld {
@@ -353,14 +346,13 @@ pub(crate) enum CliVerb {
     BusOn,
     /// Message Bus: Turn Off… (palette): `aterm fabric off`, behind a confirmation.
     BusOff,
-    /// The menu bar's read of one fleet Mac, whole or one session
-    /// (`aterm ctl survey --host <dial> [--sid <sid>]`): argv and title are the plan's
-    /// ([`CliPlan::peer`]).
-    ReadPeer,
-    /// The menu bar's Take Over or Hand Back of a fleet Mac's session, the step-in
-    /// (`aterm ctl --host <dial> hold <sid> on|off`): argv and title are the plan's
-    /// ([`CliPlan::driven`]).
-    DrivePeer,
+    /// The menu bar's All activity…: `aterm fleet activity`, this Mac's record of the agent
+    /// requests between it and the other Macs.
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        expect(dead_code, reason = "the menu-bar status item is macOS's")
+    )]
+    FleetActivity,
 }
 
 impl CliVerb {
@@ -374,8 +366,7 @@ impl CliVerb {
             Self::BusStatus => "bus-status",
             Self::BusOn => "bus-on",
             Self::BusOff => "bus-off",
-            Self::ReadPeer => "read-peer",
-            Self::DrivePeer => "drive-peer",
+            Self::FleetActivity => "fleet-activity",
         }
     }
 
@@ -388,8 +379,7 @@ impl CliVerb {
             Self::BusStatus => &["fabric"],
             Self::BusOn => &["fabric", "on"],
             Self::BusOff => &["fabric", "off"],
-            Self::ReadPeer => &["ctl", "survey"],
-            Self::DrivePeer => &["ctl", "--host"],
+            Self::FleetActivity => &["fleet", "activity"],
         };
         words.iter().map(|w| (*w).to_string()).collect()
     }
@@ -403,8 +393,7 @@ impl CliVerb {
             Self::BusStatus => "Message bus status",
             Self::BusOn => "Message Bus On",
             Self::BusOff => "Message Bus Off",
-            Self::ReadPeer => "Read a Fleet Mac",
-            Self::DrivePeer => "Step In on a Fleet Mac",
+            Self::FleetActivity => "Fleet Activity",
         }
     }
 
@@ -417,17 +406,15 @@ impl CliVerb {
             Self::BusStatus => "aterm fabric",
             Self::BusOn => "aterm fabric on",
             Self::BusOff => "aterm fabric off",
-            Self::ReadPeer => "aterm ctl survey --host",
-            Self::DrivePeer => "aterm ctl --host",
+            Self::FleetActivity => "aterm fleet activity",
         }
     }
 
     const fn cap(self) -> Option<Duration> {
         match self {
-            Self::ReadThisMac | Self::ReadFleet | Self::FleetPeers | Self::ReadPeer => {
+            Self::ReadThisMac | Self::ReadFleet | Self::FleetPeers | Self::FleetActivity => {
                 Some(crate::bounded_child::READ_CAP)
             }
-            Self::DrivePeer => Some(HOLD_ACTION_HANG),
             Self::BusStatus | Self::BusOn | Self::BusOff => None,
         }
     }
@@ -438,8 +425,7 @@ impl CliVerb {
             | Self::ReadFleet
             | Self::FleetPeers
             | Self::BusStatus
-            | Self::ReadPeer
-            | Self::DrivePeer => None,
+            | Self::FleetActivity => None,
             Self::BusOn => Some((
                 "Turn the message bus on?",
                 "Sessions on this machine can post to each other and to channels.",
@@ -461,7 +447,7 @@ pub(crate) struct CliPlan {
     pub(crate) verb: CliVerb,
     pub(crate) argv: Vec<String>,
     pub(crate) out: PathBuf,
-    /// The record's and the tab's title: the verb's, or a fleet Mac's name.
+    /// The record's and the tab's title: the verb's.
     pub(crate) title: String,
     /// Raise the window its tab opens in ([`App::raise_window`]): the menu bar's reads, whose
     /// click never makes aterm the active app.
@@ -476,36 +462,6 @@ impl CliPlan {
             out: cli_document_path(verb.key()),
             title: verb.title().to_string(),
             raise: false,
-        }
-    }
-
-    /// The menu bar's read of one fleet Mac: `argv` after the program
-    /// (`fleet_glance::fleet_read_args`), the tab titled `title`.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
-    pub(crate) fn peer(argv: Vec<String>, title: String) -> Self {
-        Self {
-            argv,
-            title,
-            raise: true,
-            ..Self::new(CliVerb::ReadPeer)
-        }
-    }
-
-    /// The menu bar's Take Over or Hand Back on one fleet Mac (`argv` after the program,
-    /// `fleet_glance::fleet_hold_args`): its answer in a tab titled `title`.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
-    pub(crate) fn driven(argv: Vec<String>, title: String) -> Self {
-        Self {
-            argv,
-            title,
-            raise: true,
-            ..Self::new(CliVerb::DrivePeer)
         }
     }
 
@@ -580,9 +536,6 @@ fn cli_markdown(
     let mut s = String::new();
     s.push_str(&format!("# {}\n\n", plan.words()));
     s.push_str(&format!("{}\n\n", cli_status_words(status)));
-    if matches!(status, Ok(Some(0))) {
-        s.push_str(&driven_next(plan).unwrap_or_default());
-    }
     for (label, text) in [("", stdout), ("stderr:\n\n", stderr)] {
         if text.trim().is_empty() {
             continue;
@@ -594,21 +547,6 @@ fn cli_markdown(
         ));
     }
     s
-}
-
-fn driven_next(plan: &CliPlan) -> Option<String> {
-    let [_, _, host, _, sid, way] = plan.argv.as_slice() else {
-        return None;
-    };
-    (plan.verb == CliVerb::DrivePeer && way == "on").then(|| {
-        format!(
-            "This Mac holds `{sid}` on {host} until it hands it back: meanwhile that Mac's \
-             harness leaves it alone and its app verbs refuse.\n\n\
-             - Type into it: `aterm ctl --host {host} @{sid} send <text>`, or `@{sid} key <k>`\n\
-             - Hand it back: \u{276f} \u{25b8} Held from here \u{25b8} Hand Back, or \
-             `aterm ctl --host {host} hold {sid} off`\n\n"
-        )
-    })
 }
 
 fn cli_failure_reason(status: &Result<Option<i32>, String>) -> String {
@@ -630,7 +568,7 @@ fn cli_status_words(status: &Result<Option<i32>, String>) -> String {
 
 impl App {
     /// Every local need, read off each session's published verdict (never classified here),
-    /// with its age and label as the status item's row has them ([`NeedStop`]).
+    /// with its age and its tab's label ([`NeedStop`]).
     pub(crate) fn local_needs(&self) -> Vec<NeedStop> {
         let needs: Vec<(u64, aterm_types::needs::Severity, bool, u64)> = self
             .pool
@@ -724,11 +662,20 @@ impl App {
             })
     }
 
-    /// Publish `wid`'s front holds for the native menu's synchronous validate (Take Over / Hand
-    /// Back).
+    /// Whether the person holds any tab, the front one or not: what Hand Back All lifts
+    /// ([`Self::person_holds`]).
+    pub(crate) fn any_person_hold(&self) -> bool {
+        self.pool
+            .iter()
+            .any(|s| s.ctx.fabric.holds().person().is_some())
+    }
+
+    /// Publish `wid`'s front holds, and whether the person holds any tab, for the native menu's
+    /// synchronous validate (Take Over, Hand Back, Hand Back All).
     pub(crate) fn publish_front_hold(&mut self, wid: WindowId) {
         crate::menu::set_front_person_hold(self.front_person_hold(wid));
         crate::menu::set_front_remote_hold(self.front_remote_hold(wid));
+        crate::menu::set_any_person_hold(self.any_person_hold());
     }
 
     /// Agents ▸ Take Over This Tab for `wid`'s focused session.
@@ -1078,8 +1025,8 @@ impl App {
         Ok(())
     }
 
-    /// Every standing person hold, oldest first, with its refused count: what the menu bar's You
-    /// hold row and the hover read.
+    /// Every standing person hold, oldest first, with its refused count: what Hand Back All
+    /// lifts and the long hold's entry reads ([`Self::hand_long_holds`]).
     pub(crate) fn person_holds(&self) -> Vec<PersonHeld> {
         let mut out: Vec<PersonHeld> = self
             .pool
@@ -1098,27 +1045,6 @@ impl App {
             .collect();
         out.sort_by_key(|held| (held.since, held.session));
         out
-    }
-
-    /// Dirty the menu bar's You hold row when a held tab's refusal count moved: the count moves
-    /// on the control thread (`fabric::halt_refusal`), which wakes nothing here, so the way to
-    /// every wait asks.
-    pub(crate) fn note_person_refusals(&mut self) {
-        if self.agents.held_since.is_empty() {
-            self.agents.refusals_seen = 0;
-            return;
-        }
-        let counted: u64 = self
-            .agents
-            .held_since
-            .keys()
-            .filter_map(|session| self.pool.get(*session))
-            .map(|s| s.ctx.fabric.person_refusals())
-            .sum();
-        if counted != self.agents.refusals_seen {
-            self.agents.refusals_seen = counted;
-            self.mark_status_dirty();
-        }
     }
 
     /// State the long hold's whole answer (`Family::LongHold`, a level family): one entry per tab
@@ -1389,7 +1315,7 @@ impl App {
                     Some(TaskState::Working) => "\u{25cf}",
                     Some(TaskState::Done) => "\u{2713}",
                     Some(TaskState::Stalled) => "\u{25c6}",
-                    Some(TaskState::Failed) => crate::status_item::FAILED_GLYPH,
+                    Some(TaskState::Failed) => crate::claude_lights::FAILED_GLYPH,
                     Some(TaskState::Exited) | None => "\u{00b7}",
                 };
                 let age = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1571,8 +1497,8 @@ impl App {
         }
     }
 
-    /// A read the menu bar's status item asked for (Read This Mac, Read the Fleet, a fleet
-    /// Mac's), on the front window (else the first), raised when its tab opens.
+    /// A read the menu bar's status item asked for (All activity…), on the front window (else
+    /// the first), raised when its tab opens.
     #[cfg_attr(
         not(target_os = "macos"),
         expect(dead_code, reason = "the menu-bar status item is macOS's")

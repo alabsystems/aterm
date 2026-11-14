@@ -73,6 +73,15 @@ fn row_shaper_matches_fresh_plans_across_segment_and_font_changes() {
                     assert_eq!(infos(&actual), infos(&expected), "glyphs: {run}");
                     assert_eq!(positions(&actual), positions(&expected), "positions: {run}");
                     scratch = actual.clear();
+                    let sub_only = RowShaper::shape_substitute_only_buffer(
+                        &shaper.face,
+                        shaper.features,
+                        &mut shaper.plans,
+                        run,
+                        &mut scratch,
+                    );
+                    assert_eq!(infos(&sub_only), infos(&expected), "sub_only glyphs: {run}");
+                    scratch = sub_only.clear();
                     assert!(shaper.plans.len() <= 4);
                     assert!(scratch.is_empty());
                     assert_eq!(scratch.direction(), Direction::Invalid);
@@ -432,9 +441,10 @@ fn map_shaped_run_rejects_duplicate_cluster_collision() {
     let run = "==";
     let run_chars = ['=', '='];
 
+    let mut scratch = MapScratch::default();
     let one_to_one = [glyph(900, 0), glyph(901, 1)];
     assert_eq!(
-        map_shaped_run(&face, run, &run_chars, false, &one_to_one),
+        map_shaped_run(&face, run, &run_chars, false, &one_to_one, &mut scratch),
         Some(ShapedRun::PerColumn(
             vec![Some(900), Some(901)].into_boxed_slice()
         ))
@@ -442,7 +452,7 @@ fn map_shaped_run_rejects_duplicate_cluster_collision() {
 
     let colliding = [glyph(900, 0), glyph(901, 0)];
     assert_eq!(
-        map_shaped_run(&face, run, &run_chars, false, &colliding),
+        map_shaped_run(&face, run, &run_chars, false, &colliding, &mut scratch),
         None
     );
 }

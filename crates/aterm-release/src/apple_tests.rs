@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::release_keychain::fake::{Fake, Kc, World};
+use std::io::Read as _;
 
 const COMMAND_CHILD: &str = "ATERM_APPLE_COMMAND_TEST_CHILD";
 
@@ -324,6 +325,80 @@ fn a_certificate_on_disk_is_judged_by_its_key_its_end_and_the_keychain() {
     );
 }
 
+/// A run's leave to change: `may_change`, `leave`, and never `mint`.
+fn change(may_change: bool, leave: Leave) -> Change {
+    Change {
+        may_change,
+        leave,
+        mint: false,
+    }
+}
+
+/// A vault registry that holds no Developer ID pair.
+fn no_vault() -> Vault {
+    Vault::Absent
+}
+
+/// With no identity, no pair on disk and none in the vault registry, provision neither asks
+/// nor spends a slot: it reports the want unheld (its caller files `developer-id:<id>`) and
+/// writes no key. A registry pair not yet imported here blocks naming why; one unreadable says
+/// so rather than reading as empty.
+#[test]
+fn a_mac_without_a_pair_files_the_want_and_never_mints_unasked() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch HOME");
+    let home = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+    let mut world = World::new(&"D".repeat(40));
+    world.search_list = vec![crate::release_keychain::login_keychain_path(&home)];
+    let fake = Fake::new(world);
+    let kc = Keychains::new(&home, &fake);
+    let asked = std::cell::Cell::new(0);
+    let absent = || {
+        asked.set(asked.get() + 1);
+        Vault::Absent
+    };
+    match acquire_in(&kc, "m9", change(true, Leave::Write), None, &absent) {
+        Outcome::Unheld(what) => assert!(what.contains("vault registry"), "{what}"),
+        _ => panic!("an unheld pair is the lab's want"),
+    }
+    assert_eq!(asked.get(), 1);
+    let dir = apple_dir_in(&home);
+    assert!(!key_path(&dir, "m9").exists() && !csr_path(&dir, "m9").exists());
+
+    let pending = || Vault::Pending("awaiting an authorized release ring".into());
+    match acquire_in(&kc, "m9", change(true, Leave::Write), None, &pending) {
+        Outcome::Blocked { what, .. } => {
+            assert!(what.contains("authorized release ring"), "{what}")
+        }
+        _ => panic!("a registry pair not imported here blocks"),
+    }
+    let unread = || Vault::Unread(aterm_secrets::registry::NO_REGISTRY.into());
+    match acquire_in(&kc, "m9", change(true, Leave::Write), None, &unread) {
+        Outcome::Blocked { what, .. } => assert!(what.contains("cannot be read"), "{what}"),
+        _ => panic!("an unread registry is not an empty one"),
+    }
+
+    // Even the release machine's mint run takes the vault's pair first and spends no slot.
+    let mint = Change {
+        may_change: true,
+        leave: Leave::Write,
+        mint: true,
+    };
+    match acquire_in(&kc, "m9", mint, None, &pending) {
+        Outcome::Blocked { what, .. } => {
+            assert!(what.contains("authorized release ring"), "{what}")
+        }
+        _ => panic!("a mint run with a registry pair imports it, never mints"),
+    }
+    assert!(!key_path(&dir, "m9").exists() && !csr_path(&dir, "m9").exists());
+
+    // A look never consults the vault; it names the import and the want.
+    let never = || -> Vault { panic!("a check reads no vault") };
+    match acquire_in(&kc, "m9", change(false, Leave::Look), None, &never) {
+        Outcome::Todo { next, .. } => assert!(next.contains("developer-id:m9"), "{next}"),
+        _ => panic!("a check with no identity is a todo"),
+    }
+}
+
 /// A scratch HOME holding a Developer ID pair in `~/.aterm/apple` as the vault fills it
 /// (`devid-<id>.key` and `.cer`, no request), and its certificate's SHA-1.
 fn vault_filled_home(id: &str) -> (aterm_tempfile::TempDir, PathBuf, String) {
@@ -391,7 +466,7 @@ fn provision_on_a_fresh_home_fills_the_release_keychain_and_never_the_login_one(
     let kc = Keychains::new(&home, &fake);
     let release = kc.release();
 
-    match acquire_in(&kc, "m9", true, Leave::Write, None) {
+    match acquire_in(&kc, "m9", change(true, Leave::Write), None, &no_vault) {
         Outcome::Ready { ids, .. } => assert_eq!(ids, std::slice::from_ref(&sha1)),
         Outcome::Blocked { what, fix } => panic!("blocked: {what} / {fix}"),
         _ => panic!("a vault-filled pair provisions in one run"),
@@ -419,7 +494,7 @@ fn provision_on_a_fresh_home_fills_the_release_keychain_and_never_the_login_one(
     let before = fake.0.borrow().keychains.clone();
     fake.0.borrow_mut().log.clear();
     assert!(matches!(
-        acquire_in(&kc, "m9", true, Leave::Write, None),
+        acquire_in(&kc, "m9", change(true, Leave::Write), None, &no_vault),
         Outcome::Ready { .. }
     ));
     assert_eq!(fake.0.borrow().keychains, before);
@@ -481,7 +556,7 @@ fn a_check_only_looks_and_a_real_release_audit_test_signs() {
     };
 
     stop();
-    match acquire_in(&kc, "m9", false, Leave::Look, None) {
+    match acquire_in(&kc, "m9", change(false, Leave::Look), None, &no_vault) {
         Outcome::Ready { ids, note } => {
             assert_eq!(ids, std::slice::from_ref(&sha1));
             assert!(note.is_some_and(|n| n.contains(OPENED_NOTE)));
@@ -498,7 +573,7 @@ fn a_check_only_looks_and_a_real_release_audit_test_signs() {
     assert!(fake.calls("codesign", "--force").is_empty());
 
     stop();
-    match acquire_in(&kc, "m9", false, Leave::Write, None) {
+    match acquire_in(&kc, "m9", change(false, Leave::Write), None, &no_vault) {
         Outcome::Ready { note, .. } => {
             assert!(!note.is_some_and(|n| n.contains(OPENED_NOTE)));
         }
@@ -530,7 +605,7 @@ fn a_login_keychain_provisioned_mac_is_accepted_with_nothing_written() {
     let fake = Fake::new(world);
     let kc = Keychains::new(&home, &fake);
     for may_change in [true, false] {
-        match acquire_in(&kc, "m9", may_change, Leave::Look, None) {
+        match acquire_in(&kc, "m9", change(may_change, Leave::Look), None, &no_vault) {
             Outcome::Ready { ids, .. } => assert_eq!(ids, std::slice::from_ref(&sha1)),
             Outcome::Blocked { what, fix } => panic!("blocked: {what} / {fix}"),
             _ => panic!("the login keychain's identity is accepted"),

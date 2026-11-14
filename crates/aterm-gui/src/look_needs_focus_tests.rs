@@ -143,9 +143,6 @@ fn an_unfocused_window_looks_at_nothing() {
         "0",
         "a landing in the front tab while another app is active stands"
     );
-    let g = app.status_glance();
-    assert_eq!(g.done.len(), 1, "its Done for you row: {:?}", g.done);
-    assert_eq!(g.button_title(), "\u{276f}");
     assert_ne!(
         marks(&app)[0],
         ChipLevel::Done,
@@ -163,9 +160,8 @@ fn an_unfocused_window_looks_at_nothing() {
     assert_eq!(
         end_seen(&app),
         "0",
-        "a menu-bar rebuild, a reveal and a tab switch nobody made from the window see nothing while they are away"
+        "a rebuild, a reveal and a tab switch nobody made from the window see nothing while they are away"
     );
-    assert_eq!(app.status_glance().done.len(), 1, "the row stands");
 }
 
 #[test]
@@ -193,16 +189,24 @@ fn a_workers_done_in_the_front_tab_waits_for_their_return_too() {
         app.on_task_changed(1);
     }
     app.note_done_seen_looking();
-    assert_eq!(
-        app.status_glance().done.len(),
-        1,
+    assert!(
+        app.done_unseen(1),
         "a worker's done in the front tab stands while they are away"
     );
-    app.window_focus_event(W, true);
-    assert!(
-        app.status_glance().done.is_empty(),
-        "and goes when they come back"
+    let said = |app: &App| {
+        let line = app.session_status_record(1).expect("status");
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix("done_unseen="))
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        said(&app).as_deref(),
+        Some("1"),
+        "its `status` says so of a tab in front, where the strip draws no mark"
     );
+    app.window_focus_event(W, true);
+    assert!(!app.done_unseen(1), "and goes when they come back");
+    assert_eq!(said(&app).as_deref(), Some("0"), "as its `status` says");
 }
 
 #[test]
@@ -225,10 +229,10 @@ fn a_refocus_marks_it_seen_once() {
         1,
         "one re-stamp for the look"
     );
-    assert!(app.take_status_rebuild(), "the look dirties the glance");
-    let g = app.status_glance();
-    assert!(g.done.is_empty(), "the row goes: {:?}", g.done);
-    assert_eq!(g.button_title(), "\u{276f}");
+    assert!(
+        app.take_status_rebuild(),
+        "the look owes the Agents surfaces a rebuild"
+    );
     away(&mut app);
     app.window_focus_event(W, true);
     assert_eq!(
@@ -242,7 +246,6 @@ fn a_refocus_marks_it_seen_once() {
         "1",
         "while aterm is active, a landing in its front tab is seen as it lands"
     );
-    assert!(app.status_glance().done.is_empty());
 }
 
 #[test]
@@ -286,7 +289,6 @@ fn a_controllers_focus_in_is_no_look() {
         "0",
         "a controller's `focus in` while they are in another app is no look: the landing stands"
     );
-    assert_eq!(app.status_glance().done.len(), 1, "its row stands");
     app.window_focus_event(W, true);
     assert_eq!(end_seen(&app), "1", "their own return is the look");
 }
@@ -303,7 +305,6 @@ fn a_controllers_focus_out_does_not_end_their_look() {
         "1",
         "while the window is their key window, a controller's `focus out` leaves them looking: seen as it lands"
     );
-    assert!(app.status_glance().done.is_empty(), "no row stands");
 }
 
 #[test]

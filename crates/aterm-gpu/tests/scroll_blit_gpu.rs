@@ -72,6 +72,33 @@ fn history_scroll_is_rescued_and_stays_byte_identical_to_a_full_repaint() {
         "all 20 cursor-hidden scroll notches must be rescued ({rescued}/{checked})"
     );
     eprintln!("gpu scroll-blit: {rescued}/{checked} notches rescued");
+
+    // Bottom-pinned (`display_offset == 0`) live-stream `\r\n` output takes `DirtyDecision::Rows`
+    // and must also rescue via `scroll_shift_plan(..., RetainedRows::Diff)` with byte-exact output.
+    for hide in [true, false] {
+        let mut live_gpu = fresh_gpu();
+        let mut live_term = scrollback_term(hide);
+        let mut live_win = WindowGpu::new();
+        let seed = live_term.cell_frame(ROWS, COLS);
+        let _ = live_gpu.present_input_readback(&mut live_win, &seed);
+        for k in 0..4 {
+            live_term.process(format!("(|_gy) live {k} 日本語\r\n").as_bytes());
+            let frame = live_term.cell_frame(ROWS, COLS);
+            assert_eq!(frame.display_offset, 0);
+            let before = live_gpu.scroll_rescues();
+            let got = live_gpu.present_input_readback(&mut live_win, &frame);
+            assert_eq!(
+                live_gpu.scroll_rescues() - before,
+                1,
+                "live-stream bottom-pinned line {k} (hide_cursor={hide}) must rescue"
+            );
+            assert_eq!(
+                got.pixels,
+                fresh_render(&frame),
+                "live-stream rescued frame {k} (hide_cursor={hide}) != full repaint"
+            );
+        }
+    }
 }
 
 #[test]

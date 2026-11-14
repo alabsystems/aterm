@@ -50,12 +50,6 @@ fn settings_session_runtime_is_published_from_local_state() {
         journal: app.session_log_journal.status(),
         keeper: crate::keeper_link::status(),
     };
-    let Some(crate::native_app::AppViewState::Settings(state)) =
-        app.native_runtime.view_state_mut(view)
-    else {
-        unreachable!()
-    };
-    state.session_runtime = None;
     app.sync_settings_session_runtime();
     let Some(crate::native_app::AppViewState::Settings(state)) =
         app.native_runtime.view_state(view)
@@ -67,6 +61,252 @@ fn settings_session_runtime_is_published_from_local_state() {
         expected.journal.phase, None,
         "headless fixture starts no writer"
     );
+}
+
+#[test]
+fn unchanged_settings_font_delivery_does_no_catalog_copy_or_topology_work() {
+    use crate::app_settings::{
+        FONT_CATALOG_DELIVERIES, FONT_REFUSAL_COPIES, SETTINGS_TOPOLOGY_VISITS,
+    };
+    use crate::native_app::AppViewState;
+    use std::sync::Arc;
+
+    let mut app = App::headless_for_test();
+    app.config.font_family = Some("Missing test font".into());
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "font_family = \"Missing test font\"\n".into(),
+    )
+    .unwrap();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    let (instance, first) = app.active_native_view(crate::WindowId(0)).unwrap();
+    let families = Arc::new(aterm_render::font_catalog::MonospaceFamilies {
+        automatic: Some("Test mono".into()),
+        installed: vec!["Test mono".into()],
+        ..Default::default()
+    });
+    let refusal = crate::native_font_catalog::FontRefusal {
+        key: crate::prefs::EDIT_FONT_FAMILY,
+        family: "Missing test font".into(),
+        reason: crate::native_font_catalog::FontRefusalReason::NotFound,
+        from_theme: None,
+    };
+    app.publish_settings_font_families(Arc::clone(&families));
+    app.publish_settings_font_refusals(vec![refusal.clone()]);
+    app.sync_settings_font_families();
+    app.sync_settings_session_runtime();
+    let (ended, done) = std::sync::mpsc::channel();
+    let other_test = std::thread::spawn(move || {
+        let mut other = App::headless_for_test();
+        assert!(
+            super::settings_font_families().is_none(),
+            "another test starts with its own facts"
+        );
+        let other_families = Arc::new(aterm_render::font_catalog::MonospaceFamilies {
+            automatic: Some("Other test mono".into()),
+            ..Default::default()
+        });
+        other.publish_settings_font_families(Arc::clone(&other_families));
+        assert!(Arc::ptr_eq(
+            &super::settings_font_families().unwrap(),
+            &other_families
+        ));
+        drop(other);
+        ended.send(()).unwrap();
+    });
+    done.recv_timeout(Duration::from_secs(60))
+        .expect("other test's font world ended");
+    other_test.join().unwrap();
+    assert!(
+        Arc::ptr_eq(&super::settings_font_families().unwrap(), &families),
+        "ending another test cannot replace this test's retained catalog"
+    );
+    let expected_runtime = match app.native_runtime.view_state(first).unwrap() {
+        AppViewState::Settings(state) => state.session_runtime.unwrap(),
+        _ => unreachable!(),
+    };
+    let window = crate::WindowId(0);
+    let terminal_tab = app.windows[&window].tab_set.tabs()[0].id;
+    app.windows
+        .get_mut(&window)
+        .unwrap()
+        .tab_set
+        .switch_to(terminal_tab);
+    app.sync_active_session();
+    assert!(
+        app.active_native_view(window).is_none(),
+        "the terminal is in front"
+    );
+    let terminal = Arc::clone(&app.pool.get(0).unwrap().term);
+    FONT_CATALOG_DELIVERIES.with(|n| assert!(n.replace(0) > 0));
+    FONT_REFUSAL_COPIES.with(|n| assert!(n.replace(0) > 0));
+    SETTINGS_TOPOLOGY_VISITS.with(|n| assert!(n.replace(0) > 0));
+    let epoch = app
+        .native_runtime
+        .view_state(first)
+        .unwrap()
+        .common()
+        .content_epoch;
+    for turn in 0..64 {
+        crate::term_lock(&terminal)
+            .process(format!("unrelated terminal output {turn}\r\n").as_bytes());
+        app.sync_settings_font_families();
+        app.sync_settings_session_runtime();
+    }
+    assert_eq!(
+        (
+            FONT_CATALOG_DELIVERIES.with(std::cell::Cell::get),
+            FONT_REFUSAL_COPIES.with(std::cell::Cell::get),
+            SETTINGS_TOPOLOGY_VISITS.with(std::cell::Cell::get),
+        ),
+        (0, 0, 0),
+        "unchanged delivery: catalog comparisons, refusal copies, window traversals"
+    );
+    assert_eq!(
+        app.native_runtime
+            .view_state(first)
+            .unwrap()
+            .common()
+            .content_epoch,
+        epoch
+    );
+
+    // A newly attached view is seeded before the next host idle pass, without
+    // announcing an old refusal as though the person had just chosen that font.
+    let second = app.view_store.insert_native(instance).unwrap();
+    app.native_runtime
+        .attach_view(
+            second,
+            instance,
+            AppViewState::Settings(Box::new(crate::native_settings::SettingsViewState::new(
+                &app.config,
+            ))),
+        )
+        .unwrap();
+    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(second) else {
+        unreachable!();
+    };
+    assert_eq!(state.session_runtime, Some(expected_runtime));
+    assert!(state.feedback.is_none());
+    assert!(
+        !state.replace_font_families(Arc::clone(&families)),
+        "current catalog already seeded"
+    );
+    assert!(
+        !state.replace_font_refusals(vec![refusal.clone()], false),
+        "current refusals already seeded"
+    );
+
+    let changed = Arc::new(aterm_render::font_catalog::MonospaceFamilies {
+        installed: vec!["New mono".into()],
+        ..(*families).clone()
+    });
+    app.publish_settings_font_families(Arc::clone(&changed));
+    for view in [first, second] {
+        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        assert!(
+            !state.replace_font_families(Arc::clone(&changed)),
+            "new completion reached every view"
+        );
+    }
+    let mut changed_runtime = expected_runtime;
+    changed_runtime.keeper.tracked += 1;
+    assert_eq!(
+        app.native_runtime
+            .deliver_settings_runtime(changed_runtime)
+            .len(),
+        2
+    );
+    for view in [first, second] {
+        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
+            unreachable!();
+        };
+        assert_eq!(state.session_runtime, Some(changed_runtime));
+    }
+
+    let drawn = aterm_render::DrawnFaces {
+        regular: Some("New mono".into()),
+        regular_has_ligatures: true,
+        styles: std::array::from_fn(|_| aterm_render::StyleDraw {
+            face: Some("New mono".into()),
+            synthetic: aterm_render::StyleBits::REGULAR,
+        }),
+        symbol: None,
+        emoji: None,
+    };
+    assert_eq!(
+        app.native_runtime
+            .deliver_settings_drawn(Some(&drawn))
+            .len(),
+        2
+    );
+    assert!(
+        app.native_runtime
+            .deliver_settings_drawn(Some(&drawn))
+            .is_empty()
+    );
+    for view in [first, second] {
+        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        assert!(!state.replace_drawn_faces(Some(drawn.clone())));
+    }
+    assert_eq!(app.native_runtime.deliver_settings_drawn(None).len(), 2);
+    assert_eq!(
+        app.native_runtime
+            .deliver_settings_drawn(Some(&drawn))
+            .len(),
+        2
+    );
+
+    app.publish_settings_font_refusals(Vec::new());
+    app.publish_settings_font_refusals(vec![refusal.clone()]);
+    for view in [first, second] {
+        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state(view) else {
+            unreachable!();
+        };
+        assert!(
+            state
+                .feedback
+                .as_deref()
+                .is_some_and(|said| said.contains("Font not found")),
+            "a newly refused generation is announced in each existing view"
+        );
+    }
+
+    app.native_runtime.remove_view(first);
+    app.native_runtime.remove_view(second);
+    app.native_runtime.remove_instance(instance);
+    let reopened = app
+        .native_runtime
+        .insert_instance(crate::native_app::NativeApp::Settings(Box::new(
+            crate::native_settings::SettingsApp::new(
+                crate::update_screen::UpdateState::from_status(1, "0.1.0", None, false),
+            ),
+        )))
+        .unwrap();
+    let view = app.view_store.insert_native(reopened).unwrap();
+    app.native_runtime
+        .attach_view(
+            view,
+            reopened,
+            AppViewState::Settings(Box::new(crate::native_settings::SettingsViewState::new(
+                &app.config,
+            ))),
+        )
+        .unwrap();
+    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+        unreachable!();
+    };
+    assert_eq!(state.session_runtime, Some(changed_runtime));
+    assert!(
+        state.feedback.is_none(),
+        "reopening does not announce old refusals"
+    );
+    assert!(!state.replace_font_families(changed));
+    assert!(!state.replace_font_refusals(vec![refusal], false));
+    assert!(!state.replace_drawn_faces(Some(drawn)));
 }
 
 #[test]

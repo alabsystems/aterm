@@ -889,7 +889,7 @@ pub enum Chain {
     Mgr,
     /// L16 (an end past the work floor, seen by a look at its tab).
     LandJ,
-    /// L17 (an end past the work floor, seen by a press on its menu-bar row).
+    /// L17 (an end past the work floor, still unseen behind the tab a look saw).
     LandK,
     /// N1–N4 (Cruise, its needs moving: two, none, one, two).
     CruiseN,
@@ -1294,7 +1294,7 @@ impl Scenario {
             Scenario::Cap => "continue_per_hour = 1: acts stop, then resume",
             Scenario::W1 => "a usage wall under Land: nothing typed into it, resumed, landed",
             Scenario::L16 => "an end past the work floor, seen by a look at its tab",
-            Scenario::L17 => "an end past the work floor, seen by a press on its row",
+            Scenario::L17 => "an end past the work floor, unseen behind the tab a look saw",
             Scenario::L18 => "a landing with no remote: what aterm checked, no-remote",
             Scenario::L19 => "a landing in a plain folder: what aterm checked, no-repo",
             Scenario::N1 => "Cruise names two needs: needs_n=2, carried on",
@@ -8420,8 +8420,8 @@ pub fn prompt_order(chains: &[Chain]) -> Vec<usize> {
 
 /// WHETHER THE LAB HAS READ A NEED STANDING on every surface its need wants judge ([`Chain::need_gate`]):
 /// `status needs=ask needs_n=1` (L3), the `meta` entry (`attention_kinds` `ask:needs`, L1), and,
-/// where the windows are read (`window`), a `Needs you` row, the tab's `attention` state and a
-/// Harness page read once `status` showed Land's hold ([`hold_paged`]).
+/// where the windows are read (`window`), the tab's `attention` state and a Harness page read
+/// once `status` showed Land's hold ([`hold_paged`]).
 #[must_use]
 pub fn need_read(seen: &Seen, window: bool) -> bool {
     let status = seen.status.iter().any(|(_, s)| {
@@ -8431,14 +8431,9 @@ pub fn need_read(seen: &Seen, window: bool) -> bool {
     let shown = !window
         || (seen
             .window
-            .menu
+            .strip
             .iter()
-            .any(|(_, m)| !surfaces::rows_in(m, "needs").is_empty())
-            && seen
-                .window
-                .strip
-                .iter()
-                .any(|(_, s)| surfaces::states(s).contains(&"attention"))
+            .any(|(_, s)| surfaces::states(s).contains(&"attention"))
             && hold_paged(seen));
     status && meta && shown
 }
@@ -8799,8 +8794,6 @@ fn finished(tab: &Tab, now: i64) -> bool {
                 && s.yield_after(acts[2].0, None, Some(NEED_C))
                     .event
                     .is_some_and(|(t, _)| now - t >= 10_000)
-                // N4's stand-in ask has been read where the window is (§14.7).
-                && (!s.window.read || s.window.stopped.is_some())
         }
         Chain::CruiseAngles => angles::watched(s, now, tab.t0),
         Chain::SwitchAgent
@@ -9002,32 +8995,6 @@ fn run_check(
             over: false,
         });
     }
-    let ask_sid = match (&desk, tabs.iter().find(|t| t.chain == Chain::CruiseN)) {
-        (Some(d), Some(cruise_n)) => {
-            let sid = spawn_tab(&door, &cruise_n.dir)?;
-            let r = on(
-                &door,
-                &sid,
-                &["meta", "set", "title", surfaces::stopped::ASK_TAB],
-            );
-            let w = surfaces::window_of(&door.out(&["ls"]), &sid).unwrap_or_default();
-            if w != d.chains_window {
-                return Err(could_not(&format!(
-                    "{}: spawned in window {w:?}, not the chains' window {}",
-                    surfaces::stopped::ASK_TAB,
-                    d.chains_window
-                )));
-            }
-            println!(
-                "  tab       {} @{sid}: a plain shell beside cruise-n, titled in window {w} ({}), \
-                 for N4's stand-in ask",
-                surfaces::stopped::ASK_TAB,
-                r.trim()
-            );
-            Some(sid)
-        }
-        _ => None,
-    };
     if let Some(d) = desk.as_mut()
         && let Some(i) = surfaces::front_of(&tabs.iter().map(|t| t.chain).collect::<Vec<_>>())
     {
@@ -9235,7 +9202,6 @@ fn run_check(
                     }
                 }
                 surfaces::held::look_step(&door, tab, front_label.as_deref());
-                surfaces::stopped::ask_step(&door, tab, ask_sid.as_deref());
             }
             open_need_gate(&run, tab, glance.is_some());
             land_contradicted_work(&run, tab);

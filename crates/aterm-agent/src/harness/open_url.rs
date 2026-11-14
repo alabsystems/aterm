@@ -34,14 +34,61 @@ pub const INPUT_ENV: &str = "ATERM_OPEN_URL_APPROVED_INPUT";
 /// once, with no headless try first, which would only meet that page again.
 pub const NO_HEADLESS_ENV: &str = "ATERM_OPEN_URL_NO_HEADLESS";
 
+/// Set to `1`, on macOS, by a sign-in this Mac started for one of its own rows
+/// (`cli::RenewBrowser::Window`: a person's `accounts renew`, an agent's terminal, this Mac's
+/// upkeep, the row's token): the sign-in runs in a window of aterm's own at once and finishes
+/// there by itself ([`super::headless_oauth::visible_sign_in`]), with no headless try first
+/// and no other browser after it. Without it the opener opens no window: every renewal
+/// removes it from its provider's environment, and one this Mac did not start for itself
+/// (another Mac's request) or that has no desk to show it on (an SSH session) never sets it.
+pub const WINDOW_ENV: &str = "ATERM_OPEN_URL_WINDOW";
+
+/// The most a flow whose page opens in aterm's sign-in window takes from its start to its
+/// end, which bounds the wait of a caller that started one (a token's capture): the wait for
+/// this Mac's other sign-in window to close, the sign-in's own four minutes, and the opening
+/// and closing of the window (`signin_window::window_turn`, `WITHIN`).
+pub const WINDOW_ROUTE_WITHIN: std::time::Duration = std::time::Duration::from_secs(9 * 60);
+
+/// `text` with every word that holds an address written `<address>`: for a line that goes
+/// where nobody asked to read the account's name (a log, a captured run's standard error).
+#[must_use]
+pub fn without_addresses(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            if word.contains('@') {
+                "<address>"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether the sign-in that started this opener lets it open aterm's sign-in window: `var`
+/// holds [`WINDOW_ENV`] as `1`.
+#[must_use]
+pub fn window_granted_by(var: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    var(WINDOW_ENV).is_some_and(|value| value == "1")
+}
+
 /// Default mailbox subdirectory under `<accounts store>` when [`MAILBOX_ENV`] is unset.
 pub const DEFAULT_MAILBOX_DIR: &str = "mailbox";
 
 /// Environment variable naming the file a renewal reads what its opener's headless sign-in met
 /// from ([`Met`]): an absolute path in a private directory the renewal made for its one run.
 /// The opener writes one closed word and, for a page outcome, its host. Browser-start and
-/// browser-control failures have no host. It never writes a URL, page text, executable path or code.
+/// browser-control failures, a missing desktop and a sign-in in aterm's window that failed for
+/// another reason have no host. A word that does not itself say why the
+/// sign-in ended carries the opener's reason as one bounded line ([`Met::reason`]): never a
+/// URL's query, an address, a code or anything shaped like one.
 pub const OUTCOME_ENV: &str = "ATERM_OPEN_URL_OUTCOME";
+
+/// Environment variable naming the file a renewal that types into its provider's paste prompt
+/// reads a hosted flow's `code#state` from ([`hand_over_hosted`]): set only by a renewal that
+/// watches it (one with no terminal), beside its outcome file. A person's own sign-in sets
+/// none, since the paste prompt is theirs.
+pub const CODE_ENV: &str = "ATERM_OPEN_URL_CODE";
 
 /// Why a headless sign-in ended without the callback ([`Met`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,8 +97,30 @@ pub enum MetWord {
     BrowserStart,
     /// Browser initialization or a terminal DevTools operation failed.
     BrowserControl,
-    /// The authenticated issuer could not admit work; no bad login was proved.
-    ServiceUnavailable,
+    /// The sign-in in aterm's own window returned no validated callback, for a reason none of
+    /// the other words names and another try may not meet: a page that did not load, a
+    /// mailbox that did not answer, a deadline
+    /// ([`super::headless_oauth::BROWSER_SIGN_IN_FAILED`]).
+    BrowserSignIn,
+    /// The sign-in had no desktop session to open aterm's window on
+    /// ([`super::headless_oauth::WINDOW_NO_DESKTOP`]).
+    WindowNoDesktop,
+    /// Cloudflare's check stood in aterm's sign-in window until the sign-in's deadline
+    /// ([`super::headless_oauth::WINDOW_BOT_CHECK`]).
+    WindowBotCheck,
+    /// Cloudflare's block page answered in aterm's sign-in window
+    /// ([`super::headless_oauth::WINDOW_BLOCK_PAGE`]).
+    WindowBlockPage,
+    /// The consent page in aterm's sign-in window held its `Authorize` behind a human check
+    /// (hCaptcha) until the sign-in's deadline
+    /// ([`super::headless_oauth::WINDOW_HUMAN_CHECK`]).
+    WindowHumanCheck,
+    /// A person closed aterm's sign-in window before the sign-in finished
+    /// ([`super::headless_oauth::WINDOW_CLOSED`]).
+    WindowClosed,
+    /// The consent page in aterm's sign-in window named another account
+    /// ([`super::headless_oauth::WINDOW_WRONG_ACCOUNT`]).
+    WindowWrongAccount,
     /// Cloudflare's bot check, which did not clear
     /// ([`super::headless_oauth::BOT_CHECK_UNCLEARED`]).
     BotCheck,
@@ -59,6 +128,9 @@ pub enum MetWord {
     BlockPage,
     /// No callback in time, on a page that was neither.
     Stall,
+    /// The opener did not authorize the sign-in and met none of the above: its reason says why
+    /// (a mailbox that gave no code, a flow it would not drive).
+    NotAuthorized,
 }
 
 impl MetWord {
@@ -68,16 +140,58 @@ impl MetWord {
         match self {
             MetWord::BrowserStart => "browser-start",
             MetWord::BrowserControl => "browser-control",
-            MetWord::ServiceUnavailable => "service-unavailable",
+            MetWord::BrowserSignIn => "browser-sign-in",
+            MetWord::WindowNoDesktop => "window-no-desktop",
+            MetWord::WindowBotCheck => "window-bot-check",
+            MetWord::WindowBlockPage => "window-block-page",
+            MetWord::WindowHumanCheck => "window-human-check",
+            MetWord::WindowClosed => "window-closed",
+            MetWord::WindowWrongAccount => "window-wrong-account",
             MetWord::BotCheck => "bot-check",
             MetWord::BlockPage => "block-page",
             MetWord::Stall => "stall",
+            MetWord::NotAuthorized => "not-authorized",
         }
     }
 
-    const fn has_page_host(self) -> bool {
-        matches!(self, Self::BotCheck | Self::BlockPage | Self::Stall)
+    /// Whether the word leaves the reason unsaid, so the opener's own reason goes with it
+    /// ([`Met::because`]). Cloudflare's pages, a missing desktop and a stall are each their
+    /// whole reason.
+    const fn takes_reason(self) -> bool {
+        matches!(
+            self,
+            Self::BrowserStart | Self::BrowserControl | Self::BrowserSignIn | Self::NotAuthorized
+        )
     }
+
+    const fn has_page_host(self) -> bool {
+        matches!(
+            self,
+            Self::BotCheck
+                | Self::BlockPage
+                | Self::Stall
+                | Self::WindowBotCheck
+                | Self::WindowBlockPage
+                | Self::WindowHumanCheck
+        )
+    }
+
+    /// Every word, in the order the outcome file's reader tries them.
+    const ALL: [MetWord; 13] = [
+        MetWord::BrowserStart,
+        MetWord::BrowserControl,
+        MetWord::BrowserSignIn,
+        MetWord::WindowNoDesktop,
+        MetWord::WindowBotCheck,
+        MetWord::WindowBlockPage,
+        MetWord::WindowHumanCheck,
+        MetWord::WindowClosed,
+        MetWord::WindowWrongAccount,
+        MetWord::BotCheck,
+        MetWord::BlockPage,
+        MetWord::Stall,
+        MetWord::NotAuthorized,
+    ];
 }
 
 /// Why a headless sign-in ended without the callback, with a page host only when one was
@@ -89,13 +203,19 @@ pub struct Met {
     /// The host it met it on: lowercase letters, digits, `.` and `-`, at most [`Met::HOST_MAX`]
     /// bytes; `None` where none such was read.
     pub host: Option<String>,
+    /// The opener's own reason, where the word leaves it unsaid: one line [`Met::reason`]
+    /// admits, set only by [`Met::because`].
+    pub why: Option<String>,
 }
 
 impl Met {
     /// The longest host a [`Met`] keeps.
     pub const HOST_MAX: usize = 32;
 
-    /// `word` on `host`, where `host` is one a [`Met`] keeps.
+    /// The longest reason a [`Met`] keeps, in bytes.
+    pub const WHY_MAX: usize = 160;
+
+    /// `word` on `host`, where `host` is one a [`Met`] keeps, with no reason.
     #[must_use]
     pub fn new(word: MetWord, host: Option<&str>) -> Met {
         let host = host.filter(|h| {
@@ -108,7 +228,121 @@ impl Met {
         Met {
             word,
             host: host.map(str::to_owned),
+            why: None,
         }
+    }
+
+    /// `text` as a reason a [`Met`] keeps: one line of printable ASCII words, each a space
+    /// apart, whole words up to [`Met::WHY_MAX`] bytes. A URL is its host alone (one a [`Met`]
+    /// keeps, else `<url>`), so no path, query or fragment of it is kept; a word holding a file
+    /// path is `<path>`; an address is `<address>`; a word holding six digits in a row, or a run of 24
+    /// letters and digits with a digit in it, could be a code or a token and is `<redacted>`.
+    /// A reason longer than that is cut at a whole word and ends `...`, so a reader never takes
+    /// a cut sentence for a whole one. `None` where nothing is left. A reason it returns is its
+    /// own fixed point, which is how a reader admits one.
+    #[must_use]
+    pub fn reason(text: &str) -> Option<String> {
+        const CUT: &str = "...";
+        let words: Vec<String> = text
+            .split(|c: char| c.is_whitespace() || c.is_control())
+            .map(Self::reason_word)
+            .filter(|word| !word.is_empty())
+            .collect();
+        let mut line = String::new();
+        for (at, word) in words.iter().enumerate() {
+            let room = if at + 1 == words.len() {
+                Met::WHY_MAX
+            } else {
+                Met::WHY_MAX - 1 - CUT.len()
+            };
+            if line.len() + usize::from(!line.is_empty()) + word.len() > room {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(CUT);
+                break;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        (!line.is_empty()).then_some(line)
+    }
+
+    fn reason_word(word: &str) -> String {
+        let word: String = word.chars().filter(char::is_ascii_graphic).collect();
+        let word = if let Some((_, rest)) = word.split_once("://") {
+            let host = rest
+                .split(['/', '?', '#', ':', '@'])
+                .next()
+                .unwrap_or_default();
+            let kept = !host.is_empty()
+                && host.len() <= Met::HOST_MAX
+                && !rest.contains('@')
+                && host.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
+                });
+            if !kept {
+                return "<url>".to_owned();
+            }
+            host
+        } else if word.contains('@') {
+            return "<address>".to_owned();
+        } else if Self::holds_file_path(&word) {
+            return "<path>".to_owned();
+        } else {
+            word.as_str()
+        };
+        let code_like = word
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .any(|run| {
+                let digits_in_a_row = run
+                    .split(|c: char| !c.is_ascii_digit())
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0);
+                digits_in_a_row >= 6 || (run.len() >= 24 && digits_in_a_row > 0)
+            });
+        if code_like {
+            "<redacted>".to_owned()
+        } else {
+            word.to_owned()
+        }
+    }
+
+    /// Whether `word` holds a file path: a `/` that begins it or follows anything but a
+    /// letter, a digit or a `.` (`/Users/…`, `~/…`, `file=/…`), with more after it. A page's
+    /// place without its scheme (`claude.ai/login`) is none.
+    fn holds_file_path(word: &str) -> bool {
+        let bytes = word.as_bytes();
+        bytes.iter().enumerate().any(|(i, b)| {
+            *b == b'/'
+                && i + 1 < bytes.len()
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'.'))
+        })
+    }
+
+    /// This outcome with the opener's reason `why` ([`Met::reason`]), where its word leaves the
+    /// reason unsaid and it holds none yet: the first reason noted is the nearest to what
+    /// happened.
+    #[must_use]
+    pub fn because(mut self, why: &str) -> Met {
+        if self.why.is_none() && self.word.takes_reason() {
+            self.why = Met::reason(why);
+        }
+        self
+    }
+
+    /// This outcome as its closed forms admit it again ([`Met::parse`] of its line,
+    /// [`Met::reason`] of its reason): what is kept of an outcome a host constructed itself.
+    #[must_use]
+    pub fn readmitted(&self) -> Option<Met> {
+        let met = Met::parse(&self.line())?;
+        Some(match &self.why {
+            Some(why) => met.because(why),
+            None => met,
+        })
     }
 
     /// Its outcome file's line: the word, then the host where there is one.
@@ -123,8 +357,8 @@ impl Met {
         }
     }
 
-    /// The [`Met`] an outcome file's `text` names; `None` for anything but one [`Met::line`]
-    /// (another word, a host it would not keep, more than one line).
+    /// The [`Met`] an outcome file's `text` names, with no reason; `None` for anything but one
+    /// [`Met::line`] (another word, a host it would not keep, more than one line).
     #[must_use]
     pub fn parse(text: &str) -> Option<Met> {
         let line = text.strip_suffix('\n').unwrap_or(text);
@@ -135,44 +369,103 @@ impl Met {
             Some((word, host)) => (word, Some(host)),
             None => (line, None),
         };
-        let word = [
-            MetWord::BrowserStart,
-            MetWord::BrowserControl,
-            MetWord::ServiceUnavailable,
-            MetWord::BotCheck,
-            MetWord::BlockPage,
-            MetWord::Stall,
-        ]
-        .into_iter()
-        .find(|w| w.as_str() == word)?;
+        let word = MetWord::ALL.into_iter().find(|w| w.as_str() == word)?;
         let met = Met::new(word, host);
         (met.host.as_deref() == host).then_some(met)
     }
 
-    /// Whether the page itself stopped the sign-in, as Cloudflare's bot check or block page does:
-    /// no headless retry passes it, where a stall may clear.
+    /// Whether what the sign-in met stops it until something changes that another try does
+    /// not change: Cloudflare's bot check or block page, in the headless page or in aterm's
+    /// own window; the consent page's human check; a consent page that named another account;
+    /// a session with no desktop; a window a person closed. No retry by itself passes one,
+    /// where a stall may clear and a sign-in in the window that failed for any other reason
+    /// ([`MetWord::BrowserSignIn`]: a page that did not load, a mailbox that did not answer,
+    /// a deadline) may not fail the next time.
     #[must_use]
     pub const fn stopped(&self) -> bool {
-        matches!(self.word, MetWord::BotCheck | MetWord::BlockPage)
+        matches!(
+            self.word,
+            MetWord::BotCheck
+                | MetWord::BlockPage
+                | MetWord::WindowNoDesktop
+                | MetWord::WindowBotCheck
+                | MetWord::WindowBlockPage
+                | MetWord::WindowHumanCheck
+                | MetWord::WindowClosed
+                | MetWord::WindowWrongAccount
+        )
     }
 
-    /// Whether authenticated service admission was unavailable rather than a bad login.
+    /// Whether the sign-in ended at aterm's own window, which had no desktop to open on or
+    /// returned no callback: the opener opens no other browser after it.
     #[must_use]
-    pub const fn is_service_unavailable(&self) -> bool {
-        matches!(self.word, MetWord::ServiceUnavailable)
+    pub const fn ended_at_the_sign_in_window(&self) -> bool {
+        matches!(
+            self.word,
+            MetWord::BrowserSignIn
+                | MetWord::WindowNoDesktop
+                | MetWord::WindowBotCheck
+                | MetWord::WindowBlockPage
+                | MetWord::WindowHumanCheck
+                | MetWord::WindowClosed
+                | MetWord::WindowWrongAccount
+        )
+    }
+
+    /// Whether a person at this Mac's desk can clear what the sign-in met: Cloudflare's
+    /// check, in the headless page or in aterm's window (where they may complete it), the
+    /// consent page's human check in that window, or a session with no desktop (theirs has
+    /// one). The renewal records the row's sign-in as theirs to run
+    /// (`accounts::SignInAction::Renew`).
+    #[must_use]
+    pub const fn takes_a_person(&self) -> bool {
+        matches!(
+            self.word,
+            MetWord::BotCheck
+                | MetWord::WindowNoDesktop
+                | MetWord::WindowBotCheck
+                | MetWord::WindowHumanCheck
+        )
     }
 
     /// Its words in a renewal's record: a local browser failure or what the page met,
-    /// naming Cloudflare where it was Cloudflare's.
+    /// naming Cloudflare where it was Cloudflare's, then the opener's own reason where it
+    /// holds one.
     #[must_use]
     pub fn words(&self) -> String {
+        let words = self.word_words();
+        match &self.why {
+            Some(why) => format!("{words}: {why}"),
+            None => words,
+        }
+    }
+
+    fn word_words(&self) -> String {
         let on = self
             .host
             .as_deref()
             .map_or_else(String::new, |host| format!(" on {host}"));
         match self.word {
             MetWord::BrowserStart => "its headless browser could not start".to_owned(),
-            MetWord::ServiceUnavailable => "its account service is unavailable".to_owned(),
+            MetWord::BrowserSignIn => {
+                "its sign-in in aterm's sign-in window did not return a validated callback"
+                    .to_owned()
+            }
+            MetWord::WindowNoDesktop => super::headless_oauth::WINDOW_NO_DESKTOP.to_owned(),
+            MetWord::WindowClosed => super::headless_oauth::WINDOW_CLOSED.to_owned(),
+            MetWord::WindowWrongAccount => super::headless_oauth::WINDOW_WRONG_ACCOUNT.to_owned(),
+            MetWord::WindowBotCheck => format!(
+                "Cloudflare's check{on} did not clear in aterm's sign-in window; aterm never \
+                 operates it, and a person at this Mac may complete it"
+            ),
+            MetWord::WindowBlockPage => {
+                format!("it met Cloudflare's block page{on} in aterm's sign-in window")
+            }
+            MetWord::WindowHumanCheck => format!(
+                "the consent page{on} held Authorize behind a human check (hCaptcha) in \
+                 aterm's sign-in window; aterm never operates it, and a person at this Mac \
+                 may complete it there"
+            ),
             MetWord::BrowserControl => {
                 "it could not communicate with its headless browser".to_owned()
             }
@@ -187,12 +480,12 @@ impl Met {
                     "its authorization reached no callback in time".to_owned()
                 }
             }
+            MetWord::NotAuthorized => "its opener did not authorize the sign-in".to_owned(),
         }
     }
 }
 
 /// Atomically publishes a terminal opener's `met` at absolute `path` ([`OUTCOME_ENV`]).
-/// Service unavailability is explicitly deferred, never an authentication failure.
 /// A file that cannot be written is left, since the opener's exit still says it failed.
 pub fn write_outcome(path: &Path, met: &Met) {
     write_outcome_phase(path, met, OutcomePhase::Failed);
@@ -202,19 +495,10 @@ pub fn write_outcome(path: &Path, met: &Met) {
 enum OutcomePhase {
     Continuing,
     Failed,
-    Deferred,
 }
 
 fn write_outcome_phase(path: &Path, met: &Met, phase: OutcomePhase) {
-    let phase = if met.is_service_unavailable() {
-        OutcomePhase::Deferred
-    } else {
-        phase
-    };
-    if phase == OutcomePhase::Deferred && !met.is_service_unavailable() {
-        return;
-    }
-    write_outcome_record(path, &met.line(), phase);
+    write_outcome_record(path, &met.line(), met.why.as_deref(), phase);
 }
 
 /// A failing opener's end for the renewal that waits on it ([`main_entry`]): what it met, kept
@@ -225,37 +509,33 @@ fn write_outcome_phase(path: &Path, met: &Met, phase: OutcomePhase) {
 /// (`headless_oauth::callback_offered`): the CLI may hold the code, and only its own exit says.
 fn publish_failed_exit(path: &Path, callback_offered: bool) {
     let recorded = read_outcome_record(path);
-    if callback_offered
-        || matches!(
-            recorded,
-            Some((OutcomePhase::Failed | OutcomePhase::Deferred, _))
-        )
-    {
+    if callback_offered || matches!(recorded, Some((OutcomePhase::Failed, _))) {
         return;
     }
     match recorded.and_then(|(_, met)| met) {
         Some(met) => write_outcome_phase(path, &met, OutcomePhase::Failed),
-        None => write_outcome_record(path, "", OutcomePhase::Failed),
+        None => write_outcome_record(path, "", None, OutcomePhase::Failed),
     }
 }
 
-/// Writes one outcome record; `met` is a [`Met::line`], empty only on a failure that met nothing.
-fn write_outcome_record(path: &Path, met: &str, phase: OutcomePhase) {
+/// Writes one outcome record; `met` is a [`Met::line`], empty only on a failure that met
+/// nothing, and `why` its reason ([`Met::reason`]), a `why=` line after it where it holds one.
+fn write_outcome_record(path: &Path, met: &str, why: Option<&str>, phase: OutcomePhase) {
     if !path.is_absolute() {
         return;
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = (met, phase);
+    let _ = (met, why, phase);
     #[cfg(any(unix, windows))]
     let _ = aterm_uds::atomic_file::write_checked(
         path,
         format!(
-            "opener-outcome=1\nphase={}\nmet={met}\n",
+            "opener-outcome=1\nphase={}\nmet={met}\n{}",
             match phase {
                 OutcomePhase::Continuing => "continuing",
                 OutcomePhase::Failed => "failed",
-                OutcomePhase::Deferred => "deferred",
             },
+            why.map_or_else(String::new, |why| format!("why={why}\n")),
         )
         .as_bytes(),
         0o600,
@@ -271,6 +551,23 @@ fn valid_oauth_code(code: &str) -> bool {
     !code.is_empty()
         && code.len() <= 16 * 1024
         && !code.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
+/// Hands a hosted flow's `callback` to the renewal that waits on this opener: its `code#state`
+/// in the file the renewal named ([`CODE_ENV`]), which the renewal types into the waiting CLI's
+/// paste prompt. Once the file is written the callback is offered
+/// (`headless_oauth::note_callback_offered`): from there only the CLI knows whether it holds
+/// the code. A hand-over that wrote nothing offered nothing, and its failure is the opener's
+/// own. A renewal that named no such file (a person's own, at their terminal) has no channel,
+/// and the hand-over says so.
+pub(super) fn hand_over_hosted(callback: &str) -> Result<(), &'static str> {
+    let credential = hosted_credential(callback)?;
+    let code = std::env::var_os(CODE_ENV)
+        .filter(|path| !path.is_empty())
+        .ok_or("the hosted OAuth callback has no renewal input channel")?;
+    write_oauth_code(PathBuf::from(code), &credential)?;
+    super::headless_oauth::note_callback_offered();
+    Ok(())
 }
 
 /// The code and state Claude's hosted paste prompt expects as one `code#state` credential.
@@ -335,24 +632,23 @@ pub fn read_outcome(path: &Path) -> Option<Met> {
     read_outcome_record(path).and_then(|(_, met)| met)
 }
 
-/// The explicit per-attempt reason for stopping an incomplete provider capture.
+/// An opener's explicit terminal failure, which alone stops its still-running provider: what it
+/// met, where it recorded that.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum TerminalOutcome {
-    /// The opener failed, with what it met where it recorded that.
-    Failed(Option<Met>),
-    Deferred(Met),
-}
+pub(super) struct TerminalFailure(pub Option<Met>);
 
 /// Only an explicit terminal record can stop its still-running provider.
 #[cfg(unix)]
-pub(super) fn read_terminal_outcome(path: &Path) -> Option<TerminalOutcome> {
+pub(super) fn read_terminal_outcome(path: &Path) -> Option<TerminalFailure> {
     match read_outcome_record(path)? {
-        (OutcomePhase::Failed, met) => Some(TerminalOutcome::Failed(met)),
-        (OutcomePhase::Deferred, met) => met.map(TerminalOutcome::Deferred),
+        (OutcomePhase::Failed, met) => Some(TerminalFailure(met)),
         (OutcomePhase::Continuing, _) => None,
     }
 }
+
+/// The most bytes of an outcome record that are read: its three fixed lines and a reason.
+const OUTCOME_MAX: u64 = 512;
 
 /// One record's phase and what it met; only a failure may have met nothing (an empty `met=`).
 fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Option<Met>)> {
@@ -368,10 +664,10 @@ fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Option<Met>)> {
     if !meta.is_file() {
         return None;
     }
-    let cap = usize::try_from(meta.len().min(256).saturating_add(1)).unwrap_or(0);
+    let cap = usize::try_from(meta.len().min(OUTCOME_MAX).saturating_add(1)).unwrap_or(0);
     let mut text = String::with_capacity(cap);
-    file.take(257).read_to_string(&mut text).ok()?;
-    if text.len() > 256 {
+    file.take(OUTCOME_MAX + 1).read_to_string(&mut text).ok()?;
+    if text.len() as u64 > OUTCOME_MAX {
         return None;
     }
     let mut lines = text.split('\n');
@@ -381,7 +677,6 @@ fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Option<Met>)> {
     let phase = match lines.next()? {
         "phase=continuing" => OutcomePhase::Continuing,
         "phase=failed" => OutcomePhase::Failed,
-        "phase=deferred" => OutcomePhase::Deferred,
         _ => return None,
     };
     let line = lines.next()?.strip_prefix("met=")?;
@@ -390,15 +685,30 @@ fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Option<Met>)> {
     } else {
         Some(Met::parse(line)?)
     };
-    if (phase == OutcomePhase::Deferred) != met.as_ref().is_some_and(Met::is_service_unavailable) {
+    if met.as_ref().map_or(String::new(), Met::line) != line {
         return None;
     }
-    if met.as_ref().map_or(String::new(), Met::line) != line
-        || !lines.next()?.is_empty()
-        || lines.next().is_some()
-    {
-        return None;
-    }
+    // The reason's line is there only where the outcome holds one, exactly as it is admitted.
+    let met = match (lines.next()?, met) {
+        ("", met) => {
+            if lines.next().is_some() {
+                return None;
+            }
+            met
+        }
+        (why, Some(met)) => {
+            let why = why.strip_prefix("why=")?;
+            let met = met.because(why);
+            if met.why.as_deref() != Some(why)
+                || !lines.next()?.is_empty()
+                || lines.next().is_some()
+            {
+                return None;
+            }
+            Some(met)
+        }
+        (_, None) => return None,
+    };
     Some((phase, met))
 }
 
@@ -408,12 +718,6 @@ fn profile_fallback_outcome(
     met: Option<&Met>,
     open: impl FnOnce() -> (u8, Option<String>),
 ) -> (u8, Option<String>) {
-    if let Some(met) = met.filter(|met| met.is_service_unavailable()) {
-        if let Some(path) = path {
-            write_outcome_phase(path, met, OutcomePhase::Deferred);
-        }
-        return (1, Some("the account service is unavailable".into()));
-    }
     if let (Some(path), Some(met)) = (path, met) {
         write_outcome_phase(path, met, OutcomePhase::Continuing);
     }
@@ -4023,6 +4327,16 @@ enum Origin {
 /// request can leave the provider origin.
 const HOSTED_CALLBACK: &str = "https://platform.claude.com/oauth/code/callback";
 
+/// Where Claude Code's loopback listener redirects the browser that brought it a callback it
+/// took, as 2.1.322 spells them (`…/oauth/code/success?app=claude-code` for a Claude
+/// subscription, `…/buy_credits?returnUrl=…` for the Console), without their queries. A
+/// callback whose state is not the flow's is answered `400` and goes nowhere.
+#[cfg(any(test, target_os = "macos"))]
+const LISTENER_ANSWERED: &[&str] = &[
+    "https://platform.claude.com/oauth/code/success",
+    "https://platform.claude.com/buy_credits",
+];
+
 pub(super) struct MailboxFlow {
     origin: Origin,
     bound: super::headless_oauth::FlowBound,
@@ -4084,25 +4398,46 @@ impl MailboxFlow {
         if self.hosted && self.is_callback(url) {
             return None;
         }
-        let hosts: &[&str] = match self.origin {
+        match self.origin {
             Origin::Prefix(_) => {
                 if !provider_url(url) {
                     return Some("the page is not an https page on Claude's pinned hosts".into());
-                }
-                if self.hosted {
-                    &["claude.ai", "claude.com", "platform.claude.com"]
-                } else {
-                    &["claude.ai", "claude.com"]
                 }
             }
             Origin::Hosts(hosts) => {
                 if !hosted_url(url, hosts) {
                     return Some("the page is outside its vendor's pinned hosts".into());
                 }
-                hosts
             }
-        };
-        self.bound.outside(url, hosts)
+        }
+        self.bound.outside(url, self.provider_hosts())
+    }
+
+    /// The hosts whose `https` pages are this flow's own ([`Self::provider_refusal`]): the two
+    /// Claude hosts, with the hosted callback's for a hosted flow, or a vendor route's.
+    pub(super) fn provider_hosts(&self) -> &'static [&'static str] {
+        match self.origin {
+            Origin::Prefix(_) if self.hosted => &["claude.ai", "claude.com", "platform.claude.com"],
+            Origin::Prefix(_) => &["claude.ai", "claude.com"],
+            Origin::Hosts(hosts) => hosts,
+        }
+    }
+
+    /// The hosts a page of this flow may be sent to at all: its own
+    /// ([`Self::provider_hosts`]) and, for Claude's, the one the waiting sign-in's listener
+    /// sends a browser on to ([`LISTENER_ANSWERED`]).
+    #[cfg(target_os = "macos")]
+    pub(super) fn navigation_hosts(&self) -> &'static [&'static str] {
+        match self.origin {
+            Origin::Prefix(_) => &["claude.ai", "claude.com", "platform.claude.com"],
+            Origin::Hosts(hosts) => hosts,
+        }
+    }
+
+    /// The port of the waiting sign-in's loopback listener; none for a hosted flow.
+    #[cfg(target_os = "macos")]
+    pub(super) fn loopback_port(&self) -> Option<u16> {
+        (!self.hosted && self.callback_port != 0).then_some(self.callback_port)
     }
 
     pub(super) fn is_callback(&self, url: &str) -> bool {
@@ -4123,6 +4458,27 @@ impl MailboxFlow {
 
     pub(super) fn hosted(&self) -> bool {
         self.hosted
+    }
+
+    /// Whether `url` is the page the waiting `claude auth login` sends a browser on to once its
+    /// loopback listener has taken this flow's callback ([`LISTENER_ANSWERED`]): a browser that
+    /// requested the callback itself has delivered it, and nothing is left to hand over. Never
+    /// so for a hosted flow, whose callback no listener takes.
+    #[cfg(any(test, target_os = "macos"))]
+    pub(super) fn answered_by_listener(&self, url: &str) -> bool {
+        !self.hosted
+            && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+            && LISTENER_ANSWERED.iter().any(|page| {
+                url.strip_prefix(page)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['?', '&', '#']))
+            })
+    }
+
+    /// Whether `url` is any page of the host the listener's answer leads to
+    /// ([`Self::answered_by_listener`]), for a tab that was seen at this flow's callback.
+    #[cfg(any(test, target_os = "macos"))]
+    pub(super) fn on_listeners_host(&self, url: &str) -> bool {
+        !self.hosted && url.starts_with("https://platform.claude.com/")
     }
 }
 
@@ -4178,14 +4534,11 @@ fn follow_until_page_or_callback_until(
     for _ in 0..8 {
         deadline.left()?;
         if flow.is_callback(&current_url) {
-            super::headless_oauth::note_callback_offered();
             if flow.hosted() {
-                let credential = hosted_credential(&current_url)?;
-                let outcome = std::env::var_os(OUTCOME_ENV)
-                    .ok_or("the hosted OAuth callback has no renewal input channel")?;
-                write_oauth_code(Path::new(&outcome).with_extension("code"), &credential)?;
+                hand_over_hosted(&current_url)?;
                 return Ok(StepOutcome::CallbackDelivered);
             }
+            super::headless_oauth::note_callback_offered();
             let cb_resp = exchange("GET", &current_url, &mut BTreeMap::new(), None)?;
             deadline.left()?;
             if (200..400).contains(&cb_resp.status) {
@@ -4777,7 +5130,7 @@ pub fn store_dir_of(
     store_dir.is_dir().then(|| store_dir.to_path_buf())
 }
 
-fn discover_store_dir() -> Option<PathBuf> {
+pub(super) fn discover_store_dir() -> Option<PathBuf> {
     let arg0 = std::env::args_os().next().map(PathBuf::from);
     store_dir_of(&|name| std::env::var_os(name), arg0.as_deref())
 }
@@ -4819,6 +5172,59 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     ExitCode::from(code)
 }
 
+/// The opener's exit for a sign-in run in aterm's own window ([`WINDOW_ENV`]): 0 where the
+/// window's page handed a loopback callback to the waiting CLI itself or a hosted one was
+/// handed over here, once; else 1, with what the sign-in met and why as the terminal record at
+/// `outcome_path` ([`met_because`]) and its words on standard error.
+fn finish_window_sign_in(
+    signed_in: Result<super::headless_oauth::VisibleDone, super::headless_oauth::VisibleStop>,
+    outcome_path: Option<&Path>,
+) -> u8 {
+    use super::headless_oauth::VisibleDone;
+    let why = match signed_in {
+        Ok(VisibleDone::Delivered) => {
+            super::headless_oauth::note_callback_offered();
+            return 0;
+        }
+        Ok(VisibleDone::Callback(callback)) => match hand_over_hosted(&callback) {
+            Ok(()) => return 0,
+            Err(why) => why,
+        },
+        Err(stop) => super::headless_oauth::note_visible_stop(stop),
+    };
+    if let Some(path) = outcome_path {
+        write_outcome_phase(path, &met_because(why), OutcomePhase::Failed);
+    }
+    eprintln!("{OPENER}: not authorized: {why}");
+    1
+}
+
+/// What this thread's sign-in met ([`super::headless_oauth::take_met`]), or that the opener did
+/// not authorize it where it met nothing, with the opener's reason `why` where the word leaves
+/// it unsaid ([`Met::because`]): the terminal record a renewal reads, so the reason it prints
+/// and keeps is the one the opener had.
+fn met_because(why: &str) -> Met {
+    super::headless_oauth::take_met()
+        .unwrap_or_else(|| Met::new(MetWord::NotAuthorized, None))
+        .because(why)
+}
+
+/// Records a refusal of the opener's at `outcome_path`: what was met and the opener's reason
+/// `why` ([`met_because`]). The record is terminal unless the callback was already handed to
+/// the waiting CLI (`headless_oauth::callback_offered`): the CLI may hold the code and be
+/// exchanging it, so the record then stops no provider and only the CLI's own exit says.
+fn note_refused(outcome_path: Option<&Path>, why: &str) {
+    let met = met_because(why);
+    if let Some(path) = outcome_path {
+        let phase = if super::headless_oauth::callback_offered() {
+            OutcomePhase::Continuing
+        } else {
+            OutcomePhase::Failed
+        };
+        write_outcome_phase(path, &met, phase);
+    }
+}
+
 /// The opener's run and its exit code, noting what a headless sign-in met at `outcome_path`.
 fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
     let args: Vec<String> = args
@@ -4828,12 +5234,7 @@ fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
     let profile = std::env::var(PROFILE_ENV).ok();
     let email = std::env::var(EMAIL_ENV).ok();
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let note_outcome = |phase| {
-        let met = super::headless_oauth::take_met();
-        if let (Some(path), Some(met)) = (outcome_path, &met) {
-            write_outcome_phase(path, met, phase);
-        }
-    };
+    let note_failed = |why: &str| note_refused(outcome_path, why);
     let mut continuing_met = None;
     if let Some(path) = std::env::var_os(INPUT_ENV) {
         let result = match args.as_slice() {
@@ -4857,11 +5258,26 @@ fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
         return match result {
             Ok(()) => 0,
             Err(why) => {
-                note_outcome(OutcomePhase::Failed);
+                note_failed(&why);
                 eprintln!("{OPENER}: approved mailbox was not authorized: {why}");
                 1
             }
         };
+    }
+    if let [url] = args.as_slice()
+        && window_granted_by(&|name| std::env::var_os(name))
+        && let Some(signed_in) = super::headless_oauth::visible_sign_in(
+            url,
+            email
+                .as_deref()
+                .filter(|email| !email.trim().is_empty())
+                .map(str::to_owned)
+                .or_else(|| extract_login_hint(url))
+                .as_deref(),
+            None,
+        )
+    {
+        return finish_window_sign_in(signed_in, outcome_path);
     }
     let store_dir = discover_store_dir();
     if let [url] = args.as_slice()
@@ -4894,21 +5310,11 @@ fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
                 Ok(()) => return 0,
                 Err(why) => {
                     if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
-                        note_outcome(OutcomePhase::Failed);
+                        note_failed(why);
                         eprintln!("{OPENER}: not authorized: {why}");
                         return 1;
                     }
-                    continuing_met = super::headless_oauth::take_met();
-                    if let Some(met) = continuing_met
-                        .as_ref()
-                        .filter(|met| met.is_service_unavailable())
-                    {
-                        if let Some(path) = outcome_path {
-                            write_outcome_phase(path, met, OutcomePhase::Deferred);
-                        }
-                        eprintln!("{OPENER}: not authorized: {why}");
-                        return 1;
-                    }
+                    continuing_met = super::headless_oauth::take_met().map(|met| met.because(why));
                 }
             }
         } else if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
@@ -4929,7 +5335,7 @@ fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
                 ) {
                     Ok(()) => return 0,
                     Err(why) => {
-                        note_outcome(OutcomePhase::Failed);
+                        note_failed(why);
                         eprintln!("{OPENER}: not authorized: {why}");
                         return 1;
                     }

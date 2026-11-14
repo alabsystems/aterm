@@ -193,20 +193,7 @@ enum Kind {
 // Dropping a duplicate declaration or contradictory discarded assignment could turn an
 // invalid source or disabled action into a valid projected execution.
 fn validate_names(model: &Model) {
-    let mut declared = BTreeSet::from(["vars", "Init", "Next", "Spec"]);
-    for name in model
-        .consts
-        .iter()
-        .map(|(name, _)| *name)
-        .chain(model.vars.iter().map(|var| var.name))
-        .chain(model.actions.iter().map(|action| action.name))
-        .chain(model.invariants.iter().map(|law| law.name))
-    {
-        assert!(
-            declared.insert(name),
-            "duplicate or reserved declaration `{name}` in bound projection"
-        );
-    }
+    model.assert_valid_names();
     for action in &model.actions {
         let mut written = BTreeSet::new();
         for update in &action.updates {

@@ -58,8 +58,9 @@ fn a_yanked_or_unjudged_installed_build_is_no_newer_build_for_a_start() {
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// Build `build` (digest `ab`×32) staged and published in `s`, as a check leaves it.
-fn publish(s: &crate::paths::Staging, build: u64) {
+/// Build `build` (digest `ab`×32, version `0.0.<build>`) staged and published in `s`, as a check
+/// leaves it.
+pub(crate) fn publish(s: &crate::paths::Staging, build: u64) {
     let commit = COMMIT;
     let ready = crate::manifest::Ready {
         build_number: build,

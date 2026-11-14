@@ -798,28 +798,11 @@ const fn progress_earns_resume(moved: u64, short: u32, resumes: u64, cap: u64) -
 /// At most `cap + 1` bytes of `path`; a file curl never wrote (no answer, or an empty one) is empty.
 fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    #[cfg(unix)]
-    let open = || {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-    };
-    #[cfg(not(unix))]
-    let open = || std::fs::File::open(path);
-    let file = match open() {
-        Ok(file) => file,
+    let (file, meta) = match aterm_uds::regular_file::open(path) {
+        Ok(opened) => opened,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
     let mut bytes =
         Vec::with_capacity(usize::try_from(meta.len().min(cap).saturating_add(1)).unwrap_or(0));
     file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;

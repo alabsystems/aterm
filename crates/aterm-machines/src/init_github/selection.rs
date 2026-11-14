@@ -286,7 +286,7 @@ impl RepositorySelection {
             let source = super::Github {
                 account: String::new(),
                 owner: String::new(),
-                token_file: Path::new(&user.home).join(super::TOKEN_FILE),
+                token_file: super::token_file(Path::new(&user.home)),
                 token_key: None,
             };
             let now = super::read_token(sys, user, &source)

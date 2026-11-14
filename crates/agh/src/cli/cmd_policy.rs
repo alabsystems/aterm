@@ -427,10 +427,7 @@ fn write_grant(
     use crate::config::ConfigText;
     use crate::identity::provision::AuthEdit;
     let verb = if add { "grant" } else { "revoke" };
-    let missing = || {
-        Error::refused(format!("there is no agh.toml to {verb} in"))
-            .with_next("agh auth add NAME --file PATH --tier TIER")
-    };
+    let missing = || Error::refused(format!("there is no agh.toml to {verb} in"));
     let seed = if std::fs::symlink_metadata(dirs.config_file())
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     {

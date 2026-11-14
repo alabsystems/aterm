@@ -2,11 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! Python value, path, integer, and `OSError` semantics used by the embedded verifier.
+//! The chain's part ([`PyPath`]'s spelling, the value readers, the errors) builds on every
+//! platform, for get-aterm.ps1's Windows verifier too; the store's part is Unix only.
 
+#[cfg(unix)]
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 
 use aterm_toml::Value;
@@ -52,6 +56,7 @@ pub(crate) fn truthy(value: Option<&Value>) -> bool {
 }
 
 /// Python's `value == n`: an int, a bool (`True == 1`) or a float equal to it.
+#[cfg(unix)]
 pub(crate) fn equals_int(value: Option<&Value>, n: i64) -> bool {
     match value {
         Some(Value::Integer(v)) => *v == n,
@@ -66,20 +71,21 @@ pub(crate) fn equals_str(value: Option<&Value>, text: &str) -> bool {
     value.and_then(Value::as_str) == Some(text)
 }
 
-/// Python's `repr()` of an OS byte string using `surrogateescape` for undecodable bytes.
+/// Python's `repr()` of an OS byte string using `surrogateescape` for undecodable bytes (off
+/// Unix, the bytes of an unpaired surrogate in the string's WTF-8 encoding).
 pub(crate) fn repr(text: &OsStr) -> String {
     let mut body = String::new();
     let mut quote = '\'';
     let mut has_single = false;
     let mut has_double = false;
-    for chunk in text.as_bytes().utf8_chunks() {
+    for chunk in text.as_encoded_bytes().utf8_chunks() {
         has_single |= chunk.valid().contains('\'');
         has_double |= chunk.valid().contains('"');
     }
     if has_single && !has_double {
         quote = '"';
     }
-    for chunk in text.as_bytes().utf8_chunks() {
+    for chunk in text.as_encoded_bytes().utf8_chunks() {
         for c in chunk.valid().chars() {
             match c {
                 '\\' => body.push_str("\\\\"),
@@ -134,7 +140,23 @@ pub(crate) fn bare_os_error(error: &std::io::Error) -> Refusal {
     }
 }
 
-/// A POSIX path normalized as `pathlib.PurePosixPath` spells it.
+/// One component of a path, the bytes [`PyPath::new`] split at a `/`.
+#[cfg(unix)]
+fn component(bytes: &[u8]) -> OsString {
+    OsString::from_vec(bytes.to_vec())
+}
+
+/// One component of a path, the WTF-8 bytes [`PyPath::new`] split at a `/`: Unicode unless it
+/// holds an unpaired surrogate, which is spelt U+FFFD instead, so the path names no file it
+/// was given and a read of it fails rather than reads another.
+#[cfg(not(unix))]
+fn component(bytes: &[u8]) -> OsString {
+    OsString::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// A POSIX path normalized as `pathlib.PurePosixPath` spells it. Off Unix only `/` separates
+/// components, as there: a Windows path (`C:\Users\me\Temp\x`) is one relative component, and a
+/// name joined to it is appended after a `/`, which Windows reads as a separator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PyPath {
     root: &'static str,
@@ -143,7 +165,7 @@ pub(crate) struct PyPath {
 
 impl PyPath {
     pub(crate) fn new(text: &OsStr) -> Self {
-        let bytes = text.as_bytes();
+        let bytes = text.as_encoded_bytes();
         let root = if bytes.starts_with(b"//") && !bytes.starts_with(b"///") {
             "//"
         } else if bytes.starts_with(b"/") {
@@ -154,12 +176,13 @@ impl PyPath {
         let parts = bytes
             .split(|b| *b == b'/')
             .filter(|part| !part.is_empty() && *part != b".")
-            .map(|part| OsString::from_vec(part.to_vec()))
+            .map(component)
             .collect();
         Self { root, parts }
     }
 
     /// `Path.absolute()`: a relative path under the working directory.
+    #[cfg(unix)]
     pub(crate) fn absolute(self) -> Verdict<Self> {
         if !self.root.is_empty() {
             return Ok(self);
@@ -178,6 +201,7 @@ impl PyPath {
     }
 
     /// `self.parent`: the path itself for a root or an empty relative path.
+    #[cfg(unix)]
     pub(crate) fn parent(&self) -> Self {
         let mut parent = self.clone();
         parent.parts.pop();
@@ -186,6 +210,7 @@ impl PyPath {
 
     /// `reversed((self, *self.parents))`: the root (or the first relative component)
     /// down to the path itself.
+    #[cfg(unix)]
     pub(crate) fn lineage(&self) -> Vec<Self> {
         (0..=self.parts.len())
             .map(|n| Self {
@@ -218,6 +243,7 @@ impl PyPath {
     }
 
     /// `str(path) == text`.
+    #[cfg(unix)]
     pub(crate) fn is(&self, text: &str) -> bool {
         self.to_os() == OsStr::new(text)
     }
@@ -230,12 +256,14 @@ impl fmt::Display for PyPath {
 }
 
 /// An `int()` of a tag's part: its sign and its digits, leading zeros gone.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Int {
     negative: bool,
     digits: String,
 }
 
+#[cfg(unix)]
 impl Ord for Int {
     fn cmp(&self, other: &Self) -> Ordering {
         let magnitude = self
@@ -252,6 +280,7 @@ impl Ord for Int {
     }
 }
 
+#[cfg(unix)]
 impl PartialOrd for Int {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -259,6 +288,7 @@ impl PartialOrd for Int {
 }
 
 /// Parses `text` as Python's base-10 `int(text)`.
+#[cfg(unix)]
 pub(crate) fn int(text: &str) -> Verdict<Int> {
     let invalid = || {
         Refusal::new(format!(
@@ -290,6 +320,7 @@ pub(crate) fn int(text: &str) -> Verdict<Int> {
 }
 
 /// `tuple(map(int, version.split(".")))`.
+#[cfg(unix)]
 pub(crate) fn int_tuple(version: &str) -> Verdict<Vec<Int>> {
     version.split('.').map(int).collect()
 }

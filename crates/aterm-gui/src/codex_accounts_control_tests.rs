@@ -15,8 +15,12 @@ fn schema_and_correlation_are_exact_and_do_not_admit_extra_authority() {
         Some((2, ID)),
         "the schema a client asks is the one it is answered"
     );
+    assert_eq!(
+        request("snapshot schema=3 request=0123456789abcdef0123456789abcdef"),
+        Some((3, ID))
+    );
     for bad in [
-        "snapshot schema=3 request=0123456789abcdef0123456789abcdef",
+        "snapshot schema=4 request=0123456789abcdef0123456789abcdef",
         "snapshot schema=0 request=0123456789abcdef0123456789abcdef",
         "snapshot schema=21 request=0123456789abcdef0123456789abcdef",
         "snapshot schema= request=0123456789abcdef0123456789abcdef",
@@ -453,12 +457,13 @@ fn a_capability_is_granted_only_where_the_pool_and_the_session_both_allow_it() {
     assert_eq!(capabilities(false, false, true), (false, false, false));
 }
 
-/// A REPLY CARRIES ITS REQUEST, AND ONLY SCHEMA 2 IS GRANTED A CAPABILITY ([`reply`]): schema 2
-/// asks whether the move would be carried and says `select` and `auto` by it; schema 1 does not
-/// ask and says none, whatever its pool would offer. The schema 2 text below is the whole reply
-/// for a session on this machine's own login, as a client parses it.
+/// A REPLY CARRIES ITS REQUEST, AND SCHEMA 1 IS NEVER GRANTED A CAPABILITY ([`reply`]): schema
+/// 2 asks whether the move would be carried and says `select` and `auto` by it, as schema 3 does
+/// ([`a_schema_3_reply_is_granted_as_schema_2s_is`]); schema 1 does not ask and says none,
+/// whatever its pool would offer. The schema 2 text below is the whole reply for a session on
+/// this machine's own login, as a client parses it.
 #[test]
-fn a_reply_carries_its_request_and_only_schema_2_is_granted() {
+fn a_reply_carries_its_request_and_schema_1_is_never_granted() {
     const ID: &str = "0123456789abcdef0123456789abcdef";
     let root = aterm_tempfile::tempdir().unwrap();
     let (env, _) = pool_env(root.path());
@@ -617,4 +622,301 @@ fn a_move_is_offered_only_where_the_restart_would_be_carried() {
     assert!(launch_of(&sid, &other).is_none(), "nor another process's");
     crate::harness_host::publish_snapshot_for_test(&sid, None);
     crate::self_claim::set_copy_for_test(&sid, None);
+}
+
+/// A SCHEMA NO ATERM SERVES IS AN INVALID REQUEST, the exact line a client falls back on: an
+/// aterm that knows schemas 1 to 3 answers schema 4 so, before it reads anything of the asker.
+#[test]
+fn a_schema_beyond_3_is_an_invalid_request() {
+    let ctx = crate::session_store::test_handle_on(7792, -1).ctx;
+    for line in [
+        "snapshot schema=4 request=0123456789abcdef0123456789abcdef",
+        "snapshot schema=30 request=0123456789abcdef0123456789abcdef",
+    ] {
+        assert_eq!(
+            serve(&ctx, -1, line),
+            "ERR codex-accounts invalid request\n",
+            "{line}"
+        );
+    }
+}
+
+/// Lays a Codex login in `dir` of the account `email`, holding the refresh token `refresh`: an
+/// unsigned stand-in for a ChatGPT login, whose claims are all a reader decodes.
+fn lay_login(dir: &std::path::Path, email: &str, refresh: &str) {
+    let part = |bytes: &[u8]| {
+        aterm_codec::base64::encode(bytes)
+            .unwrap()
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_")
+    };
+    let token = format!(
+        "{}.{}.fixture",
+        part(br#"{"alg":"none"}"#),
+        part(format!(r#"{{"email":"{email}"}}"#).as_bytes())
+    );
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join(codex_app_login::AUTH_FILE),
+        aterm_json::to_string(&json!({"auth_mode": "chatgpt", "tokens": {
+            "id_token": token, "access_token": token, "refresh_token": refresh}}))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// A Codex pool under `root` whose rows each have a login here and a settled refusal of its
+/// refresh token as expired on record beside it: `main`, on the default login, and `lost`, on
+/// a directory of its own, signed out here; `kept`, signed out here too, its login in aterm's
+/// own custody (an owner marker beside the file); and `live`, usable here.
+fn refused_pool(root: &std::path::Path) -> Env {
+    let mut env = Env::from_process().unwrap();
+    env.home = Some(root.join("home"));
+    env.state = root.join("state");
+    env.config = Some(root.join("config/aterm.toml"));
+    env.now = 1_792_700_000;
+    let home = env.home.clone().unwrap();
+    let dir = |label: &str| root.join("logins/codex").join(label);
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::write(
+        root.join("config/accounts-codex.toml"),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n{}",
+            ["lost", "kept", "live"]
+                .map(|label| format!(
+                    "[[account]]\nlabel = \"{label}\"\nclass = \"dedicated\"\n\
+                     email = \"{label}@example.test\"\ndir = {}\n\n",
+                    crate::test_host::toml(&dir(label))
+                ))
+                .concat()
+        ),
+    )
+    .unwrap();
+    let default_home = home.join(accounts::Cli::Codex.accounts().default_home);
+    lay_login(&default_home, "main@example.test", "main-refresh");
+    for label in ["lost", "kept", "live"] {
+        lay_login(
+            &dir(label),
+            &format!("{label}@example.test"),
+            &format!("{label}-refresh"),
+        );
+    }
+    let seat = accounts_pool::Seat {
+        config_dir: &root.join("config"),
+        state: &env.state,
+        home: &home,
+        now: env.now,
+    };
+    let store = seat.store(accounts::Cli::Codex);
+    let records = accounts_pool::move_records(&seat, accounts::Cli::Codex).unwrap();
+    for label in ["main", "lost", "kept"] {
+        let row = records.roster.row(label).unwrap();
+        store
+            .record_lapse_for_lab(row, env.now)
+            .expect("signed out here");
+    }
+    store
+        .transact_within(&accounts::LOCK_LADDER, env.now, &mut None, |state| {
+            Ok(accounts::note_sample(
+                state,
+                "live",
+                accounts::Sample {
+                    at: env.now,
+                    session_pct: Some(10),
+                    session_reset: Some(env.now + 3600),
+                    ..accounts::Sample::default()
+                },
+                env.now,
+            ))
+        })
+        .unwrap();
+    // An hour ago: long settled.
+    let settled = env.now - 3600;
+    for place in [default_home, dir("lost"), dir("kept"), dir("live")] {
+        codex_app_login::record_refusal_for_test(&place, RefusalReason::Expired, settled)
+            .expect("the refusal");
+    }
+    std::fs::write(
+        dir("kept").join(format!(
+            "{}{}",
+            codex_app_login::AUTH_FILE,
+            codex_app_login::OWNER_MARKER_SUFFIX
+        )),
+        codex_app_login::OWNER_MARKER_TEXT,
+    )
+    .unwrap();
+    env
+}
+
+/// `key` of each row of `value`'s accounts, by label: `None` where the row has no such key.
+fn per_row(value: &Value, key: &str) -> Vec<(String, Option<Value>)> {
+    value["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["label"].as_str().unwrap().to_owned(),
+                row.get(key).cloned(),
+            )
+        })
+        .collect()
+}
+
+/// A schema 3 snapshot `value` as schema 2 would say it: its schema word 2, and no row's
+/// `signed_out_reason`.
+fn as_schema_2(value: &mut Value) {
+    let top = value.as_object_mut().unwrap();
+    top.insert("schema".into(), Value::from(2));
+    for row in top
+        .get_mut("accounts")
+        .and_then(Value::as_array_mut)
+        .unwrap()
+    {
+        row.as_object_mut().unwrap().remove("signed_out_reason");
+    }
+}
+
+/// A SCHEMA 3 SNAPSHOT SAYS WHY A ROW IS SIGNED OUT: each row carries `signed_out_reason`, the
+/// closed word of the settled refusal on record of the token its login holds where the row is
+/// signed out here (`refresh_token_expired`, for a row on a directory of its own and for the row
+/// on the default login, read where the accounts store reads that login), and null for a row
+/// that is usable here, or whose login is in aterm's custody, though the same refusal is on
+/// record beside each. SCHEMAS 1 AND 2 ARE WHAT THEY WERE: no row of theirs has the key, and the
+/// schema 2 snapshot is schema 3's with the key and the schema word taken out.
+#[test]
+fn a_schema_3_snapshot_says_why_a_row_is_signed_out() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let env = refused_pool(root.path());
+    let program = aterm_agent::harness::codex_alab::lay_package(&root.path().join("store"), true);
+    let launch = running(&launched(&program, None));
+    let snapshot = |schema: u8| {
+        snapshot_in("bound-session", &proof(), &env, schema, Some(&launch))
+            .unwrap()
+            .value
+    };
+    let three = snapshot(3);
+    assert_eq!(three["schema"].as_u64(), Some(3));
+    let word = |word: &str| Some(Value::from(word));
+    assert_eq!(
+        per_row(&three, "condition"),
+        [
+            ("main".to_owned(), word("signed-out")),
+            ("lost".to_owned(), word("signed-out")),
+            ("kept".to_owned(), word("signed-out")),
+            ("live".to_owned(), word("usable")),
+        ],
+        "CONTROL: the conditions the reasons are judged by"
+    );
+    assert_eq!(
+        per_row(&three, "signed_out_reason"),
+        [
+            ("main".to_owned(), word("refresh_token_expired")),
+            ("lost".to_owned(), word("refresh_token_expired")),
+            ("kept".to_owned(), Some(Value::Null)),
+            ("live".to_owned(), Some(Value::Null)),
+        ]
+    );
+    let two = snapshot(2);
+    let one = snapshot(1);
+    for (schema, value) in [(1, &one), (2, &two)] {
+        assert!(
+            per_row(value, "signed_out_reason")
+                .iter()
+                .all(|(_, reason)| reason.is_none()),
+            "schema {schema} carries no reason: {value}"
+        );
+    }
+    let mut stripped = three.clone();
+    as_schema_2(&mut stripped);
+    assert_eq!(text_of(stripped), text_of(two));
+}
+
+/// A SCHEMA 3 REPLY IS GRANTED AS SCHEMA 2'S IS ([`reply`]): it asks whether the move would be
+/// carried and says `select` and `auto` by it, and is the schema 2 reply with the schema word
+/// and each row's reason (null for rows not signed out here) beside it.
+#[test]
+fn a_schema_3_reply_is_granted_as_schema_2s_is() {
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (env, _) = pool_env(root.path());
+    let home = env.home.clone().unwrap();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
+    let program = aterm_agent::harness::codex_alab::lay_package(&root.path().join("store"), true);
+    let on_main = launched(&program, None);
+    let body = |schema: u8, offered: bool| {
+        let snapshot = snapshot_in(
+            "bound-session",
+            &proof(),
+            &env,
+            schema,
+            Some(&running(&on_main)),
+        )
+        .expect("a snapshot");
+        let said = reply(ID, schema, snapshot, || offered);
+        let body = said
+            .strip_prefix("OK codex-accounts ")
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .unwrap_or_else(|| panic!("{said}"));
+        aterm_json::from_str::<Value>(body).unwrap()
+    };
+    let mut granted = body(3, true);
+    assert_eq!(granted["schema"].as_u64(), Some(3));
+    assert_eq!(
+        per_row(&granted, "signed_out_reason"),
+        [
+            ("main".to_owned(), Some(Value::Null)),
+            ("work".to_owned(), Some(Value::Null)),
+        ]
+    );
+    as_schema_2(&mut granted);
+    assert_eq!(text_of(granted), SCHEMA_2);
+    assert_eq!(
+        body(3, false)["capabilities"],
+        json!({"add": false, "select": false, "auto": false}),
+        "a restart that would not be carried offers no move"
+    );
+}
+
+/// SCHEMAS 2 AND 3 JUDGE THE SESSION'S LAUNCH, AND SCHEMA 1 DOES NOT ([`judged_launch`], what
+/// [`snapshot`] hands [`snapshot_in`]): from schema 2 on, the launch is the tab's validated copy
+/// of the proven process, read with the environment that process was started with, so a schema
+/// 3 snapshot names the session's row, its eligible rows and its capabilities as schema 2's
+/// does. Schema 1 reads neither.
+#[test]
+fn schemas_2_and_3_judge_the_launch_and_schema_1_does_not() {
+    const SID: &str = "launch-judging-session";
+    // This test's own process stands in for the session's, so its environment is readable.
+    let proof = crate::self_claim::Proven {
+        pid: std::process::id(),
+        start: "t".into(),
+    };
+    let resume = launched(std::path::Path::new("/opt/codex/bin/codex"), None);
+    crate::self_claim::set_copy_for_test(
+        SID,
+        Some(self_claimed::Copy {
+            lifetime: None,
+            pid: proof.pid,
+            start: proof.start.clone(),
+            home: std::path::PathBuf::from("/u/.codex"),
+            seen: self_claimed::Seen::Removed,
+            resume: Ok(resume.clone()),
+        }),
+    );
+    let judged = |schema: u8| judged_launch(SID, &proof, schema).map(|launch| launch.resume);
+    assert_eq!(judged(1), None, "schema 1 judges no launch");
+    assert_eq!(
+        judged(2),
+        Some(resume.clone()),
+        "CONTROL: schema 2's launch"
+    );
+    assert_eq!(
+        judged(3),
+        Some(resume),
+        "schema 3 judges the launch schema 2 does"
+    );
+    crate::self_claim::set_copy_for_test(SID, None);
+    assert_eq!(judged(3), None, "CONTROL: no validated copy, no launch");
 }

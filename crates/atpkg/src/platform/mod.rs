@@ -642,7 +642,7 @@ pub(crate) fn twin_prelude_with_launcher(
 /// THE HARNESS HAND-OFF of an agent program's twin ([`crate::harness::twin_harness`]): once a
 /// LIVE build of the harness is installed, the twin execs `<prefix>/bin/<tool> run --` with the
 /// argv the yolo block left, so the session runs under the harness
-/// (`docs/DESIGN-harness-repos-2026-10-24.md` §9 step 6, §11 D32); `--no-alab-harness`,
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D32); `--no-alab-harness`,
 /// `--no-harness` (each sets `ATERM_NO_HARNESS=1` above) or the variable itself runs the vendor
 /// alone, and so does a harness that is not installed.
 ///

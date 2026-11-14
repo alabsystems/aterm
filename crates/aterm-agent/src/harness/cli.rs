@@ -22,6 +22,7 @@ use super::accounts::Auth;
 use super::accounts::{self, Class, Cli, Roster};
 use super::accounts_step::Step;
 use super::align::Captured;
+use super::codex_app_login::RefusalReason;
 use super::disk;
 use super::footer;
 use super::profile;
@@ -349,6 +350,18 @@ THRESHOLDS (`watch:`):
   A knob written in `aterm.toml` is read as written; only the defaults follow the volume.
   Volume state is `ok` (>=warn), `low` (<warn), `short` (<floor), or `emergency`.
 
+REBUILDABLE BUDGET (`budget` in `aterm ctl @self sys disk`):
+  - `cap`: `disk.cap_used_gib`, the most used GiB the home volume is held to, or 80% of the
+    volume where that is smaller or the key is unwritten.
+  - `kept`: the volume's used bytes less the rebuildable ones (aterm's registered build caches
+    and the build directories a search finds); `target`: `cap` less `kept`, never below 0.
+  The window sizes the rebuildable bytes on a thread of its own, at most once an hour across
+  its processes and only while the volume is `ok`, and the record says how far over or under
+  `target` they are; a sizing cut short is a floor. It is a reading: it changes no volume
+  state, starts no pass, takes no build's lock and removes nothing. `disk.cap_used_gib = 0`,
+  or a value that is not a whole number, turns the budget off and leaves every removal as it
+  was; a negative one is unwritten.
+
 AUTOMATIC TIERS (window or `disk watch`, cheapest first, re-measuring before each item):
   - tier 1 (`low`, `disk.dead_build_dirs = true`): whole scratch/workspace build dirs whose
     owner session or checkout is gone, with signed `CACHEDIR.TAG` and no locks or open files.
@@ -505,7 +518,10 @@ REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
   condition (`not-enrolled`, `signed-out`, `limited until <time>`, `low`, `usable`, or
   `unseen`), its mark (`active`, `active:unproven`, `pinned`, or `-`), `offer:`, `credits:`
   and `warned:` where they apply, `on:` (its sessions, or `-`), and `login:` where it
-  applies; then `next:` and `not next:`. For Claude Code `next:` is the row a rotation moves a
+  applies (`signed-out` for a row with no login to run on here, none made or one that
+  ended; `signing-in` while its sign-in runs on this Mac; else `due`, `ok` or `idle`; the
+  vault tokens section says `login signed-out` of the same row, and the footer's account
+  row `signed out` or `signing in`); then `next:` and `not next:`. For Claude Code `next:` is the row a rotation moves a
   session to, so one more line says what a worker aterm starts takes: a row, or no row where
   no row lists this machine's own login (`--json`: `next.worker`).
   - Under `early` (default), the supervisor rotates sessions at turn end off a limited or
@@ -634,16 +650,51 @@ VERBS:
     to its pinned size and sha256 (Ctrl-C stops it; a download off the pin installs nothing,
     and a failed one is remembered for an hour or until a fetch succeeds). It never opens your
     own browser or its profiles (a row's `browser` key names one of those, for Claude Code's
-    at-the-desk renewals).
+    at-the-desk renewals). On macOS a Claude Code row's profile here is used only by a renewal
+    nobody is at the terminal for, of a row with no mailbox aterm's sign-in window reads
+    (`accounts renew` below): every other Claude Code sign-in runs in that window.
   - `accounts renew [--due | <label>...] [--on <host>,... | --here]`
     Signs in rows with `email` through a staging dir (`<label>+<n>`), checks that the
     account email matches, and binds the row in `<state>/accounts/logins.json` so sessions
     move at their next idle turn end (the reply names a `[harness]` switch that stops this;
     `wrong-account` deletes the staging dir and changes nothing live, though a bound row
-    records the attempt). A row whose page stopped its automatic sign-in (`blocked`) signs in
-    with a person at this Mac's terminal in its own browser profile, or with none named their
-    default browser, with no headless try; SSH takes the usual route, and so does an agent's
-    terminal, which never opens a browser: a row with no headless route is left to a person there. A person at a terminal waits out a sign-in
+    records the attempt). A sign-in stays on the Mac that owns the account, and nothing about
+    it is sent to another Mac. A renewal that signs
+    nothing in says how it ended and the reason its opener gave, in one line with no URL
+    path or query, address or code; the row's `sign-in:` line keeps it and one `sign-in`
+    ledger row records it (`hand failed: …` or `hand blocked: …`), as the upkeep's own
+    does (`auto …`).
+    On macOS a sign-in this Mac starts for its own row, at its own desktop (your renewal, an
+    agent's terminal, the upkeep), opens in a small window of aterm's own, one at a time (a
+    token's window included: the next waits for it), titled with the account: it sets the
+    row's email, reads the login code from the account's mailbox, and presses Continue with
+    email, Verify email address and Authorize. The mailbox is read on this Mac, with no
+    browser (a mail folder, IMAP, an HTTP mailbox, Proton's or Gmail's own API); the fleet's
+    mail relay is never asked. With nobody at the terminal the window opens only for a row
+    with such a mailbox; you may type the code in the window and press Verify email address
+    yourself. Each account keeps its own claude.ai session there, apart from every other
+    account's and from your browsers. Claude's consent page may hold Authorize behind a human
+    check (hCaptcha), and Cloudflare may show its own: aterm never operates either. Complete
+    it in the window and aterm presses Authorize; left alone for four minutes the sign-in
+    ends `blocked`, and the row is left to a renewal with a person at this Mac: the upkeep
+    opens no window for it again. Authorize is pressed only on a consent page that names the
+    row's account, or names none in a session aterm itself signed in as that account; a
+    page that names another account, or none aterm can vouch for, ends the sign-in with
+    nothing authorized and that window's session forgotten (nothing is signed out anywhere),
+    so the next sign-in starts at the sign-in page. Closing the window ends the sign-in
+    (`blocked`). A sign-in that failed for another reason (a page that did not load, a
+    mailbox that did not answer, its four minutes) ends `failed` and is tried again on the
+    ordinary backoff. `ATERM_SIGN_IN_TRACE=<absolute file>` appends each step and each read
+    of the window's page to that file (its host and path, title and button texts; never an
+    address, a code, a link or a query). An SSH session, another Mac's request and a tab
+    another Mac's drive started or typed into open no window: SSH takes the headless route,
+    which ends `blocked` at Cloudflare. The window is not the only browser a Claude sign-in
+    runs in: a renewal nobody is at the terminal for, of a row with no mailbox the window
+    reads, still signs in headlessly in the row's stored browser profile (`accounts
+    browser`); your own renewal of such a row opens the window and does not use that
+    profile. Off macOS a row whose sign-in ended `blocked` signs in with a person at a
+    terminal there, in the row's own browser profile or, with none named, their default
+    browser. A person at a terminal waits out a sign-in
     that holds the machine's sign-in lock, about 16 minutes at most; anyone else is refused
     (`held`), and `accounts login` and `accounts browser` do the same. Then requests each host's
     own unattended
@@ -656,10 +707,15 @@ VERBS:
     clears the pin (`--auto`).
   - `accounts token <label|email> [--replace | --remove]`
     Claude Code's alone. Makes a year-long Claude Code token for one account with `claude
-    setup-token`, signed in as that account by a person at this Mac's terminal, stores it in
-    the vault and records it in the accounts store's value-free `tokens.json`. An email names an account a session here is
+    setup-token`, stores it in the vault and records it in the accounts store's value-free
+    `tokens.json`. On macOS at this Mac's own desktop its page opens in aterm's sign-in
+    window, in that account's own claude.ai session, and nobody is asked (the consent page's
+    human check is still a person's); anywhere else a person at this Mac's terminal signs in
+    as that account in their browser. An email names an account a session here is
     logged into or a row names; a label names a row with an email, one another Mac holds
-    included. Refused before any sign-in without a terminal, on a Mac not seated in the vault's
+    included. Refused before any sign-in with neither that window nor a person's terminal (an
+    SSH session, another Mac's request, a tab another Mac's drive started or typed into), on
+    a Mac not seated in the vault's
     log, under a routed environment, or off macOS; a bare run is refused while the account's
     token is in use, made on another Mac and awaiting verification there, or not yet in vault.
     A busy vault after the sign-in never loses the token: it waits, then lands in the vault's
@@ -933,9 +989,11 @@ FLEET ACCOUNTS (fetched where a source is named, signed in wherever a roster sta
     signs in only the account a person picked. Its routes: the mailbox
     (`<state>/accounts/mailbox`, or a mailbox file), a stored browser profile in a headless
     browser, and a vault member's bounded `aterm secrets sync` when neither is there. It
-    opens no window and asks no one. A row no route signs in is an error on record naming
-    each route tried (the report's `sign-in:` line, one `sign-in` ledger event per finding,
-    an `aterm.log` line per try), tried again once what a route reads
+    asks no one; on macOS, at this Mac's desktop, the sign-in runs in aterm's own window
+    (above), on no other machine. A row no route signs in is an error on record naming
+    each route tried and the reason its opener gave (the report's `sign-in:` line, one
+    `sign-in` ledger event per finding, an `aterm.log` line per try), tried again once what
+    a route reads
     changes, and at the latest after a wait that doubles from 15 minutes to 6 hours.
   - Where no source is, the window fetches nothing and logs `accounts-upkeep=unconfigured`
     once (`fleet-file=ignored` where a fleet file opts nothing in). `accounts renew` by hand
@@ -2688,6 +2746,10 @@ struct LocalSourceTable {
     error: Option<String>,
     /// The owner's home, where a default row's login is looked for ([`enrolled_under`]).
     home: Option<PathBuf>,
+    /// The directory the default login's file is in, as the accounts store names it
+    /// ([`accounts::Store::default_login_home`]), where a default row's refusal is read
+    /// ([`signed_out_reason`]).
+    default_login: Option<PathBuf>,
 }
 
 type SourceTableTextRow = (String, String, String, String, String, String);
@@ -2705,7 +2767,7 @@ fn source_table_rows(
     });
     let mut push = |account: &super::accounts_sync::FleetAccount,
                     state: &str,
-                    readiness: String| {
+                    (readiness, reason): (String, Option<RefusalReason>)| {
         let region = account.vendor.region.map(|value| value.as_str());
         let flow = account.vendor.flow.map(|value| value.as_str());
         let machines: Vec<_> = account
@@ -2720,34 +2782,62 @@ fn source_table_rows(
                     .map_or(key.as_str(), |machine| machine.display_or_key())
             })
             .collect();
-        json_rows.push(aterm_json::json!({
-                "label": account.label,
-                "state": state,
-                "readiness": readiness,
-                "preferred_machines": machines,
-                "preferred_machine_keys": if fleet.roster.alab.is_some() {Some(&account.machines)} else {None},
-                "class": account.class.as_str(),
-                "region": region,
-                "flow": flow,
-            }));
+        let mut json_row = aterm_json::json!({
+            "label": account.label,
+            "state": state,
+            "readiness": readiness,
+            "preferred_machines": machines,
+            "preferred_machine_keys": if fleet.roster.alab.is_some() {Some(&account.machines)} else {None},
+            "class": account.class.as_str(),
+            "region": region,
+            "flow": flow,
+        });
+        if cli == Cli::Codex
+            && let Some(object) = json_row.as_object_mut()
+        {
+            object.insert(
+                "signed_out_reason".into(),
+                Value::from(reason.map(RefusalReason::code)),
+            );
+        }
+        json_rows.push(json_row);
         text_rows.push((
             account.label.clone(),
             state.to_owned(),
             machines.join(","),
             account.class.as_str().to_owned(),
             region.or(flow).unwrap_or("-").to_owned(),
-            readiness,
+            with_reason(&readiness, reason),
         ));
+    };
+    // A row's condition, and why it is signed out where that is on record.
+    let condition_of = |row: &accounts::Row, local: &LocalSourceTable| {
+        let condition = accounts::condition(
+            row,
+            &local.records.state,
+            enrolled.contains(&row.label),
+            local.now,
+        );
+        (
+            condition.as_str().to_owned(),
+            signed_out_reason(
+                cli,
+                row,
+                condition,
+                local.default_login.as_deref(),
+                local.now,
+            ),
+        )
     };
     for (state, source_rows) in [("active", &fleet.roster.accounts), ("pending", &fleet.held)] {
         for account in source_rows {
             let readiness =
                 if cli == Cli::Kimi && state == "pending" && account.vendor.region.is_none() {
-                    "needs-region".to_owned()
+                    ("needs-region".to_owned(), None)
                 } else if local.as_ref().is_some_and(|local| local.error.is_some()) {
-                    "unreadable".to_owned()
+                    ("unreadable".to_owned(), None)
                 } else if state == "pending" {
-                    "pending".to_owned()
+                    ("pending".to_owned(), None)
                 } else if let Some(local) = &local {
                     local
                         .records
@@ -2760,20 +2850,11 @@ fn source_table_rows(
                             })
                         })
                         .map_or_else(
-                            || "elsewhere".to_owned(),
-                            |row| {
-                                accounts::condition(
-                                    row,
-                                    &local.records.state,
-                                    enrolled.contains(&row.label),
-                                    local.now,
-                                )
-                                .as_str()
-                                .to_owned()
-                            },
+                            || ("elsewhere".to_owned(), None),
+                            |row| condition_of(row, local),
                         )
                 } else {
-                    "unmeasured".to_owned()
+                    ("unmeasured".to_owned(), None)
                 };
             push(account, state, readiness);
         }
@@ -2805,13 +2886,7 @@ fn source_table_rows(
                 browser: row.browser.clone(),
                 vendor: row.vendor,
             };
-            let readiness = accounts::condition(
-                row,
-                &local.records.state,
-                enrolled.contains(&row.label),
-                local.now,
-            );
-            push(&account, "local", readiness.as_str().to_owned());
+            push(&account, "local", condition_of(row, local));
         }
     }
     let status = if json_rows.is_empty() {
@@ -2969,6 +3044,7 @@ fn local_source_table(env: &Env, cli: Cli) -> Option<LocalSourceTable> {
         now: env.now,
         error,
         home: env.home.clone(),
+        default_login: store.default_login_home(),
     })
 }
 
@@ -5225,7 +5301,10 @@ impl DiskReading {
 
     fn unread(note: String) -> Self {
         DiskReading {
-            config: removal_off(disk::Config::default()),
+            config: disk::Config {
+                cap_used_gib: disk::Cap::Off,
+                ..removal_off(disk::Config::default())
+            },
             floor_gib: None,
             notes: vec![note],
             off_by_fault: true,
@@ -5381,6 +5460,32 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
                         }
                         notes.push(note);
                     }
+                    ("cap_used_gib", T::Integer(0)) => cfg.cap_used_gib = disk::Cap::Off,
+                    ("cap_used_gib", T::Integer(n)) if *n > 0 => {
+                        cfg.cap_used_gib = disk::Cap::Written(n.unsigned_abs());
+                    }
+                    ("cap_used_gib", value) => {
+                        if matches!(value, T::Integer(_)) {
+                            notes.push(format!(
+                                "disk.cap_used_gib is negative, so the cap is {}% of the volume",
+                                disk::CAP_USED_PCT
+                            ));
+                        } else {
+                            let kind = value.type_str();
+                            let note = format!(
+                                "disk.cap_used_gib must be a whole number, not {} {kind}, so \
+                                 the rebuildable budget is off",
+                                article(kind)
+                            );
+                            cfg.cap_used_gib = disk::Cap::Off;
+                            faults.push(DiskFault {
+                                path: "disk.cap_used_gib".to_owned(),
+                                note: note.clone(),
+                                removal_off: false,
+                            });
+                            notes.push(note);
+                        }
+                    }
                     ("warn_free_gib" | "target_stale_days" | "auto_free_gib", T::Integer(n)) => {
                         if *n < 0
                             && let Some(reading) = disk::Config::negative_reading(key)
@@ -5432,6 +5537,7 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
         Some(other) => {
             off = true;
             floor_read = false;
+            cfg.cap_used_gib = disk::Cap::Off;
             let kind = other.type_str();
             let note = format!(
                 "disk must be a table, not {} {kind}, {DISK_OFF}",
@@ -5628,7 +5734,7 @@ fn disk_tick_with(
             cursor.scope(&(
                 state,
                 volume,
-                config,
+                config.removal_view(),
                 demand,
                 projected.is_some(),
                 config.pressed(free, projected.as_ref()),
@@ -5733,6 +5839,30 @@ fn disk_tick_with(
     };
     let hogs = disk::hogs_left(&survey, &rep, &done, &there);
     DiskTick::Reclaimed(done, hogs)
+}
+
+/// The rebuildable bytes on `volume` now, for the budget `aterm ctl sys disk` prints
+/// ([`disk::budget::rebuildable`]): the registered build caches and the build directories an
+/// unpaged search from `discover` finds, those on `volume` (the volume ids a pass's search
+/// compares, `table`'s on Windows), each sized once before `deadline`. A reading: it takes no
+/// build's lock, journals nothing, removes nothing and holds no pass's discovery cursor.
+#[must_use]
+pub fn disk_rebuildable(
+    volume: &Path,
+    discover: &disk::discover::Roots,
+    table: Option<&aterm_sysprobe::volumes::Table>,
+    deadline: std::time::Instant,
+) -> disk::Rebuildable {
+    let fresh = (cfg!(windows) && table.is_none()).then(aterm_sysprobe::volumes::table);
+    let ids = table.or(fresh.as_ref());
+    let measured = volume_id(volume, ids);
+    let same_volume = |path: &Path| measured.is_some() && volume_id(path, ids) == measured;
+    disk::budget::rebuildable(
+        discover,
+        disk::discover::Budget::SHIPPED,
+        deadline,
+        &same_volume,
+    )
 }
 
 /// What the reserve did on one look of the disk watch ([`disk_reserve_look`]).
@@ -6226,6 +6356,17 @@ pub fn disk_sweep_journal(
     removed: bool,
     now: i64,
 ) -> bool {
+    let action = if removed {
+        disk::SweepAction::outcome(why)
+    } else {
+        disk::SweepAction::Removing
+    };
+    disk_ledger_append(state, &disk::sweep_row(now, path, action, bytes, why))
+}
+
+/// Append one row that is already a JSON object to `<state>/disk.jsonl`, cut back to its bound
+/// first: `false` when it is not on record.
+fn disk_ledger_append(state: &Path, row: &str) -> bool {
     let ledger = state.join(DISK_LEDGER);
     let mut sink = io::sink();
     if std::fs::create_dir_all(state).is_err() {
@@ -6235,12 +6376,97 @@ pub fn disk_sweep_journal(
         return false;
     }
     let mut journal = Journal::open(Some(&ledger), None, &mut sink);
-    let action = if removed {
-        disk::SweepAction::outcome(why)
-    } else {
-        disk::SweepAction::Removing
+    journal.append_raw(row, &mut sink)
+}
+
+/// What one run of the disk look's worktree step reads ([`disk_worktree_step`]): every path
+/// and figure is the host's.
+#[derive(Debug, Clone, Copy)]
+pub struct WorktreeLook<'a> {
+    /// The harness state directory; the ledger is `<state>/disk.jsonl`.
+    pub state: &'a Path,
+    /// The home whose children are the checkouts.
+    pub home: &'a Path,
+    /// Unix seconds.
+    pub now: i64,
+    /// Where transcripts live: nothing at, under or over it goes.
+    pub transcripts: Option<&'a Path>,
+    /// The working directory of every session of this host.
+    pub session_cwds: &'a [PathBuf],
+    /// Why the working directory of some session is not known: while it stands nothing goes.
+    pub session_cwd_unknown: Option<&'a str>,
+    /// The open Claude Code sessions ([`disk::worktree::open_sessions`]).
+    pub open: &'a [disk::worktree::OpenSession],
+    /// The mount table the look read.
+    pub table: Option<&'a aterm_sysprobe::volumes::Table>,
+}
+
+/// One run of the disk look's worktree step ([`disk::worktree::step`]) over the linked
+/// worktrees of `look.home`'s checkouts: each merged, clean worktree no session uses goes,
+/// journalled into `<state>/disk.jsonl` before and after, with its merged branch, through the
+/// retired gate's remover under the live process fence, while `still_held` says the pass lock
+/// is this host's: no judgment or removal starts after [`disk::worktree::STEP_WALL`], and no git
+/// run outlives it by more than [`disk::worktree::GIT_GRACE`]. `disk.auto_free_gib = 0` (an
+/// unreadable aterm.toml included) runs nothing and leaves `schedule` due.
+pub fn disk_worktree_step(
+    look: &WorktreeLook<'_>,
+    config: disk::Config,
+    schedule: &mut disk::worktree::Schedule,
+    still_held: &dyn Fn() -> bool,
+) -> disk::worktree::Done {
+    if config.auto_free_gib == 0 {
+        return disk::worktree::Done::default();
+    }
+    let started = std::time::Instant::now();
+    let found = disk::discover::linked_worktrees(look.home);
+    let mut known: Vec<PathBuf> = found
+        .iter()
+        .flat_map(|(checkout, wt)| [checkout.clone(), wt.clone()])
+        .collect();
+    known.sort();
+    known.dedup();
+    let cwds: Vec<disk::idle::SessionCwd> = look
+        .session_cwds
+        .iter()
+        .chain(look.open.iter().filter_map(|s| s.cwd.as_ref()))
+        .map(|cwd| disk::idle::SessionCwd::on(cwd, look.table))
+        .collect();
+    let now = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(look.now).unwrap_or(0));
+    let facts = disk::worktree::Facts {
+        home: look.home,
+        transcripts_root: look.transcripts,
+        cwds: &cwds,
+        cwd_unknown: look.session_cwd_unknown,
+        open: look.open,
+        table: look.table,
+        known: &known,
     };
-    journal.append_raw(&disk::sweep_row(now, path, action, bytes, why), &mut sink)
+    // Every git run ends by the wall and a grace for the one judgment or removal under way at
+    // it: none starts after the wall, and a hung git cannot hold the disk look's thread.
+    let git = atpkg::build_cache::retired::GitUntil(
+        started + disk::worktree::STEP_WALL + disk::worktree::GIT_GRACE,
+    );
+    let mut remove = |checkout: &Path, wt: &Path| {
+        atpkg::build_cache::retired::remove_worktree(&git, look.home, checkout, wt, now)
+    };
+    let mut journal = |row: &str| disk_ledger_append(look.state, row);
+    let after = schedule.after().map(Path::to_path_buf);
+    let (done, reached) = disk::worktree::step(
+        &git,
+        &facts,
+        &found,
+        after.as_deref(),
+        now,
+        started + disk::worktree::STEP_WALL,
+        disk::worktree::Hooks {
+            still_held,
+            remove: &mut remove,
+            journal: &mut journal,
+        },
+    );
+    schedule.ran(std::time::Instant::now(), reached);
+    done
 }
 
 /// A managed-cache sweep with its write-ahead sizes and any journal refusal.
@@ -7593,6 +7819,24 @@ pub trait AccountsHost {
         false
     }
 
+    /// Whether a sign-in this call starts may open aterm's own sign-in window
+    /// ([`RenewBrowser::Window`]): only on macOS, at this Mac's own desk (never over SSH), and
+    /// only for a sign-in this Mac started for itself, never one another machine asked for
+    /// ([`super::remote_renew::FOR_PEER_ENV`], [`Self::driven_over_the_fleet`]). A host that
+    /// does not say so opens none.
+    fn opens_sign_in_window(&self) -> bool {
+        false
+    }
+
+    /// Whether another Mac's fleet drive typed into the aterm session this call runs in, as
+    /// the instance that holds the session says (`fleet_session`): what it typed is that
+    /// Mac's request, whatever terminal it runs on. A tab a fleet drive started says so in its
+    /// environment instead ([`super::remote_renew::FOR_PEER_ENV`]). A host that does not say
+    /// so is in no such session.
+    fn driven_over_the_fleet(&self) -> bool {
+        false
+    }
+
     /// This program's own executable, for the opener's argv0 link ([`open_url::OPENER`](super::open_url::OPENER)).
     fn current_exe(&self) -> Option<PathBuf> {
         None
@@ -7811,11 +8055,70 @@ pub enum RenewBrowser {
         /// The profile's display name.
         profile: String,
     },
-    /// Over SSH: nothing opens on this machine.
+    /// On macOS, for a sign-in this Mac starts for one of its own rows
+    /// ([`AccountsHost::opens_sign_in_window`]) with a person at its terminal, or for a row
+    /// whose mailbox the window reads by itself
+    /// ([`super::headless_oauth::MailboxConfig::window_reads`]): a window of aterm's own,
+    /// through aterm's opener, at once ([`super::open_url::WINDOW_ENV`]). The sign-in
+    /// finishes there by itself with the code from the account's mailbox, or with the code a
+    /// person types, and no other browser opens before or after it. A renewal opens the
+    /// window through this alone; an account's token opens it through its own route
+    /// (`setup_token::WindowRoute`).
+    ///
+    /// It is not the only browser a Claude sign-in runs in: a renewal nobody is at the
+    /// terminal for, of a row with no mailbox the window reads, still signs in headlessly
+    /// in the row's stored browser profile (`accounts browser`), as [`Self::Remote`].
+    Window {
+        /// The opener's link ([`super::open_url::OPENER`]).
+        opener: PathBuf,
+    },
+    /// Nothing a person sees opens on this machine: over SSH, for another Mac's request, and
+    /// off macOS at an agent's terminal or with no terminal. The opener, where there is one,
+    /// signs in headlessly or not at all.
     Remote {
         /// The opener's link ([`super::open_url::OPENER`]), where one could be made.
         opener: Option<PathBuf>,
     },
+}
+
+impl RenewBrowser {
+    /// Whether aterm's opener is the whole sign-in and finishes it by itself in aterm's own
+    /// window: nothing of it is typed at the terminal, so it runs as a sign-in with no
+    /// terminal does, its hosted code handed to the waiting CLI by aterm
+    /// ([`LiveAccounts::renew_outcome`]).
+    pub(super) const fn finishes_by_itself(&self) -> bool {
+        matches!(self, Self::Window { .. })
+    }
+}
+
+/// Whether a sign-in started under the environment `var` may open aterm's own sign-in window
+/// ([`AccountsHost::opens_sign_in_window`]): on macOS, with no SSH connection, no mark of
+/// another machine's request ([`super::remote_renew::FOR_PEER_ENV`], which a renewal another
+/// Mac asked for and every tab another Mac's fleet drive started carry), and in no session
+/// another Mac's drive typed into (`driven_over_the_fleet`, asked only where nothing else
+/// refuses).
+pub(super) fn opens_sign_in_window_by(
+    on_macos: bool,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    driven_over_the_fleet: &dyn Fn() -> bool,
+) -> bool {
+    on_macos && !under_ssh_by(var) && !for_another_machine(var, driven_over_the_fleet)
+}
+
+fn under_ssh_by(var: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    var("SSH_CONNECTION").is_some_and(|value| !value.is_empty())
+}
+
+/// Whether what runs under the environment `var` runs for another machine: it carries that
+/// machine's mark ([`super::remote_renew::FOR_PEER_ENV`]), or another Mac's fleet drive typed
+/// into its session (`driven_over_the_fleet`). Nothing it starts opens a window or a browser
+/// on this Mac's desk, and nobody at this Mac's terminal is taken to have started it.
+pub(super) fn for_another_machine(
+    var: &dyn Fn(&str) -> Option<OsString>,
+    driven_over_the_fleet: &dyn Fn() -> bool,
+) -> bool {
+    var(super::remote_renew::FOR_PEER_ENV).is_some_and(|value| !value.is_empty())
+        || driven_over_the_fleet()
 }
 
 /// A completed provider process, preserving its exit independently of browser diagnostics.
@@ -7834,28 +8137,15 @@ impl From<i32> for RenewalExit {
 }
 
 impl RenewalExit {
-    /// An authenticated service refusal cannot authorize a fresh status or adoption step.
-    pub fn is_deferred(&self) -> bool {
-        self.met
-            .as_ref()
-            .is_some_and(super::open_url::Met::is_service_unavailable)
-    }
     pub(super) fn from_capture(
         (ran, met): (Captured, Option<super::open_url::Met>),
     ) -> Result<Self, RenewalFailure> {
         match ran.code {
             Some(code) => Ok(Self { code, met }),
-            None => {
-                let deferred = met
-                    .as_ref()
-                    .is_some_and(super::open_url::Met::is_service_unavailable);
-                let mut failure =
-                    RenewalFailure::new("provider flow ended without an exit code", met);
-                if deferred {
-                    failure.kind = RenewalFailureKind::Deferred;
-                }
-                Err(failure)
-            }
+            None => Err(RenewalFailure::new(
+                "provider flow ended without an exit code",
+                met,
+            )),
         }
     }
 
@@ -7868,13 +8158,13 @@ impl RenewalExit {
 }
 
 /// Safe facts from exactly one provider invocation. These do not authorize a login or
-/// establish shared custody. Typed service unavailability can defer work without an auth penalty.
+/// establish shared custody. A host's typed deferral can put work off without an auth penalty.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenewalObservation {
     exit_code: Option<i32>,
     met: Option<super::open_url::Met>,
     capture_failed: bool,
-    service_deferred: bool,
+    deferred: bool,
 }
 
 impl RenewalObservation {
@@ -7887,11 +8177,9 @@ impl RenewalObservation {
             exit_code,
             // Hosts can construct Met directly. Re-admit its closed wire form before
             // retaining anything for process-local history or a UI reader.
-            met: met.and_then(|met| super::open_url::Met::parse(&met.line())),
+            met: met.and_then(super::open_url::Met::readmitted),
             capture_failed,
-            service_deferred: outcome
-                .as_ref()
-                .map_or_else(RenewalFailure::is_deferred, RenewalExit::is_deferred),
+            deferred: outcome.as_ref().is_err_and(RenewalFailure::is_deferred),
         }
     }
 
@@ -7910,10 +8198,11 @@ impl RenewalObservation {
         self.capture_failed
     }
 
-    /// Exact service unavailability from this invocation, not an authentication failure.
+    /// The host deferred this invocation's work ([`RenewalFailure::is_deferred`]): not an
+    /// authentication failure.
     #[must_use]
-    pub fn service_deferred(&self) -> bool {
-        self.service_deferred
+    pub fn deferred(&self) -> bool {
+        self.deferred
     }
 
     /// Explain validated helper facts and the process exit, never provider output.
@@ -7936,6 +8225,9 @@ impl RenewalObservation {
 pub struct LiveAccounts {
     work: Option<super::account_work::Scope>,
     automatic: bool,
+    /// Whether another Mac's drive typed into this process's session
+    /// ([`AccountsHost::driven_over_the_fleet`]), asked of this Mac's instances once.
+    fleet_driven: std::sync::OnceLock<bool>,
 }
 
 impl LiveAccounts {
@@ -7950,6 +8242,7 @@ impl LiveAccounts {
         Self {
             work: Some(scope),
             automatic: false,
+            fleet_driven: std::sync::OnceLock::new(),
         }
     }
 
@@ -7958,6 +8251,7 @@ impl LiveAccounts {
         Self {
             work,
             automatic: true,
+            fleet_driven: std::sync::OnceLock::new(),
         }
     }
 }
@@ -8128,6 +8422,7 @@ impl AccountsHost for LiveAccounts {
             host: None,
             within: aterm_ctl::FLEET_WITHIN,
             holder: None,
+            by: None,
         })
         .ok()
     }
@@ -8172,7 +8467,11 @@ impl AccountsHost for LiveAccounts {
             email,
             browser,
             &|name| std::env::var_os(name),
-            (!self.stdin_is_terminal()).then_some(UNATTENDED_RENEWAL_BUDGET),
+            // A sign-in in aterm's own window finishes by itself, so it runs bounded and
+            // captured even with a person at the terminal: its hosted code then has the same
+            // channel to the waiting CLI's paste prompt as a run with no terminal.
+            (browser.finishes_by_itself() || !self.stdin_is_terminal())
+                .then_some(UNATTENDED_RENEWAL_BUDGET),
             self.work.as_ref(),
         )
     }
@@ -8228,6 +8527,18 @@ impl AccountsHost for LiveAccounts {
 
     fn under_ssh(&self) -> bool {
         std::env::var_os("SSH_CONNECTION").is_some_and(|v| !v.is_empty())
+    }
+
+    fn opens_sign_in_window(&self) -> bool {
+        opens_sign_in_window_by(self.on_macos(), &|name| std::env::var_os(name), &|| {
+            self.driven_over_the_fleet()
+        })
+    }
+
+    fn driven_over_the_fleet(&self) -> bool {
+        *self
+            .fleet_driven
+            .get_or_init(super::fleet_session::an_instance_says_another_mac_drives)
     }
 
     fn current_exe(&self) -> Option<PathBuf> {
@@ -8629,7 +8940,7 @@ fn window_until_enter<T>(
     wait(&|| None)
 }
 
-/// `<program> auth login --claudeai --email <email>` as a renewal runs it ([`AccountsHost::renew_flow`]): the login made under the staging home alone ([`accounts::HOME_ENV`] = `home`) with [`accounts::LOGIN_ENV`] removed (set, it would name the keychain item instead, and the new login would land in a live session's), and the page opened as `browser` says: the account's profile through the argv0 opener, Claude Code's default, or, over SSH, nothing (the opener with no profile: the paste-code flow).
+/// `<program> auth login --claudeai --email <email>` as a renewal runs it ([`AccountsHost::renew_flow`]): the login made under the staging home alone ([`accounts::HOME_ENV`] = `home`) with [`accounts::LOGIN_ENV`] removed (set, it would name the keychain item instead, and the new login would land in a live session's), and the page opened as `browser` says: the account's profile through the argv0 opener, Claude Code's default, or, over SSH, nothing (the opener with no profile: the paste-code flow). Whether aterm's sign-in window may open is `browser`'s alone to say: the variable that lets the opener open it ([`super::open_url::WINDOW_ENV`]) is removed from what the provider inherits and set only for [`RenewBrowser::Window`].
 pub(super) fn renew_command(
     program: &std::ffi::OsStr,
     home: &str,
@@ -8642,9 +8953,14 @@ pub(super) fn renew_command(
         .env(accounts::HOME_ENV, home)
         .env_remove(super::open_url::PROFILE_ENV)
         .env_remove(super::open_url::INPUT_ENV)
-        .env_remove(super::open_url::NO_HEADLESS_ENV);
+        .env_remove(super::open_url::NO_HEADLESS_ENV)
+        .env_remove(super::open_url::WINDOW_ENV);
     match browser {
         RenewBrowser::Default => {}
+        RenewBrowser::Window { opener } => {
+            cmd.env("BROWSER", opener)
+                .env(super::open_url::WINDOW_ENV, "1");
+        }
         RenewBrowser::Profile { opener, profile } => {
             cmd.env("BROWSER", opener)
                 .env(super::open_url::PROFILE_ENV, profile);
@@ -8736,10 +9052,24 @@ fn renew_flow_of_with_work(
         });
     }
     // A person's sign-in on this terminal waits for them, unbounded, as Claude Code's own paste
-    // prompt does.
-    person_flow(cmd)
-        .map(RenewalExit::from)
-        .map_err(RenewalFailure::from)
+    // prompt does. Its opener's outcome is read as an unattended run's is, so a sign-in that
+    // ends without a login says why; it names no code file, since the paste prompt is theirs.
+    let outcome = aterm_tempfile::tempdir()
+        .ok()
+        .map(|dir| (dir.path().join("outcome"), dir));
+    cmd.env_remove(super::open_url::OUTCOME_ENV)
+        .env_remove(super::open_url::CODE_ENV);
+    if let Some((path, _)) = &outcome {
+        cmd.env(super::open_url::OUTCOME_ENV, path);
+    }
+    let ran = person_flow(cmd);
+    let met = outcome
+        .as_ref()
+        .and_then(|(path, _)| super::open_url::read_outcome(path));
+    match ran {
+        Ok(code) => Ok(RenewalExit { code, met }),
+        Err(reason) => Err(RenewalFailure::new(reason, met)),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -8758,18 +9088,16 @@ pub struct RenewalFailure {
 }
 
 impl RenewalFailure {
-    /// Authenticated service unavailability retains uncertainty without an auth penalty.
+    /// Work put off because its custody or publication was no longer current: it retains
+    /// uncertainty without an auth penalty.
     pub fn deferred() -> Self {
         Self {
             kind: RenewalFailureKind::Deferred,
-            reason: "the account service is unavailable".into(),
-            met: Some(super::open_url::Met::new(
-                super::open_url::MetWord::ServiceUnavailable,
-                None,
-            )),
+            reason: "account work was deferred".into(),
+            met: None,
         }
     }
-    /// Whether an authenticated service deferred this work.
+    /// Whether this work was deferred rather than failed.
     pub fn is_deferred(&self) -> bool {
         self.kind == RenewalFailureKind::Deferred
     }
@@ -8850,7 +9178,6 @@ pub(super) fn capture_unattended_renewal_scoped(
 #[cfg(unix)]
 enum CaptureStop {
     Cancelled,
-    Deferred,
     Failed,
 }
 
@@ -8881,12 +9208,7 @@ fn capture_unattended_renewal_for(
                     } else {
                         outcome
                             .and_then(super::open_url::read_terminal_outcome)
-                            .map(|outcome| match outcome {
-                                super::open_url::TerminalOutcome::Failed(_) => CaptureStop::Failed,
-                                super::open_url::TerminalOutcome::Deferred(_) => {
-                                    CaptureStop::Deferred
-                                }
-                            })
+                            .map(|_| CaptureStop::Failed)
                     };
                     if observed.is_some() {
                         return true;
@@ -8914,7 +9236,7 @@ fn capture_unattended_renewal_for(
                 super::align::Ended::Exited(ran) => Ok(ran),
                 super::align::Ended::Stopped => {
                     stopped = observed;
-                    Err("its browser opener stopped before authorization completed".into())
+                    Err(OPENER_STOPPED.into())
                 }
             }
         }
@@ -8927,7 +9249,6 @@ fn capture_unattended_renewal_for(
     #[cfg(unix)]
     match stopped {
         Some(CaptureStop::Cancelled) => return Err(RenewalFailure::cancelled()),
-        Some(CaptureStop::Deferred) => return Err(RenewalFailure::deferred()),
         Some(CaptureStop::Failed) | None => {}
     }
     result
@@ -9038,9 +9359,12 @@ fn capture_unattended_renewal_with(
     let outcome = aterm_tempfile::tempdir()
         .ok()
         .map(|dir| (dir.path().join("outcome"), dir));
-    cmd.env_remove(super::open_url::OUTCOME_ENV);
+    cmd.env_remove(super::open_url::OUTCOME_ENV)
+        .env_remove(super::open_url::CODE_ENV);
     if let Some((path, _)) = &outcome {
-        cmd.env(super::open_url::OUTCOME_ENV, path);
+        // This run watches the code file and types what arrives into its provider's prompt.
+        cmd.env(super::open_url::OUTCOME_ENV, path)
+            .env(super::open_url::CODE_ENV, path.with_extension("code"));
     }
     let ran = capture(cmd, outcome.as_ref().map(|(path, _)| path.as_path()));
     let met = outcome
@@ -9071,6 +9395,8 @@ pub(super) fn unattended_renewal_environment(
             super::headless_oauth::WEBMAIL_URL_ENV,
             super::headless_oauth::WEBMAIL_PASS_ENV,
             super::headless_oauth::TOTP_SECRET_ENV,
+            #[cfg(target_os = "macos")]
+            super::signin_window::TRACE_ENV,
             "XDG_CONFIG_HOME",
             "XDG_CACHE_HOME",
             "XDG_STATE_HOME",
@@ -9117,6 +9443,11 @@ fn login_command(program: &std::ffi::OsStr, dir: Option<&str>) -> aterm_uds::spa
 fn login_flow_of(program: &std::ffi::OsStr, dir: Option<&str>) -> Result<i32, String> {
     person_flow(login_command(program, dir))
 }
+
+/// Why a sign-in ended without its provider's own exit: its opener recorded a terminal failure
+/// ([`super::open_url::read_terminal_outcome`]), in a captured run.
+#[cfg(unix)]
+const OPENER_STOPPED: &str = "its browser opener stopped before authorization completed";
 
 /// One sign-in on this terminal, a person's, waited for as long as they take, as
 /// [`terminal_flow`] waits: tied to this process ([`super::align::tie`]), so an `aterm` killed,
@@ -11702,6 +12033,36 @@ fn usage_words(account: &accounts::Account, now: i64) -> String {
     words
 }
 
+/// Why `row`'s login of `cli` is signed out, as a report says it: only a Codex login keeps the
+/// issuer's refusal beside it, read as [`super::codex_app_login::row_signed_out_reason`] reads
+/// it (`condition` is [`accounts::Condition::SignedOut`] and the refusal of the refresh token
+/// its login file holds is settled at `now`, that login being the row's own account); `None` for
+/// another CLI. A row with no directory of its own is on the default login, whose file is in
+/// `default_login`: the directory the accounts store reads that login's lapse in
+/// ([`accounts::Store::default_login_home`]), or the place the observer read. Read-only: it
+/// decides nothing a launch, a pick or a move reads.
+fn signed_out_reason(
+    cli: Cli,
+    row: &accounts::Row,
+    condition: accounts::Condition,
+    default_login: Option<&Path>,
+    now: i64,
+) -> Option<RefusalReason> {
+    if cli != Cli::Codex {
+        return None;
+    }
+    super::codex_app_login::row_signed_out_reason(row, condition, default_login, now)
+}
+
+/// A row's condition `word`, with `reason`'s plain words after it where one is on record
+/// (`signed-out (token expired)`, [`signed_out_reason`]).
+fn with_reason(word: &str, reason: Option<RefusalReason>) -> String {
+    match reason {
+        Some(reason) => format!("{word} ({})", reason.words()),
+        None => word.to_owned(),
+    }
+}
+
 /// The text report of `cli`'s pool; `launch` holds the Codex program a worker aterm starts runs
 /// here ([`AccountsHost::codex_launch_program`]) and whether it would start nothing, which narrow
 /// `next:`, as `[harness] accounts` (`mode`) does ([`accounts_next`]).
@@ -11716,10 +12077,10 @@ fn accounts_text(
         Option<&super::outlook::Outlook>,
         Option<&BTreeSet<String>>,
     ),
-    (path, present, home): (&Path, bool, Option<&Path>),
+    (path, present, home, default_login): (&Path, bool, Option<&Path>, Option<&Path>),
     roster: &Roster,
     raw_roster: &Roster,
-    (state, logins): (&accounts::State, &accounts::Logins),
+    (state, logins, signing_in): (&accounts::State, &accounts::Logins, Option<&str>),
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> String {
@@ -11750,7 +12111,10 @@ fn accounts_text(
             accounts::Condition::Limited { until } => {
                 format!("limited until {}", rfc3339_utc(until))
             }
-            other => other.as_str().to_string(),
+            other => with_reason(
+                other.as_str(),
+                signed_out_reason(cli, row, other, default_login, now),
+            ),
         };
         let on: Vec<String> = state
             .sessions
@@ -11788,7 +12152,7 @@ fn accounts_text(
             } else {
                 on.join(" ")
             },
-            login_words(row, enrolled, state, logins, now),
+            login_words(row, enrolled, state, (logins, signing_in), now),
         ));
         let raw = raw_roster.row(&row.label);
         if let Some(step) = raw
@@ -11912,20 +12276,29 @@ fn accounts_text(
     text
 }
 
-/// The login state the report says of `row` ([`accounts::login_state`]: expired where its records
-/// or its own credential file say it is signed out here), but a row on this machine's own login
-/// with no login there has none to be well or due ([`reported_enrolled`]).
+/// What the report says of a row whose sign-in runs on this Mac now
+/// ([`accounts::Store::signing_in`]), as the glass says `signing in`.
+const SIGNING_IN_WORD: &str = "signing-in";
+
+/// The login word the report says of `row`, from the one reading of its login here
+/// ([`accounts::login_here`], over the rows whose login the report says is here,
+/// [`reported_enrolled`]): a row with no login to run on here, none made or one signed out, is
+/// [`accounts::LoginHere::SIGNED_OUT`], or [`SIGNING_IN_WORD`] while `signing_in` names it; any
+/// other row is what its records say ([`accounts::login_state`]). The vault tokens section says
+/// the same of the same row ([`super::accounts_token_view::LoginHalf::of_row`]).
 fn reported_login_state(
     row: &accounts::Row,
     enrolled: &BTreeSet<String>,
     state: &accounts::State,
-    logins: &accounts::Logins,
+    (logins, signing_in): (&accounts::Logins, Option<&str>),
     now: i64,
 ) -> &'static str {
-    if row.dir.is_none() && !enrolled.contains(&row.label) {
-        accounts::LoginState::Idle.as_str()
-    } else {
-        accounts::login_state(row, logins, state, now).as_str()
+    match accounts::login_here(row, state, enrolled.contains(&row.label)) {
+        accounts::LoginHere::In => accounts::login_state(row, logins, state, now).as_str(),
+        _ if signing_in == Some(row.label.as_str()) => SIGNING_IN_WORD,
+        accounts::LoginHere::NotMade | accounts::LoginHere::SignedOut => {
+            accounts::LoginHere::SIGNED_OUT
+        }
     }
 }
 
@@ -11933,7 +12306,7 @@ fn login_words(
     row: &accounts::Row,
     enrolled: &BTreeSet<String>,
     state: &accounts::State,
-    logins: &accounts::Logins,
+    (logins, signing_in): (&accounts::Logins, Option<&str>),
     now: i64,
 ) -> String {
     if row.email.is_none() {
@@ -11942,7 +12315,7 @@ fn login_words(
     let binding = logins.get(&row.label);
     let mut words = format!(
         "  login: {}",
-        reported_login_state(row, enrolled, state, logins, now)
+        reported_login_state(row, enrolled, state, (logins, signing_in), now)
     );
     if let Some(by) = accounts::login_forecast(row, logins, state) {
         words.push_str(&format!(", renew by {}", rfc3339_utc(by)));
@@ -12050,7 +12423,9 @@ fn sign_in_step(
 }
 
 /// What a person does for a row with an email whose page stopped aterm's automatic sign-in:
-/// `accounts renew` at a terminal here runs in the row's own browser ([`run_accounts_renew`]).
+/// `accounts renew` at a terminal here, which on macOS opens aterm's sign-in window, where
+/// they complete the page's check, and elsewhere the row's own browser
+/// ([`run_accounts_renew`]).
 pub(super) fn stopped_step(cli: Cli, label: &str) -> String {
     format!(
         "a page stopped aterm's sign-in: run `{}` in a terminal on this Mac",
@@ -12105,10 +12480,14 @@ fn accounts_refused_json(path: Option<&Path>, why: &str, now: i64) -> String {
 )]
 fn accounts_json(
     (cli, launch): (Cli, Launch<'_>),
-    (path, origin): (&Path, Option<&super::accounts_sync::FleetOrigin>),
+    (path, origin, default_login): (
+        &Path,
+        Option<&super::accounts_sync::FleetOrigin>,
+        Option<&Path>,
+    ),
     roster: &Roster,
     raw_roster: &Roster,
-    (state, logins): (&accounts::State, &accounts::Logins),
+    (state, logins, signing_in): (&accounts::State, &accounts::Logins, Option<&str>),
     enrolled: &BTreeSet<String>,
     (by, policy, judged, outlook, series): (
         HeldBy,
@@ -12282,6 +12661,13 @@ fn accounts_json(
             );
             let binding = logins.get(&row.label);
             if cli == Cli::Codex {
+                m.insert(
+                    "signed_out_reason".into(),
+                    Value::from(
+                        signed_out_reason(cli, row, condition, default_login, now)
+                            .map(RefusalReason::code),
+                    ),
+                );
                 m.insert("email".into(), Value::from(row.email.clone()));
                 m.insert(
                     "identity_email".into(),
@@ -12320,7 +12706,13 @@ fn accounts_json(
             );
             m.insert(
                 "login".to_owned(),
-                Value::from(reported_login_state(row, enrolled, state, logins, now)),
+                Value::from(reported_login_state(
+                    row,
+                    enrolled,
+                    state,
+                    (logins, signing_in),
+                    now,
+                )),
             );
             let ends = accounts::login_forecast(row, logins, state);
             put_time(&mut m, "renew_by", ends);
@@ -12569,6 +12961,8 @@ fn token_report(env: &Env, host: &dyn AccountsHost) -> super::accounts_token_vie
             logins: &logins,
             now,
             offers: host.on_macos(),
+            // The report's own rows: both say one thing of a row's login.
+            enrolled: &|roster| reported_enrolled(Cli::Claude, roster, env),
         },
         vault.as_ref(),
     );
@@ -12843,6 +13237,11 @@ fn write_accounts_report_snapshot(
     launch.other_macs = Some(&other_macs);
     let enrolled = reported_enrolled(cli, &roster, env);
     let read = (&state, &logins);
+    // The row whose sign-in runs on this Mac now, read once for every row's login word.
+    let signing_in = env
+        .accounts_store_for(cli)
+        .and_then(|store| store.signing_in());
+    let said = (&state, &logins, signing_in.as_deref());
     let origin = (cli == Cli::Claude && !own).then(|| {
         super::accounts_sync::fleet_origin(
             &env.accounts_store(),
@@ -12852,6 +13251,10 @@ fn write_accounts_report_snapshot(
         )
     });
     let (policy, rotation) = rotation_beside(cli, env, path);
+    // Where a default row's refusal is read: the store's default login.
+    let default_login = env
+        .accounts_store_for(cli)
+        .and_then(|store| store.default_login_home());
     // Each row's readings series, read once and cut as it is read to what the outlook's pace and
     // each window's `since` read, so no whole series is held. Claude Code's alone: its footer
     // writes the `plan` rows, and its files are named by label, which another CLI's roster may
@@ -12887,6 +13290,7 @@ fn write_accounts_report_snapshot(
                 env.now,
                 report_clock(REPORT_LOCAL_CLOCK.load(std::sync::atomic::Ordering::Relaxed)),
             ),
+            signing_in.as_deref(),
         )
     });
     let _ = if json {
@@ -12895,10 +13299,10 @@ fn write_accounts_report_snapshot(
             "{}",
             accounts_json(
                 (cli, launch),
-                (path, origin.as_ref()),
+                (path, origin.as_ref(), default_login.as_deref()),
                 &roster,
                 &raw_roster,
-                read,
+                said,
                 &enrolled,
                 (by, &policy, &rotation, outlook.as_ref(), &series),
                 env.now
@@ -12910,10 +13314,15 @@ fn write_accounts_report_snapshot(
         let mut text = accounts_text(
             (cli, launch),
             (&rotation, outlook.as_ref(), no_route.as_ref()),
-            (path, roster_present, env.home.as_deref()),
+            (
+                path,
+                roster_present,
+                env.home.as_deref(),
+                default_login.as_deref(),
+            ),
             &roster,
             &raw_roster,
-            read,
+            said,
             &enrolled,
             env.now,
         );
@@ -13512,8 +13921,10 @@ fn renewed_since(before: &accounts::Logins, current: &accounts::Logins, label: &
     success(current) != 0 && success(current) != success(before)
 }
 
-/// Whether a person runs this at a terminal of their own: no automatic call, no pipe on stdin, and
-/// no agent's marker in its environment.
+/// Whether a person runs this at a terminal of their own: no automatic call, no pipe on stdin,
+/// no agent's marker in its environment, and nothing that says another machine is behind it
+/// ([`for_another_machine`]): a tab another Mac's fleet drive started or typed into has a
+/// terminal, and what runs in it is that Mac's.
 pub(in crate::harness) fn person_at_terminal(host: &dyn AccountsHost) -> bool {
     !host.automatic_sign_in()
         && host.stdin_is_terminal()
@@ -13522,6 +13933,9 @@ pub(in crate::harness) fn person_at_terminal(host: &dyn AccountsHost) -> bool {
                 .map(|value| value.to_string_lossy().into_owned())
         })
         .is_none()
+        && !for_another_machine(&|name| host.machine_var(name), &|| {
+            host.driven_over_the_fleet()
+        })
 }
 
 /// Recheck a captured row and login generation after taking the machine's
@@ -14694,8 +15108,9 @@ fn renew_one(
     browser: &RenewBrowser,
     out: &mut dyn Write,
     err: &mut dyn Write,
+    observation: &mut Option<RenewalObservation>,
 ) -> Renewal {
-    renew_one_guarded(
+    renew_one_observed(
         env,
         host,
         store,
@@ -14706,7 +15121,88 @@ fn renew_one(
         out,
         err,
         &mut shared_renewal::Guard::Local,
+        observation,
     )
+}
+
+/// Records how a renewal a person or an agent ran by hand ended short of a login, as the
+/// upkeep's ladder records its own ([`accounts::note_hand_sign_in_attempt`]), in the ladder's
+/// own words for a run's end ([`super::sign_in_ladder::how_it_ended`]: the exit, what the
+/// opener met and the reason it gave, from `observation`), so the row's `sign-in:` line and
+/// one `sign-in` ledger row keep why it ended after the terminal's lines are gone. A page that stopped it records
+/// `blocked`, as the ladder does. It records a run that says why it ended: its provider exited
+/// with a failure of its own (1 to 127), or its opener wrote what it met. A run a signal ended
+/// (a person's Ctrl-C), one whose provider never started or exited 0 (what failed then has its
+/// own line and record), one put off, and one that signed in another account write nothing
+/// here. The records are read again under the writer: the run itself may have moved them.
+fn note_hand_renewal(
+    store: &accounts::Store,
+    roster_path: &Path,
+    label: &str,
+    (renewal, observation): (Renewal, Option<&RenewalObservation>),
+    now: i64,
+    err: &mut dyn Write,
+) {
+    let Some(observation) = observation else {
+        return;
+    };
+    let says_why = renewal == Renewal::BotCheck
+        || observation.met().is_some()
+        || matches!(observation.exit_code(), Some(1..=127));
+    if !says_why
+        || !matches!(
+            renewal,
+            Renewal::AuthFailed | Renewal::Failed | Renewal::BotCheck
+        )
+    {
+        return;
+    }
+    let outcome = if renewal == Renewal::BotCheck
+        || observation.met().is_some_and(super::open_url::Met::stopped)
+    {
+        accounts::AttemptOutcome::Blocked
+    } else {
+        accounts::AttemptOutcome::Failed
+    };
+    let routes = format!(
+        "by hand: {}",
+        super::sign_in_ladder::how_it_ended(renewal, observation.exit_code(), observation.met())
+    );
+    let recorded = store
+        .read_account_records(Some(roster_path), now)
+        .map_err(|why| match why {
+            accounts::RosterReadError::Roster(why) | accounts::RosterReadError::Records(why) => why,
+        })
+        .and_then(|records| {
+            let row = records
+                .roster
+                .row(label)
+                .ok_or_else(|| format!("`{label}` left the roster"))?;
+            store.transact_renewal_within(
+                &accounts::LOCK_LADDER,
+                now,
+                &mut None,
+                accounts::RenewalPolicy {
+                    roster_path,
+                    roster: &records.raw_roster,
+                    row,
+                    logins: &records.logins,
+                },
+                |_, logins| {
+                    accounts::admit_workflow(logins, label)?;
+                    Ok(accounts::note_hand_sign_in_attempt(
+                        logins, label, outcome, &routes, now,
+                    ))
+                },
+            )
+        });
+    if let Err(why) = recorded {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts renew: {label}: how this sign-in ended was not recorded: {}",
+            super::one_line(&why, 160)
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14829,6 +15325,20 @@ fn renew_one_observed(
     };
     let how = match browser {
         RenewBrowser::Default => "it opens in your default browser".to_string(),
+        RenewBrowser::Window { .. } => format!(
+            "it opens in a window of aterm's own and signs in there by itself within four \
+             minutes, with the login code from the account's mailbox (where the window can \
+             read none on this Mac, type the code in the window and press Verify email \
+             address). Claude's consent page may hold Authorize behind a human check \
+             (hCaptcha), and Cloudflare may show its own: aterm never operates either, so \
+             complete it in the window, and aterm presses Authorize once the page allows it{}",
+            row.browser.as_deref().map_or_else(String::new, |profile| {
+                format!(
+                    ". The row's browser profile '{}' is not used by this run",
+                    super::one_line(profile, 64)
+                )
+            })
+        ),
         RenewBrowser::Profile { profile, .. } | RenewBrowser::OwnProfile { profile, .. } => {
             format!(
                 "it opens in browser profile '{}'",
@@ -14866,10 +15376,7 @@ fn renew_one_observed(
         return Renewal::Deferred;
     }
     *observation = Some(RenewalObservation::from_outcome(&exited));
-    if exited
-        .as_ref()
-        .map_or_else(RenewalFailure::is_deferred, RenewalExit::is_deferred)
-    {
+    if exited.as_ref().is_err_and(RenewalFailure::is_deferred) {
         discard_staging(&staging, err);
         return Renewal::Deferred;
     }
@@ -14887,7 +15394,7 @@ fn renew_one_observed(
         && observation
             .as_ref()
             .and_then(RenewalObservation::met)
-            .is_some_and(|met| met.word == super::open_url::MetWord::BotCheck)
+            .is_some_and(super::open_url::Met::takes_a_person)
     {
         let recorded = store.transact_renewal_within(
             &accounts::LOCK_LADDER,
@@ -14900,14 +15407,14 @@ fn renew_one_observed(
                 }
                 guard.check(row)?;
                 accounts::admit_workflow(logins, label)?;
-                accounts::note_sign_in_task(logins, label, accounts::SignInAction::Login, now);
+                accounts::note_sign_in_task(logins, label, accounts::SignInAction::Renew, now);
                 Ok(Vec::new())
             },
         );
         if let Err(why) = recorded {
             say(
                 err,
-                &format!("the browser challenge could not be recorded: {why}"),
+                &format!("the step this sign-in needs could not be recorded: {why}"),
             );
             return Renewal::Deferred;
         }
@@ -14916,7 +15423,14 @@ fn renew_one_observed(
             .as_ref()
             .map_or_else(ToString::to_string, RenewalExit::failure_words);
         say(err, &format!("{why}; no login was bound"));
-        human_challenge_step(Cli::Claude, label, out);
+        // The step is the row's own renewal, run by a person at this Mac's terminal, who can
+        // complete the page's check in the sign-in window. `accounts login` refuses a row
+        // with an email.
+        let _ = writeln!(
+            out,
+            "{label}: this sign-in takes a person at this Mac; {}",
+            accounts::SignInAction::Renew.next_step(Cli::Claude, label)
+        );
         return Renewal::BotCheck;
     }
     let exited = match exited {
@@ -14927,7 +15441,7 @@ fn renew_one_observed(
                 err,
                 &format!(
                     "`claude` sign-in did not complete: {}",
-                    super::one_line(&why.to_string(), 160)
+                    super::one_line(&why.to_string(), 400)
                 ),
             );
             return Renewal::Failed;
@@ -15018,16 +15532,32 @@ fn renew_one_observed(
             return Renewal::Deferred;
         }
         discard_staging(&staging, err);
+        // A window whose session signed in another account is not the row's, whatever was
+        // recorded of it: its record goes, so its next consent page is authorized only where
+        // it names the row's account, and a page that names nobody ends with the session
+        // forgotten.
+        let in_window = matches!(browser, RenewBrowser::Window { .. });
+        #[cfg(target_os = "macos")]
+        if in_window && let Some(email) = row.email.as_deref() {
+            super::signin_window::disown_store(&store.dir, email);
+        }
         say(
             err,
             &format!(
                 "the browser signed in ANOTHER account than this row's, so nothing live changed{}; \
-                 sign in as the row's account (its own browser profile) and run `aterm harness \
-                 accounts renew {label}` again",
+                 {} and run `aterm harness accounts renew {label}` again",
                 if recorded.is_ok() {
                     ""
                 } else {
                     " (and the attempt was not recorded)"
+                },
+                if in_window {
+                    "aterm's sign-in window no longer takes its session for this row's (the next \
+                     sign-in authorizes only a page that names the row's account)"
+                } else if row.browser.is_some() {
+                    "sign in as the row's account in the row's browser profile"
+                } else {
+                    "sign in as the row's account in your browser"
                 }
             ),
         );
@@ -15441,6 +15971,18 @@ fn run_accounts_renew(
             em,
         )
     };
+    // The one answer both this choice and the window's own desk give: whether the window
+    // reads the row's login code by itself, on this Mac, with no browser.
+    let window_reads_mailbox = |label: &str| {
+        let em = roster.row(label).and_then(|r| r.email.as_deref());
+        super::accounts_sync::window_reads_mailbox_for_row_with(
+            &machine_var,
+            env.home.as_deref(),
+            &store,
+            Some(label),
+            em,
+        )
+    };
     let row_can_run_headless = |label: &str, logins: &accounts::Logins| {
         file_roster.row(label).is_some_and(|raw| {
             claude_row_can_run_headless(
@@ -15661,20 +16203,43 @@ fn run_accounts_renew(
                         profile: profile.to_string(),
                     }),
             };
-        // A person is here for a row whose page stopped its automatic sign-in: a headless run
-        // would only meet that page again, so the sign-in is theirs, in the row's own browser
-        // profile, or with none named their default browser, where no opener of aterm's runs. An
-        // agent's terminal is nobody here.
+        // On macOS a sign-in this Mac starts for its own row opens in aterm's own window at
+        // once and finishes there by itself: a person's, an agent's terminal's, the upkeep's.
+        // With nobody at the terminal it needs a mailbox the window reads by itself, on this
+        // Mac, for its code (a webmail-only mailbox and the fleet's relay are none: such a
+        // row keeps its headless route); a person may type the code in the window. No
+        // headless run comes first, which would only meet Cloudflare's check. Another Mac's
+        // request, a tab another Mac's drive started or typed into, and an SSH session open
+        // no window.
+        //
+        // Elsewhere a person is here for a row whose page stopped its automatic sign-in: it is
+        // theirs, in the row's own browser profile, or with none named their default browser,
+        // where no opener of aterm's runs. An agent's terminal is nobody here.
         let person = person_at_terminal(host);
-        let stopped = !host.under_ssh()
+        // Where the opener cannot be made, no window can open, and the row is signed in as
+        // it is anywhere else.
+        let window_opener = (host.opens_sign_in_window()
+            && (person || window_reads_mailbox(label)))
+        .then(|| {
+            opener
+                .get_or_insert_with(|| opener_link(&store, host))
+                .clone()
+                .ok()
+        })
+        .flatten();
+        let window = window_opener.is_some();
+        let stopped = !window
+            && !host.under_ssh()
             && person
             && file_roster
                 .row(label)
                 .is_some_and(|raw| accounts::current_sign_in_blocked(raw, &attempt_logins));
         let headless = row_can_run_headless(label, &attempt_logins);
         let used_headless_profile_only =
-            !stopped && !host.under_ssh() && !row_has_mailbox(label) && headless;
-        let browser = if stopped {
+            !window && !stopped && !host.under_ssh() && !row_has_mailbox(label) && headless;
+        let browser = if let Some(opener) = window_opener {
+            Ok(RenewBrowser::Window { opener })
+        } else if stopped {
             interactive_browser(&mut opener).map(|browser| match browser {
                 RenewBrowser::Profile { opener, profile } => {
                     RenewBrowser::OwnProfile { opener, profile }
@@ -15697,8 +16262,19 @@ fn run_accounts_renew(
         } else {
             let _ = writeln!(
                 err,
-                "aterm harness accounts renew: {label}: not run: this row's sign-in opens a \
-                 browser, which takes a person at this Mac's terminal"
+                "aterm harness accounts renew: {label}: not run: {}",
+                if for_another_machine(&machine_var, &|| host.driven_over_the_fleet()) {
+                    "another Mac's drive started or typed into this session, and a sign-in \
+                     for another machine opens nothing on this Mac's desk; run it in a tab of \
+                     your own on this Mac"
+                } else if host.opens_sign_in_window() {
+                    "nobody is at this terminal to type the login code, and aterm's sign-in \
+                     window can read no mailbox for this row on this Mac; run it yourself in \
+                     a terminal on this Mac and type the code in the window"
+                } else {
+                    "this row's sign-in opens a browser, which takes a person at this Mac's \
+                     terminal"
+                }
             );
             ok = false;
             continue;
@@ -15730,6 +16306,7 @@ fn run_accounts_renew(
             ok = false;
             continue;
         };
+        let mut observation = None;
         let mut renewal = renew_one(
             env,
             host,
@@ -15740,6 +16317,7 @@ fn run_accounts_renew(
             &browser,
             out,
             err,
+            &mut observation,
         );
         if renewal.can_retry_authentication() && used_headless_profile_only && person {
             let fallback = match interactive_browser(&mut opener) {
@@ -15748,6 +16326,14 @@ fn run_accounts_renew(
                     let _ = writeln!(
                         err,
                         "aterm harness accounts renew: {label}: {error}; fallback was not run"
+                    );
+                    note_hand_renewal(
+                        &store,
+                        &path,
+                        label,
+                        (renewal, observation.as_ref()),
+                        host.now().max(now),
+                        err,
                     );
                     ok = false;
                     continue;
@@ -15763,9 +16349,37 @@ fn run_accounts_renew(
                 &fallback,
                 out,
                 err,
+                &mut observation,
             );
         }
+        note_hand_renewal(
+            &store,
+            &path,
+            label,
+            (renewal, observation.as_ref()),
+            host.now().max(now),
+            err,
+        );
         ok &= renewal == Renewal::Renewed;
+        // The row's sign-in lock is released before its token is made (design §4.6).
+        drop(signin);
+        if renewal == Renewal::Renewed {
+            // A row signed in here gets its year-long token before the next row signs in.
+            // Claude Code's success names no account, so only a browser session that is this
+            // row's makes this row's token: the account's own store where the sign-in ran in
+            // aterm's window, which then makes the token by itself. Any other sign-in (a
+            // headless one, one in a person's browser where no window could open) left no
+            // session aterm knows to be the row's, and its row is offered the step instead.
+            // What the token verb refuses, it says, and the renewal stands either way. The
+            // token verb is Unix's (macOS's, by its own refusal), so no other system has
+            // this step.
+            #[cfg(unix)]
+            if browser.finishes_by_itself() {
+                let _ = super::accounts_tokens::after_sign_in(env, host, label, out, err);
+            } else {
+                super::accounts_tokens::offer_after_sign_in(env, host, label, out);
+            }
+        }
     }
     for machine in &machines {
         let _ = writeln!(out, "renewing on {machine}:");
@@ -18003,7 +18617,8 @@ fn renew_one_for_operation(
                             cli.id()
                         );
                     }
-                    None => {}
+                    // A driven sign-in's step is never the Claude renewal's ([`person_step`]).
+                    Some(accounts::SignInAction::Renew) | None => {}
                 }
                 // A bot check keeps its own outcome and backoff. Its human task is a quiet
                 // account record, not a prompt repeated into working agent sessions.
@@ -19622,8 +20237,12 @@ pub struct PlaceSeen {
     /// (no file, or a login no file names) or the route that answers for it (`gateway`).
     pub gap: Option<&'static str>,
     /// Whether the login works, as its account's record last learned
-    /// ([`super::observed_account::Record::auth`]); `None` for a place no such record covers.
+    /// ([`super::observed_account::Record::auth`]; a Codex row signed out here,
+    /// [`accounts::signed_out_here`]); `None` for a place no such record covers.
     pub auth: Option<&'static str>,
+    /// Why a Codex row's login is signed out, where the refusal is on record
+    /// ([`signed_out_reason`]).
+    pub signed_out_reason: Option<RefusalReason>,
     /// The account's week in the footer's words, where its record holds a figure still shown.
     pub week: Option<String>,
 }
@@ -19692,6 +20311,7 @@ pub fn places_seen_on(
                 src: place.src.word(),
                 gap: None,
                 auth: None,
+                signed_out_reason: None,
                 week: None,
             }
         })
@@ -19770,6 +20390,7 @@ fn place_of(
         src: seen.seen().map_or(src, |seen| seen.src).word(),
         gap,
         auth: None,
+        signed_out_reason: None,
         week: None,
     }
 }
@@ -19778,6 +20399,7 @@ fn place_of(
 /// and its default home, each as its own observer reads it now ([`super::observe::pooled`]) for
 /// a process started on that place with nothing else set. The default home is a place whether
 /// or not a row names it, and is left out only where no row does and nothing is read there.
+/// A Codex row signed out here says so, and why where that is on record ([`signed_out_reason`]).
 /// Claude Code's places are [`places_seen`]'s.
 #[must_use]
 pub fn pool_places_seen(
@@ -19790,7 +20412,7 @@ pub fn pool_places_seen(
     super::observe::sweep::pool_places(cli, roster, user_home)
         .iter()
         .map(|place| {
-            place_of(
+            let mut seen = place_of(
                 cli.id(),
                 &place.seen,
                 place.row,
@@ -19798,7 +20420,23 @@ pub fn pool_places_seen(
                 &place.fallback,
                 place.src,
                 (user_home, now),
-            )
+            );
+            if cli == Cli::Codex
+                && let Some(row) = place
+                    .row
+                    .filter(|row| accounts::signed_out_here(row, state))
+            {
+                seen.auth = Some(accounts::Auth::SignedOut.as_str());
+                // The place's own directory: a default row's is its default home.
+                seen.signed_out_reason = signed_out_reason(
+                    cli,
+                    row,
+                    accounts::Condition::SignedOut,
+                    Some(&place.fallback),
+                    now,
+                );
+            }
+            seen
         })
         .collect()
 }
@@ -19906,6 +20544,7 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
                         "source": row.src,
                         "gap": row.gap,
                         "auth": row.auth,
+                        "signed_out_reason": row.signed_out_reason.map(RefusalReason::code),
                         "week": row.week,
                     })
                 })
@@ -19914,12 +20553,27 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
         let _ = writeln!(out, "{value}");
         return ExitCode::SUCCESS;
     }
+    // AUTH is as wide as its longest word, a Codex row's reason included
+    // (`signed-out (token expired)`), so WEEK starts in one column on every line.
+    let auth: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            row.auth.map_or_else(
+                || "—".to_owned(),
+                |auth| with_reason(auth, row.signed_out_reason),
+            )
+        })
+        .collect();
+    let auth_width = auth
+        .iter()
+        .map(|word| word.chars().count())
+        .fold(11, usize::max);
     let _ = writeln!(
         out,
-        "{:<7} {:<26} {:<34} {:<12} {:<12} {:<10} {:<10} {:<11} WEEK",
+        "{:<7} {:<26} {:<34} {:<12} {:<12} {:<10} {:<10} {:<auth_width$} WEEK",
         "CLI", "PLACE", "OBSERVED", "BELIEVED", "TABS", "SEEN", "SOURCE", "AUTH"
     );
-    for row in &rows {
+    for (row, auth) in rows.iter().zip(&auth) {
         let believed = match (&row.believed, row.agrees) {
             (Some(label), Some(true)) => format!("{label} ✓"),
             (Some(label), Some(false)) => format!("{label} ✗"),
@@ -19938,7 +20592,7 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
         };
         let _ = writeln!(
             out,
-            "{:<7} {:<26} {:<34} {:<12} {:<12} {:<10} {:<10} {:<11} {}",
+            "{:<7} {:<26} {:<34} {:<12} {:<12} {:<10} {:<10} {:<auth_width$} {}",
             row.cli,
             row.place,
             row.observed
@@ -19948,7 +20602,7 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
             tabs,
             seen,
             row.src,
-            row.auth.unwrap_or("—"),
+            auth,
             row.week.as_deref().unwrap_or("—"),
         );
     }

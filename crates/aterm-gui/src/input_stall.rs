@@ -1140,8 +1140,9 @@ pub(crate) fn episode_key(fact: &InputStallFact) -> u64 {
     h.finish()
 }
 
-/// Format the stall summary row for the session status menu.
-pub(crate) fn menu_row(
+/// Format the stall's row: the server's attention words for it and its episode key, as the
+/// session's need carries them (`needs::StallFact`).
+pub(crate) fn stall_row(
     fact: &InputStallFact,
     program: Option<&str>,
     after: &AfterRestart,

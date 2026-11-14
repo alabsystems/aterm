@@ -536,6 +536,8 @@ pub struct RowOutlook {
     /// Its week as this Mac read it over the last [`READ_SPAN_S`], oldest first: the last
     /// reading of each hour of each window, at most [`READ_MAX`] ([`Read`]).
     pub read: Vec<Read>,
+    /// A sign-in of it runs on this Mac now ([`Inputs::signing_in`]).
+    pub signing_in: bool,
 }
 
 impl RowOutlook {
@@ -545,9 +547,25 @@ impl RowOutlook {
         self.windows.iter().find(|x| x.window == w)
     }
 
-    /// Its week's figure as the glass says it ([`Figure::of_week`]).
+    /// What the glass says in its figure's place: a row with no login to run on here
+    /// ([`accounts::login_here`], which [`Self::condition`] holds as not enrolled or signed out)
+    /// is [`Figure::SignedOut`], or [`Figure::SigningIn`] while a sign-in of it runs, whatever
+    /// was last read of its week; any other row is its week's figure ([`Self::week_figure`]). So
+    /// `?` is said only of a signed-in row whose week has not been read.
     #[must_use]
     pub fn figure(&self, as_of: i64) -> Figure {
+        match self.condition {
+            Condition::NotEnrolled | Condition::SignedOut if self.signing_in => Figure::SigningIn,
+            Condition::NotEnrolled | Condition::SignedOut => Figure::SignedOut,
+            _ => self.week_figure(as_of),
+        }
+    }
+
+    /// Its week's reading as the glass says it ([`Figure::of_week`]), whatever its login: the
+    /// figure of this tab's own account, whose session is the evidence that it runs, and what
+    /// the chart and the lanes draw.
+    #[must_use]
+    pub fn week_figure(&self, as_of: i64) -> Figure {
         self.window(Window::Week)
             .map_or(Figure::Unread, |week| Figure::of_week(week, as_of))
     }
@@ -568,9 +586,17 @@ pub struct Read {
     pub epoch: Option<i64>,
 }
 
+/// What the glass says of an account with no login to run on here ([`Figure::SignedOut`]).
+pub const SIGNED_OUT: &str = "signed out";
+/// [`SIGNED_OUT`] at a row's narrowest form ([`Figure::narrow_words`]).
+pub const NO_LOGIN: &str = "no login";
+/// What the glass says of an account whose sign-in runs on this Mac now ([`Figure::SigningIn`]).
+pub const SIGNING_IN: &str = "signing in";
+
 /// A week figure as the glass says it (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1):
 /// held as the use that was read, said as what is left ([`super::left`]), never an inferred
-/// `0% left`.
+/// `0% left`. An account with no login here has no week to say: its login is said in the
+/// figure's place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Figure {
     /// Read within the last 15 minutes, its reset ahead: `37% left` of 63.0% used.
@@ -584,6 +610,12 @@ pub enum Figure {
     Out,
     /// Unread, or read before a reset that has passed: `?`.
     Unread,
+    /// The account has no login to run on here, none made or one signed out
+    /// ([`RowOutlook::figure`]): `signed out`, in the figure's place. A fact of the row, in the
+    /// quiet ink; it raises nothing.
+    SignedOut,
+    /// A sign-in of the account runs on this Mac now: `signing in`.
+    SigningIn,
 }
 
 impl Figure {
@@ -634,13 +666,21 @@ impl Figure {
     pub const fn used_x10(self) -> Option<u16> {
         match self {
             Figure::Exact(x10) | Figure::AtLeast(x10) => Some(x10),
-            Figure::Out | Figure::Unread => None,
+            Figure::Out | Figure::Unread | Figure::SignedOut | Figure::SigningIn => None,
         }
     }
 
+    /// Whether it says the account's login, not its week: [`Figure::SignedOut`] or
+    /// [`Figure::SigningIn`], which the glass lays in its quiet ink.
+    #[must_use]
+    pub const fn of_login(self) -> bool {
+        matches!(self, Figure::SignedOut | Figure::SigningIn)
+    }
+
     /// Its words, the one form every surface a person reads says ([`super::left`]): `37% left`,
-    /// `≤30% left`, `out`, `?`. A percentage always carries the word `left`, `0% left` is said
-    /// only of a reading of 100, and a bound never says less is left than may be.
+    /// `≤30% left`, `out`, `?`, `signed out`, `signing in`. A percentage always carries the word
+    /// `left`, `0% left` is said only of a reading of 100, and a bound never says less is left
+    /// than may be.
     #[must_use]
     pub fn words(self) -> String {
         match self {
@@ -651,6 +691,19 @@ impl Figure {
             Figure::AtLeast(x10) => super::left::bound_words(u32::from(x10)),
             Figure::Out => "out".into(),
             Figure::Unread => "?".into(),
+            Figure::SignedOut => SIGNED_OUT.into(),
+            Figure::SigningIn => SIGNING_IN.into(),
+        }
+    }
+
+    /// [`Self::words`] where a row is laid at its narrowest (its name's local part): a row
+    /// with no login says [`NO_LOGIN`], two cells shorter and never `out`, which is a wall's
+    /// word. Every other figure says its words.
+    #[must_use]
+    pub fn narrow_words(self) -> String {
+        match self {
+            Figure::SignedOut => NO_LOGIN.into(),
+            figure => figure.words(),
         }
     }
 
@@ -669,6 +722,8 @@ impl Figure {
             }
             Figure::Out => "out until its reset".into(),
             Figure::Unread => "not read".into(),
+            Figure::SignedOut => "signed out on this Mac".into(),
+            Figure::SigningIn => "signing in on this Mac".into(),
         }
     }
 
@@ -1047,6 +1102,9 @@ pub struct Inputs<'a> {
     /// The local clock's offset from UTC at an instant: its words say each instant on its own
     /// offset ([`Offsets::around`]).
     pub offset: fn(i64) -> i64,
+    /// The label of the row whose sign-in runs on this Mac now
+    /// ([`accounts::Store::signing_in`]), read by the caller: the outlook reads no file.
+    pub signing_in: Option<&'a str>,
 }
 
 /// How far either side of now an outlook says instants on their own offsets: the week ahead and
@@ -2686,6 +2744,7 @@ pub fn for_report(
     (roster, state, logins, enrolled): (&Roster, &State, &accounts::Logins, &BTreeSet<String>),
     (mode, credits): (Mode, bool),
     (now, offset): (i64, fn(i64) -> i64),
+    signing_in: Option<&str>,
 ) -> Outlook {
     let series = series_view(series, now);
     let renewals = renewals_of(roster, logins);
@@ -2699,6 +2758,7 @@ pub fn for_report(
         credits,
         now,
         offset,
+        signing_in,
     })
 }
 
@@ -2846,6 +2906,7 @@ fn build(
                 .get(&row.label)
                 .map(|rows| reads_of(rows, now))
                 .unwrap_or_default(),
+            signing_in: inputs.signing_in == Some(row.label.as_str()),
         });
         // The carrier is followed from its reading whatever its order here (the replay holds the
         // work on it, as R7 follows a row once taken); every other row read before now is a

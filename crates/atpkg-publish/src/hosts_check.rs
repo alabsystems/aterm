@@ -254,35 +254,45 @@ fn trust_origin(ctx: &Ctx) -> HostCheck {
 
 /// The router agh.toml under `dirs` builds, or the failing `config` detail.
 fn config(dirs: &Dirs) -> std::result::Result<agh::Github, String> {
-    AghHost::configured_client(dirs, false)
+    AghHost::configured_client(dirs, false).map_err(|refusal| refusal.why().to_string())
 }
 
-/// Whether `owner`'s writer is present: `Ok(profile)` names it, `Err` says why not.
-fn writer(client: &agh::Github, owner: &str) -> std::result::Result<String, String> {
+/// Whether `owner`'s writer is present: `Ok(profile)` names it, `Err` says why not. `slot` is
+/// the vault token that writes `owner` (dev for the staging owner, release for the public one):
+/// its step is the one a missing writer takes.
+fn writer(
+    client: &agh::Github,
+    owner: &str,
+    slot: agh::identity::vault::Slot,
+) -> std::result::Result<String, String> {
     let router = client.router();
     let Some(name) = router.writer_of(owner) else {
         return Err(format!(
-            "no profile writes {owner}: agh auth add NAME --file PATH --tier TIER --owner \
-             {owner} --write ({RUNBOOK})"
+            "no profile writes {owner}: {} ({RUNBOOK})",
+            slot.sync_step()
         ));
     };
     // A lane unit carries no token variable, and agh's git runner refuses a credentialed run
     // whose profile keeps its token anywhere but a token file, so only a file serves a lane.
-    if let Some(profile) = router.profile(name)
+    let profile = router.profile(name);
+    if let Some(profile) = profile
         && !matches!(profile.source, agh::identity::Source::File(_))
     {
         return Err(format!(
             "{name} writes {owner}, and its token is not in a token file: a lane unit carries \
-             no token variable and git's credential helper reads only token files; agh auth \
-             add NAME --file PATH --tier TIER --owner {owner} --write ({RUNBOOK})"
+             no token variable and git's credential helper reads only token files; {} \
+             ({RUNBOOK})",
+            slot.sync_step()
         ));
     }
-    let presence = client.presence(name);
-    match presence {
+    match client.presence(name) {
         agh::policy::Presence::Present => Ok(name.to_string()),
         other => Err(format!(
-            "{name} writes {owner}, and its token is {}",
-            other.slug()
+            "{name} writes {owner}, and its token is {}: {}",
+            other.slug(),
+            profile
+                .and_then(agh::identity::vault::absent_step)
+                .unwrap_or_else(|| slot.sync_step())
         )),
     }
 }
@@ -338,7 +348,7 @@ fn check_scoped(
     )];
     let (staging, public) = (ctx.accounts.staging.as_str(), ctx.accounts.public.as_str());
     let mut present: Vec<String> = Vec::new();
-    let mut judge = |name: &'static str, owner: &str| match writer(&client, owner) {
+    let mut judge = |name: &'static str, owner: &str, slot| match writer(&client, owner, slot) {
         Ok(profile) => {
             let detail = format!("{profile} writes {owner}");
             if !present.contains(&profile) {
@@ -348,10 +358,14 @@ fn check_scoped(
         }
         Err(why) => HostCheck::new(name, false, why),
     };
-    checks.push(judge("staging_writer", staging));
+    checks.push(judge(
+        "staging_writer",
+        staging,
+        agh::identity::vault::Slot::Dev,
+    ));
     let public_written = choice == HostChoice::Agh && !keyless;
     checks.push(if public_written {
-        judge("public_writer", public)
+        judge("public_writer", public, agh::identity::vault::Slot::Release)
     } else if keyless {
         HostCheck::new("public_writer", true, "not needed by a keyless lane")
     } else {

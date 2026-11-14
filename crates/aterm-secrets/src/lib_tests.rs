@@ -33,7 +33,7 @@ fn the_compiled_alab_genesis_is_a_digest_when_there_is_one() {
 }
 
 /// A12's predicate: each fact alone marks an identity, the first that holds names it, and
-/// only a release build on a Mac's own hardware makes an unmarked one.
+/// only a release build on a Mac's own hardware, in its login's own home, makes an unmarked one.
 #[test]
 fn each_lab_fact_marks_an_identity_and_a_release_build_on_hardware_none() {
     use super::{LabMark, Making, lab_identity};
@@ -50,11 +50,13 @@ fn each_lab_fact_marks_an_identity_and_a_release_build_on_hardware_none() {
         one(|m| m.virtual_machine = true),
         Some(LabMark::VirtualMachine)
     );
+    assert_eq!(one(|m| m.foreign_home = true), Some(LabMark::ForeignHome));
     let all = Making {
         test_binary: true,
         debug_build: true,
         lab_lane: true,
         virtual_machine: true,
+        foreign_home: true,
     };
     assert_eq!(lab_identity(all), Some(LabMark::TestBinary));
     for mark in [
@@ -62,6 +64,7 @@ fn each_lab_fact_marks_an_identity_and_a_release_build_on_hardware_none() {
         LabMark::DebugBuild,
         LabMark::LabLane,
         LabMark::VirtualMachine,
+        LabMark::ForeignHome,
     ] {
         assert_eq!(LabMark::of_word(mark.word()), mark);
     }

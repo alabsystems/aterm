@@ -94,15 +94,7 @@ fn masked(ty: &Ty, value: &Value, show: bool) -> Value {
     }
 }
 
-/// What every surface shows in place of a string shaped like a credential, naming a secret or
-/// holding a phone number, which another writer's build stored though this one refuses it.
-pub const REFUSED: &str = "(refused value: not shown)";
-
-/// Whether a stored string is never shown, whatever the reader asks: shaped like a credential,
-/// naming a secret, or holding a phone number.
-fn refused(text: &str) -> bool {
-    guard::withheld(text) || guard::phone_shaped(text)
-}
+pub use guard::REFUSED;
 
 /// A value of no known type: every string shaped like a secret or a phone number replaced with
 /// [`REFUSED`], and every string holding `@` masked unless `show`.
@@ -111,7 +103,7 @@ pub fn raw_masked(value: &Value, show: bool) -> Value {
         Value::String(text) if super::secret::is_sealed(text) => {
             Value::String(super::secret::MASK.to_owned())
         }
-        Value::String(text) if refused(text) => Value::String(REFUSED.to_owned()),
+        Value::String(text) if guard::never_shown(text) => Value::String(REFUSED.to_owned()),
         Value::String(text) if !show && text.contains('@') => Value::String(mask(text)),
         Value::Array(items) => Value::Array(items.iter().map(|v| raw_masked(v, show)).collect()),
         Value::Object(object) => Value::Object(
@@ -201,14 +193,15 @@ pub fn show_field(column: &Column, field: Option<&Field>, reveal: bool) -> Strin
                 Ty::Set(inner) => Some(inner),
                 _ => None,
             };
-            set.members()
-                .into_iter()
-                .map(|elem| match inner {
-                    Some(inner) => show(inner, &Value::String(elem.to_owned()), reveal),
-                    None => show_raw_text(elem, reveal),
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
+            show_members(
+                cell::members(column, Some(set))
+                    .into_iter()
+                    .map(|elem| match inner {
+                        Some(inner) => show(inner, &Value::String(elem.to_owned()), reveal),
+                        None => show_raw_text(elem, reveal),
+                    })
+                    .collect(),
+            )
         }
     }
 }
@@ -216,7 +209,7 @@ pub fn show_field(column: &Column, field: Option<&Field>, reveal: bool) -> Strin
 fn show_raw_text(text: &str, reveal: bool) -> String {
     if super::secret::is_sealed(text) {
         super::secret::MASK.to_owned()
-    } else if refused(text) {
+    } else if guard::never_shown(text) {
         REFUSED.to_owned()
     } else if !reveal && text.contains('@') {
         mask(text)
@@ -225,16 +218,55 @@ fn show_raw_text(text: &str, reveal: bool) -> String {
     }
 }
 
+/// A set's shown members: comma-separated, or a JSON list where a member holds a comma, reads
+/// as a list or starts as a conflict does, so the shown set reads back as these members and a
+/// set's text starts with the conflict marker only when it is a conflict.
+fn show_members(parts: Vec<String>) -> String {
+    if parts
+        .iter()
+        .any(|p| p.contains(',') || p.starts_with('[') || p.starts_with(CONFLICT))
+    {
+        compact(&Value::Array(
+            parts.into_iter().map(Value::String).collect(),
+        ))
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// A cell of a column this reader cannot interpret: each candidate's raw value as JSON, masked.
-fn show_raw(cell: Option<&crate::database::Cell>, field: Option<&Field>, reveal: bool) -> String {
+fn show_raw(
+    column: Option<&Column>,
+    cell: Option<&crate::database::Cell>,
+    field: Option<&Field>,
+    reveal: bool,
+) -> String {
     let Some(cell) = cell else {
         return match field {
-            Some(set @ Field::Set(_)) => set
-                .members()
+            Some(set @ Field::Set(elements)) => show_members(
+                match column {
+                    Some(column) => cell::members(column, Some(set)),
+                    // A column this build does not know: an element added with `true` is its
+                    // key, one holding a text its key digests (a text set's) that text.
+                    None => elements
+                        .iter()
+                        .filter_map(|(elem, field)| {
+                            if field.present() {
+                                return Some(elem.as_str());
+                            }
+                            field.candidates().iter().find_map(|c| match &c.value.x {
+                                Value::String(text) if super::keys::text_elem(text) == *elem => {
+                                    Some(text.as_str())
+                                }
+                                _ => None,
+                            })
+                        })
+                        .collect(),
+                }
                 .into_iter()
                 .map(|elem| show_raw_text(elem, reveal))
-                .collect::<Vec<_>>()
-                .join(", "),
+                .collect(),
+            ),
             _ => String::new(),
         };
     };
@@ -320,12 +352,25 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
 }
 
 /// The members a set cell's text names.
-fn read_set(text: &str) -> BTreeSet<String> {
-    text.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect()
+/// A set cell's members: comma-separated, or a JSON list of texts (how a set whose member holds
+/// a comma shows), each in its normal form. `None` for a JSON list that is not one of texts.
+fn read_set(text: &str) -> Option<BTreeSet<String>> {
+    if text.trim_start().starts_with('[') {
+        let Ok(Value::Array(items)) = aterm_json::from_str::<Value>(text.trim()) else {
+            return None;
+        };
+        return items
+            .iter()
+            .map(|item| item.as_str().map(super::keys::normal_text))
+            .filter(|part| part.as_ref().is_none_or(|p| !p.is_empty()))
+            .collect();
+    }
+    Some(
+        text.split(',')
+            .map(super::keys::normal_text)
+            .filter(|part| !part.is_empty())
+            .collect(),
+    )
 }
 
 /// What one grid column shows.
@@ -530,21 +575,15 @@ impl Where {
         })?;
         if let Ty::Set(inner) = column.ty {
             if self.text.trim().is_empty() {
-                return Ok(row.fields.get(column.name).is_none_or(|set| match set {
-                    Field::Set(elements) => !elements.values().any(Field::present),
-                    _ => true,
-                }));
+                return Ok(cell::members(column, row.fields.get(column.name)).is_empty());
             }
-            let wanted = read(inner, &self.text).map_err(|rule| {
+            let wanted = read(inner, &super::keys::normal_text(&self.text)).map_err(|rule| {
                 Error::new(&format!("{}.{}: {rule}", collection.name, column.name))
             })?;
-            let Some(elem) = wanted.as_str() else {
+            let Some(member) = wanted.as_str() else {
                 return Ok(false);
             };
-            return Ok(row
-                .fields
-                .get(column.name)
-                .is_some_and(|set| set.has_member(elem)));
+            return Ok(cell::members(column, row.fields.get(column.name)).contains(member));
         }
         let wanted = read(&column.ty, &self.text)
             .map_err(|rule| Error::new(&format!("{}.{}: {rule}", collection.name, column.name)))?;
@@ -711,14 +750,24 @@ pub fn export_projected(
                     raw_lookup.1.push_str(pk);
                     raw_lookup.1.push('.');
                     raw_lookup.1.push_str(&column.name);
-                    show_raw(cells.get(&raw_lookup), row.fields.get(&column.name), reveal)
+                    show_raw(
+                        None,
+                        cells.get(&raw_lookup),
+                        row.fields.get(&column.name),
+                        reveal,
+                    )
                 }
-                Source::Schema(_) if raw => {
+                Source::Schema(schema) if raw => {
                     raw_lookup.1.clear();
                     raw_lookup.1.push_str(pk);
                     raw_lookup.1.push('.');
                     raw_lookup.1.push_str(&column.name);
-                    show_raw(cells.get(&raw_lookup), row.fields.get(&column.name), reveal)
+                    show_raw(
+                        Some(schema),
+                        cells.get(&raw_lookup),
+                        row.fields.get(&column.name),
+                        reveal,
+                    )
                 }
                 Source::Schema(schema) => match row.claims.get(&column.name) {
                     Some(Some(value)) => show(&schema.ty, value, reveal),
@@ -936,28 +985,50 @@ impl<'a> Reader<'a> {
                 self.problem(record, at, "keep one set: delete the ⚠ and the other value");
                 return;
             }
-            // A reopened stale set shows `⚠ mine ‖ theirs`: the set as it is now is theirs.
+            // A reopened stale set shows `⚠ mine ‖ theirs`: the set as it is now is theirs. A
+            // set shown as it is never starts with `⚠ ` ([`show_members`]).
             let before: BTreeSet<String> = seen
-                .map(|s| {
-                    read_set(match s.shown.strip_prefix(CONFLICT) {
-                        Some(both) => both.rsplit(BETWEEN).next().unwrap_or_default(),
-                        None => &s.shown,
-                    })
+                .and_then(|s| {
+                    read_set(
+                        match s
+                            .shown
+                            .strip_prefix(CONFLICT)
+                            .and_then(|both| both.rsplit_once(BETWEEN))
+                        {
+                            Some((_, theirs)) => theirs,
+                            None => &s.shown,
+                        },
+                    )
                 })
                 .unwrap_or_default();
-            let after = read_set(text);
-            for (elem, present) in after
+            let Some(after) = read_set(text) else {
+                self.problem(record, at, "a set is its members, or a JSON list of texts");
+                return;
+            };
+            for (member, present) in after
                 .difference(&before)
                 .map(|e| (e, true))
                 .chain(before.difference(&after).map(|e| (e, false)))
             {
-                let value = CellValue::owner(collection.version, Value::Bool(present));
+                let (elem, added) = match cell::element(column, member) {
+                    Ok(element) => element,
+                    Err(rule) => {
+                        self.problem(
+                            record,
+                            at,
+                            format!("{}.{}: {rule}", collection.name, column.name),
+                        );
+                        continue;
+                    }
+                };
+                let x = if present { added } else { Value::Bool(false) };
+                let value = CellValue::owner(collection.version, x.clone());
                 let change = cell::change(
                     collection,
                     CellKey {
                         pk,
                         col: column.name,
-                        elem: Some(elem),
+                        elem: Some(&elem),
                     },
                     &value,
                 );
@@ -965,14 +1036,14 @@ impl<'a> Reader<'a> {
                     Ok(change) => out.push(Edit {
                         pk: pk.to_owned(),
                         column: column.name.to_owned(),
-                        elem: Some(elem.clone()),
-                        key: change.key,
-                        x: Value::Bool(present),
-                        value: change.value.unwrap_or_default(),
                         expected: seen
-                            .and_then(|s| s.elements.get(elem))
+                            .and_then(|s| s.elements.get(&elem))
                             .cloned()
                             .unwrap_or_default(),
+                        elem: Some(elem),
+                        key: change.key,
+                        x,
+                        value: change.value.unwrap_or_default(),
                         mine: text.to_owned(),
                         at,
                         record,
@@ -1327,6 +1398,37 @@ pub fn plan(
     }
 }
 
+/// The edits one cell asks for when its text becomes `text`, read against what an export showed
+/// there (`seen`; `None` for a cell the export did not hold): what [`plan`] makes of one changed
+/// cell, for a writer that changes one cell without a saved file (`aterm file set`). A set
+/// column's edits are its added and removed elements; a cell whose text is its column's value
+/// already still asks for its write, so the caller compares first.
+///
+/// # Errors
+/// The rule the text breaks, naming the collection and column, never the value.
+pub fn cell_edits(
+    collection: &'static Collection,
+    pk: &str,
+    column: &'static Column,
+    text: &str,
+    seen: Option<&Seen>,
+) -> std::result::Result<Vec<Edit>, String> {
+    let whole = || "the cell is larger than the grid reads".to_owned();
+    let sheet = Sheet::scan("", Delimiter::Tab).map_err(|_| whole())?;
+    let mut reader = Reader {
+        collection,
+        text: "",
+        sheet: &sheet,
+        problems: Vec::new(),
+    };
+    let mut edits = Vec::new();
+    reader.edits(0, 0, pk, column, text, seen, &mut edits);
+    match reader.problems.into_iter().next() {
+        Some(problem) => Err(problem.rule),
+        None => Ok(edits),
+    }
+}
+
 /// A changed cell whose register moved since the export: never overwritten.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Stale {
@@ -1453,7 +1555,7 @@ pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
                 .unwrap_or_default();
             now.sort_unstable();
             let stopped = cell.is_some_and(|c| c.stopped);
-            if !taken && !stopped && now == edit.expected {
+            if !taken && !stopped && aterm_db_core::file_merge::settle(&now, &edit.expected) {
                 changes.push(Change {
                     collection: lookup.0.clone(),
                     key: edit.key.clone(),
@@ -1464,6 +1566,7 @@ pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
             // An import's candidate (its value names a source) is the import's, never the
             // owner's, whatever it holds.
             let mut imported = false;
+            let mut unreadable = false;
             let mut values = Vec::new();
             if let Some(c) = cell {
                 values.reserve(c.candidates.len());
@@ -1473,14 +1576,23 @@ pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
                             imported |= v.s.is_some();
                             values.push(v.x);
                         }
-                        Err(_) => values.push(Value::Null),
+                        Err(_) => {
+                            // A revert's bare null is an absence; anything else is unreadable.
+                            unreadable |= !candidate.value.is_null();
+                            values.push(Value::Null);
+                        }
                     }
                 }
             }
-            // A set element reads present when any candidate adds it (add-wins).
+            // A set element reads present when any candidate adds it (add-wins), as a
+            // projection reads it.
+            let column = collection.column(&edit.column);
             let holds = !stopped
                 && match &edit.elem {
-                    Some(_) => values.contains(&Value::Bool(true)) == (edit.x == Value::Bool(true)),
+                    Some(elem) => column.is_some_and(|c| {
+                        cell::element_present(c, elem, &values, unreadable)
+                            == cell::adds(c, elem, &edit.x)
+                    }),
                     None if values.is_empty() => edit.x.is_null(),
                     None => values.iter().all(|x| *x == edit.x),
                 };

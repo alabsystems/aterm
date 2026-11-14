@@ -84,8 +84,13 @@ fn agent_standin() {
     let mut running = Vec::new();
     let mut done: Vec<Option<String>> = Vec::new();
     let mut spawned = false;
+    let mut progress = 0;
+    let mut progressed_at = Instant::now();
     loop {
-        assert!(t0.elapsed() < HANG, "calls were never released and reaped");
+        assert!(
+            progressed_at.elapsed() < HANG,
+            "calls stopped making progress before release and reaping"
+        );
         while queue.last().is_some_and(|(at, _)| t0.elapsed() >= *at) {
             let (_, cmd) = queue.pop().expect("a call");
             // Signed cat stand-ins keep each original program's kernel name, but wait for
@@ -116,6 +121,9 @@ fn agent_standin() {
             aterm_uds::deadline::prints(&mut child, "call-proof", HANG);
             running.push((done.len(), child));
             done.push(None);
+            progress += 1;
+            std::fs::write(gate.join("progress"), progress.to_string()).expect("spawn progress");
+            progressed_at = Instant::now();
         }
         if queue.is_empty() && !spawned {
             std::fs::write(gate.join("spawned"), b"").expect("spawned marker");
@@ -126,6 +134,7 @@ fn agent_standin() {
                 drop(child.stdin.take());
             }
         }
+        let before = running.len();
         running.retain_mut(|(i, child)| match child.try_wait() {
             Ok(Some(st)) => {
                 use std::os::unix::process::ExitStatusExt as _;
@@ -143,6 +152,11 @@ fn agent_standin() {
                 standin::exit(1)
             }
         });
+        if running.len() != before {
+            progress += before - running.len();
+            std::fs::write(gate.join("progress"), progress.to_string()).expect("reap progress");
+            progressed_at = Instant::now();
+        }
         if queue.is_empty() && running.is_empty() {
             break;
         }
@@ -251,8 +265,18 @@ fn run(prefix: &str, calls: &[(u64, &str)]) -> (Vec<String>, String) {
 }
 
 fn wait_file(path: &std::path::Path) {
-    let deadline = Instant::now() + HANG;
+    let progress_file = path.parent().expect("marker directory").join("progress");
+    let mut progress = 0;
+    let mut deadline = Instant::now() + HANG;
     while !path.exists() {
+        if let Some(next) = std::fs::read_to_string(&progress_file)
+            .ok()
+            .and_then(|text| text.parse::<usize>().ok())
+            .filter(|next| *next > progress)
+        {
+            progress = next;
+            deadline = Instant::now() + HANG;
+        }
         assert!(Instant::now() < deadline, "no {}", path.display());
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -278,7 +302,27 @@ fn start(inst: &Instance, sid: &str, calls: &[(u64, &str)]) {
     )
     .expect("write call specification");
     for name in ["sleep", "caffeinate"] {
-        aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/cat"), &inst.tmp.join(name));
+        let image = inst.tmp.join(name);
+        aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/cat"), &image);
+        // Prepare the copied pathname before the observer is stopped and calls begin.
+        // Its emitted line also proves the image may be removed when this world ends.
+        let mut proof = aterm_uds::spawnfd::command(&image)
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+            .expect("prepare call image");
+        proof
+            .stdin
+            .as_mut()
+            .expect("proof input")
+            .write_all(b"call-image-ready\n")
+            .expect("write image proof");
+        aterm_uds::deadline::prints(
+            &mut proof,
+            "call-image-ready",
+            aterm_uds::deadline::FIRST_EXEC_HANG,
+        );
+        aterm_uds::deadline::kill_within(&mut proof, HANG);
     }
     headless_boot::type_line(
         inst,

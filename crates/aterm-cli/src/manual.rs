@@ -31,11 +31,12 @@ fn overview() -> String {
 /// bundle and Linux its executable, both from the signed appcast.
 #[cfg(not(windows))]
 const OVERVIEW_SELF_UPDATE: &str = "aterm updates itself through its own signed appcast.";
-/// Windows downloads nothing: it installs a build staged on the machine, which `aterm help
-/// update` spells out beside the by-hand lane (`crate::WINDOWS_UPDATE_LANE`).
+/// Windows stages the signed appcast's release zip, or a build made on the machine, and
+/// installs the staged one when asked, which `aterm help update` spells out beside the by-hand
+/// lane (`crate::WINDOWS_UPDATE_LANE`).
 #[cfg(windows)]
 const OVERVIEW_SELF_UPDATE: &str =
-    "aterm installs a build staged on this machine on Windows: `aterm help update` says how.";
+    "On Windows aterm stages its signed release and installs it when asked (`aterm help update`).";
 
 /// A manual page for one tool or topic.
 struct Topic {
@@ -422,7 +423,7 @@ KEY USAGE
   aterm exceptions [--all]   what needs a look later, and what you filed
                              (`aterm help update`)
   aterm --window             a GUI window: tabs, splits and the `❯` menu
-                             (`aterm help needs`)
+                             (`aterm help fleet`)
 
 REWIND
   View > Rewind Pane (Cmd-Shift-R, or `aterm ctl rewind open`) freezes the focused pane
@@ -677,7 +678,7 @@ GOTCHAS
     },
     Topic {
         name: "needs",
-        tagline: Some("what needs you: the words, the ❯ menu, the tab hover, Take Over"),
+        tagline: Some("what needs you: the words, the tab hover, the Overview, Take Over"),
         body: Some(NEEDS_PAGE),
     },
     Topic {
@@ -1273,8 +1274,8 @@ FILES
   aterm members allow <name>         on a member: show a phrase for that Mac on this screen
   aterm members list                 the members, and the Macs the vault removed
   aterm members remove <name>        on a member: take that Mac out and rotate the
-                                     fleet code (--stolen: also deny-list it and name
-                                     what to rotate)
+                                     fleet code (--stolen: also deny-list it and file
+                                     what it could read for rotation)
   aterm members undo [<name>]        on a Mac that member removed: its Undo rows; a
                                      person's press of one in the window signs a share
 
@@ -1320,8 +1321,8 @@ HOW A MAC LEAVES
   Where the vault holds a membership log, any member removes a Mac, no admin needed:
   `aterm members remove <name>` (or Remove on its row) signs its removal, gives every
   audience it was in a new key the rest hold, rotates the fleet code, and lists what it
-  could read, to rotate at the provider where it was lost; `--stolen` also prints one
-  NEEDS YOU: line. A removed Mac that asks again shows as "m12 was removed by m7 on
+  could read; `--stolen` also files each credential among them for rotation in this
+  Mac's need ledger (`aterm secrets need ls`). A removed Mac that asks again shows as "m12 was removed by m7 on
   Oct 30. Allow again?"; Allow again restores it. A Mac one member removed shows
   "m7 removed this Mac and 3 others. Undo m7's removals?": a quorum of the Macs that
   were members before m7's contested removals undoes them all, and then m7 is out. A
@@ -1553,8 +1554,7 @@ AUTOPILOT — how far the harness carries a session's work
     repository and the reply's `Nothing left:` lines, with `leg=on-main`, `pushed`,
     `no-remote`, `no-repo` (no repository checked) or `gone` (the folder was deleted).
     Every surface says what that check read while the tab reads landed: the chip's
-    hover, the menu bar's Done for you and worker rows' tips, the Settings ▸ Harness
-    state line and Messages (`aterm checked 3f9a1c2e4b7d on origin/main in /Users//me/src/proj;
+    hover, the Settings ▸ Harness state line and Messages (`aterm checked 3f9a1c2e4b7d on origin/main in /Users//me/src/proj;
     nothing uncommitted, untracked or unpushed, and no stash on main`; the hover leaves out
     the clause after `;`); `status landed_head= landed_on= landed_leg= landed_repo=` give
     its fields (`-` off a landing); and `task`, `await task` and `result`'s header say `checked=<head>@<ref>`,
@@ -1584,8 +1584,8 @@ AUTOPILOT — how far the harness carries a session's work
   while your own turn in the tab holds it (an hour from your last key); otherwise it
   waits out the short back-off (2, 4, 8 … at most 60 minutes) and types a recovery
   asking the agent to change approach or take up another task (`continue@v1`), and
-  goes on so. The chip's title and description, the menu bar's worker row and
-  the Settings ▸ Harness state line lead with `stopped typing: <why>`; the tab's
+  goes on so. The chip's title and description and the Settings ▸ Harness state
+  line lead with `stopped typing: <why>`; the tab's
   hover and the Overview say it after the mode (`driven by aterm (land: stopped
   typing; …)`); and `status held=` names why (`same-reply`, `no-work`, `-` when
   typing). It types again at your turn or once the agent works, and under Cruise
@@ -1601,16 +1601,15 @@ AUTOPILOT — how far the harness carries a session's work
   codex-alab, which supervises itself, stops its own typing the same way and tells
   it on its proven claim (`meta set harness_held same-reply|no-work`, `meta unset
   harness_held`): while that claim stands `status held=` names its stop, the
-  Settings ▸ Harness state line and the menu bar's worker row lead with it in its
+  Settings ▸ Harness state line leads with it in its
   name (`codex-alab stopped typing: <why>`, typing again at your turn or once the
   agent works: Land's ask at a switch is aterm's, not codex-alab's), and the hover
   and the Overview say it as its own (`driven by aterm (land: codex-alab stopped
   typing)`), none of them while the tab reads landed or quiet, as for aterm's own;
   it goes with the claim.
 
-  Land's hold: while Land's instruction stands unlanded, the menu bar counts the tab
-  `landing`, and its worker row, the Overview, the tab's hover and the Settings ▸
-  Harness state line say why (`not landed yet: 1 untracked file: wip-notes.txt; open
+  Land's hold: while Land's instruction stands unlanded, the Overview, the tab's
+  hover and the Settings ▸ Harness state line say why (`not landed yet: 1 untracked file: wip-notes.txt; open
   in its report: “the docs PR is still open” · 3 nudges`): the agent's own answer to
   the land check, quoted, and the files `git` found; a hold that only a person's need
   holds says `waits only on you: <the need>`;
@@ -1624,12 +1623,11 @@ AUTOPILOT — how far the harness carries a session's work
   codex-alab does not tell it shows no hold.
 
   NEEDS YOU: a report line starting `NEEDS YOU: <what only a person can give>` puts an
-  `owner=needs kind=ask` entry on the menu bar (`❯`) while the
+  `owner=needs kind=ask` entry on the tab (its attention mark, its hover, the
+  Overview and `status needs=`) while the
   agent works on everything else; `NEEDS YOU: nothing`, a `Nothing left:` defense,
-  someone else's turn, or Autopilot `off` clears it. The menu bar's row says the
-  first need whole and gives the next two a row each one level in (8 such rows in
-  the whole menu; the rest are counted as `(+N more)`), and the tab's hover a
-  `Needs you:` line each. A codex-alab that tells its own set on its proven claim
+  someone else's turn, or Autopilot `off` clears it. The tab's hover gives each
+  need a `Needs you:` line. A codex-alab that tells its own set on its proven claim
   (`meta set harness_needs entry=<pct text> need=<pct need> …`, at most 32;
   `meta unset harness_needs`) has its needs shown the same way while that claim
   stands, any past the 32 still counted; one that does not is shown by its
@@ -1639,11 +1637,11 @@ AUTOPILOT — how far the harness carries a session's work
   owner's standing go-ahead (`go-ahead@v1`), which covers that work only, grants
   nothing outward, destructive or another's and lifts no hold the person gave, and
   tell the agent to drop that line now. A line aterm answers with the standing
-  go-ahead never goes on the menu bar or the hover; it comes back once
+  go-ahead never goes on the tab's mark or its hover; it comes back once
   aterm no longer answers it. For an hour after the person types in the tab none
   is typed, whatever they wrote: no words of theirs are read for a hold, and a
   park the hour held is answered once it ends. A park three such answers or
-  an hour leave standing goes on the menu bar at once as an agent that refuses the
+  an hour leave standing is raised at once as the need of an agent that refuses the
   standing go-ahead, and nothing more is typed. A decision to publish outward,
   spend, touch work the agent did not make, or do anything irreversible (delete,
   overwrite, reset, force-push) stays a need.
@@ -1768,7 +1766,7 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
   disk       report, or with `--apply <class>` reclaim, idle build directories and caches;
              never `~/.claude/projects` (`[disk]` keys: `apply`, `warn_free_gib`,
              `target_stale_days`, `auto_free_gib`, `dead_build_dirs`, `room_gib`,
-             `idle_build_dirs`, `idle_build_days`)
+             `idle_build_dirs`, `idle_build_days`, `cap_used_gib`)
   ledger     the approval ledger of a session, or the `disk`, `upgrade` or `accounts` one
   accounts   the Claude Code account pool (`accounts.toml`), sign-ins and renewals, and
              fleet account sync from a source this machine names or keeps in `~/.secrets`
@@ -1990,19 +1988,15 @@ THE FOOTER
   row says so), `Waited for you` (times it stopped and asked you, and how long it
   waited), `Needs, carried on` (NEEDS YOU lines it put on screen while the work went
   on), and one `None in 7 days` row naming every count the week has none of.
-  The menu bar's This Mac row counts a Land session that holds as `landing` (a need
-  or a wait it carries counts first, as `need you` or `waiting`; a Cruise session at
-  rest is `resting`), so its `landing` can be smaller than the page's Every session
-  row, which counts every open Land session. The Overview's row of a landed task says
+  The Overview's row of a landed task says
   `task landed` and `driven by aterm (land)`; the tab's hover says `driven by aterm
   (land, landed)`.
-  The menu bar's Needs you lists work that has stopped first: an approval box no
+  Next That Needs You (⇧⌘J) goes to work that has stopped first: an approval box no
   harness presses, a question, a frozen or stalled agent or another owner's request
   comes before a NEEDS YOU report its agent carries on past, however old the report
-  (stuck before decide, then local before another aterm's before the fleet's, oldest
-  first). Next That Needs You (⇧⌘J) starts there too. A report's row says on
-  hover `<program> carries on meanwhile`, or `<program>'s landing waits on this alone`
-  where that need is all that holds its Land session.
+  (stuck before decide, oldest first). A report's tab says on hover `<program>
+  carries on meanwhile`, or `<program> waits on you` where the work waits on that
+  need.
 
   `aterm ctl @<sid> occupancy why` says why the occupancy door typed a line at a break,
   or why it did not; `occupancy check --replay 24h` replays a day of looks.
@@ -3010,9 +3004,12 @@ PROVISION — make this machine able to publish
       --unverified verify provision --release` (OpenSSL 3 for source signing,
       and the standalone CPython the publication engine runs on, which a
       release puts first on the engine's PATH), builds this checkout's
-      source-signing helper, lays rustup's `trust` link, asks before spending
-      one of the five Developer ID slots, and runs `notarytool store-credentials`
-      (it prompts for the app-specific password). Once the independent
+      source-signing helper, lays rustup's `trust` link, imports the vault's
+      Developer ID pair (else files `aterm secrets need developer-id:<id>`), and
+      sets the notarytool profile from the vault's release-notary entry (else
+      files `aterm secrets need notary`); it asks no one for a credential.
+      `--mint-developer-id`, on the release machine only, spends one of the five
+      Developer ID slots when the vault holds no pair. Once the independent
       prerequisites pass, it can mint the machine's key, asking for the paper
       master phrase. Keys are never copied between machines. The final
       source-signing audit runs after the identity and its signed roster are in
@@ -3079,10 +3076,17 @@ LINUX
   from the next launch; `check` and `apply` still work.
 
 WINDOWS
-  Windows downloads nothing. `aterm update status` and `aterm update check` name
-  the running build and the newer one a build on this machine staged
-  (%LOCALAPPDATA%\aterm\dist\latest.json); the window marks its version label
-  and offers an install row while one is staged and not yet installed. A build
+  `aterm update check` reads the signed release channel now: the newest
+  release's zip is checked (paper master, machine roster, appcast signature,
+  SHA-256 and size, the zip's images and BUILD.json) and staged under
+  %LOCALAPPDATA%\aterm\update\channel, never installed. A window checks it
+  every 30 minutes while [update] enabled is on. A build made on this machine
+  (%LOCALAPPDATA%\aterm\dist\latest.json) is weighed against it: the higher
+  build number is the one offered, the local build on a tie. `aterm update
+  status` and `check` name the running build and the staged one; the window
+  marks its version label and offers an install row while one is staged and
+  not yet installed. A release is read back against its check before its
+  installer runs. A build
   already installed under an open window (BUILD.json beside the executable) is
   named as installed: restart aterm to use it. A copy run from a build tree, a
   dist folder or an MSIX package is told why apply does not install over it.
@@ -3158,9 +3162,8 @@ LOG
     packages.log   the package manager's — 1 MiB, five older copies
 
   TO LOOK AT. What needs a look but not now takes no row from your terminal: it is
-  an entry of the "To look at" list (in the menu-bar item's menu; Settings ▸
-  Messages puts them first), each saying why and the one thing to do. Dismiss all
-  (menu bar), Dismiss (Settings) or `aterm ctl notice dismiss review` files them in
+  an entry of Settings ▸ Messages, which puts these first, each saying why and the
+  one thing to do. Dismiss (Settings) or `aterm ctl notice dismiss review` files them in
   messages.log; a filed fact is not raised again for a week (a month for a choice of
   yours), longer each time. To read the list, and what you filed, without aterm:
     aterm exceptions          the entries open when aterm last wrote the log, then
@@ -3377,6 +3380,7 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
   aterm ctl --host <h> await task @<w>,… since=0 [all] [timeout=<ms>]
   aterm ctl --host <h> await task @<w>:<rev>,… [all] [timeout=<ms>]
   aterm ctl --host <h> @<w> result | status | text | screen
+  aterm ctl --host <h> update status | holds   read the open window's updater; Read Only access
   aterm ctl --host <h> @<w> turn [settle=submitted] '<line>' | key <k> | send <text>
   aterm ctl --host <h> hold <w> on|off   (<w> bare: no @)
   aterm ctl --host <h> @<w> close   (or `close <w>`): its own worker, even after that Mac's
@@ -3454,10 +3458,9 @@ const NEEDS_PAGE: &str = r#"needs — what needs you, where it shows, and steppi
 
 WHAT IT IS
   A NEED is a session that requires a person now for something aterm cannot settle on its
-  own. One verdict per session drives the macOS menu bar item's menu (`❯`), the tab's hover,
-  Overview and `aterm ctl @<sid> status` (`needs=`). Waits (`limit`, `api`, `overloaded`,
-  `memory-restart`, `login`, and `entry`, a script's own `kind=wait`) show under ❯ ▸ Waiting
-  and light no need.
+  own. One verdict per session drives the tab's hover, Overview and `aterm ctl @<sid>
+  status` (`needs=`). Waits (`limit`, `api`, `overloaded`, `memory-restart`, `login`,
+  and `entry`, a script's own `kind=wait`) light no need.
 
 THE WORDS
   Stuck (red, first match wins):
@@ -3474,12 +3477,8 @@ THE WORDS
     question   question dialog under the same conditions
 
 WHERE IT SHOWS
-  * Menu bar (`❯`): a stable entry to diagnostics; open it to see Needs you and To look at.
-    In a fleet the item carries this Mac's fleet access lock (`aterm help fleet`): a
-    pointer's plain click there is the lock's, and a right-click, a Control-click or a
-    press from the keyboard or an accessibility client opens the menu.
-  * Tab hover: what the tab needs. A worker's `NEEDS YOU:` report shows here, in the menu
-    bar and in Overview, and a direct request outranks a report in the same session.
+  * Tab hover: what the tab needs. A worker's `NEEDS YOU:` report shows here and in
+    Overview, and a direct request outranks a report in the same session.
   * Overview: each session's chip opens with its mark, `◆` stuck or `◇` decide.
   * Tab strip: `□` on a tab you hold. A need draws no mark there. `Agents ▸ Next That Needs
     You` (`⇧⌘J`) cycles through active needs.
@@ -3488,7 +3487,7 @@ TAKE OVER, HAND BACK AND HOLD COST
   `Agents ▸ Take Over This Tab` (or a right-click on the tab, or `t` in Overview) sets
   a person's hold (`hold_by=person`): the harness parks, and socket writes to that tab
   answer `ERR halted reason=taken-over origin=person`. Only Hand Back (the menu, the
-  `✋ you` chip, or `❯ ▸ Hand Back All`) lifts it. While any tab is held, the
+  `✋ you` chip, or `Agents ▸ Hand Back All`) lifts it. While any tab is held, the
   UI-driving verbs (`invoke`, `tab`, `pane`, `hwkey`, `pointer`, `confirm`) and no-tty
   `sudo` are refused across the instance, so no agent can click Hand Back itself.
 
@@ -3504,7 +3503,6 @@ DESKTOP NOTICES
 FOR SCRIPTS AND AGENTS
   aterm ctl @<sid> status    `needs=`, `hold_by=`, `typed_by=`, `typed_ms=`
   aterm ctl survey           per-session `needs=`, `hold_by=`, `typed_by=`, `held_from=`
-  aterm ctl chrome           `statusitem` and `statusmenu` rows
   aterm ctl meta set attention owner=<k> kind=ask|wait <text>
   NEEDS YOU: <what only a person can give>
                              in an agent's report under `cruise` or `land`: raises
@@ -3735,6 +3733,12 @@ DEBUGGER ACCESS (a password dialog, not privacy)
   Never run bare `DevToolsSecurity` (with no flag it raises an admin dialog to turn on
   developer mode Mac-wide) or edit `security authorizationdb`.
 
+ACCESSIBILITY (System Events: \"not allowed assistive access\", -1719)
+  1. `aterm ctl privacy`: the `accessibility` row says whether aterm holds macOS's
+     Accessibility grant (`grant=granted`, `not_granted`, or `unknown` when not read).
+  2. Only a person grants it, in System Settings ▸ Privacy & Security ▸ Accessibility.
+  Whether aterm's grant covers an `osascript` run in a tab is not measured yet.
+
 SLOW FIRST RUNS (macOS's first-run check, not a wall)
   A newly built binary that pauses for seconds before it starts is being scanned by
   `syspolicyd` / XProtect, one binary at a time. aterm calls a program held at that check
@@ -3944,8 +3948,8 @@ FLEET ACCESS (what a member this Mac's grants trust may do here now)
   (round to Read Only) or takes back a raise still resting, and never raises. A raise
   still resting is dropped where the level was stated again, or this Mac left or
   changed its fleet, meanwhile. A right-click, a Control-click, and a press that is no
-  pointer's (the keyboard's, an accessibility client's) open the menu, whose Fleet
-  Access submenu sets a level directly. `aterm fleet access <level>` states the level
+  pointer's (the keyboard's, an accessibility client's) open the menu, whose three
+  level rows set a level directly. `aterm fleet access <level>` states the level
   it names even where that is the one in force. A raise is written under the lock a
   join, an init and a leave write under, and is refused where it cannot take it. The
   level is kept in `<state>/fleet-access`; a file that is missing, not private or not
@@ -3965,16 +3969,62 @@ FLEET ACCESS (what a member this Mac's grants trust may do here now)
   it only when that Mac's person says so (a worker another Mac started here is
   refused a raise). A refused act is recorded and the work goes elsewhere.
 
+FLEET ACTIVITY (the agent requests that crossed between this Mac and the others)
+  aterm fleet activity [--json] [--since <span>]
+                       what sessions asked for across Macs over the last hour
+                       (`--since 90s|30m|6h|2d`, a week at most)
+  An agent request is something a session asked for on another Mac: a read of its
+  sessions, a message, typing (`turn`, `key`, `send`), a hold or hand back, a close, a
+  new job. Each is one row on both Macs: incoming on the Mac asked, outgoing on the
+  Mac that asked, admitted, or blocked where the asked Mac's fleet access refused it
+  (with the level in force and the level it needed). A block is counted every time. A
+  read is a row only where a session asked for it: a drive's requester line names the
+  session, and a session's `aterm ctl survey --fleet` names it to each Mac it reads. A
+  wait on several sessions (`await task @a,@b`) is one read of each Mac it waits on,
+  however many sessions and turns of the wait. Mail a session sends straight to another
+  Mac names that session on both.
+  What aterm does of its own is not in it: a window's background fleet read, the board's
+  keeper, heartbeats, replication, and the vault, `service-repair` and `accounts-renew`
+  services, admitted or refused, whoever sent the line. The admitted reads of one Mac in
+  one minute are one row with their count.
+  The first line counts the Macs each way and what was blocked (`Last hour · in from 2
+  Macs · out to 1 · 3 blocked`), or says `Quiet for <span>` where the window holds
+  nothing. Then a line for each Mac and way, busiest first: the Mac, `←` incoming or
+  `→` outgoing, the count, a phrase (`reads`, `mostly typing`, `3 new jobs, 1
+  blocked`) and how long ago the last was. Then each request, newest first: when,
+  which way, the Mac, `read|message|typed|hold|close|new-job`, `admitted` or `blocked
+  at <level>, needs <level>`, and the session that asked. `--json` gives the same as
+  one object (`headline`, `pairs`, `rows`). A Mac is named as this Mac's book names
+  its node now.
+  The `❯` menu (macOS, in a fleet) shows the last hour of it under the three levels:
+  the first line, then at most five of the Mac lines, busiest first, a line marked where
+  a lock refused one of its requests, and `All activity…`, which opens this record in a
+  tab. While this Mac's lock has refused another Mac's request that no opened menu has
+  shown, the lock in the menu bar wears a blocked mark. Opening a menu that shows the
+  refusal clears it, in every aterm of this account and across a restart, and so does
+  the refusal leaving the hour; a refusal after the one the menu showed marks it again.
+  A request of this Mac's that another Mac's lock refused is marked in the menu and
+  never on the bar.
+  It is a local read of `<state>/fleet-activity/rows`, written by this Mac's node job,
+  its windows and `aterm ctl`. The record holds no message text, prompt, command line
+  or secret. It keeps a week and at most 512 KiB: a record that outgrows that keeps
+  each minute's alike requests as one counted row (a block's with the session that
+  asked), and only where that is still too much do the oldest go, after which the first
+  line names the span the record still covers (`Last 20m`). A row that cannot be written
+  is dropped, and no request waits for it or is answered differently. A Mac running an aterm from before the record keeps none, and its
+  surveys count as polls on the Macs it reads.
+
 FILES & CONFIG (`<state>` is `~/Library/Application Support/aterm` on macOS)
   `fleet.key`, `fleet-join-code`, `fleet-node`, `fleet-node-key`, `fleet-peers`,
-  `fleet-issuer-book`, `fleet-off`, `fleet-access`; and in `aterm.toml`:
+  `fleet-issuer-book`, `fleet-off`, `fleet-access`, `fleet-activity/rows`; and in
+  `aterm.toml`:
     [fleet]
     listen = "0.0.0.0:7100"
     allow = "facts"                # "facts" | "content" | "drive"
     drive_from = ["<node>:<key>"]  # written by `aterm fleet allow drive --from`
                                    # (["*"] by `--all`, and by sync's first join)
-    watch = true                   # poll the fleet every minute for the macOS ❯ menu
-                                   # (default false)"#;
+    watch = true                   # read the fleet in the background, every minute
+                                   # (default true)"#;
 
 /// `aterm help name`: this machine's name (`docs/DESIGN-machine-names-2026-11-04.md` §5.7).
 const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `unnumbered` until it is numbered) and nickname

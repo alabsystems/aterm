@@ -47,20 +47,22 @@ fn main() {
         let dir = PathBuf::from(std::env::var_os("LAND_WATCHERS_DIR").unwrap());
         let verifier = aterm_tempfile::bin_exe("aterm-verify");
         let payload = exe.to_str().expect("this fixture's executable path");
-        let mut child = aterm_verify::land::judgment_command(
+        // A judgment's command before its words ([`aterm_verify::land::judgment_command`]):
+        // the same tether, group and runtime, here running the payload, which carries a
+        // judgment's `--events` words so the case can tell its own processes by them.
+        let mut child = aterm_verify::land::verifier_command(
             &verifier,
             &dir,
-            "fixture-base",
-            &[payload],
-            &dir.join("events"),
-            &aterm_verify::land::LandResources {
-                admit: aterm_capacity::Admit::Wait,
-                timeout: None,
-                test_cores: None,
-            },
             &aterm_verify::EnvSnapshot::capture(),
         )
         .unwrap()
+        .arg(payload)
+        .args(["--base", "fixture-base", "--events"])
+        .arg(dir.join("events"))
+        .args([
+            aterm_capacity::Admit::FLAG,
+            aterm_capacity::Admit::Wait.word(),
+        ])
         // The real CLI's existing record-only compiler wrapper runs the payload after its
         // ordinary early startup. The payload's receipt proves that main reached dispatch.
         .env("ATERM_VERIFY_UNIT_WRAPPER", "1")

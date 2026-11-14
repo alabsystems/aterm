@@ -573,67 +573,37 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
     );
 }
 
-/// FNV-1a over `words`, from `h`.
-fn fold_words(h: u64, words: impl IntoIterator<Item = u64>) -> u64 {
-    words.into_iter().fold(h, aterm_hash::fnv1a_64_u64_le)
-}
-
-/// Every quad of a published stream as its words.
-fn quad_words(q: &GlowQuad) -> [u64; 3] {
-    [
-        u64::from(q.row) | u64::from(q.x) << 16 | u64::from(q.y) << 32 | u64::from(q.w) << 48,
-        u64::from(q.h) | u64::from(q.alpha) << 16 | u64::from(q.alpha2) << 24,
-        u64::from(q.color) | u64::from(q.color2) << 32,
-    ]
-}
-
-/// One fold of the guarded streams every frame publishes, over every style the guard reads and
-/// the dark, light and dim grounds, a coloured line beside the typed one: what
-/// `EffectsPipeline::apply` hands the renderer once the letter guard had its word.
-fn guarded_fold(guard: bool) -> u64 {
+/// Every style and ground publishes the same complete frames with cached guard
+/// decisions as with fresh decisions. Native glyph rasterization is an input to
+/// both paths, so the comparison holds without a digest tied to another host.
+#[test]
+fn every_guarded_stream_matches_fresh_judgment() {
     let mut ev = vec![(
         200,
         Ev::Out(b"\x1b[2J\x1b[3H\x1b[31mred\x1b[0m \x1b[34mblue\x1b[0m plain\x1b[5H$ ".to_vec()),
     )];
     ev.extend(typed("echo hello world", 1_000, 50));
-    let styles = [
+    let mut cuts = 0;
+    for style in [
         "rainbow", "phaser", "comet", "fire", "laser", "sparkle", "aurora",
-    ];
-    let mut h = aterm_hash::FNV64_OFFSET;
-    for style in styles {
+    ] {
         for look in [DARK, LIGHT, DIM] {
-            let mut r = Replay::new(style, look, true);
-            r.fx.set_letter_guard(guard);
-            let (frames, _) = run(&mut r, &ev, 1_500);
-            for f in &frames {
-                h = fold_words(h, f.under.iter().flat_map(quad_words));
-                h = fold_words(h, [u64::MAX]);
-                h = fold_words(h, f.over.iter().flat_map(quad_words));
-                h = fold_words(h, [u64::MAX - 1]);
-                h = fold_words(h, f.halos.iter().flatten().copied());
-                h = fold_words(h, [u64::MAX - 2]);
-            }
+            let (frames, _) = run(&mut Replay::new(style, look, true), &ev, 1_500);
+            let (fresh, _) = run(&mut Replay::new(style, look, false), &ev, 1_500);
+            assert_eq!(frames, fresh, "{style} on {:06x}: cached guard", look.1);
+            let (repeat, _) = run(&mut Replay::new(style, look, true), &ev, 1_500);
+            assert_eq!(
+                frames, repeat,
+                "{style} on {:06x}: deterministic replay",
+                look.1
+            );
+            let mut bare = Replay::new(style, look, true);
+            bare.fx.set_letter_guard(false);
+            let (unguarded, _) = run(&mut bare, &ev, 1_500);
+            cuts += usize::from(unguarded != frames);
         }
     }
-    h
-}
-
-/// Replay the same observed glyphs and stream inputs twice, with the guard off as a
-/// negative control. Font rasters, palette and system libm are runtime inputs, so a target
-/// triple alone cannot identify a portable stream digest.
-#[test]
-fn guarded_streams_replay_deterministically_and_measure_the_guard() {
-    let fold = guarded_fold(true);
-    assert_ne!(
-        guarded_fold(false),
-        fold,
-        "control: the streams with the guard off fold alike"
-    );
-    assert_eq!(
-        guarded_fold(true),
-        fold,
-        "the guarded streams replay deterministically"
-    );
+    assert!(cuts > 0, "control: no stream exercised the guard");
 }
 
 /// A PASS LOWERS WHAT THE FRAME LAYS (CT-44's review). A row's cuts are one eased ramp

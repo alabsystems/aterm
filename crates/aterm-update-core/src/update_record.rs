@@ -449,17 +449,9 @@ pub fn clock_words_in(until: u64, now: u64, offset_at: &dyn Fn(i64) -> Option<i6
     )
 }
 
-/// `secs` of time left in plain words: "under a minute", "40 min", "3 h".
-#[must_use]
-pub fn left_words(secs: u64) -> String {
-    if secs < 60 {
-        "under a minute".to_string()
-    } else if secs < 2 * HOUR {
-        format!("{} min", secs.div_ceil(60))
-    } else {
-        format!("{} h", secs.div_ceil(HOUR))
-    }
-}
+/// `secs` of time left in plain words: "under a minute", "40 min", "3 h". One copy, shared with
+/// the fleet's readers of a peer's hold ([`aterm_types::update_standing`]).
+pub use aterm_types::update_standing::left_words;
 
 impl Hold {
     /// The held build as a person names it: its version, or "build N" where none was recorded.

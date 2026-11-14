@@ -1,18 +1,26 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Background sibling instance scanner (`survey facts` -> [`Wake::SiblingScan`]) and [`raise_sibling`] dialer.
+//! Background sibling instance scanner (`survey facts` -> [`Wake::SiblingScan`]): how many
+//! sessions each other aterm on this Mac has, which the Overview counts.
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use aterm_types::needs::NeedWord;
 use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
-use crate::status_item::{SiblingInstance, SiblingNeed};
+
+/// One same-Mac sibling aterm, from the last scan (its `survey facts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SiblingInstance {
+    /// Its pid.
+    pub pid: u32,
+    /// Its live sessions.
+    pub sessions: usize,
+}
 
 /// Per-peer WALL-CLOCK budget covering the whole dial (connect, auth, the
 /// survey).
@@ -26,13 +34,12 @@ const MAX_SESSIONS_PER_PEER: usize = 1024;
 /// Each line contains at least its newline, so this also bounds the frame count.
 const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
 
-/// One scan at a time: menu-open spam coalesces onto the in-flight scan (its
-/// result is at most a menu-track old, and the NEXT open kicks a fresh one).
+/// One scan at a time: a request made while one runs is that scan's.
 static SCAN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// The cadence's owner: each request that starts a scan takes the next
 /// ticket, and a scan thread sleeping for an older one ends when it wakes,
-/// so one cadence runs however many opens requested scans.
+/// so one cadence runs however many requests were made.
 static CADENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Rescan interval when the previous scan found a live sibling.
@@ -80,45 +87,8 @@ pub(crate) fn request_scan(proxy: EventLoopProxy<Wake>) {
     }
 }
 
-/// Dials `raise <sid>` on the sibling at `sock` (`pid`) on a background thread.
-#[cfg(target_os = "macos")]
-pub(crate) fn raise_sibling(proxy: EventLoopProxy<Wake>, pid: u32, sock: String, sid: String) {
-    let _ = std::thread::Builder::new()
-        .name("aterm-sibling-raise".to_string())
-        .spawn(move || {
-            let raised = raise_on(&sock, &sid).is_some();
-            if !raised {
-                aterm_log::info!("status item: sibling {pid} did not raise {sid}");
-            }
-            let _ = proxy.send_event(Wake::SiblingRaised { pid });
-        });
-}
-
-/// `raise <sid>` on the sibling at `sock`, under [`PEER_BUDGET`]: `Some` when
-/// it answered `OK`.
-#[cfg(target_os = "macos")]
-fn raise_on(sock: &str, sid: &str) -> Option<()> {
-    if !sid.starts_with("s-") || sid.bytes().any(|b| b.is_ascii_whitespace()) {
-        return None;
-    }
-    let deadline = Instant::now() + PEER_BUDGET;
-    let (stream, token) = aterm_ctl::connect_then_read_token(sock).ok()?;
-    let token = token.ok()?;
-    arm(&stream, deadline)?;
-    (&stream)
-        .write_all(format!("AUTH {token}\nraise {sid}\n").as_bytes())
-        .ok()?;
-    (&stream).flush().ok()?;
-    let mut reader = BufReader::new(PeerRead {
-        stream: &stream,
-        deadline,
-    });
-    let line = read_bounded_line(&mut reader, deadline)?;
-    line.starts_with("OK").then_some(())
-}
-
-/// Enumerate live sibling instances and summarize each — sorted by pid so the
-/// glance fingerprint is deterministic.
+/// Enumerate live sibling instances and summarize each, sorted by pid so two scans of the
+/// same instances compare equal.
 fn scan_siblings() -> Vec<SiblingInstance> {
     let mut rows: Vec<SiblingInstance> = sibling_targets()
         .into_iter()
@@ -199,57 +169,17 @@ fn sibling_targets() -> Vec<(u32, String)> {
     targets
 }
 
-/// One `session …` row of a `survey facts` reply, read by key: the session
-/// counted, and its need where the row publishes one.
-fn parse_session_row(line: &str) -> Option<(Option<SiblingNeed>, bool)> {
-    let rest = line
-        .trim_end_matches(['\r', '\n'])
-        .strip_prefix("session ")?;
-    let field = |key: &str| {
-        rest.split(' ')
-            .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
-            .filter(|v| *v != "-")
-            .map(aterm_control::wire::pct_decode)
-    };
-    if field("state").as_deref() == Some("exited") {
-        return None;
-    }
-    let sid = field("sid")?;
-    let Some(needs) = field("needs") else {
-        let published = rest.split(' ').any(|tok| tok.starts_with("needs="));
-        return Some((None, published));
-    };
-    let Some(word) = NeedWord::parse(&needs) else {
-        // Unknown need word from a newer build.
-        return Some((None, true));
-    };
-    let label = field("role")
-        .or_else(|| field("program"))
-        .unwrap_or_else(|| crate::presence::short_sid(&sid));
-    let agent = field("program_kind").as_deref() == Some("agent");
-    let by = field("needs_by");
-    let claim = (by.as_deref() == Some("program"))
-        .then(|| crate::needs::claim_words_of_row(word, field("agent").as_deref()))
-        .flatten();
-    let age_ms = match word {
-        NeedWord::Stalled => field("task_ms"),
-        NeedWord::Ask => None,
-        NeedWord::Frozen | NeedWord::Stopped if !agent => None,
-        _ => field("agent_ms"),
-    }
-    .filter(|ms| !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()))
-    .and_then(|ms| ms.parse::<u64>().ok());
-    Some((
-        Some(SiblingNeed {
-            sid,
-            word,
-            label: crate::needs::fold_clip(&label, 40),
-            age_ms,
-            claim,
-            carries_on: by.as_deref() == Some("harness"),
-        }),
-        true,
-    ))
+/// Whether `line` of a `survey facts` reply is a live session's row.
+fn live_session_row(line: &str) -> bool {
+    line.trim_end_matches(['\r', '\n'])
+        .strip_prefix("session ")
+        .is_some_and(|rest| {
+            let field = |key: &str| {
+                rest.split(' ')
+                    .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+            };
+            field("sid").is_some_and(|sid| sid != "-") && field("state") != Some("exited")
+        })
 }
 
 /// The remaining slice of a peer's budget, `None` once exhausted (also `None`
@@ -300,8 +230,6 @@ fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<Sibli
         return None;
     }
     let mut sessions = 0;
-    let mut needs = Vec::new();
-    let mut published = true;
     let mut bytes = 0usize;
     for _ in 0..count {
         let line = read_bounded_line(&mut reader, deadline)?;
@@ -309,25 +237,14 @@ fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<Sibli
         if bytes > MAX_REPLY_BYTES {
             return None;
         }
-        if let Some((need, publishes)) = parse_session_row(&line) {
+        if live_session_row(&line) {
             sessions += 1;
             if sessions > MAX_SESSIONS_PER_PEER {
                 return None;
             }
-            published &= publishes;
-            needs.extend(need);
         }
     }
-    if !published {
-        needs.clear();
-    }
-    Some(SiblingInstance {
-        pid,
-        sock: sock.to_string(),
-        sessions,
-        needs,
-        scanned_ms: aterm_time::unix_millis().unwrap_or(0),
-    })
+    Some(SiblingInstance { pid, sessions })
 }
 
 struct PeerRead<'a> {

@@ -59,6 +59,7 @@ struct RowStamp {
     combining: Vec<(usize, Box<[char]>)>,
     line: LineSize,
     spans: Vec<LineSizeSpan>,
+    has_images: bool,
     image_mask: Vec<bool>,
     chrome: bool,
     breaks: Vec<usize>,
@@ -66,6 +67,8 @@ struct RowStamp {
 
 impl RowStamp {
     fn new(input: &RenderInput, row: usize, breaks: Vec<usize>) -> Self {
+        let row_images = input.images.get(row).map_or(&[][..], Vec::as_slice);
+        let has_images = !row_images.is_empty();
         Self {
             cols: input.cols,
             cells: input.cells.get(row).cloned().unwrap_or_default(),
@@ -78,17 +81,21 @@ impl RowStamp {
                 .copied()
                 .unwrap_or(LineSize::SingleWidth),
             spans: input.line_size_spans.get(row).cloned().unwrap_or_default(),
-            image_mask: (0..input.cols)
-                .map(|col| {
-                    crate::image_covers(input.images.get(row).map_or(&[], Vec::as_slice), col)
-                })
-                .collect(),
+            has_images,
+            image_mask: if has_images {
+                (0..input.cols)
+                    .map(|col| crate::image_covers(row_images, col))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             chrome: input.chrome_raster(row).is_some(),
             breaks,
         }
     }
 
     fn matches(&self, input: &RenderInput, row: usize) -> bool {
+        let row_images = input.images.get(row).map_or(&[][..], Vec::as_slice);
         self.cols == input.cols
             && self.cells.as_slice() == input.cells.get(row).map_or(&[][..], Vec::as_slice)
             && self.visual_to_logical.as_slice() == input.visual_to_logical_row(row)
@@ -106,13 +113,16 @@ impl RowStamp {
                     .get(row)
                     .map_or(&[][..], Vec::as_slice)
             && self.chrome == input.chrome_raster(row).is_some()
-            && self
-                .image_mask
-                .iter()
-                .copied()
-                .eq((0..input.cols).map(|col| {
-                    crate::image_covers(input.images.get(row).map_or(&[], Vec::as_slice), col)
-                }))
+            && if !self.has_images && row_images.is_empty() {
+                true
+            } else if !self.has_images {
+                !(0..input.cols).any(|col| crate::image_covers(row_images, col))
+            } else {
+                self.image_mask
+                    .iter()
+                    .copied()
+                    .eq((0..input.cols).map(|col| crate::image_covers(row_images, col)))
+            }
     }
 }
 
@@ -292,7 +302,7 @@ impl Renderer {
                     || cell.ch.is_control()
                     || cell.ch == ' '
                     || stamp.chrome
-                    || stamp.image_mask[col]
+                    || stamp.image_mask.get(col).copied().unwrap_or(false)
                     || input.line_size_run_at(row, col).0 != LineSize::SingleWidth
                     || stamp.combining.iter().any(|(at, _)| *at == col)
                     || crate::procedural::covers(cell.ch)
@@ -409,7 +419,21 @@ impl Renderer {
         };
         if let Some((old_epoch, ink)) = old
             && old_epoch == epoch
-            && ink.frame.as_ref() == Some(&frame)
+            && ink.frame.as_ref().is_some_and(|old_frame| {
+                (old_frame.cell == frame.cell
+                    && old_frame.cols == frame.cols
+                    && old_frame.cursor == frame.cursor
+                    && old_frame.selection == frame.selection
+                    && old_frame.selection_clip == frame.selection_clip
+                    && old_frame.selections == frame.selections
+                    && old_frame.rows.len() == frame.rows.len()
+                    && old_frame
+                        .rows
+                        .iter()
+                        .zip(&frame.rows)
+                        .all(|(a, b)| Arc::ptr_eq(a, b)))
+                    || old_frame == &frame
+            })
         {
             self.glyph_frame_ink_memo = Some((epoch, Arc::clone(&ink)));
             return ink;

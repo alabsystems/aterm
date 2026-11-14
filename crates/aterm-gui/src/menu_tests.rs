@@ -303,6 +303,7 @@ fn the_agents_menu_holds_its_rows_in_order_with_their_classes() {
             (MenuAction::Workers, "", MenuMods::None),
             (MenuAction::TakeOver, "", MenuMods::None),
             (MenuAction::HandBack, "", MenuMods::None),
+            (MenuAction::HandBackAll, "", MenuMods::None),
             (MenuAction::HarnessLog, "l", MenuMods::CommandShift),
             (MenuAction::SetRole, "", MenuMods::None),
             (MenuAction::ReadThisMac, "", MenuMods::None),
@@ -320,7 +321,9 @@ fn the_agents_menu_holds_its_rows_in_order_with_their_classes() {
     );
     for (action, ..) in &rows {
         let want = match action {
-            MenuAction::TakeOver | MenuAction::HandBack => InvokeAuthority::PersonOnly,
+            MenuAction::TakeOver | MenuAction::HandBack | MenuAction::HandBackAll => {
+                InvokeAuthority::PersonOnly
+            }
             MenuAction::NextNeed | MenuAction::SetRole => InvokeAuthority::WriteInput,
             _ => InvokeAuthority::OwnerOnly,
         };

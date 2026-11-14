@@ -299,7 +299,8 @@ fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
             },
             &other_holds,
             &held,
-            &cell::project(&MACHINE, &other_holds)
+            &cell::project(&MACHINE, &other_holds),
+            &|_| false,
         )
         .is_err()
     );
@@ -544,6 +545,7 @@ fn facts(rows: &[(&str, Value)]) -> OwnedRead {
     }
 }
 
+/// A pass over fixture rows, which carry no history: no birth record saw anything.
 fn run(
     me: &Me,
     probe: &Probe,
@@ -551,6 +553,19 @@ fn run(
     heard: bool,
     cells: &Cells,
     read: &OwnedRead,
+) -> Plan {
+    run_saw(me, probe, live, heard, cells, read, &|_| false)
+}
+
+/// [`run`], with `saw` answering which facts rows the record that birthed `me`'s own row saw.
+fn run_saw(
+    me: &Me,
+    probe: &Probe,
+    live: &[&str],
+    heard: bool,
+    cells: &Cells,
+    read: &OwnedRead,
+    saw: &dyn Fn(&str) -> bool,
 ) -> Plan {
     let live: BTreeSet<String> = live.iter().map(|uuid| (*uuid).to_owned()).collect();
     plan_projected(
@@ -564,6 +579,7 @@ fn run(
         cells,
         read,
         &cell::project(&MACHINE, cells),
+        saw,
     )
     .unwrap()
 }
@@ -1142,6 +1158,7 @@ fn a_bound_rows_label_outlasts_a_conflicted_machine_label() {
         &cells,
         &facts(&[(ME, stored)]),
         &machines,
+        &|_| false,
     )
     .unwrap();
     assert_eq!(plan.outcome, Outcome::Unchanged);
@@ -2969,4 +2986,593 @@ fn a_writer_successor_adopts_the_row_planned_for_its_first_seat() {
     let row = &view.owned[MACHINE_FACTS.name].rows[&successor].value;
     assert_eq!(row["mac"], json!(mac));
     assert_eq!(row.get("predecessor"), None);
+}
+
+/// m2 on 2026-11-13 (0.199.0, a build before rule 0), as fixtures: its writer successor `ME`
+/// birthed a machine row under `m34`, a label the row of another Mac (`m19`'s, at `ELSEWHERE`)
+/// also holds, beside the machine `PRED` its earlier writer `OLD`, still seated, is bound to and
+/// which names this Mac's label `m2` and node.
+struct M2 {
+    probe: Probe,
+    born: String,
+    /// What the unfixed birth wrote besides the facts row, its `m34` label included.
+    birth: Vec<Vec<Change>>,
+    old: Value,
+    theirs: Value,
+    /// `ME`'s facts row as the unfixed birth wrote it.
+    births: Value,
+    /// `ME` as the unfixed build read it, with no lineage.
+    seat: Me,
+    /// `ME` as this build reads it, its lineage naming `OLD`.
+    successor: Me,
+}
+
+const PRED: &str = "mc-1000000000000001";
+const OTHER: &str = "mc-1000000000000002";
+const ELSEWHERE: &str = "33333333333333333333333333333333";
+const THIRD: &str = "44444444444444444444444444444444";
+const STRANGER: &str = "55555555555555555555555555555555";
+
+impl M2 {
+    /// The rows before the unfixed birth, `PRED` in `pred_lifecycle`.
+    fn rows(pred_lifecycle: &str) -> Vec<Vec<Change>> {
+        vec![
+            machine(
+                PRED,
+                &[
+                    ("label", json!("m2")),
+                    ("status", json!("active")),
+                    ("node", json!(NODE)),
+                    ("fleet_node", json!("00112233445566778899aabbccddeeff")),
+                    ("row", json!(pred_lifecycle)),
+                ],
+            ),
+            machine(
+                OTHER,
+                &[
+                    ("label", json!("m34")),
+                    ("status", json!("active")),
+                    ("node", json!(OTHER_NODE)),
+                    ("hosts", json!(["m19"])),
+                    ("row", json!("live")),
+                ],
+            ),
+        ]
+    }
+
+    /// The unfixed build's pass, checked, and what it left.
+    fn new() -> Self {
+        let born = keys::machine_pk(ME);
+        let probe = Probe {
+            hosts: vec!["m2".into()],
+            ..probe()
+        };
+        let old = json!({"r": 1, "n": 3, "mac": PRED, "label": "m2", "hw_hint": HINT,
+            "node": NODE, "seen": 399, "hosts": ["m2"]});
+        let theirs = json!({"r": 1, "n": 2, "mac": OTHER, "label": "m34",
+            "hw_hint": "bbbbbbbbbbbbbbbb", "node": OTHER_NODE, "seen": 399, "hosts": ["m19"]});
+        // The unfixed build's pass: no lineage, so the earlier writer reads as a clone.
+        let seat = Me {
+            label: Some("m34".into()),
+            ..me()
+        };
+        let before = facts(&[(OLD, old.clone()), (ELSEWHERE, theirs.clone())]);
+        let unfixed = run(
+            &seat,
+            &probe,
+            &[ME, OLD, ELSEWHERE],
+            true,
+            &apply(&Self::rows("live")),
+            &before,
+        );
+        assert_eq!(unfixed.outcome, Outcome::Born { mac: born.clone() });
+        assert_eq!(kinds(&unfixed), ["hw-hint-live", "node-bound-elsewhere"]);
+        // Its birth landed under `m34`, as m19's row had: the number both took on their own.
+        let m34 = cell::change(
+            &MACHINE,
+            CellKey {
+                pk: &born,
+                col: "label",
+                elem: None,
+            },
+            &CellValue::automatic(MACHINE.version, json!("m34")),
+        )
+        .unwrap();
+        let birth = vec![
+            unfixed
+                .changes
+                .iter()
+                .filter(|c| c.collection != MACHINE_FACTS.name)
+                .cloned()
+                .collect(),
+            vec![m34],
+        ];
+        let births = with(written_row(&unfixed).clone(), "label", json!("m34"));
+        let successor = Me {
+            former: vec![writer(OLD, Some("m2"))],
+            ..seat.clone()
+        };
+        Self {
+            probe,
+            born,
+            birth,
+            old,
+            theirs,
+            births,
+            seat,
+            successor,
+        }
+    }
+
+    /// The registry after the unfixed birth, `PRED` in `pred_lifecycle` and the birth's row in
+    /// `born_lifecycle`.
+    fn cells(&self, pred_lifecycle: &str, born_lifecycle: &str) -> Cells {
+        let mut records = Self::rows(pred_lifecycle);
+        records.extend(self.birth.iter().cloned());
+        records.push(vec![
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk: &self.born,
+                    col: "row",
+                    elem: None,
+                },
+                &CellValue::owner(MACHINE.version, json!(born_lifecycle)),
+            )
+            .unwrap(),
+        ]);
+        apply(&records)
+    }
+
+    /// The facts rows: `OLD`'s and m19's, and `ME`'s as `own` states it.
+    fn read(&self, own: Value) -> OwnedRead {
+        facts(&[
+            (OLD, self.old.clone()),
+            (ELSEWHERE, self.theirs.clone()),
+            (ME, own),
+        ])
+    }
+
+    /// `ME`'s facts row once this build's heard pass folded it.
+    fn folded(&self) -> Value {
+        let folded = run_saw(
+            &self.successor,
+            &self.probe,
+            &[ME, OLD, ELSEWHERE],
+            true,
+            &self.cells("live", "live"),
+            &self.read(self.births.clone()),
+            &|writer| writer == OLD,
+        );
+        assert_eq!(folded.outcome, Outcome::Refreshed { mac: PRED.into() });
+        written_row(&folded).clone()
+    }
+}
+
+/// The next heard pass of m2's successor, its lineage naming `OLD` and its birth record having
+/// seen `OLD`'s facts row, folds the birth: this Mac's own facts row keeps its binding and states
+/// `merged_into` `PRED` and `predecessor` `OLD`, and no machine row is written. `LabView` then
+/// answers `PRED` and `m2` for this Mac, no facts row answers the born row, `check` raises
+/// neither shared finding, the next pass writes nothing, and a refresh keeps the fold.
+///
+/// Nothing folds on an unheard pass, since a partial history can show a machine the owner
+/// ended as live; nor where the birth record had not seen `OLD`'s row, a birth rule 0 would have
+/// made too (the clone finding stays for the owner); nor for a home whose lineage names no
+/// writer bound elsewhere. A merge the Mac already acknowledged stays its word, a row it adopted
+/// is never moved, and a fold onto a row the owner ended does not happen.
+/// NEGATIVE CONTROL: with `fold` always `None`, the folding pass keeps the born binding:
+/// `` left: Unchanged right: Refreshed { mac: "mc-1000000000000001" } ``. With `fold` not
+/// asking `input.heard`, the unheard pass folds:
+/// `` left: (Refreshed { mac: "mc-1000000000000001" }, 1) right: (Unchanged, 0) ``; with `fold`
+/// not asking `saw`, the unseen pass folds the same way.
+#[test]
+fn a_writer_successor_whose_row_was_born_before_the_fix_folds_it_into_its_predecessors_machine() {
+    let m2 = M2::new();
+    let born = m2.born.clone();
+    let live = [ME, OLD, ELSEWHERE];
+    let cells = m2.cells("live", "live");
+    let after = m2.read(m2.births.clone());
+    let labview = |read: &OwnedRead| {
+        crate::alab::view::LabView::read(&cells, read, &OwnedRead::default(), Some(ME))
+    };
+    let shown = labview(&after);
+    assert_eq!(
+        (shown.me.as_deref(), shown.my_label()),
+        (Some(born.as_str()), Some("m34")),
+        "PRECONDITION: the unfixed birth answers this Mac"
+    );
+    let machines = cell::project(&MACHINE, &cells);
+    let live_set: BTreeSet<String> = live.iter().map(|uuid| (*uuid).to_owned()).collect();
+    let check = |read: &OwnedRead| -> Vec<&'static str> {
+        checks::facts(read, &live_set, &machines)
+            .into_iter()
+            .map(|f| f.kind)
+            .collect()
+    };
+    assert_eq!(check(&after), ["hw-hint-clone"], "PRECONDITION");
+    let saw_old = |writer: &str| writer == OLD;
+    // An unheard pass, or a birth record that had not seen the earlier writer's row, refreshes
+    // the row as it stands.
+    for (heard, saw) in [
+        (false, &saw_old as &dyn Fn(&str) -> bool),
+        (true, &|_: &str| false),
+    ] {
+        let kept = run_saw(&m2.successor, &m2.probe, &live, heard, &cells, &after, saw);
+        assert_eq!(
+            (kept.outcome, kept.changes.len()),
+            (Outcome::Unchanged, 0),
+            "heard {heard}"
+        );
+    }
+    let folded = run_saw(
+        &m2.successor,
+        &m2.probe,
+        &live,
+        true,
+        &cells,
+        &after,
+        &saw_old,
+    );
+    assert_eq!(folded.outcome, Outcome::Refreshed { mac: PRED.into() });
+    assert!(folded.findings.is_empty(), "{:?}", folded.findings);
+    assert!(folded.changes.iter().all(|c| c.collection != MACHINE.name));
+    let row = written_row(&folded).clone();
+    assert_eq!(row, m2.folded());
+    assert_eq!(row["mac"], json!(born));
+    assert_eq!(row["merged_into"], json!(PRED));
+    assert_eq!(row["predecessor"], json!(OLD));
+    assert_eq!(row["label"], json!("m2"));
+    assert_eq!(row["n"], json!(2));
+    let rebound = m2.read(row.clone());
+    let shown = labview(&rebound);
+    assert_eq!(
+        (shown.me.as_deref(), shown.my_label()),
+        (Some(PRED), Some("m2"))
+    );
+    assert!(
+        shown.bound.values().all(|mac| *mac != born),
+        "{:?}",
+        shown.bound
+    );
+    assert!(check(&rebound).is_empty(), "{:?}", check(&rebound));
+    // Folded, the Mac is quiet; a refresh carries the fold.
+    let again = run_saw(
+        &m2.successor,
+        &m2.probe,
+        &live,
+        true,
+        &cells,
+        &rebound,
+        &saw_old,
+    );
+    assert_eq!(
+        (again.outcome, again.changes.len()),
+        (Outcome::Unchanged, 0)
+    );
+    let aged = with(row.clone(), "seen", json!(300));
+    let refreshed = run(
+        &m2.successor,
+        &m2.probe,
+        &live,
+        true,
+        &cells,
+        &m2.read(aged),
+    );
+    assert_eq!(refreshed.outcome, Outcome::Refreshed { mac: PRED.into() });
+    assert_eq!(written_row(&refreshed)["merged_into"], json!(PRED));
+    assert_eq!(written_row(&refreshed)["label"], json!("m2"));
+    // No earlier writer in the lineage: the birth stands.
+    let alone = run_saw(&m2.seat, &m2.probe, &live, true, &cells, &after, &saw_old);
+    assert_eq!(
+        (alone.outcome, alone.changes.len()),
+        (Outcome::Unchanged, 0)
+    );
+    // A merge the Mac acknowledged is its word, and a row it adopted is its binding.
+    let acknowledged = with(m2.births.clone(), "merged_into", json!(OTHER));
+    let kept = run_saw(
+        &m2.successor,
+        &m2.probe,
+        &live,
+        true,
+        &cells,
+        &m2.read(acknowledged),
+        &saw_old,
+    );
+    assert!(
+        matches!(&kept.outcome, Outcome::Unchanged)
+            || matches!(&kept.outcome, Outcome::Refreshed { mac } if mac == OTHER),
+        "{:?}",
+        kept.outcome
+    );
+    let adopted = with(m2.births.clone(), "mac", json!(OTHER));
+    let stays = run_saw(
+        &m2.successor,
+        &m2.probe,
+        &live,
+        true,
+        &cells,
+        &m2.read(adopted),
+        &saw_old,
+    );
+    assert!(
+        matches!(&stays.outcome, Outcome::Unchanged)
+            || matches!(&stays.outcome, Outcome::Refreshed { mac } if mac == OTHER),
+        "{:?}",
+        stays.outcome
+    );
+    // The owner ended the earlier writer's machine: nothing to fold into, and the birth stands
+    // (it publishes this Mac's node, which no live row names any more).
+    let ended = run_saw(
+        &m2.successor,
+        &m2.probe,
+        &live,
+        true,
+        &m2.cells("retired", "live"),
+        &after,
+        &saw_old,
+    );
+    assert_eq!(ended.outcome, Outcome::Refreshed { mac: born.clone() });
+    assert!(
+        ended
+            .changes
+            .iter()
+            .all(|c| c.collection != MACHINE_FACTS.name),
+        "{:?}",
+        ended.changes
+    );
+}
+
+/// After m2's fold, every reader of a facts row takes the folded row for the machine it was
+/// folded into (`registry::bound_machine`), so the fold holds past the Mac's own row:
+///
+/// - a later writer succession (`THIRD`, lineage `OLD`, `ME`) adopts `PRED` by rule 0, not the
+///   born row, and still does once the owner retired the born row, where rule 0 over `mac` held
+///   it at `bound-machine-retired`; a later pre-fix birth of that writer folds into `PRED` too;
+/// - with `OLD`'s seat gone, a stranger carrying this Mac's fleet node (a disk clone) is not
+///   adopted onto `PRED` by its node: `PRED` is bound elsewhere, so it births, and `check` names a
+///   clone that did bind `PRED`;
+/// - a reinstall long after both seats are gone finds one machine, `PRED`, by its hint.
+///
+/// NEGATIVE CONTROL: with `succession` reading `mac` alone, `THIRD` adopts the born row:
+/// `` left: Adopted { rule: Succession, mac: "mc-1d866dd060273165" } ``; with `bound_elsewhere`
+/// reading `mac` alone, the stranger is `` left: Adopted { rule: Node, mac: "mc-1000000000000001" }
+/// ``; with `checks::facts` grouping by `mac` alone, the clone that bound `PRED` raises `[]`;
+/// with `reinstall` grouping by `mac`, the reinstall is `` left: Held `` at `hw-hint-ambiguous`.
+#[test]
+fn a_folded_successor_is_its_predecessors_machine_to_every_rule_after_it() {
+    let m2 = M2::new();
+    let folded = m2.folded();
+    let rebound = m2.read(folded.clone());
+    let live = [ME, OLD, ELSEWHERE, THIRD];
+    let third = Me {
+        uuid: THIRD.into(),
+        former: vec![writer(OLD, Some("m2")), writer(ME, Some("m34"))],
+        ..m2.seat.clone()
+    };
+    for born_lifecycle in ["live", "retired"] {
+        let cells = m2.cells("live", born_lifecycle);
+        let next = run(&third, &m2.probe, &live, true, &cells, &rebound);
+        assert_eq!(
+            next.outcome,
+            Outcome::Adopted {
+                rule: Rule::Succession,
+                mac: PRED.into()
+            },
+            "born row {born_lifecycle}"
+        );
+        assert_eq!(written_row(&next)["predecessor"], json!(ME));
+        assert_eq!(written_row(&next)["label"], json!("m2"));
+    }
+    // A later writer's own pre-fix birth folds into the machine its earlier writer was folded
+    // into, never the earlier writer's birth.
+    let cells = m2.cells("live", "live");
+    let its_birth = json!({"r": 1, "n": 1, "mac": keys::machine_pk(THIRD), "label": "m35",
+        "hw_hint": HINT, "node": NODE, "seen": 399, "hosts": ["m2"]});
+    let mut both = rebound.clone();
+    both.rows.insert(
+        THIRD.into(),
+        facts(&[(THIRD, its_birth)]).rows[THIRD].clone(),
+    );
+    let mut third_birth = m2.birth.clone();
+    third_birth.push(machine(
+        &keys::machine_pk(THIRD),
+        &[("label", json!("m35")), ("row", json!("live"))],
+    ));
+    let mut records = M2::rows("live");
+    records.extend(third_birth);
+    let refold = run_saw(
+        &third,
+        &m2.probe,
+        &live,
+        true,
+        &apply(&records),
+        &both,
+        &|writer| writer == ME,
+    );
+    assert_eq!(refold.outcome, Outcome::Refreshed { mac: PRED.into() });
+    assert_eq!(written_row(&refold)["merged_into"], json!(PRED));
+    // `OLD`'s seat is gone; a disk clone of this Mac on other hardware carries its fleet node.
+    let stranger = Me {
+        uuid: STRANGER.into(),
+        label: Some("m40".into()),
+        hw_hint: "cccccccccccccccc".into(),
+        ..me()
+    };
+    let gone = [ME, ELSEWHERE, STRANGER];
+    let clone = run(&stranger, &m2.probe, &gone, true, &cells, &rebound);
+    assert_eq!(
+        clone.outcome,
+        Outcome::Born {
+            mac: keys::machine_pk(STRANGER)
+        }
+    );
+    assert!(
+        kinds(&clone).contains(&"node-bound-elsewhere"),
+        "{:?}",
+        clone.findings
+    );
+    let machines = cell::project(&MACHINE, &cells);
+    let gone_set: BTreeSet<String> = gone.iter().map(|uuid| (*uuid).to_owned()).collect();
+    let mut adopted = rebound.clone();
+    adopted.rows.insert(
+        STRANGER.into(),
+        facts(&[(
+            STRANGER,
+            json!({"r": 1, "n": 1, "mac": PRED, "label": "m2", "hw_hint": "cccccccccccccccc",
+                "node": NODE, "seen": 400, "hosts": ["m2"]}),
+        )])
+        .rows[STRANGER]
+            .clone(),
+    );
+    let found: Vec<&str> = checks::facts(&adopted, &gone_set, &machines)
+        .into_iter()
+        .map(|f| f.kind)
+        .collect();
+    assert!(found.contains(&"facts-bind-one-machine"), "{found:?}");
+    // Both seats gone, the Mac wiped and enrolled again long after: one machine by its hint.
+    let reinstalled = Me {
+        uuid: STRANGER.into(),
+        label: Some("m41".into()),
+        enrolled_ms: Some(NOW),
+        ..me()
+    };
+    let wiped = Probe {
+        node: None,
+        hosts: Vec::new(),
+        ..m2.probe.clone()
+    };
+    let long_gone = facts(&[
+        (OLD, with(m2.old.clone(), "seen", json!(250))),
+        (ELSEWHERE, m2.theirs.clone()),
+        (ME, with(folded, "seen", json!(300))),
+    ]);
+    let back = run(
+        &reinstalled,
+        &wiped,
+        &[ELSEWHERE, STRANGER],
+        true,
+        &cells,
+        &long_gone,
+    );
+    assert_eq!(
+        back.outcome,
+        Outcome::Adopted {
+            rule: Rule::Reinstall,
+            mac: PRED.into()
+        },
+        "{:?}",
+        back.findings
+    );
+    assert_eq!(written_row(&back)["predecessor"], json!(ME));
+}
+
+/// `row` with `column` set to `x`.
+fn with(mut row: Value, column: &str, x: Value) -> Value {
+    if let Some(object) = row.as_object_mut() {
+        object.insert(column.into(), x);
+    }
+    row
+}
+
+/// End to end on a real lab, the same shape: a Mac registers under its first writer, its writer
+/// is succeeded, and a build before rule 0 registers the successor's own seat (`m34` here, which
+/// no row is planned under) with no lineage, so it births a row beside the earlier writer's, in a
+/// record whose causal past holds the earlier writer's facts row. This build's unheard pass
+/// writes nothing and reads no lineage; its next heard pass reads the lineage for that unfolded
+/// birth (`store::planned`, gated by `register::may_fold`), folds it in one record, and the lab's
+/// view names the earlier writer's machine and label for this Mac; the pass after writes nothing
+/// and reads no lineage. A row bound to a machine the Mac adopted is never worth the read.
+/// NEGATIVE CONTROL: with `store::planned` reading no lineage for a row the Mac already has (its
+/// `may_fold` arm answering `Ok(Vec::new())`, as before the fold), the folding pass reads
+/// `` left: (Unchanged, 0) ``; with `birth_saw` answering false, `may_fold` refuses the birth
+/// before any pass runs.
+#[test]
+fn a_writer_successors_birth_from_before_the_fix_is_folded_by_its_next_pass() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    name_macs(&lab);
+    let original = lab.paths[0].clone();
+    let config = lab_config(&lab, 0);
+    if !config.exists() {
+        aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    }
+    let registry = Registry::at(original.clone());
+    registry.open().unwrap();
+    registry.seed().unwrap();
+    let first = registry.register(&config, &probe(), true, NOW).unwrap();
+    let Outcome::Adopted {
+        rule: Rule::Planned,
+        mac,
+    } = first.outcome
+    else {
+        panic!("{:?}", first.outcome);
+    };
+    let earlier = keys::uuid32(&machine_of(&lab, 0));
+    let successor = keys::uuid32(&machine_of(&lab, 1));
+    let selected = crate::generation::test_complete_successor(
+        lab._home.path(),
+        &original,
+        &lab.paths[1],
+        &config,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    lab.paths[1] = selected.clone();
+    let day = 86_400_000;
+    let trust = lab.bootstrap(0).trust();
+    let seat = Me {
+        uuid: successor.clone(),
+        label: Some("m34".into()),
+        chosen: None,
+        hw_hint: keys::hw_hint(&trust.network, &probe().platform_uuid),
+        enrolled_ms: None,
+        former: Vec::new(),
+    };
+    let live = registry.live_uuids().unwrap();
+    assert!(live.contains(&earlier) && live.contains(&successor));
+    let unfixed = super::plan(
+        &Input {
+            me: &seat,
+            probe: &probe(),
+            live: &live,
+            heard: true,
+            now_ms: NOW + day,
+        },
+        &registry.view().unwrap(),
+    )
+    .unwrap();
+    let born = keys::machine_pk(&successor);
+    assert_eq!(unfixed.outcome, Outcome::Born { mac: born.clone() });
+    registry.write(vec![unfixed.changes]).unwrap();
+    let before = registry.view().unwrap();
+    assert!(super::may_fold(&before, &successor, &seat.hw_hint, true));
+    assert!(!super::may_fold(&before, &successor, &seat.hw_hint, false));
+    assert!(!super::may_fold(&before, &earlier, &seat.hw_hint, true));
+    let unheard = Registry::at(selected.clone())
+        .register(&config, &probe(), false, NOW + 2 * day)
+        .unwrap();
+    assert_eq!((unheard.outcome, unheard.records), (Outcome::Unchanged, 0));
+    let pass = Registry::at(selected.clone())
+        .register(&config, &probe(), true, NOW + 2 * day)
+        .unwrap();
+    assert_eq!(
+        (pass.outcome, pass.records),
+        (Outcome::Refreshed { mac: mac.clone() }, 1)
+    );
+    let view = registry.view().unwrap();
+    assert!(!super::may_fold(&view, &successor, &seat.hw_hint, true));
+    let read = &view.owned[MACHINE_FACTS.name];
+    let row = &read.rows[&successor].value;
+    assert_eq!(row["mac"], json!(born));
+    assert_eq!(row["merged_into"], json!(mac));
+    assert_eq!(row["predecessor"], json!(earlier));
+    let shown =
+        crate::alab::view::LabView::read_view(&view, read, &OwnedRead::default(), Some(&successor));
+    assert_eq!(
+        (shown.me.as_deref(), shown.my_label()),
+        (Some(mac.as_str()), Some("m1"))
+    );
+    let again = Registry::at(selected)
+        .register(&config, &probe(), true, NOW + 2 * day)
+        .unwrap();
+    assert_eq!((again.outcome, again.records), (Outcome::Unchanged, 0));
 }

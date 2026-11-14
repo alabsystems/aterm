@@ -91,6 +91,50 @@ fn retained_identified_wires_keep_signature_facts_across_cyclic_replay() {
 }
 
 #[test]
+fn detached_facts_survive_body_eviction_without_accepting_changed_bytes_or_keys() {
+    let cache = Cache::new(2);
+    let (signer, _) = signed(1, DOMAIN);
+    let bytes: Vec<_> = (1..=3).map(|tag| signed(tag, DOMAIN).1).collect();
+    let wires: Vec<_> = bytes.iter().cloned().map(Identified::new).collect();
+    let facts = Facts::of(wires.iter());
+    // Installation precedes replay authentication, as it does in the journal
+    // cache. Later successes must populate the independently retained facts.
+    for wire in &wires {
+        cache.verify_identified(&signer, wire).unwrap();
+        wire.remember_non_cut(crypto::payload_key_identity(&[41; 32]));
+    }
+    drop(wires);
+    for _ in 0..3 {
+        for bytes in &bytes {
+            let wire = Identified::new_with(bytes.clone(), Some(&facts));
+            cache.verify_identified(&signer, &wire).unwrap();
+            assert!(wire.verified_non_cut(&crypto::payload_key_identity(&[41; 32])));
+            assert!(!wire.verified_non_cut(&crypto::payload_key_identity(&[42; 32])));
+        }
+    }
+    assert_eq!(cache.checks.load(Ordering::Relaxed), 3);
+    let wrong_signer = crypto::public(&[18; 32]).unwrap();
+    assert!(
+        cache
+            .verify_identified(
+                &wrong_signer,
+                &Identified::new_with(bytes[0].clone(), Some(&facts))
+            )
+            .is_err()
+    );
+    let mut changed = bytes[0].clone();
+    changed[0] ^= 1;
+    let wire = Identified::new_with(changed, Some(&facts));
+    assert!(!wire.verified_non_cut(&crypto::payload_key_identity(&[41; 32])));
+    assert!(cache.verify_identified(&signer, &wire).is_err());
+    assert_eq!(cache.checks.load(Ordering::Relaxed), 5);
+    assert!(
+        facts.allocation_bytes()
+            < bytes.iter().map(Vec::capacity).sum::<usize>() + 3 * size_of::<Wire>()
+    );
+}
+
+#[test]
 fn identified_facts_require_the_exact_signer_and_wire_and_never_keep_failures() {
     let cache = Cache::new(1);
     let (signer, bytes) = signed(1, DOMAIN);

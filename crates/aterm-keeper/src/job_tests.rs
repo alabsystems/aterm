@@ -4,6 +4,53 @@
 use super::*;
 
 #[test]
+#[cfg(unix)]
+fn a_failed_launchctl_print_is_not_evidence_of_absence() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let out = std::process::Output {
+        status: std::process::ExitStatus::from_raw(1 << 8),
+        stdout: Vec::new(),
+        stderr: b"Could not communicate with launchd: Operation not permitted\n".to_vec(),
+    };
+    assert!(
+        state_output("gui/501", "test-keeper", &out).is_err(),
+        "an unavailable job observation must not manufacture absence"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn only_the_requested_services_complete_missing_receipt_means_absent() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut out = std::process::Output {
+        status: std::process::ExitStatus::from_raw(113 << 8),
+        stdout: Vec::new(),
+        stderr:
+            b"Bad request.\nCould not find service \"test-keeper\" in domain for user gui: 501\n"
+                .to_vec(),
+    };
+    assert_eq!(
+        state_output("gui/501", "test-keeper", &out).unwrap(),
+        JobState::Absent
+    );
+    assert!(state_output("gui/502", "test-keeper", &out).is_err());
+    assert!(state_output("gui/501", "another-keeper", &out).is_err());
+    out.stdout = b"an incomplete response".to_vec();
+    assert!(state_output("gui/501", "test-keeper", &out).is_err());
+    out.stdout.clear();
+    out.stderr = b"Bad request.\nCould not find domain for user gui: 501\n".to_vec();
+    assert!(state_output("gui/501", "test-keeper", &out).is_err());
+    out.stderr = b"Bad request.\nCould not find service \"test-keeper\"".to_vec();
+    assert!(state_output("gui/501", "test-keeper", &out).is_err());
+    out.status = std::process::ExitStatus::from_raw(0);
+    out.stdout = b"\tpid = 42\n".to_vec();
+    assert_eq!(
+        state_output("gui/501", "test-keeper", &out).unwrap(),
+        JobState::Loaded { pid: Some(42) }
+    );
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn native_launchctl_survives_scheduling_delay() {
     let program = aterm_uds::deadline::stand_in(Path::new("/bin/launchctl"));

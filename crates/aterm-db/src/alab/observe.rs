@@ -8,10 +8,12 @@
 //!
 //! An observation is matched to an account by address, never by a recomputed key: the `account`
 //! row at the observed realm whose `login` or `identity` address row says the login email. Where
-//! none does, the account is born (and its address first, where no row says it), keyed as the
-//! importer keys it (`keys::account_pk` of the realm and the claims email), so two Macs that
-//! observe one login birth the same cells and converge; an owner's cell beats a birth cell. Where
-//! several rows say it, nothing is written and the pass reports `account-ambiguous`.
+//! no live row does but a row that is not live holds the key a birth would take, the sighting is
+//! that row's and nothing is born: a birth would revive what the owner retired. Where none does,
+//! the account is born (and its address first, where no row says it), keyed as the importer keys
+//! it (`keys::account_pk` of the realm and the claims email), so two Macs that observe one login
+//! birth the same cells and converge; a concurrent owner's cell beats a birth cell. Where several
+//! rows say it, nothing is written and the pass reports `account-ambiguous`.
 //!
 //! A record is written only for news the registry keeps for good: an account born, or this
 //! Mac's first row of an account. A row that exists is rewritten only with such a record, where
@@ -191,7 +193,8 @@ const fn tabs_bucket(tabs: u64) -> u64 {
 
 /// The account a sighting is of, by address.
 enum Matched {
-    /// One live account row at the realm says the email.
+    /// One live account row at the realm says the email, or none does and a row that is not live
+    /// holds the key a birth would take.
     Row(String),
     /// None does: born under this key, its login address `login` (born first where `addr` is
     /// some, not yet a row).
@@ -243,6 +246,16 @@ fn matched(
         [] => {}
     }
     let pk = keys::account_pk(realm, &keys::claims_email(None, Some(&email))?)?;
+    // A row at the account's own key that is not live (the owner retired, ended, merged or
+    // locked it, or its lifecycle is conflicted) is this account: the sighting marks it and
+    // births nothing. This Mac reads the row as not live only once it holds the owner's write,
+    // so a birth would be appended after it and its automatic cells would replace the owner's
+    // (`documents::apply` keeps no candidate a write observed): `row=live`, `status=active` and
+    // the default label, the account back in use. A machine's birth never revives an ended row
+    // either (`register::plan`).
+    if accounts.rows.get(&pk).is_some_and(|row| !row.live()) {
+        return Ok(Matched::Row(pk));
+    }
     match index.holder(&email)? {
         AddressHolder::Row(login) => Ok(Matched::Born {
             pk,

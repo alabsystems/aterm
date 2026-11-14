@@ -370,12 +370,18 @@ fn the_screen_readers_node_is_the_tabs_chip() {
          autopilot sid=s-c window=2 program=claude face=land drawn=\"⤓\"\n\
          a11y window=2 autopilot sid=s-d role=Button label=\"Autopilot: land.\" description=-\n\
          a11y window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description=\"x\"\n\
-         statusitem title=❯ needs=0";
+         statusitem title=❯ fleet=off access=read shown=read blocked=no";
     assert_eq!(
         ax_of(chrome, "s-c"),
         "window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description=\"x\""
     );
-    assert_eq!(ax_of("OK 1\nstatusitem title=❯ needs=0", "s-c"), "-");
+    assert_eq!(
+        ax_of(
+            "OK 1\nstatusitem title=❯ fleet=off access=read shown=read blocked=no",
+            "s-c"
+        ),
+        "-"
+    );
     assert_eq!(ax_of(chrome, "s-e"), "-");
 }
 

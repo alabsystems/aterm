@@ -2456,7 +2456,7 @@ fn cold_native_settled() -> ColdNative {
     aterm_uds::deadline::prints(
         &mut proof,
         "2.1.318 (Claude Code)",
-        aterm_uds::deadline::ECHO_HANG,
+        aterm_uds::deadline::FIRST_EXEC_HANG,
     );
     assert!(proof.wait().unwrap().success());
     std::fs::write(
@@ -2553,7 +2553,7 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
     aterm_uds::deadline::prints(
         &mut proof,
         "2.1.319 (Claude Code)",
-        aterm_uds::deadline::ECHO_HANG,
+        aterm_uds::deadline::FIRST_EXEC_HANG,
     );
     assert!(proof.wait().unwrap().success());
     until_on(a, s, DEADLINE, "activation wake is armed", || {

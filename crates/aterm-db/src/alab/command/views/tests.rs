@@ -13,13 +13,10 @@ use crate::typed::{grid::tests::put, keys};
 use aterm_secrets::commons::roster::Role;
 use std::path::Path;
 
-/// A rekey cut short right after its rename leaves no `database.json` at the replica's path: the
-/// nouns stay with fleet_db, each spelling of a verb names the rekey, and the import refuses alike.
-/// NEGATIVE CONTROL: with `kept` reading the missing file as no replica:
-/// `` assertion failed: kept(paths).is_some() ``. With `handed_back` not asking whether a replica is at
-/// its path, the command line says it read one that is not there.
+/// A rekey cut short right after its rename leaves no `database.json` at the replica's path:
+/// each spelling of a fleet_db verb names the rekey, and the import refuses alike.
 #[test]
-fn a_rekey_cut_short_after_its_rename_keeps_the_nouns_with_fleet_db() {
+fn a_rekey_cut_short_after_its_rename_refuses_fleet_db_and_the_import() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 2, "active");
@@ -33,15 +30,10 @@ fn a_rekey_cut_short_after_its_rename_keeps_the_nouns_with_fleet_db() {
     )
     .unwrap();
 
-    assert!(kept(paths).is_some());
-    // No replica is at its path, so the command line adds no word of its own: fleet_db's
-    // refusal names the rekey.
-    let why = kept(paths).unwrap();
-    assert!(handed_back(paths, Noun::Emails, &why).is_none());
     for line in [
-        &["emails"][..],
-        &["emails", "--edit"],
-        &["emails", "--digest"],
+        &["scan", "emails"][..],
+        &["get", "emails", "ada.fb@alpha.example"],
+        &["tables"],
     ] {
         let held = dir.clone();
         let refused = crate::fleet_db::try_run_with(&words(line), move || Ok(held)).unwrap_err();
@@ -889,52 +881,38 @@ fn a_killed_sessions_grid_folder_is_swept_at_the_next_edit() {
     std::fs::remove_dir_all(&planted[1]).unwrap();
 }
 
-/// The four nouns serve from the registry once any import filled it, or where no fleet_db
-/// replica is; before that, a Mac holding a replica keeps fleet_db's views, and the command line
-/// says so and why: the registry cannot be read here, or it reads and no import has filled it.
-/// NEGATIVE CONTROL: with `kept` taking a registry that cannot be read for one that is empty (or
-/// the reverse), the matching `matches!` fails.
+/// No noun reads fleet_db, whatever this Mac's registry holds: on a Mac with a fleet_db replica
+/// and an empty registry (where the nouns used to fall through to the replica, and on a Mac
+/// whose registry refused answered its 0 rows), `emails` answers no rows and `never` with the
+/// reason, and `ai-accounts` answers its shared file's snapshot; once an import fills the
+/// registry, `emails` answers its rows `live`.
+/// NEGATIVE CONTROL: with `run` returning the registry read's error for `emails`, as it did
+/// before: `` called `Result::unwrap()` on an `Err` value: Error("table enrollment claim is
+/// missing or damaged") ``.
 #[test]
-fn the_registry_takes_the_nouns_once_imported_or_where_no_replica_is() {
+fn the_nouns_never_read_fleet_db_whatever_the_registry_holds() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
-    assert!(kept(paths).is_none(), "no replica here");
-    let dir = replica_fixture(paths, 1, "active");
-    assert!(
-        kept(paths).is_some(),
-        "a replica and an empty registry: fleet_db keeps them"
+    replica_fixture(paths, 1, "active");
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let journal = Journal::at(scratch.path());
+    let read = |noun: Noun| view(paths, noun, &[], &spawned, &mut no_grid, b"", &journal).unwrap();
+
+    let emails = read(Noun::Emails);
+    assert_eq!(emails["state"].as_str(), Some("never"), "{emails}");
+    assert_eq!(emails["why"].as_str(), Some("catalog"), "{emails}");
+    assert_eq!(emails["emails"], json!([]), "the replica's row is not read");
+    let accounts = read(Noun::AiAccounts);
+    assert_eq!(accounts["file"].as_str(), Some("ai/accounts"), "{accounts}");
+    assert_eq!(accounts["state"].as_str(), Some("never"), "{accounts}");
+    assert_eq!(accounts["ai-accounts"], json!([]));
+    let computers = read(Noun::Computers);
+    assert_eq!(
+        computers["file"].as_str(),
+        Some("lab/machines"),
+        "{computers}"
     );
-    // Why they stay there is said, and the two reasons are told apart: a registry this Mac
-    // cannot read, and one it reads that no import has filled.
-    let unread = kept(paths).unwrap();
-    assert!(
-        matches!(unread, Kept::Unread(_)),
-        "no registry is declared here"
-    );
-    assert!(handed_back(paths, Noun::AiAccounts, &unread).is_some());
-    Handle::at(paths.clone(), &att::REGISTRY)
-        .publish_schema()
-        .unwrap();
-    assert!(
-        matches!(kept(paths), Some(Kept::Empty)),
-        "declared, and holding no source row"
-    );
-    // A record of this Mac's own import keeps the nouns with the registry, whatever it reads.
-    let record = crate::alab::import::covered::Record {
-        covered: false,
-        uncovered: 1,
-        digest: None,
-        epoch: None,
-        at_ms: NOW,
-        sources: std::collections::BTreeSet::new(),
-    };
-    crate::alab::import::covered::write(&dir, &record, &[]).unwrap();
-    assert!(kept(paths).is_none(), "this Mac's import ran");
-    std::fs::remove_file(dir.join(crate::alab::import::covered::FILE)).unwrap();
-    assert!(
-        kept(paths).is_some(),
-        "the negative control: no record, an empty registry"
-    );
+
     let mut never = |_: &Path| -> Result<()> { panic!("no review") };
     super::super::run(
         paths,
@@ -944,7 +922,13 @@ fn the_registry_takes_the_nouns_once_imported_or_where_no_replica_is() {
         NOW,
     )
     .unwrap();
-    assert!(kept(paths).is_none());
+    let emails = read(Noun::Emails);
+    assert_eq!(emails["state"].as_str(), Some("live"), "{emails}");
+    assert_eq!(
+        emails["emails"].as_array().map(Vec::len),
+        Some(1),
+        "{emails}"
+    );
     let (email, _) = email_row(1, "active");
     assert_eq!(Noun::parse("emails"), Some(Noun::Emails));
     assert_eq!(Noun::parse("ai_accounts"), Some(Noun::AiAccounts));
@@ -1188,4 +1172,82 @@ fn seen_on_lapses_without_a_sighting_and_counts_heard_tabs() {
     assert_eq!(rows[1]["status"], json!("pending"));
     let alone = seen_on(&lapsed, &[], &named, NOW);
     assert!(alone[UNICORN].macs.is_empty(), "{alone:?}");
+}
+
+/// `--registry` keeps the nouns' own projection, read through custody, with what the snapshot
+/// does not hold yet: `ai-accounts` carries `seen_on` and `last_seen`, `computers` each live seat
+/// no machine row binds. The plain view is the shared file's snapshot and carries neither. It
+/// goes with the plain view only, and only with a noun that has a shared file.
+/// NEGATIVE CONTROL: with `run` answering the snapshot for `--registry` too, the view is the
+/// file's, which no pass has written: `` left: Some("never") right: Some("live") ``.
+#[test]
+fn the_registry_view_keeps_the_observed_columns_and_the_unbound_seats() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let registry = crate::alab::Registry::at(paths.clone());
+    registry.open().unwrap();
+    let machine = keys::machine_pk("m7");
+    let (address, account) = (
+        keys::address_pk("ada.fb@alpha.example").unwrap(),
+        keys::account_pk("claude", "ada.fb@alpha.example").unwrap(),
+    );
+    registry
+        .write(vec![vec![
+            put(&MACHINE, &machine, "label", json!("m7")),
+            put(&MACHINE, &machine, "status", json!("active")),
+            put(&ADDRESS, &address, "addr", json!("ada.fb@alpha.example")),
+            put(&ACCOUNT, &account, "provider", json!("anthropic")),
+            put(&ACCOUNT, &account, "realm", json!("claude")),
+            put(&ACCOUNT, &account, "login", json!(address)),
+            put(&ACCOUNT, &account, "status", json!("pending")),
+        ]])
+        .unwrap();
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let journal = Journal::at(scratch.path());
+    let read =
+        |noun: Noun, list: &[&str]| view(paths, noun, list, &spawned, &mut no_grid, b"", &journal);
+
+    let accounts = read(Noun::AiAccounts, &["--registry"]).unwrap();
+    assert_eq!(accounts["state"].as_str(), Some("live"), "{accounts}");
+    assert!(accounts.get("file").is_none(), "{accounts}");
+    let rows = accounts["ai-accounts"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{accounts}");
+    let row = rows[0].as_object().unwrap();
+    assert_eq!(row["ac"], json!(account));
+    assert_eq!(
+        row["status"],
+        json!("pending"),
+        "no Mac was seen running it"
+    );
+    assert!(row.contains_key("seen_on") && row.contains_key("last_seen"));
+
+    let computers = read(Noun::Computers, &["--registry"]).unwrap();
+    let listed = computers["computers"].as_array().unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|row| row["mc"] == json!(machine) && row["seats"] == json!([])),
+        "{computers}"
+    );
+    assert!(
+        listed.iter().any(|row| row["mc"].is_null()
+            && row["seats"]
+                .as_array()
+                .is_some_and(|seats| seats.len() == 1)),
+        "this Mac's seat, which no machine row binds: {computers}"
+    );
+
+    // The plain view is the file's snapshot: no pass ran, so it answers `never`, and it has no
+    // observed column.
+    let plain = read(Noun::AiAccounts, &[]).unwrap();
+    assert_eq!(plain["file"].as_str(), Some("ai/accounts"), "{plain}");
+    assert_eq!(plain["state"].as_str(), Some("never"), "{plain}");
+
+    for (noun, list) in [
+        (Noun::Emails, &["--registry"][..]),
+        (Noun::AiAccounts, &["--registry", "--digest"]),
+        (Noun::Computers, &["--registry", "--edit"]),
+    ] {
+        assert!(read(noun, list).is_err(), "{noun:?} {list:?}");
+    }
 }

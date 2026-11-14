@@ -1716,7 +1716,7 @@ fn fda_entries(app: &App) -> Vec<aterm_messages::DigestEntry> {
 }
 
 #[test]
-fn the_launch_reassert_posts_nothing_and_lights_the_menu_line_for_a_regression() {
+fn the_launch_reassert_posts_nothing_and_lights_the_signal_line_for_a_regression() {
     use super::consent_card::{NeedCause, NeedWords};
     let mut app = App::headless_for_test();
     let words = NeedWords {
@@ -1735,12 +1735,12 @@ fn the_launch_reassert_posts_nothing_and_lights_the_menu_line_for_a_regression()
         ..words
     });
     assert!(fda_entries(&app).is_empty(), "never an entry");
-    assert!(app.access_steps.fda_regressed(), "the menu line names it");
+    assert!(app.access_steps.fda_regressed(), "the signal line names it");
 }
 
 /// A verified grant a young process read off (an update's successor) is read again once the
 /// process settled, from a fresh probe: held then, it ends there with no regression; still off,
-/// it is the card's need as any regression is, whose menu line says the update needs it
+/// it is the card's need as any regression is, whose signal line says the update needs it
 /// re-allowed when another build verified it, and the next focus gain looks once more; a probe
 /// read made just before the settled look does not hold that look's back. Negative controls:
 /// before the settled time nothing is read; verified by this build, no update note.
@@ -1849,7 +1849,7 @@ fn a_grant_a_young_process_read_off_is_read_again_once_settled() {
         app.settle_access_steps(at);
         let updated = verified_build != this_build;
         assert_eq!(
-            app.system_state_menu_line().and_then(|line| line.note),
+            app.system_state_signal_line().and_then(|line| line.note),
             updated.then(|| crate::system_state_access::FDA_AFTER_UPDATE.to_owned()),
             "the update note only when another build verified the grant"
         );
@@ -1882,7 +1882,7 @@ fn access_card_due(app: &mut App, now: std::time::Instant) {
     assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
 }
 
-/// platform gate) hold on every host. On macOS the park asks once, posts nothing and watches the probe; a regressed grant lights the menu line.
+/// platform gate) hold on every host. On macOS the park asks once, posts nothing and watches the probe; a regressed grant lights the signal line.
 #[test]
 fn the_access_question_posts_nothing_and_watches_the_probe() {
     use super::consent_card::{CardPhase, NeedCause, NeedWords};
@@ -1929,7 +1929,7 @@ fn the_access_question_posts_nothing_and_watches_the_probe() {
         CardPhase::Watching { .. }
     ));
 
-    // A regression (a verified grant later reads off) lights the menu line.
+    // A regression (a verified grant later reads off) lights the signal line.
     app.hold_fda_need(
         &NeedWords {
             cause: NeedCause::ProtectedRead { session: None },
@@ -2027,7 +2027,7 @@ fn a_grant_settles_the_card_and_is_a_record() {
     assert_eq!(granted.key.as_deref(), Some(KEY_FILE_ACCESS));
     assert_eq!(app.next_macos_access_card_deadline(t0), None);
 
-    // A regression lights the menu line, and a grant ends it.
+    // A regression lights the signal line, and a grant ends it.
     app.hold_fda_need(
         &super::consent_card::NeedWords {
             cause: super::consent_card::NeedCause::ProtectedRead { session: None },

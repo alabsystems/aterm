@@ -40,6 +40,10 @@ pub(crate) struct ConsentProbes {
     pub(crate) devtools: fn(ProbeGate, &str) -> DevToolProbe,
     /// Read-only query of the subject's row in the system `TCC.db`.
     pub(crate) devtools_list: fn(ProbeGate, &str) -> DevToolList,
+    /// `AXIsProcessTrusted` with no prompt option: aterm's own Accessibility grant, read
+    /// in-process by the permission walk's live arm (`permission_walk::WalkReach::live`) behind
+    /// the in-bundle fence ([`accessibility_with`]).
+    pub(crate) accessibility: fn(ProbeGate) -> AxProbe,
     /// Running bundle's `CFBundleIdentifier` if already warm (`None` when cold).
     pub(crate) subject: fn() -> Option<&'static str>,
     /// Running bundle's `CFBundleIdentifier`, warming the identity if needed (worker-only).
@@ -68,6 +72,78 @@ const fn inert_devtools_list(_gate: ProbeGate, _subject: &str) -> DevToolList {
     DevToolList::refused(DevToolListLabel::RefusedDisabled)
 }
 
+const fn inert_accessibility(_gate: ProbeGate) -> AxProbe {
+    AxProbe::RefusedDisabled
+}
+
+/// The permission walk's own live read of aterm's Accessibility grant, behind the in-bundle
+/// fence of the other consent probes ([`accessibility_with`] over [`consent::fence_exe`]), so the
+/// report and the walk read the grant through one arm. It raises no dialog.
+fn live_accessibility(_gate: ProbeGate) -> AxProbe {
+    accessibility_with(
+        consent::fence_exe().as_deref(),
+        crate::permission_walk::WalkReach::live().ax_trusted,
+    )
+}
+
+/// The Accessibility read with the executable and the read injected. It calls `read` only when
+/// `exe` lies inside a `.app`, as `consent::probe_fda_with` opens nothing outside one: macOS
+/// answers `AXIsProcessTrusted` for the app it holds responsible for this process, which for an
+/// executable outside a bundle is the program that started it (a terminal), not aterm.
+pub(crate) fn accessibility_with(exe: Option<&Path>, read: impl FnOnce() -> bool) -> AxProbe {
+    let Some(exe) = exe else {
+        return AxProbe::RefusedNoExe;
+    };
+    if !consent::path_is_in_app_bundle(exe) {
+        return AxProbe::RefusedOutOfBundle;
+    }
+    AxProbe::Read { trusted: read() }
+}
+
+/// One read of aterm's own Accessibility grant: the `accessibility` row of `privacy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AxProbe {
+    /// macOS answered `AXIsProcessTrusted`: whether this process holds the grant.
+    Read {
+        /// The answer.
+        trusted: bool,
+    },
+    /// Not read: `[privacy] enabled` or `[privacy] check` is off, or the instance is headless.
+    RefusedDisabled,
+    /// Not read: the running executable could not be resolved.
+    RefusedNoExe,
+    /// Not read: the running executable is not inside a `.app` bundle, so macOS would answer
+    /// for another app.
+    RefusedOutOfBundle,
+    /// Not macOS: there is no Accessibility grant here.
+    UnsupportedPlatform,
+}
+
+impl AxProbe {
+    /// The `grant=` token, in the `devtools` row's words: `unknown` when nothing was read.
+    pub(crate) const fn grant(self) -> &'static str {
+        match self {
+            Self::Read { trusted: true } => "granted",
+            Self::Read { trusted: false } => "not_granted",
+            Self::RefusedDisabled
+            | Self::RefusedNoExe
+            | Self::RefusedOutOfBundle
+            | Self::UnsupportedPlatform => "unknown",
+        }
+    }
+
+    /// The `probe=` token, in the words of the other consent probes' labels.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Read { .. } => "read",
+            Self::RefusedDisabled => "refused_disabled",
+            Self::RefusedNoExe => "refused_no_exe",
+            Self::RefusedOutOfBundle => "refused_out_of_bundle",
+            Self::UnsupportedPlatform => "unsupported_platform",
+        }
+    }
+}
+
 impl ConsentProbes {
     /// Live probes for a windowed instance.
     pub(crate) const fn live() -> Self {
@@ -79,6 +155,7 @@ impl ConsentProbes {
             hardening: consent::self_hardening,
             devtools: consent::probe_devtool,
             devtools_list: consent::probe_devtool_list,
+            accessibility: live_accessibility,
             subject: running_bundle_id_if_warm,
             warm_subject: running_bundle_id,
             live: true,
@@ -95,6 +172,7 @@ impl ConsentProbes {
             hardening: inert_hardening,
             devtools: inert_devtools,
             devtools_list: inert_devtools_list,
+            accessibility: inert_accessibility,
             subject: running_bundle_id_if_warm,
             warm_subject: running_bundle_id_if_warm,
             live: false,
@@ -116,6 +194,7 @@ impl ConsentProbes {
                 hardening: inert_hardening,
                 devtools: unsupported_devtools_probe,
                 devtools_list: unsupported_devtools_list,
+                accessibility: unsupported_accessibility,
                 subject: running_bundle_id_if_warm,
                 warm_subject: running_bundle_id_if_warm,
                 live: false,
@@ -163,6 +242,14 @@ const fn unsupported_devtools_list(gate: ProbeGate, _subject: &str) -> DevToolLi
     } else {
         DevToolListLabel::RefusedDisabled
     })
+}
+
+const fn unsupported_accessibility(gate: ProbeGate) -> AxProbe {
+    if gate.permits() {
+        AxProbe::UnsupportedPlatform
+    } else {
+        AxProbe::RefusedDisabled
+    }
 }
 
 const fn inert_fda_probe(_gate: ProbeGate) -> FdaProbe {
@@ -1213,6 +1300,17 @@ impl ConsentState {
 
     pub(crate) fn responsible_answers(&self, pids: &[i32]) -> Vec<Result<i32, ResponsibleError>> {
         (self.probes.responsible)(pids)
+    }
+
+    /// Read aterm's own Accessibility grant on the calling thread: one call of the arm while
+    /// the gate permits, none while it does not. Nothing is cached, since a read is one
+    /// in-process call that raises no dialog.
+    pub(crate) fn accessibility(&self, gate: ProbeGate) -> AxProbe {
+        if gate.permits() {
+            (self.probes.accessibility)(gate)
+        } else {
+            AxProbe::RefusedDisabled
+        }
     }
 
     /// Read all four consent slots for the full privacy report, dispatching workers as needed.

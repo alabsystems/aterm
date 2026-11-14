@@ -1836,3 +1836,67 @@ fn failed_direct_proofs_keep_all_reachable_members_for_the_plain_request() {
         Ok(2)
     );
 }
+
+/// A member's `list` line says who let it in, the UTC day its entry was signed, how the member
+/// knew to and whether the log holds a fleet node key for its seat: together they tell a seat a
+/// person allowed (`how=phrase`), one a member let in by itself with a node key (a proof from
+/// the home ALab LAN, `how=manual node=yes`) and a writer successor (`how=manual node=no`) apart,
+/// and date each. An entry whose record this Mac's log does not hold prints no day; a removed
+/// Mac's line is as before.
+///
+/// NEGATIVE CONTROL: `signed_day` counting a day's first millisecond as the day before
+/// (`(ms - 1) / 86 400 000`) prints `on=2026-11-12` for the second line's 00:00:00 stamp; `listed_line` not reading `node` prints `node=no` for the
+/// first; reading `how` as `Phrase` for every seat fails the second.
+#[test]
+fn a_members_line_says_who_let_it_in_on_which_day_and_whether_it_holds_a_node_key() {
+    let mac = |by: Option<&str>, ms: u64, how: Option<Evidence>, node: bool| client::ListedMac {
+        label: "m391".to_owned(),
+        name: "m11".to_owned(),
+        admitted_by: by.map(str::to_owned),
+        admitted_ms: ms,
+        how,
+        node,
+        code: "code".to_owned(),
+        removed: None,
+    };
+    // 2026-11-12T23:59:59Z and the second after it.
+    assert_eq!(
+        listed_line(&mac(
+            Some("m3"),
+            1_794_527_999_000,
+            Some(Evidence::Phrase),
+            true
+        )),
+        "m391 m11 code=code admitted by=m3 on=2026-11-12 how=phrase node=yes"
+    );
+    assert_eq!(
+        listed_line(&mac(
+            Some("m11"),
+            1_794_528_000_000,
+            Some(Evidence::Manual),
+            false
+        )),
+        "m391 m11 code=code admitted by=m11 on=2026-11-13 how=manual node=no"
+    );
+    assert_eq!(
+        listed_line(&mac(Some("m22"), 1, Some(Evidence::Listed), true)),
+        "m391 m11 code=code admitted by=m22 on=1970-01-01 how=listed node=yes"
+    );
+    assert_eq!(
+        listed_line(&mac(None, 0, None, false)),
+        "m391 m11 code=code founder node=no"
+    );
+    let removed = client::ListedMac {
+        removed: Some(client::RemovedNote {
+            label: "m391".to_owned(),
+            by: vec!["m22".to_owned(), "m3".to_owned()],
+            on_ms: 1,
+            quorum: true,
+        }),
+        ..mac(None, 0, None, true)
+    };
+    assert_eq!(
+        listed_line(&removed),
+        "m391 m11 code=code removed by=m22,m3 quorum"
+    );
+}

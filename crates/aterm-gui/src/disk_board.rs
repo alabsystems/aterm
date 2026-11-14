@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::disk::{Class, Hog, Level, Thresholds};
+use aterm_agent::harness::disk::budget::Sizing;
+use aterm_agent::harness::disk::{Cap, Class, Hog, Level, Thresholds};
 use aterm_sysprobe::volumes::{Reading, Table, VolumeKey};
+use aterm_vitals::sys::{BudgetFacts, BudgetRead};
 
 /// Maximum number of deduplicated volumes retained on the board.
 pub(crate) const MAX_VOLUMES: usize = 8;
@@ -76,6 +78,17 @@ pub(crate) struct PassSummary {
     pub(crate) left: Vec<Hog>,
     /// Unix completion timestamp (`None` if wall clock was unavailable).
     pub(crate) ended_at_unix: Option<i64>,
+}
+
+/// Which volume this process's disk watch sizes the rebuildable budget on ([`Board::budget_look`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BudgetHome {
+    /// No look has said yet.
+    Unlooked,
+    /// None: this process is not the account's own watch, or its home volume was not read.
+    Unsized,
+    /// The home volume, by its spelled key.
+    Volume(String),
 }
 
 /// Whether a reclamation pass for `demand` exhausted all candidates without meeting `demand`.
@@ -263,6 +276,14 @@ pub(crate) struct Board {
     pub(crate) spelled: BTreeMap<u64, (PathBuf, PathBuf)>,
     /// Summary of the last reclamation pass.
     pub(crate) last_pass: Option<PassSummary>,
+    /// The rebuildable budget's last sizing (`None`: none in this process or in the record it
+    /// read, `aterm_agent::harness::disk::budget::Record`). A reading for `sys disk` alone: no
+    /// level, wait or alert reads it.
+    pub(crate) budget: Option<Sizing>,
+    /// `disk.cap_used_gib` as the last look read it ([`Self::budget_look`]).
+    pub(crate) budget_cap: Cap,
+    /// The volume the budget is sized on, as the last look said ([`Self::budget_look`]).
+    pub(crate) budget_home: BudgetHome,
     /// The checkouts' `target*` links whose target a pass's search found not there, kept while
     /// each look finds them still dangling ([`Shelf::keep_dangling`]; the leftover view's `link`
     /// rows).
@@ -400,6 +421,9 @@ impl Board {
             sessions: BTreeMap::new(),
             spelled: BTreeMap::new(),
             last_pass: None,
+            budget: None,
+            budget_cap: Cap::Unwritten,
+            budget_home: BudgetHome::Unlooked,
             dangling: Vec::new(),
             demands: Vec::new(),
             episode: DiskEpisode {
@@ -507,6 +531,65 @@ impl Board {
     /// Look up the [`VolumeRow`] for `key`.
     pub(crate) fn row_keyed(&self, key: &VolumeKey) -> Option<&VolumeRow> {
         self.volumes.iter().find(|r| &r.reading.key == key)
+    }
+
+    /// What a look of the disk watch read for the budget: `disk.cap_used_gib` (`cap`), and the
+    /// volume this process sizes it on (`home`, `None` where it sizes none). The last sizing's
+    /// figures give their budget under the cap each look reads, so an edit shows with no walk.
+    pub(crate) fn budget_look(&mut self, cap: Cap, home: Option<String>) {
+        self.budget_cap = cap;
+        self.budget_home = home.map_or(BudgetHome::Unsized, BudgetHome::Volume);
+    }
+
+    /// Keep `sizing` as the budget's last one, unless the board holds one that ended later
+    /// (a record another process kept, read after this process's own sizing).
+    pub(crate) fn budget_sized(&mut self, sizing: Sizing) {
+        if self
+            .budget
+            .as_ref()
+            .is_none_or(|kept| kept.sized_unix <= sizing.sized_unix)
+        {
+            self.budget = Some(sizing);
+        }
+    }
+
+    /// What `sys disk` says of the budget on the volume `key` (`None`: one the watch has no
+    /// row for) at `now_unix`: warming before a watching process's first look; not sampled
+    /// where this process's watch does not size that volume; off where `disk.cap_used_gib`
+    /// turns it off; the last sizing of that volume under the cap last read (its age `0` where
+    /// the clock is unread or reads before it); else warming.
+    pub(crate) fn budget_read(&self, key: Option<&VolumeKey>, now_unix: Option<i64>) -> BudgetRead {
+        let home = match &self.budget_home {
+            BudgetHome::Unlooked if self.watched => return BudgetRead::Warming,
+            BudgetHome::Unlooked | BudgetHome::Unsized => return BudgetRead::NotSampled,
+            BudgetHome::Volume(home) => home,
+        };
+        if key.is_none_or(|key| *home != key.spelled()) {
+            return BudgetRead::NotSampled;
+        }
+        if self.budget_cap == Cap::Off {
+            return BudgetRead::Off;
+        }
+        let Some(sizing) = self.budget.as_ref().filter(|s| s.volume == *home) else {
+            return BudgetRead::Warming;
+        };
+        let Some(budget) = self
+            .budget_cap
+            .budget(sizing.total, sizing.used, sizing.sized.bytes)
+        else {
+            return BudgetRead::Off;
+        };
+        BudgetRead::Sized(BudgetFacts {
+            cap: budget.cap,
+            cap_written: budget.cap_written,
+            kept: budget.kept,
+            target: budget.target,
+            rebuildable: budget.rebuildable,
+            partial: sizing.sized.partial,
+            sized_s: now_unix
+                .and_then(|now| u64::try_from(now.saturating_sub(sizing.sized_unix)).ok())
+                .unwrap_or(0),
+        })
     }
 
     /// Update `row`'s reading from a waiter probe while preserving the watch's pressure judgment.
@@ -750,17 +833,25 @@ pub(crate) fn watching(on: bool) {
 
 /// Format `status` disk fields (`disk=`, `disk_free_mb=`, `disk_room_mb=`) for `session`.
 pub(crate) fn status_fields(session: u64, cwd: Option<&str>) -> String {
-    let b = SHELF.board_lock();
-    match b.row_of(session, cwd) {
-        Some(r) => format!(
-            "disk={} disk_free_mb={} disk_room_mb={} disk_age_ms={}",
-            r.level.as_str(),
-            r.reading.free >> 20,
-            r.room
-                .map_or_else(|| "-".to_owned(), |room| (room >> 20).to_string()),
-            r.as_of.elapsed().as_millis()
-        ),
-        None => "disk=- disk_free_mb=- disk_room_mb=- disk_age_ms=-".to_owned(),
+    SHELF
+        .board_lock()
+        .status_words(session, cwd, Instant::now())
+}
+
+impl Board {
+    /// [`status_fields`] from this board at `now`.
+    pub(crate) fn status_words(&self, session: u64, cwd: Option<&str>, now: Instant) -> String {
+        match self.row_of(session, cwd) {
+            Some(r) => format!(
+                "disk={} disk_free_mb={} disk_room_mb={} disk_age_ms={}",
+                r.level.as_str(),
+                r.reading.free >> 20,
+                r.room
+                    .map_or_else(|| "-".to_owned(), |room| (room >> 20).to_string()),
+                now.saturating_duration_since(r.as_of).as_millis()
+            ),
+            None => "disk=- disk_free_mb=- disk_room_mb=- disk_age_ms=-".to_owned(),
+        }
     }
 }
 

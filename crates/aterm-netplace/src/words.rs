@@ -332,7 +332,7 @@ pub fn header(place: &Place, words: &Words<'_>) -> String {
     format!("network: {}", summary(place, words))
 }
 
-/// [`header`] without its label: the menu bar's first Fleet row and the doctor's row.
+/// [`header`] without its label: the doctor's row.
 #[must_use]
 pub fn summary(place: &Place, words: &Words<'_>) -> String {
     use std::fmt::Write as _;
@@ -615,8 +615,8 @@ pub enum Dial {
     Other,
 }
 
-/// THE ON-LINK RULE's verdict on one fleet read's no-route dials, which `fleet peers`,
-/// `ctl survey --fleet` and the menu bar (through the survey's note and rows) say alike. A
+/// THE ON-LINK RULE's verdict on one fleet read's no-route dials, which `fleet peers`
+/// and `ctl survey --fleet` say alike. A
 /// no-route dial is judged by its address against the network this Mac is on now, never by a
 /// network members were once on:
 ///

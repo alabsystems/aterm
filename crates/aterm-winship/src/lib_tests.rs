@@ -112,3 +112,56 @@ fn a_usage_error_exits_2_and_help_exits_0() {
     assert_eq!(run(&args(&["install"])), USAGE);
     assert_eq!(run(&args(&["help"])), PASS);
 }
+
+#[test]
+fn parse_reads_release_build() {
+    let commit = "1a37de31a3401234567890abcdef1234567890ab";
+    assert_eq!(
+        parse(&args(&[
+            "release-build",
+            "--version",
+            "0.200.0",
+            "--build-number",
+            "1794421328",
+            "--commit",
+            commit,
+            "--out",
+            "carry",
+            "--repo",
+            "r",
+        ])),
+        Ok(Verb::ReleaseBuild(release::Options {
+            version: "0.200.0".to_string(),
+            build: 1_794_421_328,
+            commit: commit.to_string(),
+            out: PathBuf::from("carry"),
+            repo: Some(PathBuf::from("r")),
+        }))
+    );
+    let full = [
+        "release-build",
+        "--version",
+        "0.200.0",
+        "--build-number",
+        "1794421328",
+        "--commit",
+        commit,
+        "--out",
+        "carry",
+    ];
+    assert!(parse(&args(&full)).is_ok());
+    // Each required flag left out, a value that is not one, and a word it does not know.
+    for drop in [1, 3, 5, 7] {
+        let mut less = full.to_vec();
+        less.drain(drop..drop + 2);
+        assert!(parse(&args(&less)).is_err(), "{less:?} was taken");
+    }
+    for (at, bad) in [(4, "12x"), (4, "0"), (6, "1a37de31a340"), (2, "v0.200.0")] {
+        let mut wrong = full.to_vec();
+        wrong[at] = bad;
+        assert!(parse(&args(&wrong)).is_err(), "{wrong:?} was taken");
+    }
+    let mut extra = full.to_vec();
+    extra.push("--sign");
+    assert!(parse(&args(&extra)).is_err());
+}

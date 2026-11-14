@@ -80,6 +80,45 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// # Errors
     /// The listing failed or did not finish: git's last line.
     fn reach(&self, url: &str) -> Result<(), String>;
+
+    /// Whether Google accepts the deployer's key at `key` and lets its account update the
+    /// configured Hosting site, as `ship site --check-access` asks: a token exchange, a read
+    /// of the site and an IAM permission test, none of which deploys or changes policy. `Ok`
+    /// is the line to show.
+    /// # Errors
+    /// The key, the site or the permission could not be verified: why.
+    fn site_access(&self, key: &Path) -> Result<String, String>;
+
+    /// Whether the origin of the site checkout at `site` would take a push from this Mac's
+    /// git: a dry run to a ref no sync writes ([`PUSH_PROBE`]), which sends nothing.
+    /// # Errors
+    /// git refused or did not finish: its last line.
+    fn site_push(&self, site: &Path) -> Result<(), String>;
+
+    /// Whether the identity this Mac's agh routes a write of the GitHub repository `slug` to
+    /// may push to it: one read of the repository's permissions as that identity, what
+    /// `agh can <slug> push` asks. Nothing is written.
+    /// # Errors
+    /// [`PushGap::Denied`] when no writer is routed or it holds no push;
+    /// [`PushGap::Unasked`] when GitHub could not be asked.
+    fn can_push(&self, slug: &str) -> Result<(), PushGap>;
+
+    /// Post the deployer key's need to the lab's table now, as `aterm secrets need
+    /// site-deployer-key --purpose release.site-key` does (the raise, which is idempotent,
+    /// and this Mac's pass), so the request does not wait for the app's own pass. Its output
+    /// is discarded.
+    /// # Errors
+    /// No installed aterm ran it: why. The need stays on file for the next pass.
+    fn post_site_key_need(&self) -> Result<(), String>;
+}
+
+/// Why a push right is not shown ([`ReleaseHost::can_push`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PushGap {
+    /// No writer is routed for the repository, GitHub refuses it, or it holds no push.
+    Denied(String),
+    /// GitHub could not be asked: no verdict.
+    Unasked(String),
 }
 
 /// Why source signing is not ready.
@@ -115,6 +154,10 @@ enum Kind {
     EngineReach,
     Site,
     SiteKey,
+    SiteAccess,
+    SitePush,
+    Writes,
+    Tap,
 }
 
 struct LayerItem {
@@ -123,7 +166,7 @@ struct LayerItem {
     host: Arc<dyn ReleaseHost>,
 }
 
-const ITEMS: [(&str, Kind); 8] = [
+const ITEMS: [(&str, Kind); 12] = [
     ("base", Kind::Base),
     ("develop", Kind::Develop),
     ("release.openssl", Kind::Openssl),
@@ -132,7 +175,39 @@ const ITEMS: [(&str, Kind); 8] = [
     ("release.engine-reach", Kind::EngineReach),
     ("release.site", Kind::Site),
     ("release.site-key", Kind::SiteKey),
+    ("release.site-access", Kind::SiteAccess),
+    ("release.site-push", Kind::SitePush),
+    ("release.writes", Kind::Writes),
+    ("release.tap", Kind::Tap),
 ];
+
+/// The deployer key's item, whose row a release's step 1 completes with the vault's answer.
+const SITE_KEY: &str = "release.site-key";
+
+/// The Homebrew tap the after-cut step aligns: the publication engine's `pub tap --bump`
+/// writes this repository and no other.
+const TAP_REPO: &str = "alabsystems/homebrew-tap";
+
+/// The ref [`ReleaseHost::site_push`] names in its dry run: one no site sync writes, so the
+/// answer is the origin's verdict on this Mac's credential and never on how far the checkout
+/// is behind its branch.
+pub(crate) const PUSH_PROBE: &str = "refs/heads/aterm-release-push-probe";
+
+/// The GitHub `OWNER/REPO` a registry address names, however its host is spelled (the
+/// registry spells some with an SSH alias): its last two path components, without `.git`.
+fn address_slug(url: &str) -> Option<String> {
+    let path = url.trim().trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.rsplit(['/', ':']);
+    let (repo, owner) = (parts.next()?, parts.next()?);
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    (valid(owner) && valid(repo)).then(|| format!("{owner}/{repo}"))
+}
 
 /// The engine's registry, in its checkout.
 const REGISTRY: &str = "registry/repos.toml";
@@ -380,6 +455,135 @@ impl LayerItem {
         }
     }
 
+    /// Google's own answer for the deployer's key, asked only of a key that parses.
+    fn probe_site_access(&self) -> Probe {
+        let key = match self.host.site_key() {
+            Ok(Some(key)) if validate_site_key(&key).is_ok() => key,
+            Ok(_) => {
+                return Probe::Blocked {
+                    why: format!(
+                        "not asked of Google: the deployer's key is not usable yet ({SITE_KEY})"
+                    ),
+                };
+            }
+            Err(why) => return Probe::Unusable { why },
+        };
+        match self.host.site_access(&key) {
+            Ok(now) => Probe::Ok { now },
+            Err(why) => Probe::Person {
+                step: self.id.into(),
+                how: format!(
+                    "Google does not let the deployer's key at {} update the site: {why}",
+                    key.display()
+                ),
+            },
+        }
+    }
+
+    /// The push a site sync ends with, as a dry run from the site checkout.
+    fn probe_site_push(&self) -> Probe {
+        let dir = match self.host.site() {
+            Ok(Some(dir)) if dir.join("firebase.json").is_file() => dir,
+            Ok(_) => {
+                return Probe::Blocked {
+                    why: "not tried: no usable site checkout is named (release.site)".into(),
+                };
+            }
+            Err(why) => return Probe::Unusable { why },
+        };
+        match self.host.site_push(&dir) {
+            Ok(()) => Probe::Ok {
+                now: format!(
+                    "the origin of {} would take a push from this Mac's git (git push \
+                     --dry-run; nothing was sent)",
+                    dir.display()
+                ),
+            },
+            Err(why) => Probe::Person {
+                step: self.id.into(),
+                how: format!(
+                    "the origin of the site checkout {} would not take a push from this Mac's \
+                     git: {why}",
+                    dir.display()
+                ),
+            },
+        }
+    }
+
+    /// One row over `repos`, each `(what it is, OWNER/REPO)`: a repository whose routed
+    /// identity may not push is a gap, one GitHub could not be asked about is no verdict.
+    fn probe_pushes(&self, repos: &[(String, String)]) -> Probe {
+        let (mut denied, mut unasked) = (Vec::new(), Vec::new());
+        for (what, slug) in repos {
+            match self.host.can_push(slug) {
+                Ok(()) => {}
+                Err(PushGap::Denied(why)) => denied.push(format!("{what} {slug} ({why})")),
+                Err(PushGap::Unasked(why)) => unasked.push(format!("{what} {slug} ({why})")),
+            }
+        }
+        if !denied.is_empty() {
+            Probe::Person {
+                step: self.id.into(),
+                how: format!(
+                    "the identity agh routes a write to may not push to {}",
+                    denied.join("; ")
+                ),
+            }
+        } else if !unasked.is_empty() {
+            Probe::Unusable {
+                why: format!(
+                    "GitHub could not be asked whether agh's routed identity may push to {}",
+                    unasked.join("; ")
+                ),
+            }
+        } else {
+            let named: Vec<String> = repos
+                .iter()
+                .map(|(what, slug)| format!("{what} {slug}"))
+                .collect();
+            Probe::Ok {
+                now: format!(
+                    "agh's routed identity may push to {} (a read of each repository's \
+                     permissions; nothing was written)",
+                    named.join(", ")
+                ),
+            }
+        }
+    }
+
+    /// The repositories a publish and a cut write through agh: [`ENGINE_REPO`]'s dev (the
+    /// ledger's claim on main), staging (the engine's stage) and release (its promote).
+    fn probe_writes(&self) -> Probe {
+        let (shown, text) = match self.host.engine_registry() {
+            Ok(read) => read,
+            Err(why) => {
+                return Probe::Unusable {
+                    why: format!("cannot read the engine's registry: {why}"),
+                };
+            }
+        };
+        let addresses = match engine_addresses(&text) {
+            Ok(addresses) => addresses,
+            Err(why) => {
+                return Probe::Unusable {
+                    why: format!("{shown}: {why}"),
+                };
+            }
+        };
+        let mut repos = Vec::new();
+        for (role, url) in addresses {
+            let Some(slug) = address_slug(&url) else {
+                return Probe::Unusable {
+                    why: format!(
+                        "{shown}: {ENGINE_REPO}'s {role} address {url} names no GitHub OWNER/REPO"
+                    ),
+                };
+            };
+            repos.push((format!("{ENGINE_REPO}'s {role}"), slug));
+        }
+        self.probe_pushes(&repos)
+    }
+
     fn remedy(&self) -> Remedy {
         match self.kind {
             Kind::Base => Remedy::Init {
@@ -411,6 +615,22 @@ impl LayerItem {
             Kind::SiteKey => Remedy::Command(
                 "`aterm secrets need site-deployer-key` (the vault lands it where \
                  publish/site.toml's firebase_sa_key names it)"
+                    .into(),
+            ),
+            Kind::SiteAccess => Remedy::Command(
+                "grant the deployer's service account Firebase Hosting's update permission on \
+                 the site, or put its current key where the deploy reads it; `targo \
+                 --unverified ship site --check-access` asks Google again"
+                    .into(),
+            ),
+            Kind::SitePush => Remedy::Command(format!(
+                "give this Mac's git a credential that may push to the site checkout's origin; \
+                 in the checkout, `git push --dry-run origin HEAD:{PUSH_PROBE}` asks again"
+            )),
+            Kind::Writes | Kind::Tap => Remedy::Command(
+                "route a writer for the repository in this Mac's agh (`agh whoami --for \
+                 OWNER/REPO` explains the route, `aterm secrets sync` brings the vault's \
+                 tokens); `agh can OWNER/REPO push` asks again"
                     .into(),
             ),
         }
@@ -456,6 +676,12 @@ impl Item for LayerItem {
             Kind::EngineReach => "the engine's addresses for this repository".into(),
             Kind::Site => "the site checkout and its firebase.json".into(),
             Kind::SiteKey => "the site deployer's service-account key".into(),
+            Kind::SiteAccess => "Google's grant to the site deployer's key".into(),
+            Kind::SitePush => "the site checkout's push to its origin".into(),
+            Kind::Writes => {
+                "the routed identities' push to the repositories a publish writes".into()
+            }
+            Kind::Tap => "the routed identity's push to the Homebrew tap".into(),
         }
     }
 
@@ -480,6 +706,10 @@ impl Item for LayerItem {
             Kind::EngineReach => self.probe_engine_reach(),
             Kind::Site => self.probe_site(),
             Kind::SiteKey => self.probe_site_key(),
+            Kind::SiteAccess => self.probe_site_access(),
+            Kind::SitePush => self.probe_site_push(),
+            Kind::Writes => self.probe_writes(),
+            Kind::Tap => self.probe_pushes(&[("the Homebrew tap".to_owned(), TAP_REPO.to_owned())]),
         }
     }
 
@@ -524,6 +754,8 @@ enum Audit {
     All,
     BeforeIdentity,
     SourceSigning,
+    /// What steps 7 to 10 of a release write with ([`distribution`]).
+    Distribution,
 }
 
 impl Audit {
@@ -532,6 +764,15 @@ impl Audit {
             Self::All => true,
             Self::BeforeIdentity => kind != Kind::SourceSigning,
             Self::SourceSigning => kind == Kind::SourceSigning,
+            Self::Distribution => matches!(
+                kind,
+                Kind::Site
+                    | Kind::SiteKey
+                    | Kind::SiteAccess
+                    | Kind::SitePush
+                    | Kind::Writes
+                    | Kind::Tap
+            ),
         }
     }
 }
@@ -622,63 +863,128 @@ fn audit_selected(host: &Arc<dyn ReleaseHost>, audit: Audit) -> Vec<(&'static st
     }
 }
 
-/// Move the deployer key's need after a provision's audit (not `--check`): a key missing at
-/// the catalog path is asked of the lab, a locally valid key meets the need, and a key named
-/// somewhere else, or named nowhere, is never asked for, since the vault delivers only to its
-/// catalog path and the deploy reads only the path it names. The line to show, if any.
-pub(crate) fn settle_site_key(host: &Arc<dyn ReleaseHost>) -> Option<String> {
-    let key = host.site_key().ok()?;
-    let valid = match key.as_ref().map(|key| validate_site_key(key)) {
-        Some(Ok(())) => true,
+/// What a provision does about the deployer key's need: the step to take, or the line that
+/// says why the lab is not asked (`None` where the settings could not be read). A key missing
+/// at the catalog path is asked of the lab, a locally valid key meets the need, and a key
+/// named somewhere else, or named nowhere, is never asked for, since the vault delivers only
+/// to its catalog path and the deploy reads only the path it names.
+fn site_key_step(host: &Arc<dyn ReleaseHost>) -> Result<NeedStep, Option<String>> {
+    let key = host.site_key().map_err(|_| None)?;
+    match key.as_ref().map(|key| validate_site_key(key)) {
+        Some(Ok(())) => return Ok(NeedStep::Satisfied),
         Some(Err(why))
             if key
                 .as_ref()
                 .is_some_and(|key| std::fs::symlink_metadata(key).is_ok()) =>
         {
-            return Some(format!(
+            return Err(Some(format!(
                 "the deployer's key is unusable: {why}; the need is not marked fulfilled"
-            ));
+            )));
         }
-        _ => false,
-    };
-    let step = if valid {
-        NeedStep::Satisfied
-    } else {
-        match (&key, host.catalog_site_key()) {
-            (Some(key), Some(catalog)) if same_missing_destination(key, &catalog) => {
-                NeedStep::Raise
-            }
-            (Some(key), Some(catalog)) => {
-                return Some(format!(
-                    "the deployer's key is named at {}, not at {}, where the vault delivers it: \
-                     the lab is not asked, so name {} in publish/site.toml's firebase_sa_key, or \
-                     put the key where it is named",
-                    key.display(),
-                    catalog.display(),
-                    catalog.display()
-                ));
-            }
-            (None, _) => {
-                return Some(
-                    "no key is named for the deploy (FIREBASE_SA_KEY, or publish/site.toml's \
-                     firebase_sa_key), so a key the vault delivers would go unread: the lab is \
-                     not asked"
-                        .to_owned(),
-                );
-            }
-            (Some(_), None) => {
-                return Some(
-                    "this account's home gives the deployer's key no catalog path, so the \
-                     vault cannot deliver it here: the lab is not asked"
-                        .to_owned(),
-                );
-            }
-        }
-    };
-    match host.site_key_need(step) {
-        Ok(line) => line,
-        Err(why) => Some(format!("the need ledger: {why}")),
+        _ => {}
     }
+    match (&key, host.catalog_site_key()) {
+        (Some(key), Some(catalog)) if same_missing_destination(key, &catalog) => {
+            Ok(NeedStep::Raise)
+        }
+        (Some(key), Some(catalog)) => Err(Some(format!(
+            "the deployer's key is named at {}, not at {}, where the vault delivers it: the lab \
+             is not asked, so name {} in publish/site.toml's firebase_sa_key, or put the key \
+             where it is named",
+            key.display(),
+            catalog.display(),
+            catalog.display()
+        ))),
+        (None, _) => Err(Some(
+            "no key is named for the deploy (FIREBASE_SA_KEY, or publish/site.toml's \
+             firebase_sa_key), so a key the vault delivers would go unread: the lab is not asked"
+                .to_owned(),
+        )),
+        (Some(_), None) => Err(Some(
+            "this account's home gives the deployer's key no catalog path, so the vault cannot \
+             deliver it here: the lab is not asked"
+                .to_owned(),
+        )),
+    }
+}
+
+/// Move the deployer key's need after a provision's audit (not `--check`), as
+/// [`site_key_step`] decides. The line to show, if any.
+pub(crate) fn settle_site_key(host: &Arc<dyn ReleaseHost>) -> Option<String> {
+    match site_key_step(host) {
+        Ok(step) => match host.site_key_need(step) {
+            Ok(line) => line,
+            Err(why) => Some(format!("the need ledger: {why}")),
+        },
+        Err(line) => line,
+    }
+}
+
+/// What a release's step 1 proves of the writes its publish, cut and after-cut steps make
+/// from this Mac, before anything is built, as `(id, check)` in [`ITEMS`] order: the site
+/// checkout, the deployer's key and Google's grant to it, the site checkout's push, and the
+/// routed identities' push to the repositories and the tap. Each is a read or a dry run.
+///
+/// A deployer key missing where the vault delivers it is asked of the lab here, by the need
+/// `aterm secrets need` raises: a real run raises and posts it, and its row says so with the
+/// remedy; a dry run (`dry`) raises nothing and says a real run would. A real run whose key
+/// Google accepted marks the need met.
+pub(crate) fn distribution(host: &Arc<dyn ReleaseHost>, dry: bool) -> Vec<(&'static str, Check)> {
+    let mut rows = audit_selected(host, Audit::Distribution);
+    let (vault, line) = match site_key_step(host) {
+        Ok(NeedStep::Raise) if dry => {
+            let now = match host.site_key_need(NeedStep::Read) {
+                Ok(Some(line)) => format!(" (the need now: {line})"),
+                Ok(None) => " (no need is on file yet)".to_owned(),
+                Err(why) => format!(" (the need ledger: {why})"),
+            };
+            (
+                true,
+                Some(format!("a real run asks the lab's vault for it{now}")),
+            )
+        }
+        Ok(NeedStep::Raise) => {
+            let asked = match host.site_key_need(NeedStep::Raise) {
+                Ok(Some(line)) => format!("asked of the lab's vault now ({line})"),
+                Ok(None) => "asked of the lab's vault now".to_owned(),
+                Err(why) => format!("the lab's vault could not be asked (the need ledger: {why})"),
+            };
+            let posted = match host.post_site_key_need() {
+                Ok(()) => String::new(),
+                Err(why) => format!("; it is posted at this Mac's next pass ({why})"),
+            };
+            (true, Some(format!("{asked}{posted}")))
+        }
+        Ok(_) => {
+            let accepted = rows
+                .iter()
+                .any(|(id, check)| *id == "release.site-access" && matches!(check, Check::Pass(_)));
+            if !dry && accepted {
+                // Best effort: the key works, whatever the ledger says of its need.
+                let _ = host.site_key_need(NeedStep::Satisfied);
+            }
+            (false, None)
+        }
+        Err(line) => (false, line),
+    };
+    if let Some(line) = line
+        && let Some((_, Check::Fail { what, fix })) =
+            rows.iter_mut().find(|(id, _)| *id == SITE_KEY)
+    {
+        what.push_str("; ");
+        what.push_str(&line);
+        if vault {
+            let at = host
+                .catalog_site_key()
+                .map(|path| format!(" to {}", path.display()))
+                .unwrap_or_default();
+            *fix = format!(
+                "wait for the vault to deliver the key{at}: a Mac that holds it answers the \
+                 request, and `aterm secrets need ls` shows where it stands"
+            );
+        }
+    }
+    rows
 }
 
 /// Parse the same bounded regular file as deployment, admitting only Google's endpoint.
@@ -941,6 +1247,60 @@ impl ReleaseHost for System {
                 || format!("git ls-remote exited {:?}", out.status.code()),
                 str::to_string,
             ))
+    }
+
+    fn site_access(&self, key: &Path) -> Result<String, String> {
+        crate::site::access_of(&self.repo, key)
+    }
+
+    fn site_push(&self, site: &Path) -> Result<(), String> {
+        let refspec = format!("HEAD:{PUSH_PROBE}");
+        let mut cmd = aterm_uds::spawnfd::command("git");
+        cmd.arg("-C")
+            .arg(site)
+            .args(["push", "--dry-run", "--quiet", "origin", &refspec])
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let out = aterm_uds::deadline::output_within(&mut cmd, REACH_WITHIN)
+            .map_err(|e| format!("git push --dry-run {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map_or_else(
+                || format!("git push --dry-run exited {:?}", out.status.code()),
+                str::to_string,
+            ))
+    }
+
+    fn can_push(&self, slug: &str) -> Result<(), PushGap> {
+        crate::github_remote::push_right(slug)
+            .map_err(PushGap::Unasked)?
+            .map_err(PushGap::Denied)
+    }
+
+    fn post_site_key_need(&self) -> Result<(), String> {
+        use aterm_secrets::need::{Purpose, Want};
+        let aterm = self
+            .installed_aterm()
+            .ok_or("no installed aterm to run `aterm secrets need`")?;
+        let mut cmd = aterm_uds::spawnfd::command(&aterm);
+        cmd.args(["secrets", "need"])
+            .arg(Want::SiteDeployerKey.key())
+            .args(["--purpose", Purpose::ReleaseSiteKey.id()])
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null());
+        let out = aterm_uds::deadline::output_within(&mut cmd, REACH_WITHIN)
+            .map_err(|e| format!("aterm secrets need {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!("aterm secrets need exited {:?}", out.status.code()))
+        }
     }
 }
 

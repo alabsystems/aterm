@@ -562,6 +562,10 @@ pub(crate) struct State {
     pub(crate) fences_lifted: u64,
     /// Refuse the next this-many publishes by a NODE producer, and group commits.
     pub(crate) refuse_next: u32,
+    /// While set, refuse every publish of a node's on a mail lane (a subject with `/in/`) as a
+    /// batch astream rolled back, counting them ([`Broker::refuse_mail`]): a post pinned and
+    /// not landed, held so until the world lifts it.
+    pub(crate) refuse_mail: Option<u64>,
     /// A CUT BETWEEN A DEDUP ANSWER AND THE NEXT REQUEST (critic item F23), drawn by this
     /// stream where a world has one ([`super::world::Opts::keys`]): one dedup answer to a node
     /// producer's publish in two is followed at once by a cut just past the answered record
@@ -1026,6 +1030,7 @@ impl Broker {
                 gap_fenced: 0,
                 fences_lifted: 0,
                 refuse_next: 0,
+                refuse_mail: None,
                 cut_after_dedup: None,
                 cuts_after_dedup: 0,
                 stray: None,
@@ -1343,6 +1348,18 @@ impl Broker {
         let mut s = lock(&self.state);
         s.note_event(|| Event::Refuse(n));
         s.refuse_next = n;
+    }
+
+    /// ROLL BACK every publish of a node's on a mail lane while `on` ([`State::refuse_mail`]).
+    pub(crate) fn refuse_mail(&self, on: bool) {
+        let mut s = lock(&self.state);
+        let refused = s.refuse_mail.unwrap_or(0);
+        s.refuse_mail = on.then_some(refused);
+    }
+
+    /// How many publishes [`Broker::refuse_mail`] has refused since it was set.
+    pub(crate) fn mail_refused(&self) -> u64 {
+        lock(&self.state).refuse_mail.unwrap_or(0)
     }
 
     /// The Ordered horizon's full flush (and nothing on another tier, or with
@@ -2611,11 +2628,21 @@ impl State {
             }
             return Ok((off, true));
         }
-        if self.refuse_next > 0
-            && self
-                .principal(producer)
-                .is_some_and(|p| p.starts_with("n-"))
-        {
+        let node = self
+            .principal(producer)
+            .is_some_and(|p| p.starts_with("n-"));
+        let mail = subject.starts_with("/f/") && subject.contains("/in/");
+        if let Some(count) = self.refuse_mail.as_mut().filter(|_| node && mail) {
+            *count += 1;
+            self.notes.push(format!(
+                "refuse publish seq={seq} {subject} (mail batch rolled back)"
+            ));
+            return Err(refused(
+                astream_broker::proto::ERR_REFUSED,
+                "commit failed: the batch was rolled back (simulated)".to_string(),
+            ));
+        }
+        if self.refuse_next > 0 && node {
             self.refuse_next -= 1;
             self.notes.push(format!(
                 "refuse publish seq={seq} {subject} (batch rolled back)"

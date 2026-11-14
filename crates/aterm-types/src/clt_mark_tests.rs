@@ -177,14 +177,13 @@ fn an_interrupted_or_unfinished_ask_comes_again_by_itself_and_a_decline_after_it
     assert!(reading(&world, &path, again).coming());
 }
 
-/// The record holds two attempts at once, a person's retry and the attempt it took over, and
-/// each writes its own end in its own place, even where the retry is the same asker's in the
-/// same second; a third attempt at once drops the oldest, whose late end then changes nothing.
-/// An end of an attempt that asked nothing gives the record back exactly as it was before its
-/// claim, whatever it was: no record, an unfinished try's schedule, a finish, a person's
-/// decline, or another asker's live attempt.
+/// The record keeps every attempt that asks at once, a person's retries and the attempts they
+/// took over, and each writes its own end in its own place, even where a retry is the same
+/// asker's in the same second. An end of an attempt that asked nothing gives the record back
+/// exactly as it was before its claim, whatever it was: no record, an unfinished try's schedule,
+/// a finish, a person's decline, or another asker's live attempt.
 /// NEGATIVE CONTROL: an unfinished end over each of those but the live attempt writes a try of
-/// its own.
+/// its own; an end of a claim the record never kept changes nothing.
 #[test]
 fn only_the_holding_attempt_ends_it_and_a_release_restores_the_earlier_state() {
     let dir = crate::test_scratch_dir("clt-mark");
@@ -201,22 +200,33 @@ fn only_the_holding_attempt_ends_it_and_a_release_restores_the_earlier_state() {
         again, older,
         "one asker's two claims in one second are two attempts"
     );
-    // A third attempt at once: the oldest is given up, and its late end writes nothing.
+    // A third attempt at once: each is kept, and the oldest's end goes in its own place.
     let theirs = explicit(&world, &path, &person, NOW + 1).unwrap();
     let before = text();
+    let never = Claim {
+        n: theirs.n + 1,
+        ..theirs.clone()
+    };
     for how in [End::Released, End::Unfinished, End::Declined] {
         assert_eq!(
-            end(&world, &path, &older, how, NOW + 2).unwrap(),
+            end(&world, &path, &never, how, NOW + 2).unwrap(),
             Took::Nowhere,
             "{how:?}"
         );
-        assert_eq!(text(), before, "{how:?}: an end the record holds nowhere");
+        assert_eq!(
+            text(),
+            before,
+            "CONTROL {how:?}: an end the record never kept"
+        );
     }
+    assert_eq!(
+        end(&world, &path, &older, End::Released, NOW + 2).unwrap(),
+        Took::Replaced
+    );
     // The attempt the retry took over ends in its own place, under the retry, which asks on.
-    assert!(
-        end(&world, &path, &again, End::Unfinished, NOW + 2)
-            .unwrap()
-            .held()
+    assert_eq!(
+        end(&world, &path, &again, End::Unfinished, NOW + 2).unwrap(),
+        Took::Replaced
     );
     assert!(matches!(reading(&world, &path, NOW + 2), Asked::Asking));
     assert!(
@@ -330,6 +340,168 @@ fn only_the_holding_attempt_ends_it_and_a_release_restores_the_earlier_state() {
     assert!(
         !path.exists(),
         "a first attempt that asked nothing leaves no record"
+    );
+}
+
+/// Three attempts at once (a terminal `aterm init`'s automatic ask, the window's Install…
+/// handed to its tab's program over it, and a typed `aterm init` over that) are each the
+/// record's to end, in whatever order they end: while the oldest still asks, no automatic ask
+/// goes beside it however the newer two ended, and its own end is what the record then says.
+/// A release over a release gives back the decline the first claim went over, its count
+/// included, so the next no in a row holds twice as long. Before, the
+/// record kept two attempts: the third claim dropped the oldest, whose end then wrote nothing,
+/// and once the newer two gave the episode back an automatic claim went beside it; a release
+/// over a release rebuilt the line from the tries and finish its claim carried, so the decline
+/// and its count were lost.
+/// NEGATIVE CONTROL: once the oldest ends too, an automatic claim goes.
+#[test]
+fn every_live_attempt_is_kept_and_a_release_over_a_release_keeps_the_decline_count() {
+    let dir = crate::test_scratch_dir("clt-mark");
+    let path = dir.path().join(FILE);
+    let world = World::new();
+    let terminal = asker("release", 601);
+    let window = asker("release", 501);
+    let program = asker("release", 502);
+    let person = asker("release", 701);
+    let beside = asker("release", 503);
+    for oldest_first in [false, true] {
+        let _ = std::fs::remove_file(&path);
+        world.start(&terminal);
+        let automatic = claim(&world, &path, &terminal, NOW)
+            .unwrap()
+            .expect("the automatic ask");
+        world.start(&window);
+        let install = explicit(&world, &path, &window, NOW + 1).unwrap();
+        world.start(&program);
+        let install = hand(&world, &path, &install, program.pid, program.birth)
+            .unwrap()
+            .expect("handed to the tab's program");
+        world.start(&person);
+        let typed = explicit(&world, &path, &person, NOW + 2).unwrap();
+        if oldest_first {
+            assert_eq!(
+                end(&world, &path, &automatic, End::Unfinished, NOW + 3).unwrap(),
+                Took::Replaced
+            );
+            world.stop(&terminal);
+            assert!(matches!(reading(&world, &path, NOW + 3), Asked::Asking));
+            assert_eq!(
+                end(&world, &path, &install, End::Released, NOW + 4).unwrap(),
+                Took::Replaced
+            );
+            world.stop(&program);
+            assert_eq!(
+                end(&world, &path, &typed, End::Released, NOW + 5).unwrap(),
+                Took::Line
+            );
+            world.stop(&person);
+            assert!(
+                matches!(
+                    reading(&world, &path, NOW + 5),
+                    Asked::Unfinished { tries: 1, due } if due == NOW + 3 + ASK_AGAIN.after(1).as_secs()
+                ),
+                "the oldest's end is the record's"
+            );
+            continue;
+        }
+        assert_eq!(
+            end(&world, &path, &typed, End::Released, NOW + 3).unwrap(),
+            Took::Line
+        );
+        world.stop(&person);
+        assert_eq!(
+            end(&world, &path, &install, End::Released, NOW + 4).unwrap(),
+            Took::Line
+        );
+        world.stop(&program);
+        assert!(
+            matches!(reading(&world, &path, NOW + 4), Asked::Asking),
+            "the automatic ask still asks"
+        );
+        assert!(
+            claim(&world, &path, &beside, NOW + 4).unwrap().is_none(),
+            "no automatic ask beside the oldest"
+        );
+        assert_eq!(
+            end(&world, &path, &automatic, End::Unfinished, NOW + 5).unwrap(),
+            Took::Line,
+            "the oldest's end is the record's"
+        );
+        world.stop(&terminal);
+        assert!(matches!(
+            reading(&world, &path, NOW + 5),
+            Asked::Unfinished { tries: 1, .. }
+        ));
+        let paused = NOW + 5 + ASK_AGAIN.after(1).as_secs();
+        assert!(
+            claim(&world, &path, &beside, paused).unwrap().is_some(),
+            "CONTROL: once it ended, an automatic claim goes"
+        );
+    }
+
+    // A decline, then, once its hold passed, an automatic ask over it, the window's Install…
+    // over that and a typed `aterm init` over both, each giving the episode back.
+    let _ = std::fs::remove_file(&path);
+    world.start(&terminal);
+    let first = claim(&world, &path, &terminal, NOW).unwrap().unwrap();
+    assert!(
+        end(&world, &path, &first, End::Declined, NOW)
+            .unwrap()
+            .held()
+    );
+    world.stop(&terminal);
+    let declined = std::fs::read_to_string(&path).unwrap();
+    let later = NOW + DECLINE_AGAIN.after(1).as_secs();
+    world.start(&terminal);
+    let automatic = claim(&world, &path, &terminal, later).unwrap().unwrap();
+    let install = explicit(&world, &path, &window, later).unwrap();
+    let typed = explicit(&world, &path, &person, later).unwrap();
+    for attempt in [&typed, &install, &automatic] {
+        assert!(
+            end(&world, &path, attempt, End::Released, later)
+                .unwrap()
+                .held()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        declined,
+        "given back exactly, its count included"
+    );
+    let again = explicit(&world, &path, &person, later).unwrap();
+    assert!(
+        end(&world, &path, &again, End::Declined, later)
+            .unwrap()
+            .held()
+    );
+    assert!(
+        matches!(
+            reading(&world, &path, later),
+            Asked::Declined { declines: 2, due } if due == later + DECLINE_AGAIN.after(2).as_secs()
+        ),
+        "the next no in a row holds twice as long"
+    );
+
+    // Past [`ATTEMPTS`] at once, the oldest goes: its end then writes only a finish.
+    std::fs::remove_file(&path).unwrap();
+    let many: Vec<Asker> = (0..=ATTEMPTS)
+        .map(|n| asker("release", 100 + i32::try_from(n).unwrap()))
+        .collect();
+    let claims: Vec<Claim> = many
+        .iter()
+        .map(|one| {
+            world.start(one);
+            explicit(&world, &path, one, later).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        end(&world, &path, &claims[0], End::Released, later).unwrap(),
+        Took::Nowhere
+    );
+    assert_eq!(
+        end(&world, &path, &claims[1], End::Released, later).unwrap(),
+        Took::Replaced,
+        "CONTROL: the next oldest is kept"
     );
 }
 
@@ -462,8 +634,9 @@ fn a_finish_the_record_no_longer_held_is_kept() {
             "{how:?}: after theirs ended"
         );
     }
-    // An attempt the record holds nowhere (a third at once dropped it, one deep), with no
-    // line left at all: its finish is the line.
+    // An attempt the record holds nowhere (cut off, its program gone before its end was
+    // written, and a later end superseded it), with no line left at all: its finish is the
+    // line.
     std::fs::remove_file(&path).ok();
     let tab = claim(&world, &path, &window, NOW).unwrap().unwrap();
     let again = explicit(&world, &path, &window, NOW).unwrap();
@@ -492,8 +665,8 @@ fn a_finish_the_record_no_longer_held_is_kept() {
 }
 
 /// An attempt that asked nothing gives the record back as it was before its claim, even where
-/// a person's retry took the episode over and gave it back in between, which keeps the line
-/// it replaced one deep (`CltEpisode`'s `TriesCountUnfinishedEnds` and
+/// a person's retry took the episode over and gave it back in between, which keeps the end
+/// under both as it was (`CltEpisode`'s `TriesCountUnfinishedEnds` and
 /// `FinishOutlivesLaterTries`): an unfinished try's schedule and the elevation's finish come
 /// back with it. Before, that release removed the record, so the automatic ask went again at
 /// once, and a finish was lost.
@@ -675,7 +848,39 @@ fn historical_records_are_asked_again_and_unreadable_ones_hold() {
         assert!(claimed.is_some(), "{historical:?}");
     }
 
+    // A line that kept one attempt over another with no end under them (written before the
+    // record kept every attempt): the end under them is what the older one carried.
+    std::fs::write(
+        &path,
+        format!(
+            "asking release 1 7 {NOW} 5 0 0 0 after asking release 2 7 {NOW} 4 2 {} 9\n",
+            NOW - 10
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        reading(&world, &path, NOW),
+        Asked::Unfinished { tries: 2, .. }
+    ));
+    assert!(record(&world, &path, NOW).finished);
+    let most = format!(
+        "{}done a 1\n",
+        "asking release 1 7 1 5 0 0 1 after ".repeat(ATTEMPTS)
+    );
+    std::fs::write(&path, &most).unwrap();
+    assert!(
+        matches!(
+            reading(&world, &path, NOW),
+            Asked::Unfinished { tries: 0, .. }
+        ),
+        "{ATTEMPTS} attempts read"
+    );
+
     let too_many = "opened again\n".repeat(LINES + 1);
+    let too_many_attempts = format!(
+        "{}done a 1\n",
+        "asking release 1 7 1 5 0 0 1 after ".repeat(ATTEMPTS + 1)
+    );
     for malformed in [
         "",
         "\n",
@@ -683,13 +888,14 @@ fn historical_records_are_asked_again_and_unreadable_ones_hold() {
         "closed\n",
         "asking release 1 2 3\n",
         "asking release 1 2 3 4 5 6 7 after\n",
-        "asking release 1 2 3 4 5 6 7 after asking release 1 2 3 4 5 6 7 after done a 1\n",
+        "asking release 1 2 3 4 5 6 7 after done a 1 after done a 1\n",
         "unfinished release 1 2\n",
         "done release\n",
         "unfinished release 1 2\nunfinished release 1 2\n",
         "declined release 1 2 0\n",
         "declined release 1 2 3 4\n",
         too_many.as_str(),
+        too_many_attempts.as_str(),
     ] {
         std::fs::write(&path, malformed).unwrap();
         assert!(
@@ -725,7 +931,7 @@ fn historical_records_are_asked_again_and_unreadable_ones_hold() {
 /// so no other automatic asker asks beside it, the end the adopting window writes against
 /// the claim is recorded (a decline holds for its long pause), and with its program gone and
 /// no end written it reads cut off. Carrying the same tab again gives back the same claim,
-/// also from the line a person's retry over it keeps, which the retry gives back as it was.
+/// also from under a person's retry over it, which gives the record back as it was.
 /// NEGATIVE CONTROL: before the carry the historical record reads a try long since due; an
 /// attempt of this format another asker made, or how one ended, is not carried over and is
 /// left as found.
@@ -772,7 +978,7 @@ fn an_earlier_builds_live_tab_is_carried_into_its_historical_record() {
         assert_eq!(
             carry(&world, &path, &tab, NOW).unwrap(),
             Some(tabs_claim.clone()),
-            "{historical:?}: under a person's retry, the line it keeps still names the tab"
+            "{historical:?}: under a person's retry, the record still names the tab"
         );
         assert!(
             end(&world, &path, &retry, End::Released, NOW)

@@ -4,7 +4,7 @@
 use super::*;
 
 #[test]
-fn the_verdict_wants_the_row_to_stand_away_and_go_back() {
+fn the_verdict_wants_the_done_unseen_away_and_seen_back() {
     let v = |away, faked, back, present| {
         verdict(Reads {
             away,
@@ -44,13 +44,21 @@ fn the_reads_parse_what_aterm_and_launch_services_print() {
     );
     assert_eq!(front_sid("OK 0\n"), None);
     assert_eq!(
-        done_rows(
-            "statusitem title=\u{276f}\u{2022} needs=0 stuck=0 exceptions=1 done=1 fleet=off\nmenu x\n"
-        )
-        .as_deref(),
-        Some("1")
+        unseen_of("OK schema=1 sid=7 end=- end_seen=- end_cheered=- done_unseen=1 goal=-\n"),
+        Some("1"),
+        "a done nobody looked at"
     );
-    assert_eq!(done_rows("menu x\n"), None);
+    assert_eq!(
+        unseen_of("OK schema=1 sid=7 done_unseen=0 goal=-\n"),
+        Some("0"),
+        "seen"
+    );
+    assert_eq!(
+        unseen_of("OK schema=1 sid=7 end=- goal=-\n"),
+        None,
+        "a build with no such field"
+    );
+    assert_eq!(unseen_of("ERR no session s-aaaa\n"), None, "no status");
 }
 
 #[test]

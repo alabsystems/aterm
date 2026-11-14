@@ -433,3 +433,108 @@ fn the_stage_judges_with_the_release_before_the_newest_tag_and_not_an_older_one(
         "{label}"
     );
 }
+
+/// A release asks this judgment of its own tree at step 1, before it qualifies anything: it is
+/// the stage's own function, so the cut's refusal and the check's row are the same words.
+/// NEGATIVE CONTROL: the same checkout with a library the release cannot compile is refused,
+/// in a row that names the judging release, its exit and the compiler's own line.
+#[test]
+fn a_cut_asks_the_stages_own_judgment_and_reads_its_row() {
+    use super::super::{Verdict, WHOLE_TREE, judge};
+    let env = EnvSnapshot::capture();
+    let store = Store::read(&env).expect("this machine's package store");
+    let installed = store.release().expect("installed public release");
+    let version = public_version(&installed).unwrap().to_owned();
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let state = aterm_tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let mut cmd = crate::git_provider::command();
+        cmd.current_dir(dir.path())
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args);
+        for name in crate::changed::GIT_REDIRECTS {
+            cmd.env_remove(name);
+        }
+        let out =
+            aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        format!(
+            "[package]\nname='aterm-time'\nversion='0.0.0'\nedition='2024'\n[workspace]\n\
+             [workspace.package]\nversion='{version}'\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"aterm-time\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn bootstrap_probe() {}\n",
+    )
+    .unwrap();
+    git(&["init", "-q"]);
+    git(&["add", "--", "Cargo.toml", "Cargo.lock", "src/lib.rs"]);
+    git(&["commit", "-qm", "candidate"]);
+    git(&["tag", &format!("v{version}")]);
+    let whole = [WHOLE_TREE.to_owned()];
+
+    let accepted = judge(dir.path(), &env, &whole);
+    assert_eq!(accepted.verdict, Verdict::Accepted, "{}", accepted.row);
+    assert_eq!(
+        accepted.row,
+        format!("released-shim: {installed} built aterm-time; inputs: {WHOLE_TREE}")
+    );
+    let context = crate::Ctx::new(
+        dir.path().to_path_buf(),
+        crate::Scope::workspace(),
+        EnvSnapshot::capture(),
+        state.path().to_path_buf(),
+    );
+    let mut report = crate::ladder::Report::new("released-shim");
+    super::super::run(&context, &mut report);
+    let rows: Vec<_> = report.outcomes().collect();
+    assert_eq!(
+        rows,
+        [(crate::ladder::Outcome::Ok, accepted.row.as_str())],
+        "{}",
+        report.render()
+    );
+
+    // The tracked file as the checkout holds it is what the release builds.
+    fs::write(dir.path().join("src/lib.rs"), "pub fn broken( {\n").unwrap();
+    let refused = judge(dir.path(), &env, &whole);
+    assert_eq!(refused.verdict, Verdict::Refused, "{}", refused.row);
+    assert!(
+        refused
+            .row
+            .starts_with(&format!("released-shim: {installed} refuses candidate ("))
+            && refused.row.contains(WHOLE_TREE)
+            && refused.row.contains("error:"),
+        "{}",
+        refused.row
+    );
+    // A refused judgment keeps its rig for whoever reads the red; this one is the test's own.
+    let retained = refused
+        .output
+        .lines()
+        .find_map(|line| line.strip_prefix("released-shim failure inputs retained at "))
+        .expect("a refusal names the rig it kept");
+    fs::remove_dir_all(retained).unwrap();
+}

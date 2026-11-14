@@ -3223,3 +3223,204 @@ fn a_failed_task_reads_its_result_and_a_turn_opens_it() {
     reopen_at_turn(ctx, 12, &TurnBy::Ctl, found());
     assert_eq!(state(), Some((TaskState::Working, Some("turn"))));
 }
+
+/// A RECORD NEVER NAMES A RESULT FILE THAT IS GONE (tracker ST-01): a stored row whose result
+/// is no longer there (a layout aterm 0.198.0 wrote, whose quit removed the file its row names)
+/// seeds a record that names none and says `result_bytes=0`, so `task` promises no result
+/// `result` cannot read. The same holds on a seamless update's road and for a retired row, for a
+/// snapshot whose sidecar is gone (`result` answers from neither without the other), and for a
+/// link left at the name, which is no file of the record's. CONTROL: a row whose result stands
+/// keeps its path, its size and its answer, under the session ID the file was written for.
+#[cfg(unix)]
+#[test]
+fn a_record_never_names_a_result_file_that_is_gone() {
+    let tasks = tasks_dir().expect("the test binary's state root");
+    let row = |path: &Path| {
+        format!(
+            "rev=4 state=done from=ctl since=1789000000000 result_bytes=605 attention=0 \
+             why=landed result_path={}",
+            crate::control::pct_encode(&path.to_string_lossy())
+        )
+    };
+    let record_of = |ctx: &SessionCtx| {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .task()
+            .cloned()
+            .expect("a record")
+    };
+    let names_nothing = |record: &TaskRecord, road: &str| {
+        assert_eq!(
+            (
+                record.state,
+                record.result_path.as_deref(),
+                record.result_bytes
+            ),
+            (TaskState::Done, None, 0),
+            "{road}: the record names no file and says so"
+        );
+        assert!(
+            !record.wire_fields().contains("result_path=")
+                && record.wire_fields().contains(" result_bytes=0 "),
+            "{road}: {}",
+            record.wire_fields()
+        );
+    };
+    let was = aterm_session::SessionId::generate();
+
+    // The file is gone: the 11 restored workers of 2026-11-12.
+    let gone = tasks.join(format!("{}-1.result.md", was.as_str()));
+    let restored = crate::session_store::test_handle(31);
+    seed_restored(&restored.ctx, &row(&gone), false, false);
+    names_nothing(&record_of(&restored.ctx), "a cold restore");
+    assert!(
+        restored
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .carried_results()
+            .is_empty()
+    );
+    assert_eq!(
+        cmd_result(&restored.ctx, 31, ""),
+        "ERR result unavailable why=no-snapshot\n"
+    );
+
+    // A seamless update's road, and a retired row's.
+    let carried = crate::session_store::test_handle(32);
+    seed_carried(&carried.ctx, Some(&row(&gone)));
+    names_nothing(&record_of(&carried.ctx), "a seamless update");
+    let adopt = |road: &str| {
+        let mut retired = crate::retired_workers::RetiredWorkers::default();
+        let line = format!("sid={} closed=7000 title=x {}", was.as_str(), row(&gone));
+        assert_eq!(
+            retired.adopt(&[line], Some(&tasks), Instant::now(), 9_000),
+            1,
+            "{road}"
+        );
+        retired.by_sid(&was).expect("adopted").record.clone()
+    };
+    names_nothing(&adopt("gone"), "a retired row");
+
+    // CONTROL: the result stands, so the record names it and `result` reads it.
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-gone-")
+        .tempdir()
+        .expect("scratch");
+    let transcript = scratch.path().join("t.jsonl");
+    let said = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Fixed the parser."}]}}"#;
+    let snap = aterm_agent::harness::result::snapshot(
+        &tasks,
+        &aterm_agent::harness::result::result_stem(Some(was.as_str()), 1),
+        Some((&transcript, &format!("{said}\n"))),
+        aterm_agent::harness::result::DoneBy::Turn,
+    )
+    .expect("written");
+    assert_eq!(snap.path, gone, "the name the row holds");
+    let sidecar = aterm_agent::harness::result::sidecar_of(&gone);
+    let stands = crate::session_store::test_handle(34);
+    seed_restored(&stands.ctx, &row(&gone), false, false);
+    let record = record_of(&stands.ctx);
+    assert_eq!(
+        (record.result_path.as_deref(), record.result_bytes),
+        (Some(gone.as_path()), 605),
+        "CONTROL: a result that stands is named"
+    );
+    assert_eq!(
+        stands.ctx.timeline.lock().unwrap().carried_results(),
+        std::slice::from_ref(&gone),
+        "CONTROL: under the ID it was written for, noted as what the tab came back with"
+    );
+    assert_eq!(
+        cmd_result(&stands.ctx, 34, ""),
+        "OK 1 source=transcript session=0b22 uuid=a-1 bytes=17\nFixed the parser.\n"
+    );
+    assert_eq!(
+        adopt("stands").result_path.as_deref(),
+        Some(gone.as_path()),
+        "CONTROL: a retired row's too"
+    );
+
+    // A link at the name is not the record's file.
+    let elsewhere = scratch.path().join("elsewhere.md");
+    std::fs::write(&elsewhere, "not a result").expect("written");
+    std::fs::remove_file(&gone).expect("the snapshot removed");
+    std::os::unix::fs::symlink(&elsewhere, &gone).expect("linked");
+    let linked = crate::session_store::test_handle(33);
+    seed_restored(&linked.ctx, &row(&gone), false, false);
+    names_nothing(&record_of(&linked.ctx), "a link at the name");
+    std::fs::remove_file(&gone).expect("the link removed");
+
+    // The snapshot without its sidecar is no result `result` can read.
+    std::fs::write(&gone, "Fixed the parser.").expect("written");
+    std::fs::remove_file(&sidecar).expect("the sidecar removed");
+    let bare = crate::session_store::test_handle(35);
+    seed_restored(&bare.ctx, &row(&gone), false, false);
+    names_nothing(&record_of(&bare.ctx), "a snapshot with no sidecar");
+    std::fs::remove_file(&gone).expect("removed");
+}
+
+/// A RESULT THAT COULD NOT BE CHECKED STAYS NAMED: a stored row's record gives up its result
+/// only where the file is known to be gone. A read that fails for another reason (here a
+/// snapshot this process may not open; in the field a descriptor limit while a restore starts
+/// its shells) proves nothing about the file, and the record is what keeps it from the restore's
+/// sweep: stripped, the result that stands would be removed. Before 2026-11-12 any failed read
+/// counted as gone. CONTROL: the same row once the file is gone names none.
+#[cfg(unix)]
+#[test]
+fn a_result_that_could_not_be_checked_stays_named() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tasks = tasks_dir().expect("the test binary's state root");
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-unchecked-")
+        .tempdir()
+        .expect("scratch");
+    let was = aterm_session::SessionId::generate();
+    let said = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Fixed the parser."}]}}"#;
+    let snap = aterm_agent::harness::result::snapshot(
+        &tasks,
+        &aterm_agent::harness::result::result_stem(Some(was.as_str()), 1),
+        Some((&scratch.path().join("t.jsonl"), &format!("{said}\n"))),
+        aterm_agent::harness::result::DoneBy::Turn,
+    )
+    .expect("written");
+    let sidecar = aterm_agent::harness::result::sidecar_of(&snap.path);
+    let row = format!(
+        "rev=4 state=done from=ctl since=1789000000000 result_bytes=605 attention=0 why=landed \
+         result_path={}",
+        crate::control::pct_encode(&snap.path.to_string_lossy())
+    );
+    let named = |ctx: &SessionCtx| {
+        let timeline = ctx.timeline.lock().unwrap();
+        let record = timeline.task().expect("a record");
+        (record.result_path.clone(), record.result_bytes)
+    };
+
+    std::fs::set_permissions(&snap.path, std::fs::Permissions::from_mode(0o000))
+        .expect("made unreadable");
+    let unread = crate::session_store::test_handle(41);
+    seed_restored(&unread.ctx, &row, false, false);
+    assert_eq!(
+        named(&unread.ctx),
+        (Some(snap.path.clone()), 605),
+        "a snapshot that would not open is not known to be gone: the record keeps it"
+    );
+    assert_eq!(
+        unread.ctx.timeline.lock().unwrap().carried_results(),
+        std::slice::from_ref(&snap.path),
+        "and its tab still answers for the file"
+    );
+
+    // CONTROL: gone, it is named no longer.
+    std::fs::remove_file(&snap.path).expect("removed");
+    let gone = crate::session_store::test_handle(42);
+    seed_restored(&gone.ctx, &row, false, false);
+    assert_eq!(
+        named(&gone.ctx),
+        (None, 0),
+        "CONTROL: a result that is gone"
+    );
+    std::fs::remove_file(&sidecar).expect("removed");
+}

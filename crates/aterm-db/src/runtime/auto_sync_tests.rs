@@ -1720,3 +1720,110 @@ fn registry_mailbox_secrets_discover_bidirectionally_and_survive_owner_restart()
     );
     check(&remote, 1, "fixture-reverse-password", SECOND_TOTP);
 }
+
+/// What `file` reads on the stand-in Mac `paths`: its state word, why, and how many rows.
+fn shared_file(
+    paths: &Paths,
+    file: &crate::file::Type,
+) -> (aterm_file::Word, Option<aterm_file::Why>, usize) {
+    let read = aterm_file::File::at(&crate::file::root(paths), &file.file()).read();
+    (read.status.word, read.status.why, read.rows().len())
+}
+
+/// The owner itself records the word of every state its custody refuses in: this test runs no
+/// pass and no `refresh`. A runtime owner over a stand-in Mac materializes its registry
+/// (`live`). An owner started with `[commons] enabled = false`, which never serves, records
+/// `off`, and `live` again once sharing is back on. An owner started on a home an unfinished
+/// succession fences, which never serves that home, records `held (succession)`. Each keeps the
+/// rows the live pass wrote.
+/// NEGATIVE CONTROL: with the materializer passing only while the owner serves (where it was,
+/// in the serving owner's upkeep), the owner that starts with sharing off never records it:
+/// `` timed out after 60s waiting for: the owner records `off` while sharing is off ``.
+#[test]
+fn the_owner_records_the_word_of_each_state_its_custody_refuses_in() {
+    use aterm_file::{Why, Word};
+    let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+    let paths = lab.paths[0].clone();
+    let config = lab._home.path().join("aterm.toml");
+    let registry = crate::alab::Registry::at(paths.clone());
+    registry.open().unwrap();
+    let machine = crate::typed::keys::machine_pk("m7");
+    registry
+        .write(vec![vec![
+            crate::typed::grid::tests::put(
+                &crate::alab::registry::MACHINE,
+                &machine,
+                "label",
+                aterm_json::json!("m7"),
+            ),
+            crate::typed::grid::tests::put(
+                &crate::alab::registry::MACHINE,
+                &machine,
+                "status",
+                aterm_json::json!("active"),
+            ),
+        ]])
+        .unwrap();
+    let machines = &crate::file::MACHINES;
+    assert_eq!(shared_file(&paths, machines), (Word::Never, None, 0));
+
+    let reservation = Multicast::bind(
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(239, 255, 31, 84),
+        0,
+        LinkScope::Loopback,
+    )
+    .unwrap();
+    let quick = crate::alab::upkeep::Cadence {
+        first: Duration::from_millis(20),
+        settle: Duration::from_millis(20),
+        every: Duration::from_millis(100),
+        busy: Duration::from_millis(50),
+        look: Duration::from_millis(10),
+    };
+    let owner = |paths: &Paths| {
+        Runtime::start_on_with_reports(
+            paths.clone(),
+            config.clone(),
+            |_| {},
+            Network {
+                isolated: Some(Attachment::new(reservation.port())),
+                files: Some(quick),
+                ..Network::default()
+            },
+            |_| {},
+        )
+        .unwrap()
+    };
+    let reads = |what: &str, expected: (Word, Option<Why>, usize)| {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            (shared_file(&paths, machines) == expected).then_some(())
+        });
+    };
+
+    let runtime = owner(&paths);
+    reads("the owner materializes its registry", (Word::Live, None, 1));
+    runtime.stop();
+
+    // Sharing is off before the owner starts, so it never serves: the word is its
+    // materializer's alone.
+    aterm_secrets::fsx::write_atomic(&config, b"[commons]\nenabled=false\n", 0o600).unwrap();
+    let runtime = owner(&paths);
+    reads(
+        "the owner records `off` while sharing is off",
+        (Word::Off, Some(Why::Policy), 1),
+    );
+    std::fs::remove_file(&config).unwrap();
+    reads("the owner records `live` again", (Word::Live, None, 1));
+    runtime.stop();
+
+    // A succession whose candidate nobody admits fences the home: the owner that starts on it
+    // never serves it, and its materializer says so.
+    crate::generation::file_seams::fence_pending(&paths, &lab.bootstrap(0));
+    let runtime = owner(&paths);
+    reads(
+        "the owner records `held (succession)` for a fenced home",
+        (Word::Held, Some(Why::Succession), 1),
+    );
+    runtime.stop();
+}
